@@ -1172,11 +1172,11 @@ def decision_evidence_payload(decision: Decision) -> dict[str, dict[str, Any]]:
 def _available_system_memory_bytes() -> int | None:
     totals: list[int] = []
     try:
-        sysconf = getattr(os, "sysconf")  # Linux container API
+        sysconf = vars(os)["sysconf"]  # Linux container API
         page_size = int(sysconf("SC_PAGE_SIZE"))
         pages = int(sysconf("SC_PHYS_PAGES"))
         totals.append(page_size * pages)
-    except (AttributeError, OSError, TypeError, ValueError):
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
         pass
     for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:
