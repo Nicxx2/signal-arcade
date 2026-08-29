@@ -1172,7 +1172,7 @@ def decision_evidence_payload(decision: Decision) -> dict[str, dict[str, Any]]:
 def _available_system_memory_bytes() -> int | None:
     totals: list[int] = []
     try:
-        sysconf = os.sysconf  # type: ignore[attr-defined]  # Linux container API
+        sysconf = getattr(os, "sysconf")  # Linux container API
         page_size = int(sysconf("SC_PAGE_SIZE"))
         pages = int(sysconf("SC_PHYS_PAGES"))
         totals.append(page_size * pages)
