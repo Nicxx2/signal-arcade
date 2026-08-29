@@ -1,0 +1,11 @@
+{
+  "name": "signal-arcade",
+  "private": true,
+  "version": "1.6.6",
+  "scripts": {
+    "build": "pnpm --filter signal-arcade-web build",
+    "lint": "pnpm --filter signal-arcade-web lint",
+    "test": "pnpm --filter signal-arcade-web test"
+  },
+  "packageManager": "pnpm@11.19.0"
+}

@@ -1,0 +1,6 @@
+packages:
+  - frontend
+
+# One physical dependency graph avoids duplicate React hook dispatchers on
+# Windows junction-based workspaces and remains deterministic in Docker.
+nodeLinker: hoisted

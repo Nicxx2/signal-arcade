@@ -1,0 +1,15 @@
+# Optional AMD ROCm acceleration overlay for a supported Linux host.
+# If the devices or ROCm driver are unavailable, use the base CPU stack instead.
+services:
+  signal-arcade:
+    environment:
+      SIGNAL_ARCADE_OLLAMA_ACCELERATOR: amd
+
+  ollama:
+    image: ollama/ollama:${SIGNAL_ARCADE_OLLAMA_VERSION:-0.33.1}-rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    environment:
+      CUDA_VISIBLE_DEVICES: "-1"
+      ROCR_VISIBLE_DEVICES: all

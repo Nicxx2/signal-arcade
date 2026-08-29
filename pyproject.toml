@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "solana-signal-arcade"
+version = "1.6.6"
+description = "A self-hosted Solana paper-trading lab that explains every decision."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Nicxx2" }]
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.15.0",
+  "uvicorn[standard]==0.52.4",
+  "websockets==15.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx2==2.12.0",
+  "mypy==1.8.0",
+  "pip-audit==2.10.1",
+  "pytest==9.0.3",
+  "ruff==0.16.4",
+]
+
+[project.scripts]
+signal-arcade = "signal_arcade.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/signal_arcade"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short --strict-markers -p no:cacheprovider"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_config.py" = ["S104", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["signal_arcade"]
+mypy_path = "backend"
+
+[[tool.mypy.overrides]]
+module = ["trio", "zstandard"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["backend/signal_arcade"]
+branch = true

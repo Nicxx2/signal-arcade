@@ -1,0 +1,92 @@
+# Image-only stack for Docker Hub, Portainer, Unraid, or another home server.
+# After the image is published, only SIGNAL_ARCADE_ADMIN_PASSWORD is required.
+services:
+  signal-arcade:
+    image: ${SIGNAL_ARCADE_IMAGE:-nicxx2/signal-arcade:latest}
+    pull_policy: always
+    restart: unless-stopped
+    stop_grace_period: 45s
+    init: true
+    environment:
+      SIGNAL_ARCADE_ADMIN_PASSWORD: ${SIGNAL_ARCADE_ADMIN_PASSWORD:?Set a long admin password in the stack environment}
+      SIGNAL_ARCADE_DEMO_MODE: ${SIGNAL_ARCADE_DEMO_MODE:-false}
+      SIGNAL_ARCADE_LOG_LEVEL: ${SIGNAL_ARCADE_LOG_LEVEL:-INFO}
+      SIGNAL_ARCADE_SOLANA_HTTP: ${SIGNAL_ARCADE_SOLANA_HTTP:-https://api.mainnet-beta.solana.com}
+      SIGNAL_ARCADE_SOLANA_WS: ${SIGNAL_ARCADE_SOLANA_WS:-wss://api.mainnet-beta.solana.com}
+      SIGNAL_ARCADE_JUPITER_BASE: ${SIGNAL_ARCADE_JUPITER_BASE:-https://api.jup.ag}
+      SIGNAL_ARCADE_JUPITER_API_KEY: ${SIGNAL_ARCADE_JUPITER_API_KEY:-}
+      SIGNAL_ARCADE_OLLAMA_URL: ${SIGNAL_ARCADE_OLLAMA_URL:-http://ollama:11434}
+      SIGNAL_ARCADE_OLLAMA_MODEL: ${SIGNAL_ARCADE_OLLAMA_MODEL:-qwen3.5:2b}
+      SIGNAL_ARCADE_OLLAMA_ACCELERATOR: ${SIGNAL_ARCADE_OLLAMA_ACCELERATOR:-cpu}
+      SIGNAL_ARCADE_DECISION_COOLDOWN_SECONDS: ${SIGNAL_ARCADE_DECISION_COOLDOWN_SECONDS:-5}
+      SIGNAL_ARCADE_STALE_MARKET_SECONDS: ${SIGNAL_ARCADE_STALE_MARKET_SECONDS:-20}
+      SIGNAL_ARCADE_ENTRY_LATENCY_MS: ${SIGNAL_ARCADE_ENTRY_LATENCY_MS:-850}
+      SIGNAL_ARCADE_EXIT_LATENCY_MS: ${SIGNAL_ARCADE_EXIT_LATENCY_MS:-1100}
+      SIGNAL_ARCADE_NETWORK_FEE_LAMPORTS: ${SIGNAL_ARCADE_NETWORK_FEE_LAMPORTS:-5000}
+      SIGNAL_ARCADE_PRIORITY_FEE_LAMPORTS: ${SIGNAL_ARCADE_PRIORITY_FEE_LAMPORTS:-25000}
+      SIGNAL_ARCADE_PUMP_FEE_BPS: ${SIGNAL_ARCADE_PUMP_FEE_BPS:-125}
+      SIGNAL_ARCADE_CANDIDATE_WINDOW_MINUTES: ${SIGNAL_ARCADE_CANDIDATE_WINDOW_MINUTES:-30}
+      SIGNAL_ARCADE_RAW_TRADE_RETENTION_HOURS: ${SIGNAL_ARCADE_RAW_TRADE_RETENTION_HOURS:-6}
+      SIGNAL_ARCADE_EQUITY_SAMPLE_SECONDS: ${SIGNAL_ARCADE_EQUITY_SAMPLE_SECONDS:-5}
+      SIGNAL_ARCADE_POSITION_MARK_STALE_SECONDS: ${SIGNAL_ARCADE_POSITION_MARK_STALE_SECONDS:-90}
+      SIGNAL_ARCADE_EVENT_QUEUE_MAX: ${SIGNAL_ARCADE_EVENT_QUEUE_MAX:-10000}
+      SIGNAL_ARCADE_EVENT_BATCH_SIZE: ${SIGNAL_ARCADE_EVENT_BATCH_SIZE:-250}
+      SIGNAL_ARCADE_EVENT_BATCH_WAIT_MS: ${SIGNAL_ARCADE_EVENT_BATCH_WAIT_MS:-25}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${SIGNAL_ARCADE_HOST_IP:-0.0.0.0}:${SIGNAL_ARCADE_HOST_PORT:-8765}:8765"
+    volumes:
+      - "${SIGNAL_ARCADE_DATA_SOURCE:-signal-arcade-data}:/data"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ollama:
+    image: ollama/ollama:${SIGNAL_ARCADE_OLLAMA_VERSION:-0.33.1}
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_CONTEXT_LENGTH: ${SIGNAL_ARCADE_OLLAMA_CONTEXT_LENGTH:-2048}
+      OLLAMA_KEEP_ALIVE: ${SIGNAL_ARCADE_OLLAMA_KEEP_ALIVE:-10m}
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_QUEUE: ${SIGNAL_ARCADE_OLLAMA_MAX_QUEUE:-4}
+      LLAMA_ARG_CACHE_RAM: ${SIGNAL_ARCADE_OLLAMA_PROMPT_CACHE_MB:-512}
+      CUDA_VISIBLE_DEVICES: "-1"
+      ROCR_VISIBLE_DEVICES: "-1"
+    expose:
+      - "11434"
+    volumes:
+      - "${SIGNAL_ARCADE_MODEL_SOURCE:-signal-arcade-models}:/root/.ollama"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  signal-arcade-data:
+  signal-arcade-models:

@@ -1,0 +1,12 @@
+# Optional NVIDIA acceleration overlay for Linux or Docker Desktop with WSL2.
+# Requires the NVIDIA Container Toolkit. The base stack remains the CPU-safe default.
+services:
+  signal-arcade:
+    environment:
+      SIGNAL_ARCADE_OLLAMA_ACCELERATOR: nvidia
+
+  ollama:
+    gpus: all
+    environment:
+      CUDA_VISIBLE_DEVICES: all
+      ROCR_VISIBLE_DEVICES: "-1"

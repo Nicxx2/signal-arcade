@@ -1,0 +1,809 @@
+from __future__ import annotations
+
+import math
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from threading import RLock
+from typing import Any
+
+from ..models import DataValue, EventKind, FeatureSnapshot, MarketEvent, Side
+
+LAMPORTS_PER_SOL = 1_000_000_000
+PUMP_TOKEN_DECIMALS = 1_000_000
+WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
+NATIVE_SOL_MINT = "11111111111111111111111111111111"
+SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"  # noqa: S105
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"  # noqa: S105
+
+
+def _value(payload: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
+    return default
+
+
+def _number(payload: dict[str, Any], *keys: str, default: int = 0) -> int:
+    value = _value(payload, *keys, default=default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(slots=True)
+class TradeObservation:
+    received_at: datetime
+    slot: int
+    side: Side
+    user: str
+    token_units: int
+    quote_lamports: int
+    price_sol: float
+
+
+@dataclass(slots=True)
+class TokenState:
+    mint: str
+    name: str = "Unknown token"
+    symbol: str = "?"
+    identity_source: str = "unavailable"
+    uri: str = ""
+    creator: str = ""
+    venue: str = "pump_curve"
+    curve_address: str = ""
+    pool_address: str = ""
+    pool_base_token_account: str = ""
+    pool_quote_token_account: str = ""
+    quote_mint: str = WRAPPED_SOL_MINT
+    route_verified: bool = False
+    token_program: str = ""
+    created_at: datetime | None = None
+    last_event_at: datetime | None = None
+    last_event_id: str | None = None
+    last_slot: int = 0
+    last_reserve_at: datetime | None = None
+    last_reserve_slot: int = 0
+    reserve_source: str = ""
+    virtual_token_reserves: int = 0
+    virtual_quote_reserves: int = 0
+    real_token_reserves: int = 0
+    # Exact spendable quote liquidity when the source exposes it. None keeps legacy/replay
+    # evidence usable without pretending that an unobserved vault balance is zero.
+    real_quote_reserves: int | None = None
+    initial_real_token_reserves: int = 0
+    token_total_supply: int = 0
+    complete: bool = False
+    fee_bps: int = 0
+    trades: deque[TradeObservation] = field(default_factory=lambda: deque(maxlen=5_000))
+    sources: set[str] = field(default_factory=set)
+    enrichment: dict[str, Any] = field(default_factory=dict)
+    enrichment_times: dict[str, datetime] = field(default_factory=dict)
+
+    def apply(self, event: MarketEvent) -> None:
+        payload = event.payload
+        reserve_observed = any(
+            _number(payload, key) > 0
+            for key in (
+                "virtual_token_reserves",
+                "virtualTokenReserves",
+                "virtual_sol_reserves",
+                "virtualSolReserves",
+                "virtual_quote_reserves",
+                "virtualQuoteReserves",
+                "pool_base_token_reserves",
+                "poolBaseTokenReserves",
+                "pool_base_amount",
+                "poolBaseAmount",
+                "base_reserves_after",
+                "baseReservesAfter",
+                "pool_quote_token_reserves",
+                "poolQuoteTokenReserves",
+                "pool_quote_amount",
+                "poolQuoteAmount",
+                "real_quote_reserves_after",
+                "realQuoteReservesAfter",
+            )
+        )
+        if event.kind != EventKind.MARKET:
+            self.last_event_at = event.received_at
+            self.last_event_id = event.event_id
+        self.last_slot = max(self.last_slot, event.slot or 0)
+        self.sources.add(event.source)
+        curve = _value(payload, "bonding_curve", "bondingCurve")
+        if isinstance(curve, str) and 30 <= len(curve) <= 50:
+            self.curve_address = curve
+        quote_mint = _value(payload, "quote_mint", "quoteMint")
+        # Once an AMM route is confirmed from its exact program-owned Pool account, later log
+        # payloads for that same pool cannot replace the pinned quote. A newly observed pool below
+        # clears route verification and may carry an untrusted provisional quote until RPC checks
+        # it.
+        if isinstance(quote_mint, str) and not (self.venue == "pump_swap" and self.route_verified):
+            self.quote_mint = quote_mint
+        token_program = _value(payload, "token_program", "tokenProgram")
+        if isinstance(token_program, str):
+            self.token_program = token_program
+        latest_creator = _value(
+            payload,
+            "new_coin_creator",
+            "newCoinCreator",
+            "new_creator",
+            "newCreator",
+            "coin_creator",
+            "coinCreator",
+            "creator",
+        )
+        if isinstance(latest_creator, str):
+            self.creator = latest_creator
+        if event.kind == EventKind.CREATE:
+            name = _bounded_display_text(_value(payload, "name"), 100)
+            symbol = _bounded_display_text(_value(payload, "symbol"), 30)
+            if name:
+                self.name = name
+            if symbol:
+                self.symbol = symbol
+            if name or symbol:
+                self.identity_source = "pump_create_event"
+            self.uri = str(_value(payload, "uri", default=""))[:500]
+            self.creator = str(
+                _value(
+                    payload,
+                    "coin_creator",
+                    "coinCreator",
+                    "creator",
+                    "user",
+                    default="",
+                )
+            )
+            timestamp = _number(payload, "timestamp")
+            self.created_at = (
+                datetime.fromtimestamp(timestamp, UTC)
+                if timestamp > 1_500_000_000
+                else event.received_at
+            )
+            self.token_total_supply = _number(
+                payload, "token_total_supply", "tokenTotalSupply", default=self.token_total_supply
+            )
+        if event.kind in {EventKind.COMPLETE, EventKind.MIGRATE}:
+            self.complete = True
+        is_amm = "pAMMBay6" in event.source or str(payload.get("event_name", "")).lower() in {
+            "buyevent",
+            "sellevent",
+            "createpoolevent",
+        }
+        if is_amm:
+            self.venue = "pump_swap"
+            pool = _value(payload, "pool")
+            if isinstance(pool, str) and pool != self.pool_address:
+                self.pool_address = pool
+                self.route_verified = False
+                if isinstance(quote_mint, str):
+                    self.quote_mint = quote_mint
+            pool_base = _number(
+                payload,
+                "pool_base_token_reserves",
+                "poolBaseTokenReserves",
+                "pool_base_amount",
+                "poolBaseAmount",
+                "base_reserves_after",
+                "baseReservesAfter",
+            )
+            pool_quote = _number(
+                payload,
+                "pool_quote_token_reserves",
+                "poolQuoteTokenReserves",
+                "pool_quote_amount",
+                "poolQuoteAmount",
+                "real_quote_reserves_after",
+                "realQuoteReservesAfter",
+            )
+            pool_quote_observed = _value(
+                payload,
+                "pool_quote_token_reserves",
+                "poolQuoteTokenReserves",
+                "pool_quote_amount",
+                "poolQuoteAmount",
+                "real_quote_reserves_after",
+                "realQuoteReservesAfter",
+            )
+            virtual_quote = _number(payload, "virtual_quote_reserves", "virtualQuoteReserves")
+            if pool_base > 0:
+                self.virtual_token_reserves = pool_base
+                self.real_token_reserves = pool_base
+                if self.initial_real_token_reserves == 0:
+                    self.initial_real_token_reserves = pool_base
+            if pool_quote > 0:
+                self.virtual_quote_reserves = max(1, pool_quote + virtual_quote)
+            if pool_quote_observed is not None and pool_quote >= 0:
+                self.real_quote_reserves = pool_quote
+        # Buyback/cashback fields describe redistribution of other fees; charging them again as
+        # a percentage of gross output substantially understates a PumpSwap sell.
+        fee_keys = (
+            (
+                ("lp_fee_basis_points", "lpFeeBasisPoints"),
+                ("protocol_fee_basis_points", "protocolFeeBasisPoints"),
+                ("coin_creator_fee_basis_points", "coinCreatorFeeBasisPoints"),
+            )
+            if is_amm
+            else (
+                ("fee_basis_points", "feeBasisPoints"),
+                ("creator_fee_basis_points", "creatorFeeBasisPoints"),
+            )
+        )
+        observed_fee_bps = sum(_number(payload, *keys) for keys in fee_keys)
+        if 0 < observed_fee_bps <= 5_000:
+            self.fee_bps = observed_fee_bps
+        if not is_amm:
+            self.virtual_token_reserves = _number(
+                payload,
+                "virtual_token_reserves",
+                "virtualTokenReserves",
+                default=self.virtual_token_reserves,
+            )
+            self.virtual_quote_reserves = _number(
+                payload,
+                "virtual_sol_reserves",
+                "virtualSolReserves",
+                "virtual_quote_reserves",
+                "virtualQuoteReserves",
+                default=self.virtual_quote_reserves,
+            )
+            real_quote_observed = _value(
+                payload,
+                "real_quote_reserves",
+                "realQuoteReserves",
+                "real_sol_reserves",
+                "realSolReserves",
+            )
+            if real_quote_observed is not None:
+                real_quote = _number(
+                    payload,
+                    "real_quote_reserves",
+                    "realQuoteReserves",
+                    "real_sol_reserves",
+                    "realSolReserves",
+                    default=-1,
+                )
+                if real_quote >= 0:
+                    self.real_quote_reserves = real_quote
+        self.real_token_reserves = _number(
+            payload,
+            "real_token_reserves",
+            "realTokenReserves",
+            default=self.real_token_reserves,
+        )
+        if self.initial_real_token_reserves == 0 and self.real_token_reserves > 0:
+            self.initial_real_token_reserves = self.real_token_reserves
+        if reserve_observed and self.virtual_token_reserves > 0 and self.virtual_quote_reserves > 0:
+            self.last_reserve_at = event.received_at
+            self.last_reserve_slot = max(self.last_reserve_slot, event.slot or 0)
+            self.reserve_source = event.source
+        if event.kind == EventKind.TRADE:
+            self._apply_trade(event)
+
+    def _apply_trade(self, event: MarketEvent) -> None:
+        payload = event.payload
+        event_name = str(payload.get("event_name") or "").lower()
+        is_buy = _value(payload, "is_buy", "isBuy")
+        if is_buy is None:
+            is_buy = "buy" in event_name
+        side = Side.BUY if bool(is_buy) else Side.SELL
+        token_units = _number(
+            payload,
+            "token_amount",
+            "tokenAmount",
+            "base_amount_out" if side == Side.BUY else "base_amount_in",
+            "baseAmountOut" if side == Side.BUY else "baseAmountIn",
+        )
+        quote_lamports = _number(
+            payload,
+            "sol_amount",
+            "solAmount",
+            "quote_amount_in" if side == Side.BUY else "quote_amount_out",
+            "quoteAmountIn" if side == Side.BUY else "quoteAmountOut",
+        )
+        price = self.price_sol
+        if token_units > 0 and quote_lamports > 0:
+            price = (quote_lamports / LAMPORTS_PER_SOL) / (token_units / PUMP_TOKEN_DECIMALS)
+        self.trades.append(
+            TradeObservation(
+                received_at=event.received_at,
+                slot=event.slot or 0,
+                side=side,
+                user=str(_value(payload, "user", default="unknown")),
+                token_units=max(0, token_units),
+                quote_lamports=max(0, quote_lamports),
+                price_sol=max(0.0, price),
+            )
+        )
+
+    @property
+    def price_sol(self) -> float:
+        if self.virtual_token_reserves <= 0 or self.virtual_quote_reserves <= 0:
+            return 0.0
+        return (self.virtual_quote_reserves / LAMPORTS_PER_SOL) / (
+            self.virtual_token_reserves / PUMP_TOKEN_DECIMALS
+        )
+
+
+class FeatureEngine:
+    def __init__(self, *, stale_market_seconds: int = 20) -> None:
+        self.tokens: dict[str, TokenState] = {}
+        self.stale_market_seconds = stale_market_seconds
+        # UI snapshots are assembled in a worker thread so large database reads cannot
+        # stall the market event loop. Protect the in-memory feature state while that
+        # thread reads it; otherwise a live trade can mutate a deque mid-snapshot.
+        self._lock = RLock()
+
+    def apply(self, event: MarketEvent) -> TokenState | None:
+        with self._lock:
+            mint = event.mint
+            if not mint:
+                return None
+            state = self.tokens.get(mint)
+            if state is None:
+                state = TokenState(mint=mint)
+                self.tokens[mint] = state
+            state.apply(event)
+            return state
+
+    def add_enrichment(
+        self,
+        mint: str,
+        data: dict[str, Any],
+        at: datetime | None = None,
+        *,
+        source: str,
+    ) -> None:
+        with self._lock:
+            state = self.tokens.get(mint)
+            if state is None:
+                return
+            state.enrichment.update(data)
+            state.enrichment_times[source] = at or datetime.now(UTC)
+            if source == "dexscreener":
+                fallback_name = _bounded_display_text(data.get("base_token_name"), 100)
+                fallback_symbol = _bounded_display_text(data.get("base_token_symbol"), 30)
+                identity_added = False
+                if state.name == "Unknown token" and fallback_name:
+                    state.name = fallback_name
+                    identity_added = True
+                if state.symbol == "?" and fallback_symbol:
+                    state.symbol = fallback_symbol
+                    identity_added = True
+                if identity_added:
+                    state.identity_source = (
+                        "dexscreener"
+                        if state.identity_source == "unavailable"
+                        else "pump_create_event+dexscreener"
+                    )
+
+    def prune(self, inactive_before: datetime, keep_mints: set[str]) -> int:
+        with self._lock:
+            stale = [
+                mint
+                for mint, state in self.tokens.items()
+                if mint not in keep_mints
+                and state.last_event_at is not None
+                and state.last_event_at < inactive_before
+            ]
+            for mint in stale:
+                self.tokens.pop(mint, None)
+            return len(stale)
+
+    def snapshot(self, mint: str, now: datetime | None = None) -> FeatureSnapshot | None:
+        with self._lock:
+            state = self.tokens.get(mint)
+            if state is None:
+                return None
+            return self._snapshot_state(state, now or datetime.now(UTC))
+
+    def position_snapshot(
+        self,
+        mint: str,
+        now: datetime | None = None,
+    ) -> FeatureSnapshot | None:
+        """Build a held-position snapshot whose route freshness may come from exact RPC state."""
+
+        with self._lock:
+            state = self.tokens.get(mint)
+            if state is None:
+                return None
+            return self._snapshot_state(state, now or datetime.now(UTC), position_mark=True)
+
+    def confirm_pumpswap_route(
+        self,
+        mint: str,
+        *,
+        pool_address: str,
+        quote_mint: str,
+        pool_base_token_account: str = "",
+        pool_quote_token_account: str = "",
+    ) -> bool:
+        """Apply a route only after its on-chain Pool account has been decoded and matched."""
+
+        with self._lock:
+            state = self.tokens.get(mint)
+            if (
+                state is None
+                or state.venue != "pump_swap"
+                or not pool_address
+                or state.pool_address != pool_address
+            ):
+                return False
+            state.quote_mint = quote_mint
+            if pool_base_token_account:
+                state.pool_base_token_account = pool_base_token_account
+            if pool_quote_token_account:
+                state.pool_quote_token_account = pool_quote_token_account
+            state.route_verified = True
+            return True
+
+    def refresh_pump_curve(
+        self,
+        mint: str,
+        *,
+        curve_address: str,
+        values: dict[str, Any],
+        slot: int,
+        at: datetime,
+    ) -> bool:
+        with self._lock:
+            state = self.tokens.get(mint)
+            if (
+                state is None
+                or state.venue != "pump_curve"
+                or not curve_address
+                or state.curve_address != curve_address
+                or slot < max(state.last_slot, state.last_reserve_slot)
+                or (state.last_reserve_slot > 0 and slot <= state.last_reserve_slot)
+            ):
+                return False
+            virtual_token = _number(values, "virtual_token_reserves")
+            virtual_quote = _number(
+                values,
+                "virtual_quote_reserves",
+                "virtual_sol_reserves",
+            )
+            real_token = _number(values, "real_token_reserves")
+            real_quote = _number(
+                values,
+                "real_quote_reserves",
+                "real_sol_reserves",
+                default=-1,
+            )
+            quote_mint = values.get("quote_mint")
+            if virtual_token <= 0 or virtual_quote <= 0 or real_token < 0:
+                return False
+            if isinstance(quote_mint, str) and quote_mint != state.quote_mint:
+                return False
+            state.virtual_token_reserves = virtual_token
+            state.virtual_quote_reserves = virtual_quote
+            state.real_token_reserves = real_token
+            if real_quote >= 0:
+                state.real_quote_reserves = real_quote
+            state.token_total_supply = max(
+                state.token_total_supply,
+                _number(values, "token_total_supply"),
+            )
+            state.complete = bool(values.get("complete", state.complete))
+            state.last_reserve_at = at
+            state.last_reserve_slot = slot
+            state.reserve_source = "solana_rpc:position_watchdog"
+            return True
+
+    def refresh_pumpswap_reserves(
+        self,
+        mint: str,
+        *,
+        pool_address: str,
+        base_token_account: str,
+        quote_token_account: str,
+        base_amount: int,
+        quote_amount: int,
+        virtual_quote_reserves: int,
+        slot: int,
+        at: datetime,
+    ) -> bool:
+        with self._lock:
+            state = self.tokens.get(mint)
+            if (
+                state is None
+                or state.venue != "pump_swap"
+                or not state.route_verified
+                or state.pool_address != pool_address
+                or state.pool_base_token_account != base_token_account
+                or state.pool_quote_token_account != quote_token_account
+                or slot < max(state.last_slot, state.last_reserve_slot)
+                or (state.last_reserve_slot > 0 and slot <= state.last_reserve_slot)
+                or base_amount <= 0
+                or quote_amount < 0
+                or virtual_quote_reserves < 0
+            ):
+                return False
+            state.virtual_token_reserves = base_amount
+            state.real_token_reserves = base_amount
+            state.virtual_quote_reserves = max(1, quote_amount + virtual_quote_reserves)
+            state.real_quote_reserves = quote_amount
+            if state.initial_real_token_reserves == 0:
+                state.initial_real_token_reserves = base_amount
+            state.last_reserve_at = at
+            state.last_reserve_slot = slot
+            state.reserve_source = "solana_rpc:position_watchdog"
+            return True
+
+    def _snapshot_state(
+        self,
+        state: TokenState,
+        now: datetime,
+        *,
+        position_mark: bool = False,
+    ) -> FeatureSnapshot:
+        last_event = state.last_event_at or state.created_at or now
+        freshness = max(0.0, (now - last_event).total_seconds())
+        reserve_at = state.last_reserve_at or last_event
+        reserve_freshness = max(0.0, (now - reserve_at).total_seconds())
+        route_freshness = reserve_freshness if position_mark else freshness
+        created = state.created_at or last_event
+        age = max(0.0, (now - created).total_seconds())
+        trades_1m = [
+            trade for trade in state.trades if (now - trade.received_at).total_seconds() <= 60
+        ]
+        trades_5m = [
+            trade for trade in state.trades if (now - trade.received_at).total_seconds() <= 300
+        ]
+        buys_1m = sum(trade.side == Side.BUY for trade in trades_1m)
+        buys_5m = sum(trade.side == Side.BUY for trade in trades_5m)
+        sells_5m = len(trades_5m) - buys_5m
+        buy_ratio = buys_5m / len(trades_5m) if trades_5m else 0.0
+        users = {trade.user for trade in trades_5m if trade.user != "unknown"}
+        wallet_volume: dict[str, int] = defaultdict(int)
+        for trade in trades_5m:
+            wallet_volume[trade.user] += trade.quote_lamports
+        total_volume = sum(wallet_volume.values())
+        hhi = (
+            sum((value / total_volume) ** 2 for value in wallet_volume.values())
+            if total_volume > 0
+            else 1.0
+        )
+        amounts = Counter(trade.quote_lamports for trade in trades_5m if trade.quote_lamports > 0)
+        repeated_ratio = max(amounts.values(), default=0) / len(trades_5m) if trades_5m else 0.0
+        slots = Counter(trade.slot for trade in trades_5m if trade.slot > 0)
+        same_slot_ratio = max(slots.values(), default=0) / len(trades_5m) if trades_5m else 0.0
+        creator_sells = sum(
+            trade.side == Side.SELL and trade.user == state.creator for trade in trades_5m
+        )
+        progress = 0.0
+        if state.initial_real_token_reserves > 0 and state.real_token_reserves >= 0:
+            progress = 1 - state.real_token_reserves / state.initial_real_token_reserves
+        progress = min(1.0, max(0.0, progress))
+        momentum_1m = _momentum(trades_1m)
+        momentum_5m = _momentum(trades_5m)
+        drawdown = _drawdown(trades_5m)
+        volume_5m_sol = sum(trade.quote_lamports for trade in trades_5m) / LAMPORTS_PER_SOL
+        reserve_sol = state.virtual_quote_reserves / LAMPORTS_PER_SOL
+        dex_at = state.enrichment_times.get("dexscreener")
+        dex_age = max(0.0, (now - dex_at).total_seconds()) if dex_at else math.inf
+        mint_safety_at = state.enrichment_times.get("solana_rpc")
+        mint_safety_age = (
+            max(0.0, (now - mint_safety_at).total_seconds()) if mint_safety_at else freshness
+        )
+
+        hard_flags: list[str] = []
+        if state.virtual_token_reserves <= 0 or state.virtual_quote_reserves <= 0:
+            hard_flags.append("missing_curve_reserves")
+        if route_freshness > self.stale_market_seconds:
+            hard_flags.append("stale_market_data")
+        if state.complete and state.venue == "pump_curve":
+            hard_flags.append("curve_complete_route_unconfirmed")
+        if creator_sells:
+            hard_flags.append("creator_sold_recently")
+        if state.venue == "pump_swap":
+            if not state.route_verified:
+                hard_flags.append("pumpswap_route_unverified")
+            elif state.quote_mint != WRAPPED_SOL_MINT:
+                hard_flags.append("unsupported_quote_mint_v1")
+        elif state.quote_mint not in {WRAPPED_SOL_MINT, NATIVE_SOL_MINT}:
+            hard_flags.append("unsupported_quote_mint_v1")
+        if state.token_program and state.token_program not in {
+            SPL_TOKEN_PROGRAM,
+            TOKEN_2022_PROGRAM,
+        }:
+            hard_flags.append("unsupported_token_program")
+        live_source = any(source.startswith("solana:") for source in state.sources)
+        mint_safety = state.enrichment.get("mint_safety")
+        if live_source and mint_safety is None:
+            hard_flags.append("mint_safety_unverified")
+        elif isinstance(mint_safety, dict) and not mint_safety.get("safe", False):
+            hard_flags.append("mint_account_failed_safety_checks")
+
+        sources = sorted(state.sources) or ["unknown"]
+        values: dict[str, DataValue] = {}
+
+        def put(
+            key: str,
+            value: float | int | str | bool | None,
+            unit: str,
+            *,
+            quality: float = 1.0,
+            source_list: list[str] | None = None,
+            item_freshness: float | None = None,
+            item_as_of: datetime | None = None,
+            missing_reason: str | None = None,
+        ) -> None:
+            values[key] = DataValue(
+                value=value,
+                unit=unit,
+                as_of=item_as_of or last_event,
+                sources=source_list or sources,
+                freshness_seconds=freshness if item_freshness is None else item_freshness,
+                quality=max(0.0, min(1.0, quality)),
+                missing_reason=missing_reason,
+            )
+
+        put("age_seconds", age, "seconds")
+        put("market_freshness", freshness, "seconds")
+        put(
+            "reserve_freshness",
+            reserve_freshness,
+            "seconds",
+            source_list=[state.reserve_source] if state.reserve_source else sources,
+            item_freshness=reserve_freshness,
+            item_as_of=reserve_at,
+        )
+        put("trade_count_1m", len(trades_1m), "count")
+        put("trade_count_5m", len(trades_5m), "count")
+        put("buys_1m", buys_1m, "count")
+        put("buys_5m", buys_5m, "count")
+        put("sells_5m", sells_5m, "count")
+        put("buy_ratio_5m", buy_ratio, "fraction")
+        put("unique_wallets_5m", len(users), "count")
+        put("wallet_volume_hhi", hhi, "fraction")
+        put("repeated_amount_ratio", repeated_ratio, "fraction")
+        put("same_slot_ratio", same_slot_ratio, "fraction")
+        put("creator_sells_5m", creator_sells, "count")
+        put("curve_progress", progress, "fraction")
+        put("momentum_1m", momentum_1m, "fraction")
+        put("momentum_5m", momentum_5m, "fraction")
+        put("drawdown_5m", drawdown, "fraction")
+        put("volume_5m_sol", volume_5m_sol, "SOL")
+        reserve_sources = [state.reserve_source] if state.reserve_source else sources
+        put(
+            "virtual_quote_reserve_sol",
+            reserve_sol,
+            "SOL",
+            source_list=reserve_sources,
+            item_freshness=reserve_freshness,
+            item_as_of=reserve_at,
+        )
+        put(
+            "price_sol",
+            state.price_sol,
+            "SOL/token",
+            source_list=reserve_sources,
+            item_freshness=reserve_freshness,
+            item_as_of=reserve_at,
+        )
+        identity_sources = (
+            ["solana:pump_create_event"]
+            if state.identity_source == "pump_create_event"
+            else ["dexscreener"]
+            if state.identity_source == "dexscreener"
+            else ["solana:pump_create_event", "dexscreener"]
+            if state.identity_source == "pump_create_event+dexscreener"
+            else sources
+        )
+        put(
+            "identity_source",
+            state.identity_source,
+            "label",
+            quality=(
+                1.0
+                if state.identity_source == "pump_create_event"
+                else 0.6
+                if state.identity_source in {"dexscreener", "pump_create_event+dexscreener"}
+                else 0.0
+            ),
+            source_list=identity_sources,
+            missing_reason=(
+                "name_and_symbol_not_observed" if state.identity_source == "unavailable" else None
+            ),
+        )
+        put(
+            "observed_fee_bps",
+            state.fee_bps or None,
+            "basis_points",
+            missing_reason=None if state.fee_bps else "not_observed_yet",
+        )
+        put("complete", state.complete, "boolean")
+        put("quote_mint", state.quote_mint, "address")
+        put(
+            "mint_safety_verified",
+            mint_safety.get("safe") if isinstance(mint_safety, dict) else None,
+            "boolean",
+            quality=1.0 if isinstance(mint_safety, dict) else 0.0,
+            source_list=["solana_rpc"],
+            item_freshness=mint_safety_age,
+            item_as_of=mint_safety_at,
+            missing_reason=None if isinstance(mint_safety, dict) else "not_checked_yet",
+        )
+        dex_values = {
+            "liquidity_usd": "USD",
+            "volume_5m_usd": "USD",
+            "market_cap_usd": "USD",
+            "price_usd": "USD/token",
+            "price_native": "SOL/token",
+            "sol_usd_price": "USD/SOL",
+        }
+        for key, unit in dex_values.items():
+            value = state.enrichment.get(key)
+            stale = value is not None and dex_age > 120
+            put(
+                key,
+                value,
+                unit,
+                quality=0.8 if value is not None and not stale else 0.0,
+                source_list=["dexscreener"],
+                item_freshness=freshness if math.isinf(dex_age) else dex_age,
+                item_as_of=dex_at,
+                missing_reason=(
+                    "stale_enrichment"
+                    if stale
+                    else None
+                    if value is not None
+                    else "not_enriched_or_unavailable"
+                ),
+            )
+
+        event_score = min(1.0, len(trades_5m) / 30)
+        wallet_score = min(1.0, len(users) / 15)
+        freshness_score = max(0.0, 1 - freshness / self.stale_market_seconds)
+        reserve_score = 1.0 if state.virtual_quote_reserves > 0 else 0.0
+        confidence = (
+            0.30 * event_score + 0.20 * wallet_score + 0.30 * freshness_score + 0.20 * reserve_score
+        )
+        return FeatureSnapshot(
+            mint=state.mint,
+            symbol=state.symbol,
+            name=state.name,
+            venue=state.venue,
+            computed_at=now,
+            values=values,
+            data_confidence=max(0.0, min(1.0, confidence)),
+            hard_flags=hard_flags,
+        )
+
+    def list_snapshots(self, limit: int = 50) -> list[FeatureSnapshot]:
+        with self._lock:
+            oldest = datetime.min.replace(tzinfo=UTC)
+            states = sorted(
+                self.tokens.values(),
+                key=lambda state: state.last_event_at or state.created_at or oldest,
+                reverse=True,
+            )[:limit]
+            now = datetime.now(UTC)
+            return [self._snapshot_state(state, now) for state in states]
+
+
+def _momentum(trades: list[TradeObservation]) -> float:
+    prices = [trade.price_sol for trade in trades if trade.price_sol > 0]
+    if len(prices) < 2 or prices[0] <= 0:
+        return 0.0
+    return max(-1.0, min(10.0, prices[-1] / prices[0] - 1))
+
+
+def _drawdown(trades: list[TradeObservation]) -> float:
+    prices = [trade.price_sol for trade in trades if trade.price_sol > 0]
+    if not prices:
+        return 0.0
+    peak = max(prices)
+    return 0.0 if peak <= 0 else min(1.0, max(0.0, 1 - prices[-1] / peak))
+
+
+def _bounded_display_text(value: Any, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    printable = "".join(character for character in value if character.isprintable())
+    normalized = " ".join(printable.split())
+    return normalized[:limit] or None
