@@ -29,7 +29,7 @@ guaranteed-profit demo.
 Paper equity, the season-locked risk profile, drawdown policy, unattended continuity, positions
 and recent decisions stay together without hiding the assumptions behind the score.
 
-![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/01-arena-overview.png)
+![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/01-arena-overview.png)
 
 ### Season progress
 
@@ -37,7 +37,7 @@ Compare win rate, drawdown, fees and net return across every retained paper seas
 freeze their exact profile for like-for-like filters; preserved pre-profile seasons remain clearly
 labelled as legacy history.
 
-![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/03-season-progress.png)
+![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/03-season-progress.png)
 
 ### Learning Lab and AI Coach Room
 
@@ -45,30 +45,30 @@ The deterministic baseline remains in control until a statistical challenger ear
 on later unseen outcomes. The local AI coach proposes only bounded, allowlisted experiments and
 collects forward evidence separately from historical screening.
 
-![Signal Arcade Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/04-learning-lab.png)
+![Signal Arcade Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/04-learning-lab.png)
 
 <details>
 <summary><strong>📷 More screenshots</strong></summary>
 
 ### Decision board
 
-![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/02-decision-board.png)
+![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/02-decision-board.png)
 
 ### Replay receipts and modeled friction
 
-![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/08-replay-receipts.png)
+![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/08-replay-receipts.png)
 
 ### Provider budgets and pacing
 
-![Signal Arcade data providers](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/05-data-providers.png)
+![Signal Arcade data providers](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/05-data-providers.png)
 
 ### Optional local AI models
 
-![Signal Arcade local AI models](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/06-local-ai.png)
+![Signal Arcade local AI models](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/06-local-ai.png)
 
 ### Mobile layout
 
-<img src="https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/07-mobile-arena.png" alt="Signal Arcade mobile Arena" width="430">
+<img src="https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/07-mobile-arena.png" alt="Signal Arcade mobile Arena" width="430">
 
 </details>
 
