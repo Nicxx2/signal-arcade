@@ -20,6 +20,11 @@ Object.assign(globalThis, {
   WebSocket: WebSocketStub,
 });
 
+Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+  configurable: true,
+  value() {},
+});
+
 const gradient = { addColorStop() {} } as unknown as CanvasGradient;
 Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
   configurable: true,

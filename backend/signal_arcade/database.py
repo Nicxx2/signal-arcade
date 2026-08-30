@@ -24,7 +24,7 @@ from .models import (
     Position,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 class Database:
@@ -238,12 +238,33 @@ class Database:
                         break_even INTEGER NOT NULL DEFAULT 0,
                         ending_drawdown_fraction REAL NOT NULL DEFAULT 0,
                         open_positions INTEGER NOT NULL DEFAULT 0,
+                        risk_mode TEXT,
+                        profile_fingerprint TEXT,
+                        profile_json TEXT,
+                        profile_locked_at TEXT,
+                        terminal_reason TEXT,
+                        result_quality TEXT NOT NULL DEFAULT 'complete'
+                            CHECK(result_quality IN ('complete','unresolved')),
+                        comparable INTEGER NOT NULL DEFAULT 1 CHECK(comparable IN (0,1)),
                         status TEXT NOT NULL CHECK(status IN ('current','completed'))
                     );
                     CREATE INDEX idx_paper_seasons_number
                         ON paper_seasons(season_number DESC);
                     CREATE UNIQUE INDEX idx_paper_seasons_one_current
                         ON paper_seasons(status) WHERE status='current';
+                    CREATE INDEX idx_paper_seasons_profile
+                        ON paper_seasons(profile_fingerprint, season_number DESC);
+                    CREATE TABLE unresolved_paper_positions (
+                        retirement_id TEXT PRIMARY KEY,
+                        season_id TEXT NOT NULL,
+                        recorded_at TEXT NOT NULL,
+                        mint TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        record_json TEXT NOT NULL,
+                        FOREIGN KEY(season_id) REFERENCES paper_seasons(season_id)
+                    );
+                    CREATE INDEX idx_unresolved_positions_season
+                        ON unresolved_paper_positions(season_id, recorded_at);
                     """
                 )
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -417,6 +438,67 @@ class Database:
                         """
                     )
                     version = 7
+                if version < 8:
+                    # Existing seasons cannot be relabelled safely: older releases allowed the
+                    # risk slider to change during a season and retained no complete change log.
+                    # Nullable additive columns therefore make legacy provenance explicit while
+                    # every newly created season receives an exact canonical profile.
+                    columns = {
+                        str(row[1])
+                        for row in self._conn.execute("PRAGMA table_info(paper_seasons)")
+                    }
+                    if "risk_mode" not in columns:
+                        self._conn.execute("ALTER TABLE paper_seasons ADD COLUMN risk_mode TEXT")
+                    if "profile_fingerprint" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN profile_fingerprint TEXT"
+                        )
+                    if "profile_json" not in columns:
+                        self._conn.execute("ALTER TABLE paper_seasons ADD COLUMN profile_json TEXT")
+                    if "profile_locked_at" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN profile_locked_at TEXT"
+                        )
+                    if "terminal_reason" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN terminal_reason TEXT"
+                        )
+                    self._conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_paper_seasons_profile "
+                        "ON paper_seasons(profile_fingerprint, season_number DESC)"
+                    )
+                    version = 8
+                if version < 9:
+                    columns = {
+                        str(row[1])
+                        for row in self._conn.execute("PRAGMA table_info(paper_seasons)")
+                    }
+                    if "result_quality" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN result_quality TEXT "
+                            "NOT NULL DEFAULT 'complete'"
+                        )
+                    if "comparable" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN comparable INTEGER "
+                            "NOT NULL DEFAULT 1"
+                        )
+                    self._conn.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS unresolved_paper_positions (
+                            retirement_id TEXT PRIMARY KEY,
+                            season_id TEXT NOT NULL,
+                            recorded_at TEXT NOT NULL,
+                            mint TEXT NOT NULL,
+                            symbol TEXT NOT NULL,
+                            record_json TEXT NOT NULL,
+                            FOREIGN KEY(season_id) REFERENCES paper_seasons(season_id)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_unresolved_positions_season
+                            ON unresolved_paper_positions(season_id, recorded_at);
+                        """
+                    )
+                    version = 9
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def health_check(self) -> bool:
@@ -656,7 +738,13 @@ class Database:
         with self._lock, self._conn:
             self._upsert_settings(values.items(), now)
 
-    def initialize_portfolio(self, tx_id: str, starting_minor: int, quote_currency: str) -> None:
+    def initialize_portfolio(
+        self,
+        tx_id: str,
+        starting_minor: int,
+        quote_currency: str,
+        season_profile: dict[str, Any] | None = None,
+    ) -> None:
         """Atomically create the first virtual bankroll and all of its durable settings."""
         if starting_minor <= 0:
             raise ValueError("starting bankroll must be positive")
@@ -697,6 +785,7 @@ class Database:
                 started_at=now,
                 quote_currency=quote_currency,
                 starting_minor=starting_minor,
+                season_profile=season_profile,
             )
             self._conn.execute(
                 """INSERT INTO equity_points(
@@ -711,6 +800,7 @@ class Database:
         started_at: str,
         quote_currency: str,
         starting_minor: int,
+        season_profile: dict[str, Any] | None = None,
     ) -> None:
         """Insert the one active paper season inside the caller's transaction."""
 
@@ -727,11 +817,15 @@ class Database:
             ).fetchone()[0]
         )
         decimals = 9 if quote_currency == "SOL" else 6
+        risk_mode = season_profile.get("risk_mode") if season_profile else None
+        profile_fingerprint = season_profile.get("profile_fingerprint") if season_profile else None
+        profile_locked_at = season_profile.get("locked_at") if season_profile else None
         self._conn.execute(
             """INSERT INTO paper_seasons(
                    season_id,season_number,started_at,quote_currency,quote_decimals,
-                   starting_minor,peak_equity_minor,status
-               ) VALUES(?,?,?,?,?,?,?,'current')""",
+                   starting_minor,peak_equity_minor,risk_mode,profile_fingerprint,
+                   profile_json,profile_locked_at,status
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'current')""",
             (
                 season_id,
                 number,
@@ -740,6 +834,14 @@ class Database:
                 decimals,
                 starting_minor,
                 starting_minor,
+                risk_mode,
+                profile_fingerprint,
+                (
+                    json.dumps(season_profile, separators=(",", ":"), sort_keys=True)
+                    if season_profile
+                    else None
+                ),
+                profile_locked_at,
             ),
         )
 
@@ -778,7 +880,105 @@ class Database:
             rows = self._reader_conn.execute(
                 "SELECT * FROM paper_seasons ORDER BY season_number"
             ).fetchall()
-        return [dict(row) for row in rows]
+            unresolved_rows = self._reader_conn.execute(
+                "SELECT season_id,record_json FROM unresolved_paper_positions ORDER BY recorded_at"
+            ).fetchall()
+        unresolved_by_season: dict[str, list[dict[str, Any]]] = {}
+        for row in unresolved_rows:
+            unresolved_by_season.setdefault(str(row["season_id"]), []).append(
+                json.loads(str(row["record_json"]))
+            )
+        seasons: list[dict[str, Any]] = []
+        for row in rows:
+            season = dict(row)
+            raw_profile = season.pop("profile_json", None)
+            season["profile"] = json.loads(raw_profile) if raw_profile else None
+            season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
+            season["comparable"] = bool(season.get("comparable", 1))
+            season["unresolved_inventory"] = unresolved_by_season.get(str(season["season_id"]), [])
+            seasons.append(season)
+        return seasons
+
+    def current_paper_season(self) -> dict[str, Any] | None:
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                "SELECT * FROM paper_seasons WHERE status='current'"
+            ).fetchone()
+        if row is None:
+            return None
+        season = dict(row)
+        raw_profile = season.pop("profile_json", None)
+        season["profile"] = json.loads(raw_profile) if raw_profile else None
+        season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
+        season["comparable"] = bool(season.get("comparable", 1))
+        season["unresolved_inventory"] = []
+        return season
+
+    def update_current_season_profile(
+        self,
+        season_id: str,
+        season_profile: dict[str, Any],
+    ) -> None:
+        """Replace only an unlocked current season's exact profile."""
+
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT profile_locked_at,status FROM paper_seasons
+                   WHERE season_id=?""",
+                (season_id,),
+            ).fetchone()
+            if row is None or str(row["status"]) != "current":
+                raise RuntimeError("paper season is not current")
+            if row["profile_locked_at"] is not None:
+                raise ValueError("paper season profile is already locked")
+            updated = self._conn.execute(
+                """UPDATE paper_seasons SET risk_mode=?,profile_fingerprint=?,
+                          profile_json=?,profile_locked_at=?
+                   WHERE season_id=? AND status='current' AND profile_locked_at IS NULL""",
+                (
+                    season_profile["risk_mode"],
+                    season_profile["profile_fingerprint"],
+                    json.dumps(season_profile, separators=(",", ":"), sort_keys=True),
+                    season_profile.get("locked_at"),
+                    season_id,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("paper season profile changed concurrently")
+
+    def lock_current_season_profile(
+        self,
+        season_id: str,
+        locked_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Durably lock the profile at the same boundary used to start trading."""
+
+        timestamp = locked_at.isoformat()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT profile_json,profile_locked_at FROM paper_seasons
+                   WHERE season_id=? AND status='current'""",
+                (season_id,),
+            ).fetchone()
+            if row is None or row["profile_json"] is None:
+                return None
+            parsed = json.loads(row["profile_json"])
+            if not isinstance(parsed, dict):
+                raise RuntimeError("current season profile is malformed")
+            profile: dict[str, Any] = dict(parsed)
+            existing = row["profile_locked_at"]
+            effective = str(existing) if existing is not None else timestamp
+            profile["locked_at"] = effective
+            self._conn.execute(
+                """UPDATE paper_seasons SET profile_locked_at=?,profile_json=?
+                   WHERE season_id=? AND status='current'""",
+                (
+                    effective,
+                    json.dumps(profile, separators=(",", ":"), sort_keys=True),
+                    season_id,
+                ),
+            )
+            return profile
 
     def _upsert_settings(self, items: Iterable[tuple[str, Any]], now: str) -> None:
         self._conn.executemany(
@@ -1647,7 +1847,14 @@ class Database:
             ).fetchall()
         return [dict(row) for row in reversed(rows)] + recent
 
-    def reset_paper_state(self, season_summary: dict[str, Any] | None = None) -> None:
+    def reset_paper_state(
+        self,
+        season_summary: dict[str, Any] | None = None,
+        *,
+        terminal_reason: str = "manual_reset",
+        unresolved_positions: Sequence[dict[str, Any]] = (),
+        comparable: bool = True,
+    ) -> None:
         """Archive the active season, then delete only its virtual portfolio state."""
         now = datetime.now().astimezone().isoformat()
         with self._lock, self._conn:
@@ -1664,7 +1871,20 @@ class Database:
                     raise RuntimeError("initialized paper portfolio has no season id")
                 if season_summary is None:
                     raise RuntimeError("active paper season must be summarized before reset")
-                self._archive_active_season(str(season_id), season_summary, now)
+                self._validate_unresolved_inventory(season_summary, unresolved_positions)
+                self._archive_active_season(
+                    str(season_id),
+                    season_summary,
+                    now,
+                    terminal_reason=terminal_reason,
+                    result_quality=("unresolved" if unresolved_positions else "complete"),
+                    comparable=comparable and not unresolved_positions,
+                )
+                self._insert_unresolved_positions(
+                    str(season_id),
+                    unresolved_positions,
+                    now,
+                )
             self._clear_paper_tables()
             self._upsert_settings(
                 [
@@ -1676,6 +1896,8 @@ class Database:
                     ("trading_enabled", False),
                     ("season_id", None),
                     ("auto_new_season_eligible_since", None),
+                    ("auto_new_season_paused_since", None),
+                    ("auto_new_season_last_observed_at", None),
                 ],
                 now,
             )
@@ -1688,6 +1910,11 @@ class Database:
         starting_minor: int,
         quote_currency: str,
         rolled_over_at: datetime,
+        next_season_profile: dict[str, Any] | None = None,
+        terminal_reason: str = "auto_drawdown",
+        next_trading_enabled: bool = True,
+        unresolved_positions: Sequence[dict[str, Any]] = (),
+        comparable: bool = True,
     ) -> None:
         """Atomically finish one season and create its like-for-like successor."""
 
@@ -1707,7 +1934,20 @@ class Database:
             if not previous_season_id:
                 raise RuntimeError("initialized paper portfolio has no season id")
 
-            self._archive_active_season(str(previous_season_id), season_summary, now)
+            self._validate_unresolved_inventory(season_summary, unresolved_positions)
+            self._archive_active_season(
+                str(previous_season_id),
+                season_summary,
+                now,
+                terminal_reason=terminal_reason,
+                result_quality=("unresolved" if unresolved_positions else "complete"),
+                comparable=comparable and not unresolved_positions,
+            )
+            self._insert_unresolved_positions(
+                str(previous_season_id),
+                unresolved_positions,
+                now,
+            )
             self._clear_paper_tables()
             self._insert_ledger(
                 next_season_id,
@@ -1725,12 +1965,19 @@ class Database:
                     ("realized_pnl_lamports", 0),
                     ("peak_equity_lamports", starting_minor),
                     ("equity_peak_basis", "executable-route-v1"),
-                    ("trading_enabled", True),
+                    ("trading_enabled", next_trading_enabled),
                     ("season_id", next_season_id),
                     ("auto_new_season_eligible_since", None),
+                    ("auto_new_season_paused_since", None),
+                    ("auto_new_season_last_observed_at", None),
                     ("auto_new_season_last_rollover_at", now),
                     ("auto_new_season_last_from", str(previous_season_id)),
                     ("auto_new_season_last_to", next_season_id),
+                    *(
+                        [("risk_mode", next_season_profile["risk_mode"])]
+                        if next_season_profile is not None
+                        else []
+                    ),
                 ],
                 now,
             )
@@ -1739,6 +1986,7 @@ class Database:
                 started_at=now,
                 quote_currency=quote_currency,
                 starting_minor=starting_minor,
+                season_profile=next_season_profile,
             )
             self._conn.execute(
                 """INSERT INTO equity_points(
@@ -1751,13 +1999,20 @@ class Database:
         season_id: str,
         season_summary: dict[str, Any],
         ended_at: str,
+        *,
+        terminal_reason: str,
+        result_quality: str = "complete",
+        comparable: bool = True,
     ) -> None:
+        if result_quality not in {"complete", "unresolved"}:
+            raise ValueError("paper season result quality is invalid")
         updated = self._conn.execute(
             """UPDATE paper_seasons SET
                    ended_at=?,ending_equity_minor=?,last_known_ending_equity_minor=?,
                    peak_equity_minor=?,realized_pnl_minor=?,net_pnl_minor=?,
                    total_fees_minor=?,closed_trades=?,wins=?,losses=?,break_even=?,
-                   ending_drawdown_fraction=?,open_positions=?,status='completed'
+                   ending_drawdown_fraction=?,open_positions=?,terminal_reason=?,
+                   result_quality=?,comparable=?,status='completed'
                WHERE season_id=? AND status='current'""",
             (
                 ended_at,
@@ -1773,11 +2028,58 @@ class Database:
                 int(season_summary["break_even"]),
                 max(0.0, min(1.0, float(season_summary["ending_drawdown_fraction"]))),
                 int(season_summary["open_positions"]),
+                terminal_reason,
+                result_quality,
+                int(comparable),
                 season_id,
             ),
         ).rowcount
         if updated != 1:
             raise RuntimeError("active paper season summary row is missing")
+
+    def _insert_unresolved_positions(
+        self,
+        season_id: str,
+        positions: Sequence[dict[str, Any]],
+        recorded_at: str,
+    ) -> None:
+        """Write immutable unresolved inventory beside its archived season."""
+
+        for position in positions:
+            position_id = str(position.get("position_id") or "")
+            mint = str(position.get("mint") or "")
+            symbol = str(position.get("symbol") or mint)
+            if not position_id or not mint:
+                raise ValueError("unresolved paper inventory requires position and mint ids")
+            if position.get("was_executed") is not False:
+                raise ValueError("unresolved paper inventory cannot be recorded as executed")
+            record = {**position, "season_id": season_id, "recorded_at": recorded_at}
+            self._conn.execute(
+                """INSERT INTO unresolved_paper_positions(
+                       retirement_id,season_id,recorded_at,mint,symbol,record_json)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    f"{season_id}:{position_id}",
+                    season_id,
+                    recorded_at,
+                    mint,
+                    symbol,
+                    json.dumps(record, separators=(",", ":"), sort_keys=True),
+                ),
+            )
+
+    @staticmethod
+    def _validate_unresolved_inventory(
+        season_summary: dict[str, Any],
+        positions: Sequence[dict[str, Any]],
+    ) -> None:
+        """Require one honest audit record for every position retired without a fill."""
+
+        open_positions = int(season_summary["open_positions"])
+        if open_positions < 0:
+            raise ValueError("paper season open position count cannot be negative")
+        if open_positions != len(positions):
+            raise ValueError("paper season open positions must match unresolved inventory records")
 
     def _clear_paper_tables(self) -> None:
         for table in (

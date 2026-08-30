@@ -40,6 +40,7 @@ import type { IssueScope } from "./systemStatus";
 import type {
   Decision,
   DecisionAction,
+  DrawdownPolicy,
   EquityPoint,
   FeatureSnapshot,
   Fill,
@@ -48,12 +49,15 @@ import type {
   MaintenanceOperation,
   PaperSeason,
   Position,
+  ProfileTransitionStrategy,
   ProviderConfiguration,
   ProviderPolicy,
   ProviderPreset,
   ProviderSettingsUpdate,
   QuoteCurrency,
+  ReadinessGate,
   RiskMode,
+  SeasonProfile,
   SeasonOperation,
   Seasons as SeasonsData,
   Snapshot,
@@ -63,6 +67,286 @@ import type {
 type Tab = "arena" | "decisions" | "leaderboard" | "learning" | "replay" | "settings";
 const RISK_MODES: RiskMode[] = ["safe", "balanced", "aggressive"];
 const EXPECTED_RESTART_KEY = "signal-arcade-expected-restart-until";
+const DISMISSED_MAINTENANCE_NOTICE_KEY = "signal-arcade-dismissed-maintenance-notice-v1";
+const MAINTENANCE_NOTICE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const MAINTENANCE_NOTICE_FUTURE_TOLERANCE_MS = 5 * 60 * 1_000;
+const ARENA_LAYOUT_KEY = "signal-arcade-arena-layout-v1";
+const ARENA_POSITION_GROUP_KEYS = ["active", "exit_blocked", "dormant"] as const;
+const DECISIONS_LAYOUT_KEY = "signal-arcade-decisions-layout-v1";
+const DECISION_GROUP_KEYS = ["best", "passed", "earlier"] as const;
+const LEARNING_UI_KEY = "signal-arcade-learning-ui-v1";
+const LEARNING_SECTION_KEYS = ["challenger_proof", "learning_evidence"] as const;
+const LEARNING_VIEW_KEYS = ["overview", "baseline", "challenger", "coach", "reviews", "safety"] as const;
+const MAX_SEASON_HISTORY_POINTS = 240;
+
+type LearningSectionKey = typeof LEARNING_SECTION_KEYS[number];
+type LearningViewKey = typeof LEARNING_VIEW_KEYS[number];
+
+function loadDismissedMaintenanceNotice(): string | null {
+  try {
+    const operationId = window.localStorage.getItem(DISMISSED_MAINTENANCE_NOTICE_KEY);
+    return operationId && operationId.length <= 180 ? operationId : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveDismissedMaintenanceNotice(operationId: string): void {
+  try {
+    window.localStorage.setItem(DISMISSED_MAINTENANCE_NOTICE_KEY, operationId);
+  } catch {
+    // Storage can be unavailable. Dismissal still applies until this page is reloaded.
+  }
+}
+
+function maintenanceCompletionCopy(
+  operation: MaintenanceOperation | null,
+  currentVersion: string,
+  serverTime: string,
+): string | null {
+  if (operation?.state !== "completed") return null;
+  const restartedVersion = typeof operation.restarted_version === "string"
+    ? operation.restarted_version.trim()
+    : "";
+  const runningVersion = typeof currentVersion === "string" ? currentVersion.trim() : "";
+  const completedAtValue = typeof operation.completed_at === "string" ? operation.completed_at : "";
+  const serverTimeValue = typeof serverTime === "string" ? serverTime : "";
+  if (!restartedVersion || restartedVersion !== runningVersion || !completedAtValue) return null;
+  const completedAt = Date.parse(completedAtValue);
+  const serverNow = Date.parse(serverTimeValue);
+  if (!Number.isFinite(completedAt) || !Number.isFinite(serverNow)) return null;
+  const ageMs = serverNow - completedAt;
+  if (ageMs < -MAINTENANCE_NOTICE_FUTURE_TOLERANCE_MS || ageMs > MAINTENANCE_NOTICE_MAX_AGE_MS) return null;
+  const preparedVersion = typeof operation.prepared_version === "string"
+    ? operation.prepared_version.trim()
+    : "";
+  return preparedVersion && preparedVersion !== restartedVersion
+    ? `Updated safely from v${preparedVersion} to v${restartedVersion}.`
+    : `Restarted safely on v${restartedVersion}.`;
+}
+
+type LearningUiPreferences = {
+  activeView: LearningViewKey;
+  expandedSections: Set<LearningSectionKey>;
+  seenMilestoneIds: Set<string>;
+  initialized: boolean;
+};
+
+type LearningMilestone = {
+  id: string;
+  title: string;
+  detail: string;
+  tone: "info" | "good" | "warning";
+};
+
+function defaultLearningUi(): LearningUiPreferences {
+  return {
+    activeView: "overview",
+    expandedSections: new Set(),
+    seenMilestoneIds: new Set(),
+    initialized: false,
+  };
+}
+
+function loadLearningUi(): LearningUiPreferences {
+  const defaults = defaultLearningUi();
+  try {
+    const raw = window.localStorage.getItem(LEARNING_UI_KEY);
+    if (!raw) return defaults;
+    const stored: unknown = JSON.parse(raw);
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return defaults;
+    const record = stored as Record<string, unknown>;
+    if (record.version !== 1 && record.version !== 2) return defaults;
+    const activeView = record.version === 2
+      && typeof record.activeView === "string"
+      && LEARNING_VIEW_KEYS.includes(record.activeView as LearningViewKey)
+      ? record.activeView as LearningViewKey
+      : defaults.activeView;
+    const expandedSections = record.version === 2 && Array.isArray(record.expandedSections)
+      ? new Set(record.expandedSections.filter(
+        (key): key is LearningSectionKey => typeof key === "string"
+          && LEARNING_SECTION_KEYS.includes(key as LearningSectionKey),
+      ))
+      : defaults.expandedSections;
+    const seenMilestoneIds = Array.isArray(record.seenMilestoneIds)
+      ? new Set(record.seenMilestoneIds.filter(
+        (id): id is string => typeof id === "string" && id.length > 0 && id.length <= 180,
+      ).slice(-100))
+      : new Set<string>();
+    return { activeView, expandedSections, seenMilestoneIds, initialized: record.initialized === true };
+  } catch {
+    return defaults;
+  }
+}
+
+function saveLearningUi(preferences: LearningUiPreferences): void {
+  try {
+    window.localStorage.setItem(LEARNING_UI_KEY, JSON.stringify({
+      version: 2,
+      initialized: preferences.initialized,
+      activeView: preferences.activeView,
+      expandedSections: LEARNING_SECTION_KEYS.filter((key) => preferences.expandedSections.has(key)),
+      seenMilestoneIds: Array.from(preferences.seenMilestoneIds).slice(-100),
+    }));
+  } catch {
+    // Storage can be unavailable. Sections and milestones still work for this page load.
+  }
+}
+
+function learningMilestones(snapshot: Snapshot): LearningMilestone[] {
+  const milestones: LearningMilestone[] = [];
+  const learning = snapshot.learning;
+  const latestVersion = learning.latest_model?.version;
+  if (latestVersion && learning.latest_model?.qualified && !learning.activation_available && learning.active_model_health.state !== "suspended") {
+    milestones.push({
+      id: `challenger-proof-${latestVersion}`,
+      title: "Challenger proof advanced",
+      detail: "The fitted model passed its historical proof; current activation safety is still collecting.",
+      tone: "info",
+    });
+  }
+  if (latestVersion && learning.activation_available && learning.mode !== "active") {
+    milestones.push({
+      id: `challenger-ready-${latestVersion}`,
+      title: "Qualified Challenger ready",
+      detail: "Every server-side proof and current coverage gate passed. It is waiting for your choice.",
+      tone: "good",
+    });
+  }
+  if (learning.mode === "active" && learning.active_model?.version) {
+    milestones.push({
+      id: `challenger-active-${learning.active_model.version}`,
+      title: "Qualified Challenger active",
+      detail: "Bounded learned protection is active while the Baseline remains the safe core and fallback.",
+      tone: "good",
+    });
+  }
+  if (learning.active_model_health.state === "suspended") {
+    milestones.push({
+      id: `challenger-suspended-${learning.active_model_health.model_version ?? "unknown"}-${learning.active_model_health.suspended_at ?? "current"}`,
+      title: "Baseline safely regained control",
+      detail: "Later unseen evidence suspended the learner and returned it to Shadow.",
+      tone: "warning",
+    });
+  }
+  snapshot.coach.recent_hypotheses
+    .filter((hypothesis) => hypothesis.context_active)
+    .slice(0, 3)
+    .forEach((hypothesis) => {
+      const copy = hypothesis.state === "testing"
+        ? "A new allowlisted coaching idea has begun collecting independent forward evidence."
+        : hypothesis.state === "promising"
+          ? "A coaching idea passed its current Shadow proof across independent seasons. Influence remains zero."
+          : hypothesis.state === "inconclusive"
+            ? "A coaching test lacked enough executable outcome coverage to be trusted."
+            : "Forward evidence did not support this coaching idea.";
+      milestones.push({
+        id: `coach-${hypothesis.hypothesis_id}-${hypothesis.state}`,
+        title: hypothesis.state === "testing" ? "AI Coach started an experiment" : `Coach experiment ${title(hypothesis.state)}`,
+        detail: copy,
+        tone: hypothesis.state === "promising" ? "good" : hypothesis.state === "testing" ? "info" : "warning",
+      });
+    });
+  if (snapshot.ai_lab.qualification.qualified) {
+    milestones.push({
+      id: `ai-shadow-proof-${snapshot.ai_lab.qualification.configuration_fingerprint}`,
+      title: "Local AI Shadow proof target reached",
+      detail: "This is an evidence milestone only. Qualified Coach remains a future, unavailable stage.",
+      tone: "good",
+    });
+  }
+  return milestones.slice(0, 8);
+}
+
+type DecisionGroupKey = typeof DECISION_GROUP_KEYS[number];
+
+type DecisionsLayoutPreferences = {
+  expandedGroups: Set<DecisionGroupKey>;
+};
+
+function defaultDecisionsLayout(): DecisionsLayoutPreferences {
+  return { expandedGroups: new Set(["best"]) };
+}
+
+function loadDecisionsLayout(): DecisionsLayoutPreferences {
+  const defaults = defaultDecisionsLayout();
+  try {
+    const raw = window.localStorage.getItem(DECISIONS_LAYOUT_KEY);
+    if (!raw) return defaults;
+    const stored: unknown = JSON.parse(raw);
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return defaults;
+    const record = stored as Record<string, unknown>;
+    if (record.version !== 1 || !Array.isArray(record.expandedGroups)) return defaults;
+    return {
+      expandedGroups: new Set(record.expandedGroups.filter(
+        (key): key is DecisionGroupKey => typeof key === "string"
+          && DECISION_GROUP_KEYS.includes(key as DecisionGroupKey),
+      )),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function saveDecisionsLayout(preferences: DecisionsLayoutPreferences): void {
+  try {
+    window.localStorage.setItem(DECISIONS_LAYOUT_KEY, JSON.stringify({
+      version: 1,
+      expandedGroups: DECISION_GROUP_KEYS.filter((key) => preferences.expandedGroups.has(key)),
+    }));
+  } catch {
+    // Storage can be unavailable in private or locked-down browsers. Layout still works for this page load.
+  }
+}
+
+type ArenaLayoutPreferences = {
+  marketRadarCollapsed: boolean;
+  collapsedPositionGroups: Set<string>;
+};
+
+function defaultArenaLayout(): ArenaLayoutPreferences {
+  const compactViewport = typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(max-width: 650px)").matches;
+  return { marketRadarCollapsed: compactViewport, collapsedPositionGroups: new Set(["dormant"]) };
+}
+
+function loadArenaLayout(): ArenaLayoutPreferences {
+  const defaults = defaultArenaLayout();
+  try {
+    const raw = window.localStorage.getItem(ARENA_LAYOUT_KEY);
+    if (!raw) return defaults;
+    const stored: unknown = JSON.parse(raw);
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return defaults;
+    const record = stored as Record<string, unknown>;
+    if (record.version !== 1) return defaults;
+    const collapsed = Array.isArray(record.collapsedPositionGroups)
+      ? new Set(record.collapsedPositionGroups.filter(
+        (key): key is string => typeof key === "string" && ARENA_POSITION_GROUP_KEYS.includes(key as typeof ARENA_POSITION_GROUP_KEYS[number]),
+      ))
+      : defaults.collapsedPositionGroups;
+    return {
+      marketRadarCollapsed: typeof record.marketRadarCollapsed === "boolean"
+        ? record.marketRadarCollapsed
+        : defaults.marketRadarCollapsed,
+      collapsedPositionGroups: collapsed,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function saveArenaLayout(preferences: ArenaLayoutPreferences): void {
+  try {
+    window.localStorage.setItem(ARENA_LAYOUT_KEY, JSON.stringify({
+      version: 1,
+      marketRadarCollapsed: preferences.marketRadarCollapsed,
+      collapsedPositionGroups: ARENA_POSITION_GROUP_KEYS.filter((key) => preferences.collapsedPositionGroups.has(key)),
+    }));
+  } catch {
+    // Storage can be unavailable in private or locked-down browsers. Layout still works for this page load.
+  }
+}
 
 type ExplanationState =
   | { status: "loading"; decision: Decision }
@@ -72,6 +356,7 @@ type ExplanationState =
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [tab, setTab] = useState<Tab>("arena");
+  const [learningUi, setLearningUi] = useState(loadLearningUi);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [expectedRestart, setExpectedRestart] = useState(() => {
@@ -86,6 +371,50 @@ export default function App() {
   const [explanation, setExplanation] = useState<ExplanationState | null>(null);
   const explanationRequest = useRef(0);
   const explanationAbort = useRef<AbortController | null>(null);
+  const milestones = useMemo(() => snapshot ? learningMilestones(snapshot) : [], [snapshot]);
+  const visibleMilestones = useMemo(() => milestones.slice(0, 3), [milestones]);
+  const unseenMilestones = learningUi.initialized
+    ? visibleMilestones.filter((milestone) => !learningUi.seenMilestoneIds.has(milestone.id))
+    : [];
+
+  useEffect(() => {
+    if (!learningUi.initialized) return;
+    saveLearningUi(learningUi);
+  }, [learningUi]);
+
+  useEffect(() => {
+    const storageChanged = (event: StorageEvent) => {
+      if (event.key === LEARNING_UI_KEY || event.key === null) setLearningUi(loadLearningUi());
+    };
+    window.addEventListener("storage", storageChanged);
+    return () => window.removeEventListener("storage", storageChanged);
+  }, []);
+
+  useEffect(() => {
+    if (!snapshot) return;
+    const timer = window.setTimeout(() => {
+      setLearningUi((current) => {
+        if (current.initialized && (tab !== "learning" || current.activeView !== "overview")) return current;
+        const seen = new Set(current.seenMilestoneIds);
+        visibleMilestones.forEach((milestone) => seen.add(milestone.id));
+        return { ...current, initialized: true, seenMilestoneIds: new Set(Array.from(seen).slice(-100)) };
+      });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [learningUi.activeView, visibleMilestones, snapshot, tab]);
+
+  const setLearningView = useCallback((activeView: LearningViewKey) => {
+    setLearningUi((current) => ({ ...current, activeView }));
+  }, []);
+
+  const toggleLearningSection = useCallback((key: LearningSectionKey) => {
+    setLearningUi((current) => {
+      const expanded = new Set(current.expandedSections);
+      if (expanded.has(key)) expanded.delete(key);
+      else expanded.add(key);
+      return { ...current, expandedSections: expanded };
+    });
+  }, []);
 
   const refresh = useCallback((): Promise<void> => {
     if (refreshInFlight.current) return refreshInFlight.current;
@@ -262,10 +591,10 @@ export default function App() {
     };
   }, [refresh]);
 
-  const setRisk = async (mode: RiskMode) => {
+  const setRisk = async (mode: RiskMode, drawdownPolicy: DrawdownPolicy = { kind: "default", custom_threshold_bps: null }, transitionStrategy: ProfileTransitionStrategy = "finish_safely") => {
     setBusy(true);
     try {
-      await api.setRisk(mode);
+      await api.setRisk(mode, drawdownPolicy, transitionStrategy);
       resolveIssue("risk");
       await refresh();
     } catch (cause) {
@@ -288,10 +617,10 @@ export default function App() {
     }
   };
 
-  const setupPortfolio = async (currency: QuoteCurrency, amount: string): Promise<string | null> => {
+  const setupPortfolio = async (currency: QuoteCurrency, amount: string, riskMode: RiskMode, drawdownPolicy: DrawdownPolicy): Promise<string | null> => {
     setBusy(true);
     try {
-      await api.setupPortfolio(currency, amount);
+      await api.setupPortfolio(currency, amount, riskMode, drawdownPolicy);
       resolveIssue("setup");
       await refresh();
       return null;
@@ -407,7 +736,7 @@ export default function App() {
           <NavButton active={tab === "arena"} onClick={() => setTab("arena")} icon={<Gauge size={17} />} label="Arena" />
           <NavButton active={tab === "decisions"} onClick={() => setTab("decisions")} icon={<BrainCircuit size={17} />} label="Decisions" />
           <NavButton active={tab === "leaderboard"} onClick={() => setTab("leaderboard")} icon={<Trophy size={17} />} label="Results" />
-          <NavButton active={tab === "learning"} onClick={() => setTab("learning")} icon={<GraduationCap size={17} />} label="Learning" />
+          <NavButton active={tab === "learning"} attention={unseenMilestones.length > 0} onClick={() => setTab("learning")} icon={<GraduationCap size={17} />} label="Learning" />
           <NavButton active={tab === "replay"} onClick={() => setTab("replay")} icon={<History size={17} />} label="Replay" />
           <NavButton active={tab === "settings"} onClick={() => setTab("settings")} icon={<Settings size={17} />} label="Settings" />
         </nav>
@@ -452,13 +781,13 @@ export default function App() {
         {!snapshot ? (
           <LoadingState />
         ) : tab === "arena" ? (
-          <Arena snapshot={snapshot} totalPnl={totalPnl} setRisk={setRisk} setSeasonAutomation={setSeasonAutomation} setupPortfolio={setupPortfolio} setEngineRunning={setEngineRunning} busy={controlsBusy} explain={explain} explainingId={explanation?.status === "loading" ? explanation.decision.decision_id : null} />
+          <Arena snapshot={snapshot} totalPnl={totalPnl} setRisk={setRisk} setSeasonAutomation={setSeasonAutomation} setupPortfolio={setupPortfolio} setEngineRunning={setEngineRunning} busy={controlsBusy} explain={explain} explainingId={explanation?.status === "loading" ? explanation.decision.decision_id : null} onViewAllDecisions={() => setTab("decisions")} />
         ) : tab === "decisions" ? (
           <Decisions decisions={snapshot.decisions} explain={explain} explainingId={explanation?.status === "loading" ? explanation.decision.decision_id : null} serverTime={snapshot.server_time} candidateWindowMinutes={snapshot.candidate_window_minutes} staleMarketSeconds={snapshot.stale_market_seconds} engineRunning={snapshot.running} />
         ) : tab === "leaderboard" ? (
           <LeaderboardView explain={explain} reportIssue={reportIssue} resolveIssue={resolveIssue} />
         ) : tab === "learning" ? (
-          <LearningLab snapshot={snapshot} setLearningMode={setLearningMode} setAiMode={setAiMode} busy={controlsBusy} />
+          <LearningLab snapshot={snapshot} setLearningMode={setLearningMode} setAiMode={setAiMode} busy={controlsBusy} activeView={learningUi.activeView} setActiveView={setLearningView} expandedSections={learningUi.expandedSections} toggleSection={toggleLearningSection} milestones={milestones} hasUnseenMilestones={unseenMilestones.length > 0} />
         ) : tab === "replay" ? (
           <Replay snapshot={snapshot} />
         ) : (
@@ -502,7 +831,13 @@ function SeasonOperationBanner({ operation }: { operation: SeasonOperation | nul
     return () => window.clearInterval(timer);
   }, [operation]);
   if (!operation || (operation.state !== "running" && operation.state !== "failed")) return null;
-  const title = operation.kind === "reset" ? "Preparing the new season" : operation.kind === "setup" ? "Creating the paper bankroll" : "Starting the paper engine";
+  const title = operation.kind === "reset"
+    ? "Preparing the new season"
+    : operation.kind === "setup"
+      ? "Creating the paper bankroll"
+      : operation.kind === "profile_transition"
+        ? `Changing to ${riskModeLabel(operation.target_risk_mode ?? "balanced")}`
+        : "Starting the paper engine";
   return <section className={`season-operation-banner ${operation.state}`} role={operation.state === "failed" ? "alert" : "status"} aria-live="polite">
     {operation.state === "running" ? <RotateCcw size={17} /> : <AlertTriangle size={17} />}
     <div><strong>{operation.state === "failed" ? "Season operation needs attention" : title}</strong><span>{operation.detail}</span><small>{humanize(operation.stage)} · {elapsedSeconds < 60 ? `${elapsedSeconds}s` : `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`} elapsed</small></div>
@@ -531,21 +866,94 @@ function MaintenanceOperationBanner({ operation }: { operation: MaintenanceOpera
   </section>;
 }
 
-function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfolio, setEngineRunning, busy, explain, explainingId }: {
+function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfolio, setEngineRunning, busy, explain, explainingId, onViewAllDecisions }: {
   snapshot: Snapshot;
   totalPnl: number;
-  setRisk: (mode: RiskMode) => Promise<void>;
+  setRisk: (mode: RiskMode, drawdownPolicy?: DrawdownPolicy, transitionStrategy?: ProfileTransitionStrategy) => Promise<void>;
   setSeasonAutomation: (enabled: boolean, graceHours?: number) => Promise<void>;
-  setupPortfolio: (currency: QuoteCurrency, amount: string) => Promise<string | null>;
+  setupPortfolio: (currency: QuoteCurrency, amount: string, riskMode: RiskMode, drawdownPolicy: DrawdownPolicy) => Promise<string | null>;
   setEngineRunning: (running: boolean) => Promise<void>;
   busy: boolean;
   explain: (decision: Decision) => Promise<void>;
   explainingId: string | null;
+  onViewAllDecisions: () => void;
 }) {
   const portfolio = snapshot.portfolio;
-  const [collapsedPositionGroups, setCollapsedPositionGroups] = useState<Set<string>>(
-    () => new Set(["dormant"]),
-  );
+  const [arenaLayout, setArenaLayout] = useState(loadArenaLayout);
+  const collapsedPositionGroups = arenaLayout.collapsedPositionGroups;
+  const marketRadarCollapsed = arenaLayout.marketRadarCollapsed;
+  const [pendingProfile, setPendingProfile] = useState<{ mode: RiskMode; drawdownPolicy: DrawdownPolicy; transitionStrategy: ProfileTransitionStrategy } | null>(null);
+  const profileDialogOpen = pendingProfile !== null;
+  const profileDialogRef = useRef<HTMLElement>(null);
+  const profileReturnFocusRef = useRef<HTMLElement | null>(null);
+  const snapshotDrawdownPolicy = snapshot.season_profile?.drawdown_policy;
+  const profileSyncKey = `${snapshot.season_profile?.profile_fingerprint ?? "uninitialized"}:${snapshotDrawdownPolicy?.kind ?? "default"}:${snapshotDrawdownPolicy?.custom_threshold_bps ?? ""}`;
+  const [drawdownKind, setDrawdownKind] = useState<DrawdownPolicy["kind"]>(snapshotDrawdownPolicy?.kind ?? "default");
+  const [customDrawdown, setCustomDrawdown] = useState(() => snapshotDrawdownPolicy?.custom_threshold_bps ? String(snapshotDrawdownPolicy.custom_threshold_bps / 100) : "");
+  const [drawdownError, setDrawdownError] = useState<string | null>(null);
+  const [loadedProfileSyncKey, setLoadedProfileSyncKey] = useState(profileSyncKey);
+  if (loadedProfileSyncKey !== profileSyncKey) {
+    setLoadedProfileSyncKey(profileSyncKey);
+    setDrawdownKind(snapshotDrawdownPolicy?.kind ?? "default");
+    setCustomDrawdown(snapshotDrawdownPolicy?.custom_threshold_bps ? String(snapshotDrawdownPolicy.custom_threshold_bps / 100) : "");
+    setDrawdownError(null);
+  }
+  const updateArenaLayout = useCallback((update: (current: ArenaLayoutPreferences) => ArenaLayoutPreferences) => {
+    setArenaLayout((current) => {
+      const next = update(current);
+      saveArenaLayout(next);
+      return next;
+    });
+  }, []);
+  useEffect(() => {
+    const syncArenaLayout = (event: StorageEvent) => {
+      if (event.key === ARENA_LAYOUT_KEY || event.key === null) {
+        setArenaLayout(loadArenaLayout());
+      }
+    };
+    window.addEventListener("storage", syncArenaLayout);
+    return () => window.removeEventListener("storage", syncArenaLayout);
+  }, []);
+  const closeProfileDialog = useCallback(() => setPendingProfile(null), []);
+  useEffect(() => {
+    if (!profileDialogOpen) return;
+    const dialog = profileDialogRef.current;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialog?.focus();
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeProfileDialog();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )];
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("keydown", handleKey);
+      document.body.style.overflow = previousOverflow;
+      profileReturnFocusRef.current?.focus();
+      profileReturnFocusRef.current = null;
+    };
+  }, [closeProfileDialog, profileDialogOpen]);
   if (!portfolio.initialized) {
     return <SetupArena snapshot={snapshot} busy={busy} setupPortfolio={setupPortfolio} />;
   }
@@ -553,6 +961,44 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
   const latestDecisionFeed = latestDecisionsByMint(snapshot.decisions).slice(0, 8);
   const capacityPositionCount = portfolio.positions.filter((item) => item.market_status !== "dormant").length;
   const autoSeasonHours = Math.max(1, Math.round(snapshot.season_automation.grace_seconds / 3600));
+  const profileTransition = snapshot.season_operation?.kind === "profile_transition"
+    && snapshot.season_operation.state === "running";
+  const selectedProfile = snapshot.season_profile_catalog.find((profile) => profile.risk_mode === snapshot.risk_mode)
+    ?? snapshot.season_profile;
+  const profileLocked = snapshot.season_profile?.locked_at !== null;
+  const requestProfile = (mode: RiskMode, drawdownPolicy: DrawdownPolicy) => {
+    if (mode === snapshot.risk_mode || busy || profileTransition) return;
+    if (profileLocked) {
+      profileReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      setPendingProfile({ mode, drawdownPolicy, transitionStrategy: "finish_safely" });
+    }
+    else void setRisk(mode, drawdownPolicy);
+  };
+  const chooseRiskMode = (mode: RiskMode) => {
+    if (mode === snapshot.risk_mode || busy || profileTransition) return;
+    requestProfile(mode, { kind: "default", custom_threshold_bps: null });
+  };
+  const applyDrawdownPolicy = () => {
+    let policy: DrawdownPolicy = { kind: drawdownKind, custom_threshold_bps: null };
+    if (drawdownKind === "custom") {
+      const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(customDrawdown.trim());
+      const value = Number(customDrawdown);
+      if (!match || !Number.isFinite(value) || value < 1 || value > 99) {
+        setDrawdownError("Enter a percentage from 1% to 99%, using at most two decimals.");
+        return;
+      }
+      policy = { kind: "custom", custom_threshold_bps: Math.round(value * 100) };
+    }
+    policy = canonicalDrawdownPolicy(snapshot.risk_mode, policy, snapshot.season_profile_catalog);
+    setDrawdownError(null);
+    const current = snapshot.season_profile?.drawdown_policy;
+    if (current?.kind === policy.kind && current.custom_threshold_bps === policy.custom_threshold_bps) return;
+    if (profileLocked) {
+      profileReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      setPendingProfile({ mode: snapshot.risk_mode, drawdownPolicy: policy, transitionStrategy: "finish_safely" });
+    }
+    else void setRisk(snapshot.risk_mode, policy);
+  };
   const positionGroups = [
     { key: "active", label: "Active", hint: "Fresh, verified sell route", positions: portfolio.positions.filter((item) => item.market_status === "active") },
     { key: "exit_blocked", label: "Exit blocked", hint: "Fresh indication; route not currently executable", positions: portfolio.positions.filter((item) => item.market_status === "exit_blocked") },
@@ -562,7 +1008,7 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
     <>
       <section className="page-heading">
         <div><span className="eyebrow"><Radio size={14} /> The Arena</span><h1>Your strategy, playing forward.</h1><p>Real market observations. Virtual {portfolio.quote_currency}. Every assumption visible.</p></div>
-        <div className={`engine-control ${snapshot.running ? "running" : "stopped"}`}><div><strong><span />Paper engine {snapshot.running ? "running" : "stopped"}</strong><small>{snapshot.running ? "Analyzing and managing the paper portfolio." : portfolio.positions.length ? "Positions are preserved and still marked from fresh data." : "No new paper decisions or fills will occur."}</small></div><button onClick={() => void setEngineRunning(!snapshot.running)} disabled={busy}>{snapshot.running ? <Pause size={15} /> : <Play size={15} />}{snapshot.running ? "Stop" : hasHistory ? "Resume" : "Start"}</button></div>
+        <div className={`engine-control ${snapshot.running ? "running" : "stopped"}`}><div><strong><span />{profileTransition ? "Changing season profile" : `Paper engine ${snapshot.running ? "running" : "stopped"}`}</strong><small>{profileTransition ? "New entries are paused while the old season safely settles." : snapshot.running ? "Analyzing and managing the paper portfolio." : portfolio.positions.length ? "Positions are preserved and still marked from fresh data." : "No new paper decisions or fills will occur."}</small></div><button onClick={() => void setEngineRunning(!snapshot.running)} disabled={busy || profileTransition}>{profileTransition ? <RotateCcw size={15} /> : snapshot.running ? <Pause size={15} /> : <Play size={15} />}{profileTransition ? "Settling" : snapshot.running ? "Stop" : hasHistory ? "Resume" : "Start"}</button></div>
       </section>
 
       <div className={`market-state-line ${snapshot.demo_mode ? "demo" : "live"}`}><span />{snapshot.demo_mode ? "Synthetic demo market" : "Solana mainnet paper feed"}{!snapshot.running && <small>Market observations continue while the paper engine is stopped.</small>}</div>
@@ -574,7 +1020,7 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
         <article className="card equity-card">
           <div className="card-label">Paper equity</div>
           <div className="equity-value">{money(portfolio.equity_lamports, portfolio.quote_currency, portfolio.quote_decimals)}</div>
-          <div className={`pnl-line ${totalPnl >= 0 ? "positive" : "negative"}`}>{signedMoney(totalPnl, portfolio.quote_currency, portfolio.quote_decimals)} <span>all time</span></div>
+          <div className={`pnl-line ${totalPnl >= 0 ? "positive" : "negative"}`}>{signedMoney(totalPnl, portfolio.quote_currency, portfolio.quote_decimals)} <span>this season</span></div>
           <EquityChart points={snapshot.equity_history} />
           <div className="equity-meta">
             <span>{portfolio.reserved_cash_lamports ? "Available" : "Cash"} <strong>{money(portfolio.available_cash_lamports, portfolio.quote_currency, portfolio.quote_decimals)}</strong></span>
@@ -588,23 +1034,35 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
           <div className="card-label"><ShieldCheck size={16} /> Risk personality</div>
           <h2>{title(snapshot.risk_mode)}</h2>
           <p>{riskCopy(snapshot.risk_mode)}</p>
-          <div className={`risk-track mode-${snapshot.risk_mode}`}>
-            <input
-              aria-label="Risk mode"
-              type="range"
-              min={0}
-              max={2}
-              step={1}
-              value={RISK_MODES.indexOf(snapshot.risk_mode)}
-              disabled={busy}
-              onChange={(event) => void setRisk(RISK_MODES[Number(event.target.value)]!)}
-            />
+          <div className="risk-profile-options" role="radiogroup" aria-label="Season risk personality">
+            {RISK_MODES.map((mode) => <button
+              type="button"
+              role="radio"
+              aria-checked={snapshot.risk_mode === mode}
+              className={snapshot.risk_mode === mode ? "active" : ""}
+              disabled={busy || profileTransition}
+              onClick={() => chooseRiskMode(mode)}
+              key={mode}
+            ><strong>{riskModeLabel(mode)}</strong><small>{profileLimitSummary(snapshot.season_profile_catalog.find((profile) => profile.risk_mode === mode) ?? null)}</small></button>)}
           </div>
-          <div className="risk-labels"><span>Safer</span><span>Balanced</span><span>Aggressive</span></div>
+          <div className="current-profile-read"><span>Portfolio drawdown halt</span><strong>{drawdownProfileLabel(snapshot.season_profile)}</strong><small>{profileLocked ? "Locked for this season" : "Editable until the first season starts"}</small></div>
+          <details className="drawdown-settings">
+            <summary>Advanced drawdown setting <ChevronDown size={13} /></summary>
+            <fieldset disabled={busy || profileTransition}>
+              <legend>Portfolio drawdown halt</legend>
+              <label><input type="radio" name="drawdown-policy" value="default" checked={drawdownKind === "default"} onChange={() => { setDrawdownKind("default"); setDrawdownError(null); }} /> <span><strong>Personality default</strong><small>{selectedProfile?.effective_drawdown_bps ? `${selectedProfile.effective_drawdown_bps / 100}% for ${riskModeLabel(snapshot.risk_mode)}` : "Backend policy default"}</small></span></label>
+              <label><input type="radio" name="drawdown-policy" value="custom" checked={drawdownKind === "custom"} onChange={() => { setDrawdownKind("custom"); setDrawdownError(null); }} /> <span><strong>Custom</strong><small>A separate season experiment</small></span></label>
+              {drawdownKind === "custom" && <label className="drawdown-custom"><span>Halt at</span><input aria-label="Custom drawdown percentage" value={customDrawdown} inputMode="decimal" onChange={(event) => { setCustomDrawdown(event.target.value); setDrawdownError(null); }} /><b>%</b></label>}
+              <label><input type="radio" name="drawdown-policy" value="disabled" checked={drawdownKind === "disabled"} onChange={() => { setDrawdownKind("disabled"); setDrawdownError(null); }} /> <span><strong>Off</strong><small>Only the portfolio halt is disabled</small></span></label>
+            </fieldset>
+            <p>Stop loss, trailing protection, exposure, position, stale-data, mint and route safety remain active.</p>
+            {drawdownError && <small className="drawdown-error" role="alert">{drawdownError}</small>}
+            <button type="button" className="button subtle" disabled={busy || profileTransition} onClick={applyDrawdownPolicy}>Apply to {profileLocked ? "a new season" : "this unstarted season"}</button>
+          </details>
           <div className="guardrail"><ShieldCheck size={17} /><span>Structural safety and stale-data gates always remain active.</span></div>
           <div className={`auto-season-control ${snapshot.season_automation.enabled ? "enabled" : ""}`}>
             <RotateCcw size={16} />
-            <div><strong>Auto new season <em>{snapshot.season_automation.enabled ? "On" : "Off"}</em></strong><small>{snapshot.season_automation.enabled ? snapshot.season_automation.detail : `Wait ${autoSeasonHours}h after a guarded pause with no active holdings; healthy data is always required.`}</small></div>
+            <div><strong>Auto new season <em>{snapshot.season_automation.enabled ? "On" : "Off"}</em></strong><small>{snapshot.season_automation.enabled ? snapshot.season_automation.detail : snapshot.season_profile?.drawdown_policy.kind === "disabled" ? `Wait ${autoSeasonHours}h after genuine bankroll exhaustion; recoverable holdings and unknown data always defer rollover.` : `Wait ${autoSeasonHours}h after a guarded pause with no active holdings; healthy data is always required.`}</small></div>
             {!snapshot.season_automation.enabled ? <label className="auto-season-delay">Wait<select aria-label="Automatic season wait" value={autoSeasonHours} disabled={busy} onChange={(event) => void setSeasonAutomation(false, Number(event.target.value))}>{Array.from({ length: 24 }, (_, index) => index + 1).map((hours) => <option value={hours} key={hours}>{hours}h</option>)}</select></label> : <span className="auto-season-delay-chip">{autoSeasonHours}h</span>}
             <button type="button" role="switch" aria-checked={snapshot.season_automation.enabled} aria-label={`${snapshot.season_automation.enabled ? "Disable" : "Enable"} automatic new seasons`} disabled={busy} onClick={() => void setSeasonAutomation(!snapshot.season_automation.enabled, snapshot.season_automation.enabled ? undefined : autoSeasonHours)}><span /></button>
           </div>
@@ -630,11 +1088,11 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
                   className="position-group-heading"
                   aria-expanded={!collapsed}
                   aria-label={`${collapsed ? "Show" : "Hide"} ${group.label} positions`}
-                  onClick={() => setCollapsedPositionGroups((current) => {
-                    const next = new Set(current);
+                  onClick={() => updateArenaLayout((current) => {
+                    const next = new Set(current.collapsedPositionGroups);
                     if (collapsed) next.delete(group.key);
                     else next.add(group.key);
-                    return next;
+                    return { ...current, collapsedPositionGroups: next };
                   })}
                 >
                   <strong>{group.label}</strong><span>{group.hint}</span><b>{group.positions.length}</b><ChevronDown className={collapsed ? "collapsed" : ""} size={13} />
@@ -646,7 +1104,11 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
           </div>
         </div>
         <div>
-          <SectionHeader title="Decision feed" subtitle="The latest evidence checkpoints" />
+          <SectionHeader
+            title="Decision feed"
+            subtitle="The latest evidence checkpoints"
+            action={<button type="button" className="section-action" onClick={onViewAllDecisions} aria-label="View all decisions">View all <ChevronRight size={13} /></button>}
+          />
           <div className="stack">
             {latestDecisionFeed.map((decision) => <DecisionRow key={decision.decision_id} decision={decision} explain={explain} loading={explainingId === decision.decision_id} />)}
             {!snapshot.decisions.length && <EmptyState icon={<Activity size={22} />} title="Waiting for evidence" copy="Choose Demo Market in Settings if you want to explore without waiting for a live launch." />}
@@ -654,10 +1116,50 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
         </div>
       </section>
 
-      <section>
-        <SectionHeader title="Market radar" subtitle="Recent tokens with point-in-time market evidence quality" />
-        <div className="token-grid">{snapshot.tokens.slice(0, 8).map((token) => <TokenCard key={token.mint} token={token} />)}</div>
+      <section className="market-radar-section">
+        <SectionHeader
+          title="Market radar"
+          subtitle="Recent tokens with point-in-time market evidence quality"
+          action={<button type="button" className="section-action" aria-expanded={!marketRadarCollapsed} aria-controls="market-radar-grid" aria-label={`${marketRadarCollapsed ? "Show" : "Hide"} Market radar`} onClick={() => updateArenaLayout((current) => ({ ...current, marketRadarCollapsed: !current.marketRadarCollapsed }))}>{marketRadarCollapsed ? "Show" : "Hide"} <ChevronDown className={marketRadarCollapsed ? "collapsed" : ""} size={13} /></button>}
+        />
+        <div className={`token-grid ${marketRadarCollapsed ? "is-collapsed" : ""}`} id="market-radar-grid" hidden={marketRadarCollapsed} aria-hidden={marketRadarCollapsed}>
+          {snapshot.tokens.slice(0, 8).map((token) => <TokenCard key={token.mint} token={token} />)}
+          {!snapshot.tokens.length && <div className="market-radar-empty"><EmptyState icon={<Activity size={22} />} title="Radar is warming up" copy={snapshot.running ? "Recent tokens will appear after the selected market source produces enough point-in-time evidence." : "Market observations continue while the paper engine is stopped; recent tokens will appear when enough evidence arrives."} /></div>}
+        </div>
       </section>
+      {pendingProfile && <div className="profile-confirm-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeProfileDialog(); }}>
+        <section
+          className="card profile-confirm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="profile-confirm-title"
+          aria-describedby="profile-confirm-copy"
+          tabIndex={-1}
+          ref={profileDialogRef}
+        >
+          <ShieldCheck size={23} />
+          <h2 id="profile-confirm-title">Change to {riskModeLabel(pendingProfile.mode)} · {drawdownPolicyTargetLabel(pendingProfile.mode, pendingProfile.drawdownPolicy, snapshot.season_profile_catalog)}?</h2>
+          <p id="profile-confirm-copy">Choose how the current season reaches a clean boundary. The next season always starts with this exact profile and no inventory crosses between profiles.</p>
+          <fieldset className="profile-transition-options">
+            <legend>Season ending</legend>
+            <label className={pendingProfile.transitionStrategy === "finish_safely" ? "selected" : ""}>
+              <input type="radio" name="profile-transition-strategy" value="finish_safely" checked={pendingProfile.transitionStrategy === "finish_safely"} onChange={() => setPendingProfile((current) => current ? { ...current, transitionStrategy: "finish_safely" } : current)} />
+              <span><strong>Finish safely <em>Recommended</em></strong><small>Freeze entries and keep managing positions with their original policy. Dormant holdings receive the configured recovery window.</small></span>
+            </label>
+            <label className={`manual ${pendingProfile.transitionStrategy === "end_now" ? "selected" : ""}`}>
+              <input type="radio" name="profile-transition-strategy" value="end_now" checked={pendingProfile.transitionStrategy === "end_now"} onChange={() => setPendingProfile((current) => current ? { ...current, transitionStrategy: "end_now" } : current)} />
+              <span><strong>End season now</strong><small>Try genuine exits for up to 90 seconds. Anything still untradeable is recorded as unresolved—never as a made-up fill, win or loss.</small></span>
+            </label>
+          </fieldset>
+          <div className={`profile-transition-impact ${pendingProfile.transitionStrategy === "end_now" ? "warning" : ""}`}>
+            {pendingProfile.transitionStrategy === "end_now" ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
+            <span>{pendingProfile.transitionStrategy === "end_now"
+              ? `${portfolio.positions.filter((position) => position.market_status === "active").length} executable · ${portfolio.positions.filter((position) => position.market_status !== "active").length} currently unresolved · ${portfolio.pending_orders.filter((order) => order.side === "sell").length} exits already pending. This season stays visible but is excluded from strategy comparisons.`
+              : `${portfolio.positions.length} open position${portfolio.positions.length === 1 ? "" : "s"} will keep the old policy until safely resolved.`}</span>
+          </div>
+          <div className="profile-confirm-actions"><button type="button" className="button ghost" onClick={closeProfileDialog}>Cancel</button><button type="button" className={`button ${pendingProfile.transitionStrategy === "end_now" ? "warning" : ""}`} onClick={() => { const target = pendingProfile; closeProfileDialog(); void setRisk(target.mode, target.drawdownPolicy, target.transitionStrategy); }}>{pendingProfile.transitionStrategy === "end_now" ? "End season & change profile" : "Change profile safely"}</button></div>
+        </section>
+      </div>}
     </>
   );
 }
@@ -665,10 +1167,13 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
 function SetupArena({ snapshot, busy, setupPortfolio }: {
   snapshot: Snapshot;
   busy: boolean;
-  setupPortfolio: (currency: QuoteCurrency, amount: string) => Promise<string | null>;
+  setupPortfolio: (currency: QuoteCurrency, amount: string, riskMode: RiskMode, drawdownPolicy: DrawdownPolicy) => Promise<string | null>;
 }) {
   const [currency, setCurrency] = useState<QuoteCurrency>("SOL");
   const [amount, setAmount] = useState("10");
+  const [riskMode, setRiskMode] = useState<RiskMode>(snapshot.risk_mode);
+  const [drawdownKind, setDrawdownKind] = useState<DrawdownPolicy["kind"]>("default");
+  const [customDrawdown, setCustomDrawdown] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const chooseCurrency = (next: QuoteCurrency) => {
@@ -694,7 +1199,18 @@ function SetupArena({ snapshot, busy, setupPortfolio }: {
       setError("That paper bankroll is unreasonably large.");
       return;
     }
-    const setupError = await setupPortfolio(currency, cleaned);
+    let drawdownPolicy: DrawdownPolicy = { kind: drawdownKind, custom_threshold_bps: null };
+    if (drawdownKind === "custom") {
+      const customMatch = /^(\d+)(?:\.(\d{1,2}))?$/.exec(customDrawdown.trim());
+      const customValue = Number(customDrawdown);
+      if (!customMatch || !Number.isFinite(customValue) || customValue < 1 || customValue > 99) {
+        setError("Custom drawdown must be from 1% to 99%, using at most two decimals.");
+        return;
+      }
+      drawdownPolicy = { kind: "custom", custom_threshold_bps: Math.round(customValue * 100) };
+    }
+    drawdownPolicy = canonicalDrawdownPolicy(riskMode, drawdownPolicy, snapshot.season_profile_catalog);
+    const setupError = await setupPortfolio(currency, cleaned, riskMode, drawdownPolicy);
     if (setupError) setError(setupError);
   };
 
@@ -707,6 +1223,16 @@ function SetupArena({ snapshot, busy, setupPortfolio }: {
       <div className="setup-intro"><strong>Virtual starting balance</strong><p>This is paper money only. No wallet, seed phrase, or real funds are used.</p></div>
       <form onSubmit={(event) => void submit(event)} noValidate>
         <fieldset className="currency-choice"><legend>Account currency</legend><button type="button" className={currency === "SOL" ? "active" : ""} onClick={() => chooseCurrency("SOL")} aria-pressed={currency === "SOL"} aria-label="Use SOL for paper bankroll"><strong>SOL</strong><small>Native Solana accounting</small></button><button type="button" className={currency === "USDC" ? "active" : ""} onClick={() => chooseCurrency("USDC")} aria-pressed={currency === "USDC"} aria-label="Use USDC for paper bankroll"><strong>USDC</strong><small>Dollar-denominated accounting</small></button></fieldset>
+        <fieldset className="risk-setup-choice"><legend>First-season personality</legend><div>{RISK_MODES.map((mode) => {
+          const profile = snapshot.season_profile_catalog.find((item) => item.risk_mode === mode) ?? null;
+          return <button type="button" role="radio" aria-checked={riskMode === mode} className={riskMode === mode ? "active" : ""} onClick={() => setRiskMode(mode)} key={mode}><strong>{riskModeLabel(mode)}</strong><span>{riskCopy(mode)}</span><small>{profileLimitSummary(profile)}</small></button>;
+        })}</div><small><ShieldCheck size={13} /> Structural, mint, route, stale-data and executable-market safety stay active in every personality.</small></fieldset>
+        <details className="setup-drawdown-settings"><summary>Advanced: portfolio drawdown halt <ChevronDown size={13} /></summary><div>
+          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "default"} onChange={() => { setDrawdownKind("default"); setError(null); }} /> Personality default</label>
+          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "custom"} onChange={() => { setDrawdownKind("custom"); setError(null); }} /> Custom</label>
+          {drawdownKind === "custom" && <label className="setup-drawdown-custom"><input aria-label="First season custom drawdown percentage" inputMode="decimal" value={customDrawdown} onChange={(event) => { setCustomDrawdown(event.target.value); setError(null); }} /><b>%</b></label>}
+          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "disabled"} onChange={() => { setDrawdownKind("disabled"); setError(null); }} /> Off</label>
+        </div><p>Off disables only the portfolio-level halt. Trade exits, exposure, position limits and permanent data safety remain active.</p></details>
         <label className="bankroll-input"><span>Starting amount</span><div><input value={amount} onChange={(event) => { setAmount(event.target.value); setError(null); }} inputMode="decimal" autoComplete="off" aria-label="Starting amount" aria-describedby={error ? "bankroll-help bankroll-error" : "bankroll-help"} /><strong>{currency}</strong></div><small id="bankroll-help">You can reset the paper season later to choose a different amount or currency.</small></label>
         {error && <p className="setup-error" id="bankroll-error" role="alert">{error}</p>}
         <div className="setup-foot"><p>{currency === "USDC" ? "Live USDC accounting converts simulated SOL costs using fresh observed SOL/USD data and abstains if that conversion is unavailable." : "SOL mode accounts directly in lamports, including simulated protocol and network fees."}</p><button className="button setup-submit" disabled={busy}>{busy ? <span className="mini-loader" /> : <CircleDollarSign size={16} />}{busy ? "Creating…" : "Create paper bankroll"}</button></div>
@@ -726,6 +1252,31 @@ export function Decisions({ decisions, explain, explainingId = null, serverTime,
 }) {
   const [frozen, setFrozen] = useState<{ decisions: Decision[]; asOfMs: number } | null>(null);
   const [selectedDecisionId, setSelectedDecisionId] = useState<string | null>(null);
+  const [layout, setLayout] = useState(loadDecisionsLayout);
+  const updateLayout = useCallback((update: (current: DecisionsLayoutPreferences) => DecisionsLayoutPreferences) => {
+    setLayout((current) => {
+      const next = update(current);
+      saveDecisionsLayout(next);
+      return next;
+    });
+  }, []);
+  const toggleGroup = useCallback((group: DecisionGroupKey) => {
+    updateLayout((current) => {
+      const expandedGroups = new Set(current.expandedGroups);
+      if (expandedGroups.has(group)) expandedGroups.delete(group);
+      else expandedGroups.add(group);
+      return { expandedGroups };
+    });
+  }, [updateLayout]);
+  useEffect(() => {
+    const syncLayout = (event: StorageEvent) => {
+      if (event.key === DECISIONS_LAYOUT_KEY || event.key === null) {
+        setLayout(loadDecisionsLayout());
+      }
+    };
+    window.addEventListener("storage", syncLayout);
+    return () => window.removeEventListener("storage", syncLayout);
+  }, []);
   const paused = frozen !== null;
   const liveAsOfMs = safeDateMs(serverTime);
   const visibleDecisions = frozen?.decisions ?? decisions;
@@ -789,7 +1340,8 @@ export function Decisions({ decisions, explain, explainingId = null, serverTime,
           explainingId={explainingId}
           selectedDecisionId={selectedDecisionId}
           toggleDetails={toggleDetails}
-          defaultOpen
+          open={layout.expandedGroups.has("best")}
+          onToggle={() => toggleGroup("best")}
           ranked
           viewAsOfMs={viewAsOfMs}
           emptyCopy={groups.passed.length
@@ -805,6 +1357,8 @@ export function Decisions({ decisions, explain, explainingId = null, serverTime,
           explainingId={explainingId}
           selectedDecisionId={selectedDecisionId}
           toggleDetails={toggleDetails}
+          open={layout.expandedGroups.has("passed")}
+          onToggle={() => toggleGroup("passed")}
           emptyCopy="No latest token decisions are currently in the passed group."
           viewAsOfMs={viewAsOfMs}
         />
@@ -817,6 +1371,8 @@ export function Decisions({ decisions, explain, explainingId = null, serverTime,
           explainingId={explainingId}
           selectedDecisionId={selectedDecisionId}
           toggleDetails={toggleDetails}
+          open={layout.expandedGroups.has("earlier")}
+          onToggle={() => toggleGroup("earlier")}
           emptyCopy="No expired checkpoints yet."
           viewAsOfMs={viewAsOfMs}
         />
@@ -825,7 +1381,7 @@ export function Decisions({ decisions, explain, explainingId = null, serverTime,
   );
 }
 
-function DecisionGroup({ id, title: heading, subtitle, decisions, explain, explainingId, selectedDecisionId, toggleDetails, defaultOpen = false, ranked = false, emptyCopy, viewAsOfMs }: {
+function DecisionGroup({ id, title: heading, subtitle, decisions, explain, explainingId, selectedDecisionId, toggleDetails, open, onToggle, ranked = false, emptyCopy, viewAsOfMs }: {
   id: string;
   title: string;
   subtitle: string;
@@ -834,15 +1390,15 @@ function DecisionGroup({ id, title: heading, subtitle, decisions, explain, expla
   explainingId: string | null;
   selectedDecisionId: string | null;
   toggleDetails: (decision: Decision) => void;
-  defaultOpen?: boolean;
+  open: boolean;
+  onToggle: () => void;
   ranked?: boolean;
   emptyCopy: string;
   viewAsOfMs: number;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
   return (
     <section className={`decision-group ${open ? "open" : ""}`}>
-      <button className="decision-group-toggle" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-controls={id}>
+      <button className="decision-group-toggle" onClick={onToggle} aria-expanded={open} aria-controls={id}>
         <span><strong>{heading}</strong><small>{subtitle}</small></span>
         <span className="decision-group-meta"><b>{decisions.length}</b><ChevronDown size={17} /></span>
       </button>
@@ -856,14 +1412,18 @@ function DecisionGroup({ id, title: heading, subtitle, decisions, explain, expla
   );
 }
 
-function LearningDisclosure({ id, title: heading, subtitle, summary, children }: {
+function LearningDisclosure({ id, title: heading, subtitle, summary, children, open: controlledOpen, onToggle }: {
   id: string;
   title: string;
   subtitle: string;
   summary: string;
   children: React.ReactNode;
+  open?: boolean;
+  onToggle?: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [localOpen, setLocalOpen] = useState(false);
+  const open = controlledOpen ?? localOpen;
+  const toggle = onToggle ?? (() => setLocalOpen((value) => !value));
   return <section className={`learning-disclosure ${open ? "open" : ""}`}>
     <button
       className="learning-disclosure-toggle"
@@ -871,7 +1431,7 @@ function LearningDisclosure({ id, title: heading, subtitle, summary, children }:
       aria-expanded={open}
       aria-controls={id}
       aria-label={`${open ? "Hide" : "Show"} ${heading.toLowerCase()}`}
-      onClick={() => setOpen((value) => !value)}
+      onClick={toggle}
     >
       <span><strong>{heading}</strong><small>{subtitle}</small></span>
       <span className="learning-disclosure-meta"><b>{summary}</b><ChevronDown size={17} /></span>
@@ -880,11 +1440,44 @@ function LearningDisclosure({ id, title: heading, subtitle, summary, children }:
   </section>;
 }
 
-function LearningLab({ snapshot, setLearningMode, setAiMode, busy }: {
+function readinessValue(gate: ReadinessGate, value: number | boolean | null): string {
+  if (value === null) return "Collecting";
+  if (gate.unit === "boolean") return value ? "Ready" : "Not ready";
+  if (typeof value !== "number") return String(value);
+  if (gate.unit === "fraction") return percent(value);
+  if (gate.unit === "milliseconds") return value >= 1_000 ? duration(value / 1_000) : `${Math.round(value)} ms`;
+  if (gate.unit === "count") return Math.round(value).toLocaleString();
+  return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(2);
+}
+
+function ReadinessGates({ gates, emptyCopy }: { gates: ReadinessGate[]; emptyCopy: string }) {
+  if (!gates.length) {
+    return <p className="readiness-empty"><ShieldCheck size={14} />{emptyCopy}</p>;
+  }
+  const passed = gates.filter((gate) => gate.state === "passed").length;
+  return <div className="readiness-gates">
+    <div className="readiness-heading"><strong>{passed} / {gates.length} proof gates</strong><small>Reported by the engine; next evaluation timing is separate.</small></div>
+    <div className="readiness-list">
+      {gates.map((gate) => <div className={`readiness-row state-${gate.state}`} key={gate.id} title={gate.detail}>
+        <span className="readiness-icon" aria-hidden="true">{gate.state === "passed" ? <Check size={13} /> : <span />}</span>
+        <span><strong>{gate.label}</strong><small>{gate.detail}</small></span>
+        <b>{readinessValue(gate, gate.current)} <em>{gate.comparison} {readinessValue(gate, gate.target)}</em></b>
+      </div>)}
+    </div>
+  </div>;
+}
+
+function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
   snapshot: Snapshot;
   setLearningMode: (mode: LearningMode) => Promise<void>;
   setAiMode: (mode: AiDecisionMode) => Promise<void>;
   busy: boolean;
+  activeView: LearningViewKey;
+  setActiveView: (view: LearningViewKey) => void;
+  expandedSections: Set<LearningSectionKey>;
+  toggleSection: (section: LearningSectionKey) => void;
+  milestones: LearningMilestone[];
+  hasUnseenMilestones: boolean;
 }) {
   const learning = snapshot.learning;
   const latest = learning.latest_model;
@@ -922,82 +1515,184 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy }: {
   const canActivate = learning.activation_available && learning.collecting_from_current_source;
   const holdReview = learning.recommended_hold_seconds[snapshot.risk_mode];
   const timing = learning.hold_timing_validation[snapshot.risk_mode];
+  const challengerGates = learning.qualification_gates ?? [];
+  const challengerPassed = learning.qualification_passed
+    ?? challengerGates.filter((gate) => gate.state === "passed").length;
+  const challengerTotal = learning.qualification_total ?? challengerGates.length;
+  const baselineState = learning.mode === "active" ? "Core + bounded learner" : "In control";
+  const challengerState = liveHealth.state === "suspended"
+    ? "Suspended safely"
+    : learning.mode === "off"
+      ? "Off"
+      : learning.mode === "active"
+        ? "Active"
+        : title(learning.state);
+  const coachState = snapshot.coach.mode === "off" ? "Off" : title(snapshot.coach.state);
+  const views: Array<{ key: LearningViewKey; label: string; summary: string }> = [
+    { key: "overview", label: "Overview", summary: "Team status and milestones" },
+    { key: "baseline", label: "Baseline", summary: baselineState },
+    { key: "challenger", label: "Challenger", summary: challengerState },
+    { key: "coach", label: "AI Coach", summary: coachState },
+    { key: "reviews", label: "Shadow Reviews", summary: snapshot.ai_lab.mode === "off" ? "Off" : "Shadow" },
+    { key: "safety", label: "Safety", summary: `${learning.guardrails.length} boundaries` },
+  ];
+  const learningTabListRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const activeTab = learningTabListRef.current?.querySelector<HTMLElement>(
+      `[data-learning-view="${activeView}"]`,
+    );
+    activeTab?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [activeView]);
+  const selectAdjacentView = (event: React.KeyboardEvent<HTMLButtonElement>, current: LearningViewKey) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = views.findIndex((view) => view.key === current);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? views.length - 1
+        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + views.length) % views.length;
+    const next = views[nextIndex]!;
+    setActiveView(next.key);
+    window.requestAnimationFrame(() => document.getElementById(`learning-tab-${next.key}`)?.focus());
+  };
 
   return <>
     <section className="page-heading learning-heading">
-      <div><span className="eyebrow"><GraduationCap size={14} /> Learning Lab</span><h1>Experience earns influence—slowly.</h1><p>{stateCopy}</p></div>
-      <div className="learning-controls">
-        {learning.mode === "off"
-          ? <button className="button learning-primary" onClick={() => void setLearningMode("shadow")} disabled={busy}><Play size={15} /> Start shadow learning</button>
-          : <button className="button ghost" onClick={() => void setLearningMode("off")} disabled={busy}><Pause size={15} /> Pause learning</button>}
-        {learning.mode === "active"
-          ? <button className="button learning-primary" onClick={() => void setLearningMode("shadow")} disabled={busy}><ShieldCheck size={15} /> Return to shadow</button>
-          : <button className="button learning-primary" onClick={() => void setLearningMode("active")} disabled={busy || !canActivate} title={!learning.collecting_from_current_source ? "Switch to Solana mainnet before activation" : learning.activation_available ? "Use the newest qualified challenger" : "Forward validation has not qualified a challenger yet"}><TrendingUp size={15} /> Use qualified learner</button>}
-      </div>
+      <div><span className="eyebrow"><GraduationCap size={14} /> Learning Lab</span><h1>Three players. One safely bounded team.</h1><p>{stateCopy}</p></div>
     </section>
 
-    {learning.demo_excluded && <div className="learning-demo-note"><ShieldCheck size={17} /><div><strong>Demo experience stays separate</strong><p>Synthetic tokens remain fun to explore, but they can never train or activate the live learner.</p></div></div>}
+    <div ref={learningTabListRef} className="learning-view-tabs" role="tablist" aria-label="Learning Lab sections">
+      {views.map((view) => <button
+        id={`learning-tab-${view.key}`}
+        key={view.key}
+        data-learning-view={view.key}
+        type="button"
+        role="tab"
+        aria-selected={activeView === view.key}
+        aria-controls="learning-view-panel"
+        tabIndex={activeView === view.key ? 0 : -1}
+        title={view.summary}
+        onClick={() => setActiveView(view.key)}
+        onKeyDown={(event) => selectAdjacentView(event, view.key)}
+      ><span>{view.label}</span>{view.key === "overview" && hasUnseenMilestones && <i aria-label="New learning milestone" />}</button>)}
+    </div>
 
-    <section className="card learning-progress-card">
-      <div><span className={`learning-state state-${learning.state}`} /> <strong>{title(learning.state)}</strong><small>{learning.mode === "active" ? `Active model · ${learning.active_model?.version ?? "none"} · ${duration(holdReview)} hold review` : `Baseline remains in control · ${duration(holdReview)} hold review`}</small></div>
-      <div className="learning-progress-copy"><strong>{latest ? `${learning.usable_outcome_count} usable` : `${learning.usable_outcome_count} / ${learning.minimum_training_samples}`}</strong><small>{latest ? `Minimum ${learning.minimum_training_samples} met · ${nextChallengerCopy}` : "usable five-minute outcomes before first training"}</small></div>
-      <div className="learning-progress" role="progressbar" aria-label={progressLabel} aria-valuemin={0} aria-valuemax={progressMax} aria-valuenow={progressNow}><span style={{ width: `${progress * 100}%` }} /></div>
-    </section>
+    <section className={`learning-view-panel view-${activeView}`} id="learning-view-panel" role="tabpanel" aria-labelledby={`learning-tab-${activeView}`}>
+    {activeView === "overview" && <>
+      {milestones.length > 0 && <section className="learning-milestones" aria-label="Latest learning milestones">
+        <div><Sparkles size={16} /><strong>Latest learning milestones</strong><small>Proof progress, never a promise of profit</small></div>
+        {milestones.slice(0, 3).map((milestone) => <article className={`tone-${milestone.tone}`} key={milestone.id}><span /><div><strong>{milestone.title}</strong><small>{milestone.detail}</small></div></article>)}
+      </section>}
+      <section className="learning-team-strip" aria-label="Learning team status">
+        <button type="button" onClick={() => setActiveView("baseline")}><span>Fast Baseline</span><strong>{baselineState}</strong><small>Deterministic · {title(snapshot.risk_mode)} · safe fallback</small><em>Open Baseline <ChevronRight size={12} /></em></button>
+        <button type="button" onClick={() => setActiveView("challenger")}><span>Statistical Challenger</span><strong>{challengerState}</strong><small>{challengerTotal ? `${challengerPassed} / ${challengerTotal} proof gates` : "Server proof is collecting"}</small><em>Open Challenger <ChevronRight size={12} /></em></button>
+        <button type="button" onClick={() => setActiveView("coach")}><span>Local AI Lab</span><strong>{snapshot.ai_lab.mode === "off" ? "Off" : "Shadow"} · {coachState}</strong><small>Coach + saved decision reviews · zero influence</small><em>Open AI Coach <ChevronRight size={12} /></em></button>
+      </section>
+      <div className="learning-overview-note"><ShieldCheck size={15} /><span><strong>The Baseline acts; the others must earn trust.</strong><small>Challenger and local AI evidence stays separate, measurable, bounded, and reversible.</small></span></div>
+    </>}
 
-    <section className="stats-grid learning-stats">
-      <Stat label="Tokens remembered" value={compact(learning.observation_count)} hint={`Newest ${compact(learning.model_window_observations)} train · ${compact(learning.retained_observation_limit)} retained`} />
-      <Stat label="Usable outcomes" value={compact(learning.usable_outcome_count)} hint="After entry, exit and fees" />
-      <Stat label="Still unfolding" value={compact(learning.pending_count)} hint="Measured at 1, 5, 10, 15 and 20 minutes" />
-      <Stat label="Unknown outcomes" value={compact(learning.unavailable_outcome_count)} hint="No fake P/L; unavailable exits still reduce horizon utility" />
-    </section>
-
-    <CoachRoom snapshot={snapshot} />
-
-    <AiDecisionLabCard snapshot={snapshot} setAiMode={setAiMode} busy={busy} />
-
-    <LearningDisclosure
-      id="learning-evidence-details"
-      title="Learning evidence"
-      subtitle="Forward validation and the associations currently being tested"
-      summary={latest ? latest.qualified ? "Qualified challenger" : "Challenger testing" : "Collecting"}
-    >
-      <div className="learning-grid">
-        <article className="card learning-card">
-          <SectionHeader title="Forward test" subtitle="Newest observations are never used to fit the challenger being judged" />
-          {latest ? <div className="learning-metrics">
-            <div><span>Qualified</span><strong className={latest.qualified ? "positive" : "negative"}>{latest.qualified ? "Yes" : "Not yet"}</strong></div>
-            <div><span>Risk cohort</span><strong>{latest.risk_mode ? title(latest.risk_mode) : "Legacy"}</strong></div>
-            <div><span>Validation outcomes</span><strong>{latest.validation_count}</strong></div>
-            <div><span>Outcome availability</span><strong className={entryAvailability.qualified ? "positive" : ""}>{percent(entryAvailability.availability_fraction)}</strong></div>
-            <div><span>Overlap embargo</span><strong>{latest.embargoed_count} excluded</strong></div>
-            <div><span>Learner top group</span><strong className={latest.learner_top_mean_return >= 0 ? "positive" : "negative"}>{percentSigned(latest.learner_top_mean_return)}</strong></div>
-            <div><span>Baseline top group</span><strong className={latest.baseline_top_mean_return >= 0 ? "positive" : "negative"}>{percentSigned(latest.baseline_top_mean_return)}</strong></div>
-            <div><span>Learner rank fit</span><strong>{latest.learner_correlation.toFixed(2)}</strong></div>
-            <div><span>Validation error</span><strong>{percent(latest.validation_rmse)}</strong></div>
-            <div><span>Veto-policy proof</span><strong>{latest.policy_validation_count} actionable · {latest.policy_uplift_lower_bound === null ? "collecting" : `${percentSigned(latest.policy_uplift_lower_bound)} floor`}</strong></div>
-            <div><span>Hold timing</span><strong className={timing.qualified ? "positive" : ""}>{timing.qualified ? `${duration(timing.selected_horizon_seconds)} qualified` : "Baseline"}</strong></div>
-            <div><span>Timing validation</span><strong>{timing.validation_count} outcomes</strong></div>
-            <div><span>Live health guard</span><strong className={liveHealth.state === "healthy" ? "positive" : liveHealth.state === "suspended" || liveHealth.state === "degraded" ? "negative" : ""}>{liveHealth.state === "healthy" && liveHealth.estimated_uplift !== null ? `${percentSigned(liveHealth.estimated_uplift)} estimated` : liveHealth.state === "collecting" ? `${liveHealth.usable_count} / ${liveHealth.minimum_samples}` : liveHealth.state === "suspended" ? "Returned to shadow" : title(liveHealth.state)}</strong></div>
-          </div> : <EmptyState icon={<GraduationCap size={22} />} title="No model fitted yet" copy="Signal Arcade is recording outcomes, but it refuses to fit a learner from a tiny sample." />}
-        </article>
-
-        <article className="card learning-card">
-          <SectionHeader title="What it is noticing" subtitle="Associations, not universal claims about every token" />
-          {learning.lessons.length ? <div className="lesson-list">{learning.lessons.map((lesson) => <div key={lesson.feature}><span className={lesson.effect === "helped" ? "lesson-up" : "lesson-down"}>{lesson.effect === "helped" ? "↑" : "↓"}</span><div><strong>{title(lesson.label)}</strong><small>Associated with {lesson.effect === "helped" ? "better" : "worse"} fee-inclusive outcomes · strength {Math.abs(lesson.coefficient).toFixed(3)}</small></div></div>)}</div> : <EmptyState icon={<TrendingUp size={22} />} title="Lessons need time" copy="The first challenger appears only after enough live, forward five-minute outcomes exist." />}
-        </article>
-      </div>
-    </LearningDisclosure>
-
-    <LearningDisclosure
-      id="learning-permanent-boundaries"
-      title="Permanent boundaries"
-      subtitle="Learning can become selective; it cannot become reckless"
-      summary={`${learning.guardrails.length} always active`}
-    >
-      <article className="card learning-guardrails">
-        <div>{learning.guardrails.map((guardrail) => <span key={guardrail}><ShieldCheck size={15} />{guardrail}</span>)}</div>
+    {activeView === "baseline" && <>
+      <div className="learning-view-heading"><div><span>Fast Baseline</span><h2>The deterministic trader and permanent safe fallback</h2></div><strong>{baselineState} · {title(snapshot.risk_mode)}</strong></div>
+      <article className="card baseline-overview">
+        <div><Gauge size={19} /><span><strong>Acts on fresh market evidence</strong><small>Scores entries and manages exits without waiting for local AI.</small></span></div>
+        <div><ShieldCheck size={19} /><span><strong>Does not fit itself</strong><small>The Challenger studies measured outcomes separately; the Baseline stays predictable.</small></span></div>
+        <div><RotateCcw size={19} /><span><strong>Always available as fallback</strong><small>If learned behavior becomes harmful or unverifiable, control returns here automatically.</small></span></div>
       </article>
-    </LearningDisclosure>
+    </>}
+
+    {activeView === "challenger" && <>
+      <div className="learning-view-heading"><div><span>Statistical Challenger</span><h2>Learns from forward, fee-inclusive outcomes without changing the Baseline</h2></div><strong>{learning.mode === "active" ? "Active" : learning.mode === "off" ? "Off" : "Shadow"} · {challengerState}</strong></div>
+      {learning.demo_excluded && <div className="learning-demo-note"><ShieldCheck size={17} /><div><strong>Demo experience stays separate</strong><p>Synthetic tokens can never train or activate the live learner.</p></div></div>}
+
+      <div className="challenger-controls">
+        <div><strong>Challenger control</strong><small>The next evaluation is not an unlock. Every proof gate must pass independently.</small></div>
+        <div className="learning-controls">
+          {learning.mode === "off"
+            ? <button className="button learning-primary" onClick={() => void setLearningMode("shadow")} disabled={busy}><Play size={15} /> Start Challenger Shadow</button>
+            : <button className="button ghost" onClick={() => void setLearningMode("off")} disabled={busy}><Pause size={15} /> Pause Challenger learning</button>}
+          {learning.mode === "active"
+            ? <button className="button learning-primary" onClick={() => void setLearningMode("shadow")} disabled={busy}><ShieldCheck size={15} /> Return Challenger to Shadow</button>
+            : <button className="button learning-primary" onClick={() => void setLearningMode("active")} disabled={busy || !canActivate} title={!learning.collecting_from_current_source ? "Switch to Solana mainnet before activation" : learning.activation_available ? "Use the newest qualified challenger" : "Every server-side proof and current coverage gate must pass first"}><TrendingUp size={15} /> Use qualified Challenger</button>}
+        </div>
+      </div>
+
+      <section className="card learning-progress-card">
+        <div><span className={`learning-state state-${learning.state}`} /> <strong>{title(learning.state)}</strong><small>{learning.mode === "active" ? `Active model · ${learning.active_model?.version ?? "none"} · ${duration(holdReview)} hold review` : `Baseline remains in control · ${duration(holdReview)} hold review`}</small></div>
+        <div className="learning-progress-copy"><strong>{latest ? `${learning.usable_outcome_count} usable` : `${learning.usable_outcome_count} / ${learning.minimum_training_samples}`}</strong><small>{latest ? `Minimum ${learning.minimum_training_samples} met · ${nextChallengerCopy}` : "usable five-minute outcomes before first training"}</small></div>
+        <div className="learning-progress" role="progressbar" aria-label={progressLabel} aria-valuemin={0} aria-valuemax={progressMax} aria-valuenow={progressNow}><span style={{ width: `${progress * 100}%` }} /></div>
+      </section>
+
+      <section className="stats-grid learning-stats">
+        <Stat label="Tokens remembered" value={compact(learning.observation_count)} hint={`Newest ${compact(learning.model_window_observations)} train · ${compact(learning.retained_observation_limit)} retained`} />
+        <Stat label="Usable outcomes" value={compact(learning.usable_outcome_count)} hint="After entry, exit and fees" />
+        <Stat label="Still unfolding" value={compact(learning.pending_count)} hint="Measured at 1, 5, 10, 15 and 20 minutes" />
+        <Stat label="Unknown outcomes" value={compact(learning.unavailable_outcome_count)} hint="No fake P/L; unavailable exits reduce horizon utility" />
+      </section>
+
+      <LearningDisclosure
+        id="challenger-readiness-details"
+        title="Road to influence"
+        subtitle="Authoritative proof gates from the engine"
+        summary={challengerTotal ? `${challengerPassed} / ${challengerTotal} passed` : "Collecting"}
+        open={expandedSections.has("challenger_proof")}
+        onToggle={() => toggleSection("challenger_proof")}
+      >
+        <ReadinessGates gates={challengerGates} emptyCopy="This running backend predates detailed proof gates; qualification remains safely server-controlled." />
+      </LearningDisclosure>
+
+      <LearningDisclosure
+        id="learning-evidence-details"
+        title="Learning evidence"
+        subtitle="Forward validation and the associations currently being tested"
+        summary={latest ? latest.qualified ? "Model proof passed" : "Challenger testing" : "Collecting"}
+        open={expandedSections.has("learning_evidence")}
+        onToggle={() => toggleSection("learning_evidence")}
+      >
+        <div className="learning-grid">
+          <article className="card learning-card">
+            <SectionHeader title="Forward test" subtitle="Newest observations are never used to fit the challenger being judged" />
+            {latest ? <div className="learning-metrics">
+              <div><span>Model proof</span><strong className={latest.qualified ? "positive" : "negative"}>{latest.qualified ? "Passed" : "Not yet"}</strong></div>
+              <div><span>Risk cohort</span><strong>{latest.risk_mode ? title(latest.risk_mode) : "Legacy"}</strong></div>
+              <div><span>Validation outcomes</span><strong>{latest.validation_count}</strong></div>
+              <div><span>Outcome availability</span><strong className={entryAvailability.qualified ? "positive" : ""}>{percent(entryAvailability.availability_fraction)}</strong></div>
+              <div><span>Overlap embargo</span><strong>{latest.embargoed_count} excluded</strong></div>
+              <div><span>Learner top group</span><strong className={latest.learner_top_mean_return >= 0 ? "positive" : "negative"}>{percentSigned(latest.learner_top_mean_return)}</strong></div>
+              <div><span>Baseline top group</span><strong className={latest.baseline_top_mean_return >= 0 ? "positive" : "negative"}>{percentSigned(latest.baseline_top_mean_return)}</strong></div>
+              <div><span>Learner rank fit</span><strong>{latest.learner_correlation.toFixed(2)}</strong></div>
+              <div><span>Validation error</span><strong>{percent(latest.validation_rmse)}</strong></div>
+              <div><span>Veto-policy proof</span><strong>{latest.policy_validation_count} actionable · {latest.policy_uplift_lower_bound === null ? "collecting" : `${percentSigned(latest.policy_uplift_lower_bound)} floor`}</strong></div>
+              <div><span>Hold timing</span><strong className={timing.qualified ? "positive" : ""}>{timing.qualified ? `${duration(timing.selected_horizon_seconds)} qualified` : "Baseline"}</strong></div>
+              <div><span>Timing validation</span><strong>{timing.validation_count} outcomes</strong></div>
+              <div><span>Live health guard</span><strong className={liveHealth.state === "healthy" ? "positive" : liveHealth.state === "suspended" || liveHealth.state === "degraded" ? "negative" : ""}>{liveHealth.state === "healthy" && liveHealth.estimated_uplift !== null ? `${percentSigned(liveHealth.estimated_uplift)} estimated` : liveHealth.state === "collecting" ? `${liveHealth.usable_count} / ${liveHealth.minimum_samples}` : liveHealth.state === "suspended" ? "Returned to Shadow" : title(liveHealth.state)}</strong></div>
+            </div> : <EmptyState icon={<GraduationCap size={22} />} title="No model fitted yet" copy="Signal Arcade records outcomes but refuses to fit a learner from a tiny sample." />}
+          </article>
+          <article className="card learning-card">
+            <SectionHeader title="What it is noticing" subtitle="Associations, not universal claims about every token" />
+            {learning.lessons.length ? <div className="lesson-list">{learning.lessons.map((lesson) => <div key={lesson.feature}><span className={lesson.effect === "helped" ? "lesson-up" : "lesson-down"}>{lesson.effect === "helped" ? "↑" : "↓"}</span><div><strong>{title(lesson.label)}</strong><small>Associated with {lesson.effect === "helped" ? "better" : "worse"} fee-inclusive outcomes · strength {Math.abs(lesson.coefficient).toFixed(3)}</small></div></div>)}</div> : <EmptyState icon={<TrendingUp size={22} />} title="Lessons need time" copy="The first challenger appears only after enough live, forward five-minute outcomes exist." />}
+          </article>
+        </div>
+      </LearningDisclosure>
+    </>}
+
+    {activeView === "coach" && <>
+      <div className="learning-view-heading"><div><span>AI Coach</span><h2>Slow, asynchronous experiments that can never delay a trade</h2></div><strong>{snapshot.coach.mode === "off" ? "Off" : `${coachState} · Shadow`}</strong></div>
+      <div className="local-ai-boundary"><Bot size={17} /><div><strong>One shared local AI mode</strong><small>Off or Shadow controls both the Coach and saved decision reviews. Coach experiments remain zero-influence in this version.</small></div></div>
+      <CoachRoom snapshot={snapshot} />
+    </>}
+
+    {activeView === "reviews" && <>
+      <div className="learning-view-heading"><div><span>Shadow Decision Reviews</span><h2>Saved decision explanations and counterfactual evidence</h2></div><strong>{snapshot.ai_lab.mode === "off" ? "Off" : "Shadow · no influence"}</strong></div>
+      <div className="local-ai-boundary"><Bot size={17} /><div><strong>Completely off the live path</strong><small>Reviews use normalized saved evidence after decisions. They cannot create, resize, delay, or alter a trade.</small></div></div>
+      <AiDecisionLabCard snapshot={snapshot} setAiMode={setAiMode} busy={busy} />
+    </>}
+
+    {activeView === "safety" && <>
+      <div className="learning-view-heading"><div><span>Permanent boundaries</span><h2>Learning can become selective; it cannot become reckless</h2></div><strong>{learning.guardrails.length} always active</strong></div>
+      <article className="card learning-guardrails"><div>{learning.guardrails.map((guardrail) => <span key={guardrail}><ShieldCheck size={15} />{guardrail}</span>)}</div></article>
+    </>}
+    </section>
   </>;
 }
 
@@ -1024,9 +1719,12 @@ function CoachRoom({ snapshot }: { snapshot: Snapshot }) {
     not_supported: "New forward evidence did not support this coaching idea.",
   };
   const latestReview = coach.recent_reviews[0];
+  const coachGates = coach.qualification_gates ?? [];
+  const coachPassed = coach.qualification_passed ?? coachGates.filter((gate) => gate.state === "passed").length;
+  const coachTotal = coach.qualification_total ?? coachGates.length;
   return <article className="card coach-card">
     <div className="coach-heading">
-      <SectionHeader title="AI Coach Room" subtitle="Slow reflection for the fast engine · every experiment remains Shadow-only" />
+      <SectionHeader title="AI Coach" subtitle="Slow, allowlisted experiments for the fast engine · Shadow-only" />
       <span className={`coach-state state-${coach.state}`}>{title(coach.state)}</span>
     </div>
     <div className="coach-summary">
@@ -1052,6 +1750,8 @@ function CoachRoom({ snapshot }: { snapshot: Snapshot }) {
       <div><strong>{latestReview?.selected_candidate_id === "none" ? "No experiment cleared screening yet" : "The coach is observing"}</strong><small>{latestReview?.summary || "It will review compact, normalized outcomes without placing work on the live decision path."}</small></div>
     </div>}
     {coach.last_error && <p className="coach-safe-error"><ShieldCheck size={14} />Optional coaching is waiting after a local-model issue; the engine was unaffected.</p>}
+    <ReadinessGates gates={coachGates} emptyCopy="No Coach experiment is selected yet, so its forward Shadow proof has not started." />
+    {coachTotal > 0 && <p className="coach-proof-note"><ShieldCheck size={13} />{coachPassed} / {coachTotal} Shadow proof gates passed. Even a Promising result has no influence in this version.</p>}
     <div className="coach-guardrails">{coach.guardrails.slice(0, 4).map((item) => <span key={item}><ShieldCheck size={13} />{item}</span>)}</div>
   </article>;
 }
@@ -1061,7 +1761,6 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
   setAiMode: (mode: AiDecisionMode) => Promise<void>;
   busy: boolean;
 }) {
-  const [open, setOpen] = useState(false);
   const lab = snapshot.ai_lab;
   const qualification = lab.qualification;
   const selectedCatalog = lab.catalog.find((model) => model.name === lab.selected_model);
@@ -1072,6 +1771,12 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
   const runtimeLabel = !lab.ollama_reachable
     ? "Runtime unavailable"
     : `${computeLabel} · ${lab.inference_busy ? "working" : "ready"}`;
+  const aiGates = qualification.gates ?? [];
+  const aiPassed = qualification.passed ?? aiGates.filter((gate) => gate.state === "passed").length;
+  const aiTotal = qualification.total ?? aiGates.length;
+  const coachGates = snapshot.coach.qualification_gates ?? [];
+  const coachPassed = snapshot.coach.qualification_passed ?? coachGates.filter((gate) => gate.state === "passed").length;
+  const coachTotal = snapshot.coach.qualification_total ?? coachGates.length;
   const modes: Array<{
     key: string;
     mode?: AiDecisionMode;
@@ -1084,34 +1789,23 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
     {
       key: "qualified-coach",
       label: "Qualified Coach",
-      copy: "Bounded suggestions after proof",
-      futureHint: "Future update — available only after Shadow earns enough forward, fee-inclusive evidence across multiple seasons.",
+      copy: coachTotal ? `${coachPassed}/${coachTotal} Coach Shadow gates · future` : "Coach proof collecting · future",
+      futureHint: "Future update — Coach proof progress is shown above. This stage remains unavailable even after evidence passes, until its bounded influence path is implemented and validated.",
     },
     {
       key: "live-critic",
       label: "Live Critic",
-      copy: "Real-time guidance after validation",
-      futureHint: "Future update — considered only after Qualified Coach proves useful, safe, bounded, and reversible.",
+      copy: "No readiness measure yet · future",
+      futureHint: "Future update — no Live Critic readiness claim exists yet. It would be considered only after Qualified Coach proves useful, safe, bounded, and reversible.",
     },
   ];
   const recent = lab.recent_assessments.slice(0, 5);
   const displayedMode = lab.mode === "guarded" ? "Qualified Coach (legacy)" : title(lab.mode);
   return <article className="card ai-lab-card">
     <div className="ai-lab-heading">
-      <SectionHeader title="AI Decision Lab" subtitle="An optional local critic that must prove itself on saved, fee-inclusive outcomes" />
-      <div className="learning-card-actions">
-        <span className={`ai-mode-badge ${lab.mode}`}>{displayedMode}</span>
-        <button
-          className="button ghost learning-section-toggle"
-          type="button"
-          aria-expanded={open}
-          aria-controls="ai-decision-lab-details"
-          aria-label={`${open ? "Hide" : "Show"} AI Decision Lab details`}
-          onClick={() => setOpen((value) => !value)}
-        >{open ? "Hide" : "Show"}<ChevronDown size={15} /></button>
-      </div>
+      <SectionHeader title="Shadow Decision Reviews" subtitle="AI Decision Lab · reviews completed decisions only; Live Critic remains a future stage" />
+      <span className={`ai-mode-badge ${lab.mode}`}>{displayedMode}</span>
     </div>
-    {open && <div className="learning-collapse-body" id="ai-decision-lab-details">
     <div className="ai-mode-grid">
       {modes.map((option) => {
         const future = option.mode === undefined;
@@ -1142,9 +1836,10 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
       <div><span>Influence</span><strong>{lab.mode === "guarded" ? "Veto only" : "None"}</strong><small>AI can never create or resize an entry</small></div>
     </div>
     <p className="ai-lab-note"><ShieldCheck size={14} />Shadow is the only AI analysis stage available now. It observes normalized saved evidence without influencing trades; later stages stay locked until separately implemented and validated.</p>
+    <ReadinessGates gates={aiGates} emptyCopy="This running backend predates detailed AI Shadow evidence gates; later stages still remain unavailable." />
+    {aiTotal > 0 && <p className="ai-proof-note"><ShieldCheck size={13} />{aiPassed} / {aiTotal} Shadow evidence gates passed. Qualified Coach remains a future feature even when all are met; Live Critic has no readiness claim yet.</p>}
     {recent.length > 0 && <div className="ai-assessment-list">
       {recent.map((assessment) => <div key={assessment.assessment_id}><span className={`ai-verdict ${assessment.valid ? assessment.verdict ?? "unknown" : "invalid"}`}>{assessment.valid ? title(assessment.verdict ?? "unknown") : aiFailureLabel(assessment.invalid_reason)}</span><div><strong title={tokenSymbolKnown(assessment.symbol) ? undefined : assessment.mint}>{tokenDisplayLabel(assessment.symbol, assessment.mint)}</strong><small>{assessment.valid ? assessment.summary || "Bounded assessment completed" : aiFailureDetail(assessment.invalid_reason)}</small></div><div><strong>{!assessment.valid ? "Ignored safely" : assessment.resolved_at ? assessment.counterfactual_uplift === null ? "No outcome" : `${percentSigned(assessment.counterfactual_uplift)} veto value` : "Measuring…"}</strong><small>{assessment.latency_ms.toLocaleString()} ms</small></div></div>)}
-    </div>}
     </div>}
   </article>;
 }
@@ -1226,10 +1921,25 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
   };
 
   const changingSort = data !== null && data.sort !== sort;
+  const summaryCurrency = data?.summary.quote_currency ?? data?.rows[0]?.quote_currency;
+  const summaryDecimals = data?.summary.quote_decimals ?? data?.rows[0]?.quote_decimals;
+  const summaryMoneyReady = Boolean(
+    data
+    && summaryCurrency
+    && typeof summaryDecimals === "number"
+    && Number.isInteger(summaryDecimals),
+  );
+  const openTrades = data?.summary.open_trades
+    ?? data?.rows.filter((row) => row.status === "open").length
+    ?? 0;
+  const availableRows = data?.available_rows
+    ?? (data?.sort === "recent" ? data.rows.length : data?.summary.closed_trades)
+    ?? 0;
+  const hiddenResultRows = Math.max(0, availableRows - (data?.rows.length ?? 0));
 
   return <>
     <section className="page-heading leaderboard-heading">
-      <div><span className="eyebrow"><Trophy size={14} /> Results board</span><h1>{view === "trades" ? "Wins, losses, and the evidence behind them." : "Is the strategy improving each season?"}</h1><p>{view === "trades" ? "Rank complete paper trades, spot patterns, then open the exact saved entry checkpoint." : "Compare each paper bankroll using percentages that stay meaningful across SOL and USDC seasons."}</p></div>
+      <div><span className="eyebrow"><Trophy size={14} /> Results board</span><h1>{view === "trades" ? "Wins, losses, and the evidence behind them." : "Is the strategy improving each season?"}</h1><p>{view === "trades" ? "Review this season's net-of-fee paper trades, then open the exact saved entry and exit evidence." : "Compare each paper bankroll using percentages that stay meaningful across SOL and USDC seasons."}</p></div>
       <div className="results-controls">
         <div className="results-view-tabs" aria-label="Results view">
           <button className={view === "trades" ? "active" : ""} aria-pressed={view === "trades"} onClick={() => setView("trades")}>Trades</button>
@@ -1241,12 +1951,16 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
       </div>
     </section>
     {view === "seasons" ? <SeasonsView reportIssue={reportIssue} resolveIssue={resolveIssue} /> : <>
+    <p className="results-scope-note"><History size={14} /><span><strong>Current season</strong> Most profit and Most loss rank closed trades; Latest also includes open positions.</span></p>
     {data && <section className="stats-grid leaderboard-stats">
-      <Stat label="Closed trades" value={String(data.summary.closed_trades)} />
-      <Stat label="Wins" value={String(data.summary.wins)} tone="good" />
-      <Stat label="Losses" value={String(data.summary.losses)} tone="bad" />
-      <Stat label="Win rate" value={data.summary.closed_trades ? percent(data.summary.wins / data.summary.closed_trades) : "—"} />
+      <Stat label="Closed trades" value={String(data.summary.closed_trades)} hint={`${openTrades} open · current season`} />
+      <Stat label="Realized net P/L" value={summaryMoneyReady ? signedMoney(data.summary.total_realized_pnl_minor, summaryCurrency!, summaryDecimals!) : "—"} hint="After simulated fees" tone={data.summary.total_realized_pnl_minor > 0 ? "good" : data.summary.total_realized_pnl_minor < 0 ? "bad" : undefined} />
+      <Stat label="Win rate" value={data.summary.closed_trades ? percent(data.summary.wins / data.summary.closed_trades) : "—"} hint={`${data.summary.wins}W · ${data.summary.losses}L`} />
+      <Stat label="Simulated fees" value={summaryMoneyReady && Number.isFinite(data.summary.total_fees_minor) ? money(data.summary.total_fees_minor, summaryCurrency!, summaryDecimals!) : "—"} hint="Open + closed trades" />
     </section>}
+    {data && <div className="results-exit-insight"><ShieldCheck size={15} /><div><strong>Exit audit</strong><span>{data.summary.closed_trades === 0
+      ? "Exit evidence and winner reversals will appear after the first closed trade."
+      : `${data.summary.audited_exits} of ${data.summary.closed_trades} closed trade${data.summary.closed_trades === 1 ? "" : "s"} ${data.summary.closed_trades === 1 ? "includes" : "include"} saved exit evidence. ${data.summary.winner_reversals ? `${data.summary.winner_reversals} ${data.summary.winner_reversals === 1 ? "trade was" : "trades were"} positive before closing negative.` : "No winner reversals recorded."}`}</span></div></div>}
     <div className="leaderboard-table" role="table" aria-busy={loading || changingSort}>
       <div className="leaderboard-row leaderboard-head" role="row"><span>Rank</span><span>Token</span><span>Paper P/L</span><span>Fees</span><span>Held</span><span>Outcome</span><span /></div>
       {data?.rows.map((row, index) => {
@@ -1254,14 +1968,15 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
         return <div className="leaderboard-row" role="row" key={`${row.mint}-${row.status}`}>
         <span className="leader-rank">#{index + 1}</span>
         <span className="leaderboard-token"><strong title={tokenSymbolKnown(row.symbol) ? undefined : row.mint}>{tokenLabel}</strong><small>{shortMint(row.mint)} · {row.status}{row.status === "open" && row.market_status !== "active" ? ` · ${humanize(row.market_status)}` : ""}</small><MintActions mint={row.mint} symbol={row.symbol} compact /></span>
-        <span className={row.pnl_minor >= 0 ? "positive" : "negative"}><strong>{signedMoney(row.pnl_minor, row.quote_currency, row.quote_decimals)}</strong><small>{row.status === "open" && !row.mark_is_executable ? `conservative · ${signedMoney(row.last_known_pnl_minor, row.quote_currency, row.quote_decimals)} last known` : percentSigned(row.return_fraction)}</small></span>
-        <span>{money(row.fees_minor, row.quote_currency, row.quote_decimals)}</span>
-        <span>{duration(row.hold_seconds)}</span>
-        <span>{row.exit_assessment ? <button className="exit-review-toggle" aria-expanded={reviewingMint === row.mint} onClick={() => setReviewingMint((current) => current === row.mint ? null : row.mint)}>{humanize(row.exit_assessment.reason)}</button> : row.exit_reason ? humanize(row.exit_reason) : row.status === "open" ? "Still open" : "Closed"}</span>
-        <span>{row.entry_decision_id && <button className="quick-explain" onClick={() => void explainEntry(row.entry_decision_id!)} disabled={explainingId === row.entry_decision_id}>{explainingId === row.entry_decision_id ? <span className="mini-loader" /> : <Sparkles size={14} />}Why it bought</button>}</span>
+        <span className={`leaderboard-pnl ${row.pnl_minor >= 0 ? "positive" : "negative"}`}><strong>{signedMoney(row.pnl_minor, row.quote_currency, row.quote_decimals)}</strong><small>{row.status === "open" && !row.mark_is_executable ? `conservative · ${signedMoney(row.last_known_pnl_minor, row.quote_currency, row.quote_decimals)} last known` : percentSigned(row.return_fraction)}</small><small className="leaderboard-mobile-fee">{money(row.fees_minor, row.quote_currency, row.quote_decimals)} fees</small></span>
+        <span className="leaderboard-fees">{money(row.fees_minor, row.quote_currency, row.quote_decimals)}</span>
+        <span className="leaderboard-held">{duration(row.hold_seconds)}</span>
+        <span className="leaderboard-outcome">{row.exit_assessment ? <button className="exit-review-toggle" aria-expanded={reviewingMint === row.mint} onClick={() => setReviewingMint((current) => current === row.mint ? null : row.mint)}>{humanize(row.exit_assessment.reason)}</button> : row.exit_reason ? humanize(row.exit_reason) : row.status === "open" ? "Still open" : "Closed"}</span>
+        <span className="leaderboard-actions">{row.entry_decision_id && <button className="quick-explain" onClick={() => void explainEntry(row.entry_decision_id!)} disabled={explainingId === row.entry_decision_id}>{explainingId === row.entry_decision_id ? <span className="mini-loader" /> : <Sparkles size={14} />}Why it bought</button>}</span>
         {reviewingMint === row.mint && row.exit_assessment && <div className="leaderboard-exit-review"><div><strong>Why it sold</strong><small>{humanize(row.exit_assessment.reason)} · policy {row.exit_assessment.policy_version}</small></div><div><span>Hold support<strong>{percent(row.exit_assessment.support_score)}</strong></span><span>Best marked return<strong>{row.peak_return_fraction === null ? "—" : percentSigned(row.peak_return_fraction)}</strong></span><span>Peak profit captured<strong>{row.peak_capture_fraction === null ? "—" : percentSigned(row.peak_capture_fraction)}</strong></span><span>Entry mode<strong>{row.entry_risk_mode ? title(row.entry_risk_mode) : "Legacy"}</strong></span></div>{row.exit_assessment.evidence.length > 0 && <p>{row.exit_assessment.evidence.join(" · ")}</p>}</div>}
       </div>})}
-      {data !== null && data.sort === sort && !loading && !data.rows.length && <EmptyState icon={<Trophy size={22} />} title="No paper results yet" copy="Completed and open paper trades will appear here with their real simulated fees and saved entry evidence." />}
+      {data !== null && data.sort === sort && !loading && !data.rows.length && <EmptyState icon={<Trophy size={22} />} title={sort === "recent" ? "No current-season trades yet" : "No closed trades this season yet"} copy={sort === "recent" ? "New paper entries will appear here with simulated fees and saved evidence." : "Choose Latest to review any open positions while completed trades continue accumulating."} />}
+      {data !== null && data.sort === sort && !loading && hiddenResultRows > 0 && <div className="leaderboard-list-note">Showing {data.rows.length.toLocaleString()} of {availableRows.toLocaleString()} {sort === "recent" ? "current-season trades, newest first." : `closed trades, ${sort === "profit" ? "highest net results" : "largest net losses"} first.`}</div>}
       {data === null && <div className="leaderboard-loading"><span className="mini-loader" /> {retrying ? "Saved results are taking longer. Retrying…" : "Loading saved results…"}</div>}
       {data !== null && (loading || changingSort || retrying) && <div className="leaderboard-refresh-note"><span className="mini-loader" /> {retrying ? "Showing the last saved order while Results retries…" : "Updating result order…"}</div>}
     </div>
@@ -1277,6 +1992,7 @@ function SeasonsView({ reportIssue, resolveIssue }: {
   const [retrying, setRetrying] = useState(false);
   const [chartRange, setChartRange] = useState<10 | 25 | "all">(10);
   const [historyLimit, setHistoryLimit] = useState<number | "all">(20);
+  const [profileFilter, setProfileFilter] = useState<string>("current");
   const consecutiveFailures = useRef(0);
 
   useEffect(() => {
@@ -1322,34 +2038,81 @@ function SeasonsView({ reportIssue, resolveIssue }: {
     return <div className="leaderboard-table"><EmptyState icon={<History size={22} />} title="No seasons yet" copy="Create a paper bankroll to begin Season 1. Its scorecard will be preserved when you start the next season." /></div>;
   }
 
-  const orderedSeasons = [...data.seasons].sort((left, right) => left.season_number - right.season_number);
+  // Keep the Results view readable during a rolling backend/frontend update: an older
+  // cached response is valid legacy history, not a reason to blank the entire tab.
+  const profiles = data.profiles ?? [];
+  const currentProfileFingerprint = data.current_profile_fingerprint ?? null;
+  const exactProfileCount = profiles.length;
+  const legacyCount = data.seasons.filter((season) => season.profile_provenance !== "exact").length;
+  const resolvedProfileFilter = profileFilter === "current"
+    ? currentProfileFingerprint ?? "all"
+    : profileFilter;
+  const filteredSeasons = resolvedProfileFilter === "all"
+    ? data.seasons
+    : resolvedProfileFilter === "legacy"
+      ? data.seasons.filter((season) => season.profile_provenance !== "exact")
+      : data.seasons.filter((season) => season.profile_fingerprint === resolvedProfileFilter);
+  const orderedSeasons = [...filteredSeasons].sort((left, right) => left.season_number - right.season_number);
   const completed = orderedSeasons.filter((season) => season.status === "completed");
-  const trend = seasonTrend(completed);
-  const chartSeasons = chartRange === "all" ? orderedSeasons : orderedSeasons.slice(-chartRange);
+  const comparableCompleted = completed.filter((season) => season.comparable !== false);
+  const excludedCompletedCount = completed.length - comparableCompleted.length;
+  const mixedHistory = resolvedProfileFilter === "all" && (exactProfileCount + (legacyCount ? 1 : 0)) > 1;
+  const trend = mixedHistory
+    ? { title: "Mixed-profile history", copy: "Choose one exact profile for a like-for-like performance trend.", tone: "neutral" as const }
+    : seasonTrend(comparableCompleted);
+  const bestCompleted = mixedHistory ? null : comparableCompleted.reduce<PaperSeason | null>((best, season) => {
+    if (season.net_return_fraction === null) return best;
+    if (best === null || best.net_return_fraction === null || season.net_return_fraction > best.net_return_fraction) return season;
+    return best;
+  }, null);
+  const chartEligibleSeasons = orderedSeasons.filter((season) => season.status === "current" || season.comparable !== false);
+  const chartSeasons = chartRange === "all" ? chartEligibleSeasons : chartEligibleSeasons.slice(-chartRange);
   const newestSeasons = [...orderedSeasons].reverse();
   const visibleHistory = historyLimit === "all" ? newestSeasons : newestSeasons.slice(0, historyLimit);
   const hiddenHistoryCount = newestSeasons.length - visibleHistory.length;
+  const completedWinRates = comparableCompleted.flatMap((season) => season.win_rate === null ? [] : [season.win_rate]);
+  const profitableCount = comparableCompleted.filter((season) => season.net_pnl_minor > 0).length;
+  const averageWinRate = completedWinRates.length
+    ? completedWinRates.reduce((total, value) => total + value, 0) / completedWinRates.length
+    : null;
   return <>
-    <section className="stats-grid leaderboard-stats season-stats">
-      <Stat label="Seasons" value={String(data.summary.season_count)} hint="Current included" />
-      <Stat label="Completed" value={String(data.summary.completed_seasons)} />
-      <Stat label="Profitable" value={String(data.summary.profitable_seasons)} tone={data.summary.profitable_seasons ? "good" : undefined} />
-      <Stat label="Average win rate" value={data.summary.average_win_rate === null ? "—" : percent(data.summary.average_win_rate)} hint="Completed seasons" />
+    <section className="season-profile-filter card">
+      <div><span>Compare profile</span><strong>{mixedHistory ? "All seasons · mixed history" : resolvedProfileFilter === "legacy" ? "Legacy / unknown" : seasonProfileOptionLabel(profiles.find((profile) => profile.profile_fingerprint === resolvedProfileFilter) ?? null)}</strong><small>{mixedHistory ? "These seasons used different policies; aggregate improvement claims are intentionally hidden." : "Every statistic, chart and scorecard below uses this same profile."}</small></div>
+      <label><span>Season profile</span><select value={profileFilter} onChange={(event) => { setProfileFilter(event.target.value); setHistoryLimit(20); }}>
+        {currentProfileFingerprint && <option value="current">Current profile</option>}
+        {(["safe", "balanced", "aggressive"] as RiskMode[]).map((mode) => {
+          const variants = profiles.filter((profile) => profile.risk_mode === mode);
+          return variants.length ? <optgroup label={`${riskModeLabel(mode)} profiles`} key={mode}>
+            {variants.map((profile) => <option value={profile.profile_fingerprint} key={profile.profile_fingerprint}>{seasonProfileOptionLabel(profile)} · {profile.season_count}</option>)}
+          </optgroup> : null;
+        })}
+        {legacyCount > 0 && <option value="legacy">Legacy / unknown · {legacyCount}</option>}
+        <option value="all">All seasons</option>
+      </select></label>
     </section>
+    {!orderedSeasons.length && <div className="leaderboard-table"><EmptyState icon={<History size={22} />} title="No seasons for this profile" copy="This retained profile has not produced a paper season yet." /></div>}
+    {!!orderedSeasons.length && <>
+    <section className="stats-grid leaderboard-stats season-stats">
+      <Stat label="Seasons" value={String(orderedSeasons.length)} hint="Filtered set" />
+      <Stat label="Completed" value={String(completed.length)} />
+      <Stat label={mixedHistory ? "Profiles" : "Profitable"} value={mixedHistory ? String(exactProfileCount + (legacyCount ? 1 : 0)) : String(profitableCount)} hint={mixedHistory ? "Mixed history" : "Comparable seasons"} tone={!mixedHistory && profitableCount ? "good" : undefined} />
+      <Stat label="Average win rate" value={mixedHistory || averageWinRate === null ? "—" : percent(averageWinRate)} hint={mixedHistory ? "Select one profile" : "Comparable seasons"} />
+    </section>
+    {excludedCompletedCount > 0 && <div className="season-comparison-note"><ShieldCheck size={15} /><span>{excludedCompletedCount} manually ended or unresolved season{excludedCompletedCount === 1 ? " is" : "s are"} retained below but excluded from best-season and performance comparisons.</span></div>}
     <section className="season-overview-grid">
       <article className="card season-chart-card">
         <div className="season-card-heading">
           <div><span>Win rate by season</span><strong>Performance progression</strong></div>
           <div className="season-chart-actions">
-            <small>{chartRange === "all" ? `All ${orderedSeasons.length} seasons` : `Latest ${Math.min(chartRange, orderedSeasons.length)} of ${orderedSeasons.length}`}</small>
-            {orderedSeasons.length > 10 && <div className="season-range-tabs" role="group" aria-label="Season chart range">
+            <small>{chartRange === "all" ? `All ${chartEligibleSeasons.length} comparable seasons` : `Latest ${Math.min(chartRange, chartEligibleSeasons.length)} of ${chartEligibleSeasons.length}`}</small>
+            {chartEligibleSeasons.length > 10 && <div className="season-range-tabs" role="group" aria-label="Season chart range">
               <button type="button" className={chartRange === 10 ? "active" : ""} aria-pressed={chartRange === 10} onClick={() => setChartRange(10)}>Latest 10</button>
               <button type="button" className={chartRange === 25 ? "active" : ""} aria-pressed={chartRange === 25} onClick={() => setChartRange(25)}>Latest 25</button>
               <button type="button" className={chartRange === "all" ? "active" : ""} aria-pressed={chartRange === "all"} onClick={() => setChartRange("all")}>All</button>
             </div>}
           </div>
         </div>
-        <SeasonWinChart seasons={chartSeasons} all={chartRange === "all"} total={orderedSeasons.length} />
+        <SeasonWinChart seasons={chartSeasons} all={chartRange === "all"} total={chartEligibleSeasons.length} />
         <p><BrainCircuit size={14} /> Starting a new season resets its bankroll, while retained learning continues across seasons.</p>
       </article>
       <article className={`card season-trend-card ${trend.tone}`}>
@@ -1357,6 +2120,7 @@ function SeasonsView({ reportIssue, resolveIssue }: {
         <span>Season read</span>
         <strong>{trend.title}</strong>
         <p>{trend.copy}</p>
+        {bestCompleted && <div className="season-best-read"><span>Best completed</span><b>Season {bestCompleted.season_number} · {percentSigned(bestCompleted.net_return_fraction!)}</b></div>}
       </article>
     </section>
     {newestSeasons.length > 20 && <div className="season-history-heading">
@@ -1375,6 +2139,7 @@ function SeasonsView({ reportIssue, resolveIssue }: {
       </div>}
       {retrying && <div className="leaderboard-refresh-note"><span className="mini-loader" /> Showing saved season scorecards while this view retries…</div>}
     </div>
+    </>}
   </>;
 }
 
@@ -1423,6 +2188,34 @@ function SeasonWinChart({ seasons, all, total }: { seasons: PaperSeason[]; all: 
   </div>;
 }
 
+function sampledSeasonIndexes(seasons: PaperSeason[], maxPoints: number): number[] {
+  const measured = seasons
+    .map((season, index) => season.win_rate === null ? null : index)
+    .filter((index): index is number => index !== null);
+  if (measured.length <= maxPoints) return measured;
+
+  const firstMeasured = measured[0];
+  const lastMeasured = measured.at(-1);
+  if (firstMeasured === undefined || lastMeasured === undefined) return [];
+  const selected = new Set<number>([firstMeasured, lastMeasured]);
+  const bucketCount = Math.max(1, Math.floor((maxPoints - 2) / 2));
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const start = Math.floor((bucket / bucketCount) * seasons.length);
+    const end = Math.floor(((bucket + 1) / bucketCount) * seasons.length);
+    let minimum: number | null = null;
+    let maximum: number | null = null;
+    for (let index = start; index < end; index += 1) {
+      const rate = seasons[index]?.win_rate;
+      if (rate === null || rate === undefined) continue;
+      if (minimum === null || rate < seasons[minimum]!.win_rate!) minimum = index;
+      if (maximum === null || rate > seasons[maximum]!.win_rate!) maximum = index;
+    }
+    if (minimum !== null) selected.add(minimum);
+    if (maximum !== null) selected.add(maximum);
+  }
+  return [...selected].sort((left, right) => left - right);
+}
+
 function SeasonHistoryChart({ seasons }: { seasons: PaperSeason[] }) {
   const width = 1000;
   const height = 192;
@@ -1432,28 +2225,43 @@ function SeasonHistoryChart({ seasons }: { seasons: PaperSeason[] }) {
   const bottom = 31;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
-  const points = seasons.map((season, index) => {
-    const x = left + (seasons.length <= 1 ? plotWidth / 2 : (index / (seasons.length - 1)) * plotWidth);
-    const rate = season.win_rate;
-    return { season, x, y: rate === null ? null : top + (1 - Math.max(0, Math.min(1, rate))) * plotHeight };
+  const xForIndex = (index: number) => left + (
+    seasons.length <= 1 ? plotWidth / 2 : (index / (seasons.length - 1)) * plotWidth
+  );
+  const missingPrefix = [0];
+  seasons.forEach((season) => {
+    missingPrefix.push(missingPrefix.at(-1)! + (season.win_rate === null ? 1 : 0));
+  });
+  const sampledIndexes = sampledSeasonIndexes(seasons, MAX_SEASON_HISTORY_POINTS);
+  const sampledPoints = sampledIndexes.map((index, sampleIndex) => {
+    const season = seasons[index]!;
+    const previousIndex = sampledIndexes[sampleIndex - 1];
+    const breakBefore = previousIndex !== undefined
+      && missingPrefix[index]! - missingPrefix[previousIndex + 1]! > 0;
+    return {
+      season,
+      index,
+      x: xForIndex(index),
+      y: top + (1 - Math.max(0, Math.min(1, season.win_rate!))) * plotHeight,
+      breakBefore,
+    };
   });
   let path = "";
   let drawing = false;
-  for (const point of points) {
-    if (point.y === null) {
-      drawing = false;
-      continue;
-    }
+  for (const point of sampledPoints) {
+    if (point.breakBefore) drawing = false;
     path += `${drawing ? " L" : " M"}${point.x.toFixed(2)} ${point.y.toFixed(2)}`;
     drawing = true;
   }
   const measured = seasons.filter((season) => season.win_rate !== null);
   const labelStep = Math.max(1, Math.ceil(Math.max(1, seasons.length - 1) / 8));
-  const labelIndexes = new Set(points.map((_, index) => index).filter((index) => index === 0 || index === points.length - 1 || index % labelStep === 0));
+  const labelIndexes = new Set(seasons.map((_, index) => index).filter((index) => index === 0 || index === seasons.length - 1 || index % labelStep === 0));
   const rates = measured.map((season) => season.win_rate!);
+  const minimumRate = rates.reduce((value, rate) => Math.min(value, rate), 1);
+  const maximumRate = rates.reduce((value, rate) => Math.max(value, rate), 0);
   const latest = seasons.at(-1);
   const accessibleLabel = measured.length
-    ? `All ${seasons.length} seasons. Measured win rates range from ${percent(Math.min(...rates))} to ${percent(Math.max(...rates))}. Latest is Season ${latest?.season_number}, ${latest?.win_rate === null ? "with no closed trades" : `${percent(latest?.win_rate ?? 0)} win rate`}.`
+    ? `All ${seasons.length} seasons. Measured win rates range from ${percent(minimumRate)} to ${percent(maximumRate)}. Latest is Season ${latest?.season_number}, ${latest?.win_rate === null ? "with no closed trades" : `${percent(latest?.win_rate ?? 0)} win rate`}.`
     : `All ${seasons.length} seasons. No season has a measured win rate yet.`;
 
   return <div className="season-history-chart">
@@ -1463,31 +2271,41 @@ function SeasonHistoryChart({ seasons }: { seasons: PaperSeason[] }) {
         return <g key={rate}><line className="season-line-grid" x1={left} x2={width - right} y1={y} y2={y} /><text className="season-line-y-label" x={left - 8} y={y + 3}>{Math.round(rate * 100)}%</text></g>;
       })}
       {path && <path className="season-line-path" d={path.trim()} />}
-      {points.map((point) => point.y === null ? null : <circle
+      {sampledPoints.map((point) => <circle
         className={`season-line-point ${point.season.status} ${(point.season.net_return_fraction ?? 0) >= 0 ? "positive" : "negative"}`}
         cx={point.x}
         cy={point.y}
         r={point.season.status === "current" ? 4.5 : 3}
         key={point.season.season_id}
       ><title>{`Season ${point.season.season_number}: ${percent(point.season.win_rate!)} win rate, ${point.season.net_return_fraction === null ? "net return unavailable" : `${percentSigned(point.season.net_return_fraction)} net return`}${point.season.status === "current" ? ", current" : ""}`}</title></circle>)}
-      {points.map((point, index) => labelIndexes.has(index) ? <text className="season-line-x-label" textAnchor={index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"} x={point.x} y={height - 8} key={`label-${point.season.season_id}`}>S{point.season.season_number}</text> : null)}
+      {seasons.map((season, index) => labelIndexes.has(index) ? <text className="season-line-x-label" textAnchor={index === 0 ? "start" : index === seasons.length - 1 ? "end" : "middle"} x={xForIndex(index)} y={height - 8} key={`label-${season.season_id}`}>S{season.season_number}</text> : null)}
     </svg>
     {!measured.length && <span className="season-line-empty">Waiting for closed paper trades</span>}
-    <div className="season-line-legend"><span><i /> Win rate across every season</span><small>Exact values remain in the scorecards below</small></div>
+    <div className="season-line-legend"><span><i /> Win rate across every season</span><small>{sampledPoints.length < measured.length ? `${sampledPoints.length.toLocaleString()} representative trend points · all exact values remain below` : "Exact values remain in the scorecards below"}</small></div>
   </div>;
 }
 
 function SeasonRow({ season }: { season: PaperSeason }) {
   const ending = season.ending_equity_minor;
   const winRate = season.win_rate;
-  return <div className={`season-row ${season.status}`} role="row">
-    <span className="season-identity" data-label="Season"><strong>Season {season.season_number}</strong><small>{season.status === "current" ? "Live scorecard" : `Finished ${shortDate(season.ended_at!)}`}</small><em>{season.status}</em></span>
-    <span data-label="Bankroll"><strong>{money(season.starting_minor, season.quote_currency, season.quote_decimals)}</strong><small>{ending === null ? "No equity mark" : `${season.status === "current" ? "Now" : "Ended"} ${money(ending, season.quote_currency, season.quote_decimals)}`}</small></span>
-    <span data-label="Net result" className={season.net_pnl_minor >= 0 ? "positive" : "negative"}><strong>{signedMoney(season.net_pnl_minor, season.quote_currency, season.quote_decimals)}</strong><small>{season.net_return_fraction === null ? "—" : percentSigned(season.net_return_fraction)}</small></span>
+  const unresolved = season.result_quality === "unresolved" || (season.unresolved_inventory?.length ?? 0) > 0;
+  return <div className={`season-row ${season.status} ${season.comparable === false ? "not-comparable" : ""}`} role="row">
+    <span className="season-identity" data-label="Season"><strong>Season {season.season_number}</strong><small>{season.status === "current" ? "Live scorecard" : `Finished ${shortDate(season.ended_at!)}`}</small><em>{season.status}</em>{unresolved && <em className="unresolved">unresolved</em>}{season.comparable === false && !unresolved && <em className="not-compared">not compared</em>}<b>{season.profile ? `${riskModeLabel(season.profile.risk_mode)} · ${shortDrawdownLabel(season.profile)}` : "Legacy / unknown"}</b>{season.terminal_reason && <small>Ended: {terminalReasonLabel(season.terminal_reason)}</small>}</span>
+    <span data-label="Bankroll"><strong>{money(season.starting_minor, season.quote_currency, season.quote_decimals)}</strong><small>{ending === null ? "No equity mark" : `${season.status === "current" ? "Now" : unresolved ? "Executable end" : "Ended"} ${money(ending, season.quote_currency, season.quote_decimals)}`}</small></span>
+    <span data-label="Net result" className={season.net_pnl_minor >= 0 ? "positive" : "negative"}><strong>{signedMoney(season.net_pnl_minor, season.quote_currency, season.quote_decimals)}</strong><small>{season.comparable === false ? "Excluded from comparisons" : season.net_return_fraction === null ? "—" : percentSigned(season.net_return_fraction)}</small></span>
     <span data-label="Win rate"><strong>{winRate === null ? "—" : percent(winRate)}</strong><small>{season.wins}W · {season.losses}L{season.break_even ? ` · ${season.break_even} even` : ""}</small></span>
     <span data-label="Trades"><strong>{season.closed_trades.toLocaleString()}</strong><small>{money(season.total_fees_minor, season.quote_currency, season.quote_decimals)} fees</small></span>
-    <span data-label="Drawdown"><strong>{percent(season.ending_drawdown_fraction)}</strong><small>{season.open_positions ? `${season.open_positions} open at ${season.status === "current" ? "present" : "finish"}` : "No open positions"}</small></span>
+    <span data-label="Drawdown"><strong>{percent(season.ending_drawdown_fraction)}</strong><small>{season.open_positions ? `${season.open_positions} ${unresolved ? "unresolved at boundary" : `open at ${season.status === "current" ? "present" : "finish"}`}` : "No open positions"}</small></span>
     <span data-label="Duration"><strong>{longDuration(season.duration_seconds)}</strong><small>Started {shortDate(season.started_at)}</small></span>
+    {!!season.unresolved_inventory?.length && <details className="season-unresolved-detail">
+      <summary>Review unresolved inventory · {season.unresolved_inventory.length}</summary>
+      <div>{season.unresolved_inventory.map((position) => <span key={position.position_id}>
+        <strong title={position.mint}>{tokenDisplayLabel(position.symbol, position.mint)}</strong>
+        <small>{position.token_units.toLocaleString()} raw token units · {humanize(position.market_status)}</small>
+        <small>Last-known indication {money(position.last_known_mark_minor, position.quote_currency, position.quote_decimals)} · not an executed sale</small>
+        <small>{position.mark_blockers.length ? position.mark_blockers.map(humanize).join(" · ") : "No executable route at the season boundary"}</small>
+      </span>)}</div>
+    </details>}
   </div>;
 }
 
@@ -1528,22 +2346,72 @@ function DecisionEvidence({ decision }: { decision: Decision }) {
     ["Creator sells (5m)", values.creator_sells_5m, "number"],
     ["Mint safety", values.mint_safety_verified, "boolean"],
   ] as const;
+  const integrityEvidence = [
+    ["One-trade wallets", values.single_trade_wallet_ratio, "percent"],
+    ["Wallet round trips", values.round_trip_wallet_ratio, "percent"],
+    ["Round-trip volume", values.round_trip_volume_ratio, "percent"],
+    ["Net flow vs gross volume", values.net_quote_flow_ratio, "percent"],
+    ["Buy/sell alternation", values.side_alternation_ratio, "percent"],
+    ["Clustered trade sizes", values.quantized_amount_repeat_ratio, "percent"],
+    ["Slot concentration", values.slot_concentration_hhi, "percent"],
+    ["One-way price movement", values.price_direction_consistency, "percent"],
+    ["Multi-trade signatures", values.multi_trade_signature_ratio, "percent"],
+  ] as const;
   return <section className="explain-evidence">
     <div className="explain-score-grid"><ScoreBar label="Opportunity" value={decision.score.opportunity} tone="good" /><ScoreBar label="Danger" value={decision.score.danger} tone="bad" /><ScoreBar label="Execution" value={decision.score.execution} tone="blue" /><ScoreBar label="Evidence confidence" value={decision.score.confidence} tone="purple" /></div>
     <h3>What the engine actually saw</h3>
     <div className="evidence-grid">{evidence.map(([label, item, format]) => <div key={label}><span>{label}</span><strong>{formatEvidence(item?.value, format)}</strong><small>{item ? `${Math.round(item.quality * 100)}% source quality · ${duration(item.freshness_seconds)} old` : "Not recorded"}</small></div>)}<div><span>Estimated entry impact</span><strong>{estimatedImpact === null ? "Unknown" : percent(estimatedImpact)}</strong><small>Planned paper size ÷ observed reserve depth</small></div></div>
+    <h3>Market integrity evidence · shadow learning</h3>
+    <div className="evidence-grid">{integrityEvidence.map(([label, item, format]) => <div key={label}><span>{label}</span><strong>{formatEvidence(item?.value, format)}</strong><small>{item?.missing_reason ? humanize(item.missing_reason) : item ? `${Math.round(item.quality * 100)}% evidence coverage` : "Not recorded in this decision"}</small></div>)}</div>
     <div className="explain-gates"><div><strong>Positive evidence</strong>{decision.reasons.map((reason) => <span key={reason}><Check size={13} />{reason}</span>)}</div><div><strong>{decision.blockers.length ? "Gates that stopped entry" : "Safety gates"}</strong>{decision.blockers.length ? decision.blockers.map((blocker) => <span key={blocker}><AlertTriangle size={13} />{humanize(blocker)}</span>) : <span><ShieldCheck size={13} />All configured entry gates passed at this checkpoint.</span>}</div></div>
   </section>;
 }
 
 function Replay({ snapshot }: { snapshot: Snapshot }) {
   const currency = snapshot.portfolio.quote_currency;
-  return <><section className="page-heading"><div><span className="eyebrow"><History size={14} /> Replay</span><h1>The score is net of the friction.</h1><p>Review fills, latency, price impact, protocol charges and simulated network fees.</p></div></section><article className="card replay-chart"><SectionHeader title="Equity history" subtitle={`${snapshot.equity_history.length} recorded market checkpoints · ${currency} account`} /><EquityChart points={snapshot.equity_history} tall /></article><SectionHeader title="Fill receipts" subtitle="Immutable paper execution evidence" /><div className="fills-table" role="table"><div className="fill-row fill-head" role="row"><span>Time</span><span>Token</span><span>Side</span><span>Net {currency}</span><span>Fees</span><span>Impact</span><span>Latency</span></div>{snapshot.fills.map((fill) => <FillRow fill={fill} key={fill.fill_id} />)}{!snapshot.fills.length && <EmptyState icon={<CircleDollarSign size={22} />} title="No fills yet" copy="A receipt appears after order latency when the latest observed reserve state is still executable." />}</div></>;
+  const fills = snapshot.fills;
+  const buys = fills.filter((fill) => fill.side === "buy").length;
+  const sells = fills.length - buys;
+  const fees = fills.reduce(
+    (total, fill) => total + fill.account_protocol_fee_minor + fill.account_network_fee_minor,
+    0,
+  );
+  const averageImpact = fills.length
+    ? fills.reduce((total, fill) => total + fill.price_impact_fraction, 0) / fills.length
+    : null;
+  const sortedLatencies = fills.map((fill) => fill.latency_ms).sort((left, right) => left - right);
+  const middle = Math.floor(sortedLatencies.length / 2);
+  const medianLatency = sortedLatencies.length
+    ? sortedLatencies.length % 2
+      ? sortedLatencies[middle]!
+      : (sortedLatencies[middle - 1]! + sortedLatencies[middle]!) / 2
+    : null;
+  const receiptScope = fills.length === 30
+    ? "Latest 30 current-season receipts · newest first"
+    : `${fills.length.toLocaleString()} current-season receipt${fills.length === 1 ? "" : "s"} · newest first`;
+  return <>
+    <section className="page-heading"><div><span className="eyebrow"><History size={14} /> Replay</span><h1>The score is net of the friction.</h1><p>Review fills, latency, price impact, protocol charges and simulated network fees.</p></div></section>
+    <section className="stats-grid replay-stats" aria-label="Visible receipt summary">
+      <Stat label="Visible receipts" value={fills.length.toLocaleString()} hint={`${buys} buy${buys === 1 ? "" : "s"} · ${sells} sell${sells === 1 ? "" : "s"}${fills.length === 30 ? " · latest 30" : ""}`} />
+      <Stat label="Visible fees" value={fills.length ? money(fees, currency, snapshot.portfolio.quote_decimals) : "—"} hint="Protocol + simulated network" />
+      <Stat label="Average impact" value={averageImpact === null ? "—" : percent(averageImpact)} hint="Recorded price impact" />
+      <Stat label="Median latency" value={medianLatency === null ? "—" : formatLatency(medianLatency)} hint="Order request to paper fill" />
+    </section>
+    <article className="card replay-chart"><SectionHeader title="Equity history" subtitle={`Current season · ${snapshot.equity_history.length} recorded market checkpoints · ${currency} account`} /><EquityChart points={snapshot.equity_history} tall /></article>
+    <SectionHeader title="Fill receipts" subtitle={receiptScope} />
+    {fills.length === 30 && <p className="replay-scope-note"><History size={14} />Replay keeps the live dashboard responsive with the newest 30 receipts; Results summarizes the complete current season.</p>}
+    <div className="fills-table" role="table" aria-label="Current-season paper fill receipts">
+      <div className="fill-row fill-head" role="row"><span role="columnheader">Time</span><span role="columnheader">Token</span><span role="columnheader">Side</span><span role="columnheader">Net flow</span><span role="columnheader">Fees</span><span role="columnheader">Impact</span><span role="columnheader">Latency</span></div>
+      {fills.map((fill) => <FillRow fill={fill} key={fill.fill_id} />)}
+      {!fills.length && <EmptyState icon={<CircleDollarSign size={22} />} title="No fills yet" copy="A receipt appears after order latency when the latest observed reserve state is still executable." />}
+    </div>
+  </>;
 }
 
-function StorageManager({ snapshot, refresh, setBusy, reportIssue, resolveIssue }: {
+function StorageManager({ snapshot, refresh, busy, setBusy, reportIssue, resolveIssue }: {
   snapshot: Snapshot;
   refresh: () => Promise<void>;
+  busy: boolean;
   setBusy: (value: boolean) => void;
   reportIssue: (scope: IssueScope, title: string, cause: unknown) => void;
   resolveIssue: (scope: IssueScope) => void;
@@ -1581,7 +2449,7 @@ function StorageManager({ snapshot, refresh, setBusy, reportIssue, resolveIssue 
     <SectionHeader title="Storage budget" subtitle="Bound high-volume evidence without deleting trades, P/L, ledger entries, or learned models" />
     <div className="storage-meter"><span style={{ width: `${usedFraction * 100}%` }} /></div>
     <div className="storage-summary"><strong>{formatBytes(storage.live_bytes)} live data</strong><span>{formatBytes(storage.database_bytes)} allocated · {formatBytes(storage.reclaimable_bytes)} reusable</span></div>
-    <form className="storage-form" onSubmit={save}><label>Maximum database<input type="number" min="0.5" max="100" step="0.5" value={maxGb} onChange={(event) => { setMaxGb(event.target.value); setSaved(false); }} disabled={saving} /><span>GB</span></label><label>Raw event history<input type="number" min="1" max="720" step="1" value={retention} onChange={(event) => { setRetention(event.target.value); setSaved(false); }} disabled={saving} /><span>hours</span></label><button className={`button${saved ? " saved" : ""}`} type="submit" disabled={saving} aria-live="polite">{saving ? <span className="mini-loader" /> : saved ? <Check size={15} /> : <Save size={15} />}{saving ? "Saving…" : saved ? "Saved" : "Save"}</button></form>
+    <form className="storage-form" onSubmit={save}><label>Maximum database<input type="number" min="0.5" max="100" step="0.5" value={maxGb} onChange={(event) => { setMaxGb(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>GB</span></label><label>Raw event history<input type="number" min="1" max="720" step="1" value={retention} onChange={(event) => { setRetention(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>hours</span></label><button className={`button${saved ? " saved" : ""}`} type="submit" disabled={saving || busy} aria-live="polite">{saving ? <span className="mini-loader" /> : saved ? <Check size={15} /> : <Save size={15} />}{saving ? "Saving…" : saved ? "Saved" : "Save"}</button></form>
     {saved && <p className="storage-saved" role="status"><Check size={13} />Policy saved. Cleanup continues safely in the background.</p>}
     <p className="storage-note"><HardDrive size={14} />SQLite reuses freed pages, so an older file may stay physically large without continuing to grow. Docker text logs are separately rotated and capped at about 30 MB by the included Compose files.</p>
   </article>;
@@ -1602,9 +2470,36 @@ function MaintenanceManager({ snapshot, refresh, busy, setBusy, reportIssue, res
   const [confirming, setConfirming] = useState(false);
   const [working, setWorking] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [dismissedCompletionId, setDismissedCompletionId] = useState(loadDismissedMaintenanceNotice);
+  const completionCopy = maintenanceCompletionCopy(operation, snapshot.version, snapshot.server_time);
+  const completionOperationId = operation?.state === "completed"
+    && typeof operation.operation_id === "string"
+    && operation.operation_id.length > 0
+    && operation.operation_id.length <= 180
+    ? operation.operation_id
+    : null;
+  const showCompletion = Boolean(
+    completionCopy && completionOperationId && completionOperationId !== dismissedCompletionId,
+  );
   const activeDownload = snapshot.ai_lab.downloads.some(
     (download) => download.status === "queued" || download.status === "downloading",
   );
+
+  useEffect(() => {
+    const syncDismissedNotice = (event: StorageEvent) => {
+      if (event.key === DISMISSED_MAINTENANCE_NOTICE_KEY || event.key === null) {
+        setDismissedCompletionId(loadDismissedMaintenanceNotice());
+      }
+    };
+    window.addEventListener("storage", syncDismissedNotice);
+    return () => window.removeEventListener("storage", syncDismissedNotice);
+  }, []);
+
+  const dismissCompletion = () => {
+    if (!completionOperationId) return;
+    saveDismissedMaintenanceNotice(completionOperationId);
+    setDismissedCompletionId(completionOperationId);
+  };
 
   const prepare = async () => {
     setWorking(true);
@@ -1672,7 +2567,7 @@ function MaintenanceManager({ snapshot, refresh, busy, setBusy, reportIssue, res
       <div className="maintenance-idle">
         <div><ShieldCheck size={18} /><p><strong>Upgrade without guessing when it is safe</strong><span>Prepare first, wait for Ready, then run the normal Docker Compose update. No paper history or learning is reset.</span></p></div>
         {operation?.state === "failed" && <p className="maintenance-warning"><AlertTriangle size={14} />{operation.detail}</p>}
-        {operation?.state === "completed" && <p className="maintenance-success"><Check size={14} />Updated safely from v{operation.prepared_version} to v{operation.restarted_version ?? snapshot.version}.</p>}
+        {showCompletion && <p className="maintenance-success" role="status"><Check size={14} /><span>{completionCopy}</span><button className="maintenance-success-dismiss" type="button" aria-label="Dismiss update confirmation" onClick={dismissCompletion}><X size={13} /></button></p>}
         <button className="button ghost" type="button" disabled={working || (busy && !active)} onClick={() => setConfirming(true)}><ShieldCheck size={15} />Prepare for upgrade</button>
       </div>
     )}
@@ -1688,11 +2583,13 @@ function SettingsView({ snapshot, refresh, busy, setBusy, reportIssue, resolveIs
   resolveIssue: (scope: IssueScope) => void;
 }) {
   const [confirmReset, setConfirmReset] = useState(false);
+  const [pendingDemoMode, setPendingDemoMode] = useState<boolean | null>(null);
   const changeMode = async (demo: boolean) => {
     setBusy(true);
     try {
       await api.setDemo(demo);
       resolveIssue("mode");
+      setPendingDemoMode(null);
       await refresh();
     } catch (cause) {
       reportIssue("mode", "Market source was not changed", cause);
@@ -1718,8 +2615,13 @@ function SettingsView({ snapshot, refresh, busy, setBusy, reportIssue, resolveIs
     <div className="settings-grid">
       <article className="card settings-card">
         <SectionHeader title="Market source" subtitle="Switching stops the engine and returns to bankroll setup so data modes never mix" />
-        <label className="mode-option"><span><Radio size={18} /><strong>Solana mainnet</strong><small>Official program logs through the configured public or private RPC.</small></span><input type="radio" name="market-source" checked={!snapshot.demo_mode} disabled={busy} onChange={() => void changeMode(false)} /></label>
-        <label className="mode-option"><span><Sparkles size={18} /><strong>Synthetic demo</strong><small>Fully offline market activity. External enrichment is paused in this mode.</small></span><input type="radio" name="market-source" checked={snapshot.demo_mode} disabled={busy} onChange={() => void changeMode(true)} /></label>
+        <label className="mode-option"><span><Radio size={18} /><strong>Solana mainnet</strong><small>Official program logs through the configured public or private RPC.</small></span><input type="radio" name="market-source" checked={!snapshot.demo_mode} disabled={busy} onChange={() => setPendingDemoMode(false)} /></label>
+        <label className="mode-option"><span><Sparkles size={18} /><strong>Synthetic demo</strong><small>Fully offline market activity. External enrichment is paused in this mode.</small></span><input type="radio" name="market-source" checked={snapshot.demo_mode} disabled={busy} onChange={() => setPendingDemoMode(true)} /></label>
+        {pendingDemoMode !== null && pendingDemoMode !== snapshot.demo_mode && <div className="source-confirm" role="alertdialog" aria-labelledby="source-confirm-title" aria-describedby="source-confirm-copy">
+          <strong id="source-confirm-title">Switch to {pendingDemoMode ? "Synthetic demo" : "Solana mainnet"}?</strong>
+          <p id="source-confirm-copy">This archives the current paper season, stops the engine, cancels unfilled orders and returns to bankroll setup so live and demo evidence never mix. Historical seasons and retained learning remain.</p>
+          <div><button className="button ghost" type="button" disabled={busy} onClick={() => setPendingDemoMode(null)}>Keep {snapshot.demo_mode ? "Synthetic demo" : "Solana mainnet"}</button><button className="button danger" type="button" disabled={busy} onClick={() => void changeMode(pendingDemoMode)}>{busy ? "Switching safely…" : "Switch and archive season"}</button></div>
+        </div>}
       </article>
       <article className="card settings-card">
         <SectionHeader title="Data health" subtitle="The engine abstains when required evidence is stale" />
@@ -1727,7 +2629,7 @@ function SettingsView({ snapshot, refresh, busy, setBusy, reportIssue, resolveIs
         <div className={`health-summary ${snapshot.database_ok ? "healthy" : "unhealthy"}`}><span />SQLite connection {snapshot.database_ok ? "healthy" : "failed"}</div>
         <div className={`health-summary ${snapshot.event_pipeline.degraded ? "unhealthy" : "healthy"}`}><span />Market processing {snapshot.event_pipeline.degraded ? snapshot.event_pipeline.degraded_reasons.map(humanize).join(", ") : "current"} · {compact(snapshot.event_pipeline.processed)} handled ({compact(snapshot.event_pipeline.persisted)} retained)</div>
       </article>
-      <StorageManager snapshot={snapshot} refresh={refresh} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
+      <StorageManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <AiModelManager snapshot={snapshot} refresh={refresh} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <ProviderManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <MaintenanceManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
@@ -1757,6 +2659,7 @@ function AiModelManager({ snapshot, refresh, reportIssue, resolveIssue }: {
   );
   const attentionRequiresExpanded = downloadActive || !lab.ollama_reachable;
   const sectionExpanded = expanded || attentionRequiresExpanded;
+  const modelMutationActive = workingModel !== null;
   const act = async (model: string, action: "download" | "select" | "remove") => {
     setWorkingModel(model);
     try {
@@ -1804,19 +2707,18 @@ function AiModelManager({ snapshot, refresh, reportIssue, resolveIssue }: {
           const download = lab.downloads.find((item) => item.model === model.name);
           const downloading = download?.status === "queued" || download?.status === "downloading";
           const selected = lab.selected_model === model.name;
-          const busy = workingModel === model.name;
           return <div className={`ai-model-row ${selected ? "selected" : ""}`} key={model.name}>
             <div className="ai-model-copy"><div><strong>{model.label}</strong>{model.role.includes("Recommended") && <span>Recommended</span>}</div><small>{model.role}</small><small>{formatBytes(model.download_bytes)} download · {model.recommended_ram_gb} GB RAM recommended{!model.fits_recommended_ram ? " · above detected RAM" : ""}</small></div>
             {downloading && download && <div className="model-download" role="status"><div><span style={{ width: `${download.progress_fraction * 100}%` }} /></div><small>{download.message} · {percent(download.progress_fraction)}</small></div>}
             {download?.status === "error" && <small className="model-error">{download.error ?? "Download failed"}</small>}
             <div className="ai-model-actions">
               {model.installed ? <>
-                {selected ? <span className="model-selected"><Check size={14} />Selected</span> : <button className="button ghost" disabled={busy || downloadActive} onClick={() => void act(model.name, "select")}>Select</button>}
+                {selected ? <span className="model-selected"><Check size={14} />Selected</span> : <button className="button ghost" disabled={modelMutationActive || downloadActive} onClick={() => void act(model.name, "select")}>Select</button>}
                 {confirmRemoval === model.name ? <>
-                  <button className="button ghost" disabled={busy} onClick={() => setConfirmRemoval(null)}>Cancel</button>
-                  <button className="button danger" disabled={busy || downloadActive} onClick={() => void act(model.name, "remove")}>Remove model</button>
-                </> : <button className="button ghost" disabled={busy || downloadActive} onClick={() => setConfirmRemoval(model.name)}>Remove</button>}
-              </> : <button className="button ghost" disabled={busy || downloadActive || !lab.ollama_reachable} onClick={() => void act(model.name, "download")}>{downloading ? "Downloading…" : download?.status === "error" ? "Retry" : "Download"}</button>}
+                  <button className="button ghost" disabled={modelMutationActive} onClick={() => setConfirmRemoval(null)}>Cancel</button>
+                  <button className="button danger" disabled={modelMutationActive || downloadActive || lab.inference_busy} title={lab.inference_busy ? "Wait for the current local AI assessment to finish" : selected ? "Removing the selected model turns the AI Decision Lab off; learning and history remain" : undefined} onClick={() => void act(model.name, "remove")}>Remove model</button>
+                </> : <button className="button ghost" disabled={modelMutationActive || downloadActive || lab.inference_busy} title={lab.inference_busy ? "Wait for the current local AI assessment to finish" : selected ? "Removing the selected model turns the AI Decision Lab off; learning and history remain" : undefined} onClick={() => setConfirmRemoval(model.name)}>Remove</button>}
+              </> : <button className="button ghost" disabled={modelMutationActive || downloadActive || !lab.ollama_reachable} onClick={() => void act(model.name, "download")}>{downloading ? "Downloading…" : download?.status === "error" ? "Retry" : "Download"}</button>}
             </div>
           </div>;
         })}
@@ -1872,9 +2774,21 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
   };
   const toggleClear = (keys: string[], checked: boolean) => {
     setSavedMessage(null);
+    if (checked) {
+      setSecretValues((current) => Object.fromEntries(
+        Object.entries(current).filter(([key]) => !keys.includes(key)),
+      ));
+    }
     setClearSecrets((current) => checked
       ? [...new Set([...current, ...keys])]
       : current.filter((key) => !keys.includes(key)));
+  };
+  const updateSecret = (key: string, value: string, clearKeys: string[] = [key]) => {
+    setSavedMessage(null);
+    setSecretValues((current) => ({ ...current, [key]: value }));
+    if (value.trim()) {
+      setClearSecrets((current) => current.filter((item) => !clearKeys.includes(item)));
+    }
   };
   const toggleEditor = () => {
     setSavedMessage(null);
@@ -1892,6 +2806,7 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
     setBusy(true);
     const solanaApiKey = secretValues.solana_api_key;
     const secrets: ProviderSettingsUpdate["secrets"] = { clear: [] };
+    const effectiveClear = new Set(clearSecrets);
     const storedSecretKeys = [
       "solana_http",
       "solana_ws",
@@ -1902,9 +2817,11 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
     ] as const;
     for (const key of storedSecretKeys) {
       const value = secretValues[key]?.trim();
-      if (value) secrets[key] = value;
+      if (value) {
+        secrets[key] = value;
+        effectiveClear.delete(key);
+      }
     }
-    const effectiveClear = new Set(clearSecrets);
     if (solanaPresetId === "public") {
       effectiveClear.add("solana_http");
       effectiveClear.add("solana_ws");
@@ -1968,13 +2885,13 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
           value={secretValues.solana_api_key ?? ""}
           placeholder={guidedSolanaConfigured ? "Saved securely · blank keeps it" : `Paste your ${guidedSolana.name} key`}
           required={!guidedSolanaConfigured}
-          onChange={(value) => { setSavedMessage(null); setSecretValues((current) => ({ ...current, solana_api_key: value })); }}
+          onChange={(value) => updateSecret("solana_api_key", value, ["solana_http", "solana_ws"])}
         />}
         {solanaPresetId === "public" && <p className="provider-connection-guide">No key required. Saving restores the configured environment endpoint or the bundled public Solana endpoint.</p>}
         {guidedSolana && <p className="provider-connection-guide">Signal Arcade creates the secure HTTP and WebSocket URLs automatically. The key remains write-only.</p>}
         {solanaPresetId === "custom" && <>
-          <SecretInput label="HTTP RPC URL" value={secretValues.solana_http ?? ""} placeholder={`${settings.providers.solana.endpoint} · blank keeps saved value`} onChange={(value) => { setSavedMessage(null); setSecretValues((current) => ({ ...current, solana_http: value })); }} />
-          <SecretInput label="WebSocket URL" value={secretValues.solana_ws ?? ""} placeholder={`${settings.providers.solana.stream_endpoint ?? "Saved stream"} · blank keeps saved value`} onChange={(value) => { setSavedMessage(null); setSecretValues((current) => ({ ...current, solana_ws: value })); }} />
+          <SecretInput label="HTTP RPC URL" value={secretValues.solana_http ?? ""} placeholder={`${settings.providers.solana.endpoint} · blank keeps saved value`} onChange={(value) => updateSecret("solana_http", value, ["solana_http", "solana_ws"])} />
+          <SecretInput label="WebSocket URL" value={secretValues.solana_ws ?? ""} placeholder={`${settings.providers.solana.stream_endpoint ?? "Saved stream"} · blank keeps saved value`} onChange={(value) => updateSecret("solana_ws", value, ["solana_http", "solana_ws"])} />
           <PolicyInputs policy={configuration.solana} onChange={(policy) => setPolicy("solana", policy)} />
           <label className="provider-check"><input type="checkbox" checked={clearSecrets.includes("solana_http") && clearSecrets.includes("solana_ws")} onChange={(event) => toggleClear(["solana_http", "solana_ws"], event.target.checked)} />Restore environment/default RPC endpoints</label>
         </>}
@@ -1985,12 +2902,12 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
       </ProviderEditor>
       <ProviderEditor title="Jupiter" copy="Optional validation adapter. V1 paper fills do not call Jupiter automatically.">
         <label>Plan<select value={matchingPreset(configuration.jupiter, settings.presets.jupiter)} onChange={(event) => applyPreset("jupiter", event.target.value)}>{settings.presets.jupiter?.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}<option value="custom">Custom limits</option></select></label>
-        <SecretInput label="API key" value={secretValues.jupiter_api_key ?? ""} placeholder={settings.providers.jupiter.api_key_configured ? "Saved on the local server · blank keeps it" : "Optional"} onChange={(value) => { setSavedMessage(null); setSecretValues((current) => ({ ...current, jupiter_api_key: value })); }} />
+        <SecretInput label="API key" value={secretValues.jupiter_api_key ?? ""} placeholder={settings.providers.jupiter.api_key_configured ? "Saved on the local server · blank keeps it" : "Optional"} onChange={(value) => updateSecret("jupiter_api_key", value)} />
         <PolicyInputs policy={configuration.jupiter} onChange={(policy) => setPolicy("jupiter", policy)} />
         <label className="provider-check"><input type="checkbox" checked={clearSecrets.includes("jupiter_api_key")} onChange={(event) => toggleClear(["jupiter_api_key"], event.target.checked)} />Remove saved Jupiter key</label>
       </ProviderEditor>
       <ProviderEditor title="Local AI connection" copy="Docker uses the private bundled Ollama service automatically. Only set an override when you deliberately want another local Ollama server.">
-        <SecretInput label="External Ollama URL override" value={secretValues.ollama_url ?? ""} placeholder={`${settings.providers.ollama.endpoint} · blank keeps the current connection`} onChange={(value) => { setSavedMessage(null); setSecretValues((current) => ({ ...current, ollama_url: value })); }} />
+        <SecretInput label="External Ollama URL override" value={secretValues.ollama_url ?? ""} placeholder={`${settings.providers.ollama.endpoint} · blank keeps the current connection`} onChange={(value) => updateSecret("ollama_url", value)} />
         <PolicyInputs policy={configuration.ollama} onChange={(policy) => setPolicy("ollama", policy)} />
         <label className="provider-check"><input type="checkbox" checked={clearSecrets.includes("ollama_url")} onChange={(event) => toggleClear(["ollama_url"], event.target.checked)} />Restore bundled/environment Ollama connection</label>
       </ProviderEditor>
@@ -2005,13 +2922,13 @@ function ProviderEditor({ title: heading, copy, children }: { title: string; cop
 }
 
 function SecretInput({ label, value, placeholder, required = false, onChange }: { label: string; value: string; placeholder: string; required?: boolean; onChange: (value: string) => void }) {
-  return <label>{label}<input type="password" autoComplete="off" value={value} placeholder={placeholder} required={required} onChange={(event) => onChange(event.target.value)} /></label>;
+  return <label>{label}<input type="password" autoComplete="off" spellCheck={false} value={value} placeholder={placeholder} required={required} onChange={(event) => onChange(event.target.value)} /></label>;
 }
 
 function PolicyInputs({ policy, onChange }: { policy: ProviderPolicy; onChange: (policy: ProviderPolicy) => void }) {
   return <>
     <label>Requests per minute<input type="number" min="1" max="60000" value={policy.requests_per_minute} onChange={(event) => onChange({ ...policy, requests_per_minute: Number(event.target.value) })} /></label>
-    <label>Monthly hard cap<input type="number" min="1" max="2000000000" value={policy.monthly_limit ?? ""} placeholder="No monthly cap" onChange={(event) => onChange({ ...policy, monthly_limit: event.target.value ? Number(event.target.value) : null })} /></label>
+    <label>Monthly hard cap<input type="number" min="1" max="2000000000" required={policy.paid_mode} value={policy.monthly_limit ?? ""} placeholder={policy.paid_mode ? "Required for paid plans" : "No monthly cap"} onChange={(event) => onChange({ ...policy, monthly_limit: event.target.value ? Number(event.target.value) : null })} /></label>
     <label className="provider-check"><input type="checkbox" checked={policy.paid_mode} onChange={(event) => onChange({ ...policy, paid_mode: event.target.checked })} />Paid plan enabled</label>
   </>;
 }
@@ -2226,7 +3143,21 @@ function FillRow({ fill }: { fill: Fill }) {
   const fees = fill.account_protocol_fee_minor + fill.account_network_fee_minor;
   const exitReason = fill.assumptions.find((item) => item.startsWith("scheduled_reason:"))?.slice(17);
   const tokenLabel = tokenDisplayLabel(fill.symbol, fill.mint);
-  return <div className="fill-row" role="row"><span>{new Date(fill.filled_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span><span><strong title={tokenSymbolKnown(fill.symbol) ? undefined : fill.mint}>{tokenLabel}</strong><small>{fill.venue}{exitReason ? ` · ${humanize(exitReason)}` : fill.sol_usd_price ? ` · SOL $${fill.sol_usd_price.toFixed(2)}` : ""}</small></span><span><ActionBadge action={fill.side === "buy" ? "enter" : "pass"} label={fill.side} /></span><span>{money(fill.account_net_minor, fill.account_currency, fill.account_decimals)}</span><span>{money(fees, fill.account_currency, fill.account_decimals)}</span><span>{percent(fill.price_impact_fraction)}</span><span>{fill.latency_ms.toLocaleString()}ms</span></div>;
+  const filledAt = new Date(fill.filled_at);
+  const time = filledAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const date = shortDate(fill.filled_at);
+  const cashFlow = fill.side === "buy" ? -fill.account_net_minor : fill.account_net_minor;
+  const venueCopy = `${fill.venue}${exitReason ? `, ${humanize(exitReason)}` : fill.sol_usd_price ? `, SOL $${fill.sol_usd_price.toFixed(2)}` : ""}`;
+  const feeCopy = `${money(fees, fill.account_currency, fill.account_decimals)} total, ${money(fill.account_protocol_fee_minor, fill.account_currency, fill.account_decimals)} protocol, ${money(fill.account_network_fee_minor, fill.account_currency, fill.account_decimals)} network`;
+  return <div className="fill-row" role="row">
+    <span role="cell" data-label="Time" aria-label={`Time ${date}, ${time}`}><strong>{time}</strong><small>{date}</small></span>
+    <span role="cell" data-label="Token" aria-label={`Token ${tokenLabel}, ${venueCopy}`}><strong title={tokenSymbolKnown(fill.symbol) ? undefined : fill.mint}>{tokenLabel}</strong><small>{fill.venue}{exitReason ? ` · ${humanize(exitReason)}` : fill.sol_usd_price ? ` · SOL $${fill.sol_usd_price.toFixed(2)}` : ""}</small></span>
+    <span role="cell" data-label="Side" aria-label={`Side ${fill.side}`}><ActionBadge action={fill.side === "buy" ? "enter" : "pass"} label={fill.side} /></span>
+    <span role="cell" data-label={`Net ${fill.account_currency}`} aria-label={`Net ${fill.account_currency} ${cashFlow >= 0 ? "inflow" : "outflow"} ${money(Math.abs(cashFlow), fill.account_currency, fill.account_decimals)}`} className={`fill-flow ${cashFlow >= 0 ? "positive" : "negative"}`}><strong>{signedMoney(cashFlow, fill.account_currency, fill.account_decimals)}</strong><small>{money(fill.account_gross_minor, fill.account_currency, fill.account_decimals)} gross</small></span>
+    <span role="cell" data-label="Fees" aria-label={`Fees ${feeCopy}`} className="fill-fees"><strong>{money(fees, fill.account_currency, fill.account_decimals)}</strong><small>{money(fill.account_protocol_fee_minor, fill.account_currency, fill.account_decimals)} protocol · {money(fill.account_network_fee_minor, fill.account_currency, fill.account_decimals)} network</small></span>
+    <span role="cell" data-label="Impact" aria-label={`Impact ${percent(fill.price_impact_fraction)}`}><strong>{percent(fill.price_impact_fraction)}</strong></span>
+    <span role="cell" data-label="Latency" aria-label={`Latency ${formatLatency(fill.latency_ms)}, ${Math.round(fill.latency_ms).toLocaleString()} milliseconds exact`}><strong>{formatLatency(fill.latency_ms)}</strong>{fill.latency_ms >= 1_000 && <small>{Math.round(fill.latency_ms).toLocaleString()}ms exact</small>}</span>
+  </div>;
 }
 
 function EquityChart({ points, tall = false }: { points: EquityPoint[]; tall?: boolean }) {
@@ -2286,7 +3217,7 @@ function EquityChart({ points, tall = false }: { points: EquityPoint[]; tall?: b
   }, [displayPoints, view]);
   const plateau = unchangedSeconds >= 60 ? ` · unchanged for ${duration(unchangedSeconds)}` : "";
   return <div className="equity-chart-shell">
-    <div className="equity-chart-toolbar"><small>{view === "journey" ? `${journey.length} meaningful equity moves${plateau}` : "True elapsed-time spacing"}</small><div role="group" aria-label="Equity chart spacing"><button className={view === "journey" ? "active" : ""} aria-pressed={view === "journey"} onClick={() => setView("journey")}>Journey</button><button className={view === "time" ? "active" : ""} aria-pressed={view === "time"} onClick={() => setView("time")}>Real time</button></div></div>
+    <div className="equity-chart-toolbar"><small>{view === "journey" ? `${journey.length} meaningful equity moves · unchanged waits collapsed${plateau}` : "True elapsed-time spacing · unchanged waits preserved"}</small><div role="group" aria-label="Equity chart spacing"><button className={view === "journey" ? "active" : ""} aria-pressed={view === "journey"} title="Journey collapses repetitive unchanged checkpoints so the season's meaningful moves stay visible." onClick={() => setView("journey")}>Journey</button><button className={view === "time" ? "active" : ""} aria-pressed={view === "time"} title="Elapsed time preserves the real waiting time between recorded checkpoints." onClick={() => setView("time")}>Elapsed time</button></div></div>
     <canvas ref={ref} className={`equity-chart ${tall ? "tall" : ""}`} role="img" aria-label={`Paper equity ${view === "journey" ? "season journey with unchanged checkpoints collapsed" : "history spaced by elapsed time"}. ${points.length} recorded checkpoints.`}>Paper equity history</canvas>
   </div>;
 }
@@ -2295,10 +3226,10 @@ function HealthRows({ health }: { health: Record<string, unknown> }) { return <d
 function ScoreBar({ label, value, tone }: { label: string; value: number; tone: string }) { return <div className="score-bar"><div><span>{label}</span><strong>{percent(value)}</strong></div><div className={`bar ${tone}`}><span style={{ width: `${Math.max(2, value * 100)}%` }} /></div></div>; }
 function ScoreRing({ score }: { score: number }) { return <span className="score-ring" style={{ "--score": `${score * 3.6}deg` } as React.CSSProperties}><strong>{score}</strong><small>/100</small></span>; }
 function ActionBadge({ action, label }: { action: DecisionAction; label?: string }) { return <span className={`action-badge ${action}`}>{label ?? action}</span>; }
-function SectionHeader({ title: heading, subtitle }: { title: string; subtitle: string }) { return <div className="section-header"><div><h2>{heading}</h2><p>{subtitle}</p></div></div>; }
+function SectionHeader({ title: heading, subtitle, action }: { title: string; subtitle: string; action?: React.ReactNode }) { return <div className="section-header"><div><h2>{heading}</h2><p>{subtitle}</p></div>{action}</div>; }
 function Stat({ label, value, hint, tone }: { label: string; value: string; hint?: string; tone?: string }) { return <article className="card stat-card"><span>{label}</span><strong className={tone}>{value}</strong>{hint && <small>{hint}</small>}</article>; }
 function EmptyState({ icon, title: heading, copy }: { icon: React.ReactNode; title: string; copy: string }) { return <div className="empty-state">{icon}<div><strong>{heading}</strong><p>{copy}</p></div></div>; }
-function NavButton({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) { return <button className={active ? "active" : ""} aria-label={label} aria-current={active ? "page" : undefined} onClick={onClick}>{icon}<span>{label}</span></button>; }
+function NavButton({ active, onClick, icon, label, attention = false }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string; attention?: boolean }) { return <button className={active ? "active" : ""} aria-label={label} aria-current={active ? "page" : undefined} aria-describedby={attention ? "learning-milestone-notice" : undefined} title={attention ? "New learning milestone" : undefined} onClick={onClick}>{icon}<span>{label}</span>{attention && <span className="nav-attention-dot" aria-hidden="true" />}{attention && <span className="sr-only" id="learning-milestone-notice">New learning milestone</span>}</button>; }
 function LoadingState() { return <div className="loading-state"><span className="loader" /><strong>Starting the arcade…</strong><p>Checking the ledger and connecting to the selected market source.</p></div>; }
 
 function money(value: number, currency: QuoteCurrency, decimals: number) { const scale = 10 ** decimals; const amount = value / scale; return currency === "USDC" ? `${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC` : `${amount.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 5 })} SOL`; }
@@ -2323,6 +3254,11 @@ function duration(seconds: number) {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
   return `${Math.floor(seconds / 3_600)}h ${Math.floor((seconds % 3_600) / 60)}m`;
+}
+function formatLatency(milliseconds: number) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "—";
+  if (milliseconds < 1_000) return `${Math.round(milliseconds).toLocaleString()}ms`;
+  return `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
 }
 function longDuration(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return "—";
@@ -2386,3 +3322,51 @@ function humanize(value: string) { return value.replaceAll("_", " ").replace(/^.
 function decisionActionLabel(action: DecisionAction) { return action === "enter" ? "Paper enter" : action === "watch" ? "Watching" : action === "pass" ? "Passed" : "Abstained"; }
 function ago(value: string) { const timestamp = Date.parse(value); if (!Number.isFinite(timestamp)) return "time unknown"; const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000)); if (seconds < 60) return `${seconds}s ago`; if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; return `${Math.floor(seconds / 3600)}h ago`; }
 function riskCopy(mode: RiskMode) { return mode === "safe" ? "Waits for stronger evidence and keeps virtual positions small." : mode === "balanced" ? "Balances opportunity, confidence, execution cost and danger." : "Explores more uncertain opportunities inside permanent hard limits."; }
+function riskModeLabel(mode: RiskMode) { return mode === "safe" ? "Safer" : title(mode); }
+function drawdownProfileLabel(profile: SeasonProfile | null) {
+  if (!profile) return "Legacy / unknown";
+  if (profile.drawdown_policy.kind === "disabled") return "Off · custom season profile";
+  const value = profile.effective_drawdown_bps === null ? "Unknown" : `${profile.effective_drawdown_bps / 100}%`;
+  return profile.drawdown_policy.kind === "default" ? `${value} · personality default` : `${value} · custom season profile`;
+}
+function drawdownPolicyTargetLabel(mode: RiskMode, policy: DrawdownPolicy, catalog: SeasonProfile[]) {
+  if (policy.kind === "disabled") return "DD off";
+  if (policy.kind === "custom") return `DD ${(policy.custom_threshold_bps ?? 0) / 100}%`;
+  const profile = catalog.find((item) => item.risk_mode === mode);
+  return `Default DD ${(profile?.effective_drawdown_bps ?? 0) / 100}%`;
+}
+function canonicalDrawdownPolicy(mode: RiskMode, policy: DrawdownPolicy, catalog: SeasonProfile[]): DrawdownPolicy {
+  if (policy.kind !== "custom") return policy;
+  const modeDefault = catalog.find((item) => item.risk_mode === mode && item.drawdown_policy.kind === "default");
+  return policy.custom_threshold_bps === modeDefault?.effective_drawdown_bps
+    ? { kind: "default", custom_threshold_bps: null }
+    : policy;
+}
+function profileLimitSummary(profile: SeasonProfile | null) {
+  if (!profile) return "Policy details unavailable";
+  const positions = profile.risk_limits.max_open_positions;
+  const exposure = profile.risk_limits.max_exposure_fraction;
+  const drawdown = profile.effective_drawdown_bps;
+  return `${positions} position${positions === 1 ? "" : "s"} · ${typeof exposure === "number" ? percent(exposure) : "—"} exposure · ${drawdown === null ? "DD off" : `${drawdown / 100}% DD`}`;
+}
+function shortDrawdownLabel(profile: SeasonProfile) {
+  if (profile.drawdown_policy.kind === "disabled") return "DD off";
+  const value = profile.effective_drawdown_bps === null ? "DD unknown" : `DD ${profile.effective_drawdown_bps / 100}%`;
+  return profile.drawdown_policy.kind === "default" ? `${value} default` : `${value} custom`;
+}
+function seasonProfileOptionLabel(profile: SeasonsData["profiles"][number] | null) {
+  if (!profile) return "Profile unavailable";
+  const drawdown = profile.drawdown_policy.kind === "disabled"
+    ? "DD off"
+    : `${profile.drawdown_policy.kind === "default" ? "Default DD" : "Custom DD"} ${(profile.effective_drawdown_bps ?? 0) / 100}%`;
+  return `${riskModeLabel(profile.risk_mode)} · ${drawdown}`;
+}
+function terminalReasonLabel(reason: string) {
+  if (reason === "profile_change") return "Profile change";
+  if (reason === "profile_change_safe") return "Safe profile change";
+  if (reason === "profile_change_manual") return "Profile changed now";
+  if (reason === "auto_drawdown" || reason === "auto_drawdown_rollover") return "Drawdown halt";
+  if (reason === "bankroll_exhausted") return "Bankroll exhausted";
+  if (reason === "manual_reset") return "Manual reset";
+  return humanize(reason);
+}

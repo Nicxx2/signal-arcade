@@ -96,8 +96,26 @@ def test_empty_leaderboard_and_missing_decision_are_explicit(settings) -> None: 
     with TestClient(create_app(settings)) as client:
         leaderboard = client.get("/api/v1/leaderboard?sort=profit")
         assert leaderboard.status_code == 200
-        assert leaderboard.json()["rows"] == []
-        assert leaderboard.json()["summary"]["closed_trades"] == 0
+        body = leaderboard.json()
+        assert body["rows"] == []
+        assert body["available_rows"] == 0
+        assert body["summary"]["closed_trades"] == 0
+        assert body["summary"]["open_trades"] == 0
+        assert body["summary"]["total_fees_minor"] == 0
+        assert body["summary"]["quote_currency"] == "SOL"
+        assert body["summary"]["quote_decimals"] == 9
+        setup = client.post(
+            "/api/v1/portfolio/setup",
+            json={"quote_currency": "USDC", "starting_amount": "100"},
+        )
+        assert setup.status_code == 200
+        usdc_body = client.get("/api/v1/leaderboard?sort=profit").json()
+        assert usdc_body["rows"] == []
+        assert usdc_body["available_rows"] == 0
+        assert usdc_body["summary"]["total_realized_pnl_minor"] == 0
+        assert usdc_body["summary"]["total_fees_minor"] == 0
+        assert usdc_body["summary"]["quote_currency"] == "USDC"
+        assert usdc_body["summary"]["quote_decimals"] == 6
         assert client.get("/api/v1/decisions/missing").status_code == 404
 
 
@@ -230,6 +248,19 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         assert first_body["summary"]["season_count"] == 1
         assert first_body["seasons"][0]["status"] == "current"
         assert first_body["seasons"][0]["net_return_fraction"] == 0
+        assert first_body["current_profile_fingerprint"]
+        assert first_body["profiles"] == [
+            {
+                "profile_fingerprint": first_body["current_profile_fingerprint"],
+                "risk_mode": "balanced",
+                "drawdown_policy": {
+                    "kind": "default",
+                    "custom_threshold_bps": None,
+                },
+                "effective_drawdown_bps": 1_500,
+                "season_count": 1,
+            }
+        ]
 
         assert (
             client.post(
@@ -242,6 +273,7 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         archived = client.get("/api/v1/seasons").json()
         assert archived["seasons"][0]["status"] == "completed"
         assert archived["seasons"][0]["ending_equity_minor"] == 1_000_000_000
+        assert archived["seasons"][0]["terminal_reason"] == "manual_reset"
 
         assert (
             client.post(
@@ -256,6 +288,68 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
             (2, "current"),
         ]
         assert seasons[1]["quote_currency"] == "USDC"
+
+
+def test_typed_drawdown_profiles_validate_and_persist_from_setup(settings) -> None:  # type: ignore[no-untyped-def]
+    app = create_app(settings)
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/api/v1/portfolio/setup",
+            json={
+                "quote_currency": "SOL",
+                "starting_amount": "1",
+                "risk_mode": "balanced",
+                "drawdown_policy": {
+                    "kind": "custom",
+                    "custom_threshold_bps": 10_000,
+                },
+            },
+        )
+        assert invalid.status_code == 422
+
+        created = client.post(
+            "/api/v1/portfolio/setup",
+            json={
+                "quote_currency": "SOL",
+                "starting_amount": "1",
+                "risk_mode": "balanced",
+                "drawdown_policy": {"kind": "disabled"},
+            },
+        )
+        assert created.status_code == 200
+        snapshot = client.get("/api/v1/snapshot").json()
+        assert snapshot["season_profile"]["drawdown_policy"] == {
+            "kind": "disabled",
+            "custom_threshold_bps": None,
+        }
+        assert snapshot["season_profile"]["effective_drawdown_bps"] is None
+        assert snapshot["portfolio"]["risk_halted"] is False
+
+
+def test_profile_transition_strategy_is_typed_and_persisted(settings) -> None:  # type: ignore[no-untyped-def]
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/api/v1/portfolio/setup",
+                json={"quote_currency": "SOL", "starting_amount": "1"},
+            ).status_code
+            == 200
+        )
+        assert client.post("/api/v1/engine/start").status_code == 200
+        invalid = client.put(
+            "/api/v1/risk",
+            json={"mode": "safe", "transition_strategy": "pretend_everything_sold"},
+        )
+        assert invalid.status_code == 422
+
+        requested = client.put(
+            "/api/v1/risk",
+            json={"mode": "safe", "transition_strategy": "end_now"},
+        )
+        assert requested.status_code == 200
+        assert requested.json()["transition_strategy"] == "end_now"
+        assert requested.json()["manual_settlement_deadline"] is not None
 
 
 def test_state_changes_and_websockets_reject_cross_origin_requests(settings) -> None:  # type: ignore[no-untyped-def]

@@ -65,8 +65,13 @@ const timing = {
   candidateWindowMinutes: 30,
   staleMarketSeconds: 120,
 };
+const decisionsLayoutKey = "signal-arcade-decisions-layout-v1";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.localStorage.clear();
+  vi.restoreAllMocks();
+});
 
 test("shows only the latest token state in ranked and passed groups", () => {
   const groups = organizeDecisions([earlier, latest, best], timing);
@@ -177,4 +182,61 @@ test("freezes the view while reviewing details and closes the review on resume",
 
   fireEvent.click(screen.getByRole("button", { name: "Resume live" }));
   expect(screen.queryByText("Evidence")).not.toBeInTheDocument();
+});
+
+test("remembers expanded Decisions sections in this browser across remounts", () => {
+  const explain = vi.fn().mockResolvedValue(undefined);
+  const first = render(<Decisions decisions={[best, latest]} explain={explain} serverTime="2026-01-01T00:02:00Z" candidateWindowMinutes={30} staleMarketSeconds={120} />);
+
+  fireEvent.click(screen.getByRole("button", { name: /Best signals now/i }));
+  fireEvent.click(screen.getByRole("button", { name: /Passed for now/i }));
+  expect(screen.queryByText("BBB")).not.toBeInTheDocument();
+  expect(screen.getByText("AAA")).toBeInTheDocument();
+  expect(JSON.parse(window.localStorage.getItem(decisionsLayoutKey) ?? "null")).toEqual({
+    version: 1,
+    expandedGroups: ["passed"],
+  });
+  first.unmount();
+
+  render(<Decisions decisions={[best, latest]} explain={explain} serverTime="2026-01-01T00:02:00Z" candidateWindowMinutes={30} staleMarketSeconds={120} />);
+  expect(screen.getByRole("button", { name: /Best signals now/i })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: /Passed for now/i })).toHaveAttribute("aria-expanded", "true");
+  expect(screen.queryByText("BBB")).not.toBeInTheDocument();
+  expect(screen.getByText("AAA")).toBeInTheDocument();
+});
+
+test("ignores corrupt Decisions layout data and keeps section toggles usable without storage", () => {
+  const explain = vi.fn().mockResolvedValue(undefined);
+  window.localStorage.setItem(decisionsLayoutKey, "{not-json");
+  const corrupt = render(<Decisions decisions={[best]} explain={explain} serverTime="2026-01-01T00:02:00Z" candidateWindowMinutes={30} staleMarketSeconds={120} />);
+  expect(screen.getByRole("button", { name: /Best signals now/i })).toHaveAttribute("aria-expanded", "true");
+  corrupt.unmount();
+  window.localStorage.clear();
+
+  vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (key: string) {
+    if (key === decisionsLayoutKey) throw new DOMException("Storage unavailable", "SecurityError");
+    return null;
+  });
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (key: string) {
+    if (key === decisionsLayoutKey) throw new DOMException("Storage unavailable", "SecurityError");
+  });
+  render(<Decisions decisions={[best]} explain={explain} serverTime="2026-01-01T00:02:00Z" candidateWindowMinutes={30} staleMarketSeconds={120} />);
+  const toggle = screen.getByRole("button", { name: /Best signals now/i });
+  fireEvent.click(toggle);
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+});
+
+test("synchronizes Decisions section preferences from another browser tab", () => {
+  const explain = vi.fn().mockResolvedValue(undefined);
+  render(<Decisions decisions={[best, latest]} explain={explain} serverTime="2026-01-01T00:02:00Z" candidateWindowMinutes={30} staleMarketSeconds={120} />);
+
+  window.localStorage.setItem(decisionsLayoutKey, JSON.stringify({
+    version: 1,
+    expandedGroups: ["passed", "earlier"],
+  }));
+  fireEvent(window, new StorageEvent("storage", { key: decisionsLayoutKey }));
+
+  expect(screen.getByRole("button", { name: /Best signals now/i })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: /Passed for now/i })).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("button", { name: /Expired from current view/i })).toHaveAttribute("aria-expanded", "true");
 });

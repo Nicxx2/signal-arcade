@@ -85,7 +85,7 @@ async function clickButton(label) {
 async function preparePage() {
   await evaluate(`(() => {
     window.scrollTo(0, 0);
-    document.querySelectorAll(".token-card, .decision-row, .decision-board-row, .leaderboard-row")
+    document.querySelectorAll(".token-card, .decision-row, .decision-board-row, .leaderboard-row, .fill-row")
       .forEach((element) => {
         if (/\\b(fuck|fucking|shit|bitch|cunt)\\b/i.test(element.textContent || "")) {
           element.style.display = "none";
@@ -195,6 +195,10 @@ await clickButton("Learning");
 await waitFor("document.body.innerText.includes('Learning')");
 await captureViewport("04-learning-lab.png");
 
+await clickButton("Replay");
+await waitFor("document.body.innerText.includes('The score is net of the friction.')");
+await captureViewport("08-replay-receipts.png");
+
 await clickButton("Settings");
 await waitFor("document.body.innerText.includes('Data providers')");
 await evaluate(`(() => {
@@ -220,4 +224,4 @@ await clickButton("Arena");
 await captureViewport("07-mobile-arena.png");
 
 socket.close();
-console.log("Captured 7 Signal Arcade README screenshots.");
+console.log("Captured 8 Signal Arcade README screenshots.");

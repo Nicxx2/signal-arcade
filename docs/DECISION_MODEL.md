@@ -10,6 +10,13 @@ missing-data reason. Rolling features include trade velocity, buy/sell balance, 
 wallet-volume concentration, repeated amounts, same-slot coordination, creator sells, curve
 progress, momentum, drawdown, reserves, observed fees, and optional DEX context.
 
+Decision explanations also retain a separate market-integrity evidence layer derived only from
+the already-received five-minute stream: one-trade wallet share, wallet round trips and their
+volume, net flow versus gross activity, side alternation, clustered sizing, slot concentration,
+price-direction consistency and multi-trade signatures. Coverage and missing reasons are saved
+with each value. These measures are inputs to forward challenger/Coach research only; V1's
+baseline score and permanent gates do not change because a heuristic looks suspicious.
+
 ## Scores
 
 - Opportunity combines velocity, participation, buy balance, curve progress, and non-extreme

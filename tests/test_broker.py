@@ -199,6 +199,46 @@ def test_realized_profit_returns_to_cash_and_scales_cautiously(settings) -> None
     database.close()
 
 
+def test_manual_profile_exit_uses_a_real_fill_without_policy_credit(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    state = TokenState(
+        mint="manual-exit",
+        symbol="REAL",
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+    assert broker.submit_decision(make_decision(now, "manual-exit")) is not None
+    assert broker.on_market_state(
+        state=state,
+        features=make_features(now, "manual-exit"),
+        event_kind=EventKind.TRADE,
+        source_event_id="real-entry-state",
+        now=now,
+        mode=RiskMode.BALANCED,
+    )
+    assert broker.schedule_profile_transition_exits(now + timedelta(seconds=1)) == 1
+
+    receipts = broker.process_due_orders(
+        state=state,
+        features=make_features(now + timedelta(seconds=2), "manual-exit"),
+        source_event_id="real-manual-exit-state",
+        now=now + timedelta(seconds=2),
+        mode=RiskMode.BALANCED,
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0].side.value == "sell"
+    assert receipts[0].exit_assessment is None
+    assert "scheduled_reason:manual_profile_change" in receipts[0].assumptions
+    assert receipts[0].source_event_id == "real-manual-exit-state"
+    assert broker.positions == {}
+    assert database.list_fills()[0].fill_id == receipts[0].fill_id
+    database.close()
+
+
 def test_pending_buys_reserve_position_capacity(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     broker = make_broker(database, settings)

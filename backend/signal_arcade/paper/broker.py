@@ -5,6 +5,7 @@ import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from typing import Any
 
 from ..config import Settings
 from ..database import Database
@@ -26,6 +27,7 @@ from ..models import (
     RiskMode,
     Side,
 )
+from ..risk_profiles import SeasonProfile
 from .curve_math import quote_buy, quote_sell
 from .exit_policy import ROUTE_BLOCKERS, assess_exit
 
@@ -68,6 +70,14 @@ class PaperBroker:
                 self.starting_lamports,
                 self.quote_currency.value,
             )
+        current_season = database.current_paper_season() if self.initialized else None
+        self.season_profile: dict[str, Any] | None = (
+            dict(current_season["profile"])
+            if current_season and isinstance(current_season.get("profile"), dict)
+            else None
+        )
+        if self.season_profile is not None:
+            SeasonProfile.model_validate(self.season_profile)
         self.positions = {item.mint: item for item in database.list_positions()}
         self.pending = {
             item.order_id: item for item in database.list_orders([OrderStatus.PENDING.value])
@@ -77,7 +87,12 @@ class PaperBroker:
         }
         self._last_equity_recorded_at: datetime | None = None
 
-    def initialize(self, quote_currency: QuoteCurrency, starting_minor: int) -> None:
+    def initialize(
+        self,
+        quote_currency: QuoteCurrency,
+        starting_minor: int,
+        season_profile: dict[str, Any] | None = None,
+    ) -> None:
         if self.initialized:
             raise ValueError("paper portfolio is already initialized")
         if starting_minor <= 0:
@@ -87,17 +102,59 @@ class PaperBroker:
             season_id,
             starting_minor,
             quote_currency.value,
+            season_profile,
         )
         self.quote_currency = quote_currency
         self.quote_decimals = 9 if quote_currency == QuoteCurrency.SOL else 6
         self.starting_lamports = starting_minor
         self.initialized = True
         self.season_id = season_id
+        self.season_profile = dict(season_profile) if season_profile else None
         self._last_equity_recorded_at = datetime.now(UTC)
 
     @property
     def cash_lamports(self) -> int:
         return self.database.ledger_balance("cash")
+
+    def risk_limits(self, mode: RiskMode | None = None) -> RiskLimits:
+        raw_profile_mode = (
+            self.season_profile.get("risk_mode") if self.season_profile is not None else None
+        )
+        selected = (
+            mode
+            if mode is not None
+            else RiskMode(raw_profile_mode)
+            if isinstance(raw_profile_mode, str)
+            else RiskMode.BALANCED
+        )
+        if (
+            self.season_profile is not None
+            and self.season_profile.get("risk_mode") == selected.value
+        ):
+            return RiskLimits.model_validate(self.season_profile["risk_limits"])
+        return RISK_LIMITS[selected]
+
+    def drawdown_limit_fraction(self, mode: RiskMode | None = None) -> float | None:
+        """Return the typed portfolio halt only; every other risk limit stays unchanged."""
+
+        raw_profile_mode = (
+            self.season_profile.get("risk_mode") if self.season_profile is not None else None
+        )
+        selected = (
+            mode
+            if mode is not None
+            else RiskMode(raw_profile_mode)
+            if isinstance(raw_profile_mode, str)
+            else RiskMode.BALANCED
+        )
+        if (
+            self.season_profile is not None
+            and self.season_profile.get("risk_mode") == selected.value
+            and "effective_drawdown_bps" in self.season_profile
+        ):
+            bps = self.season_profile.get("effective_drawdown_bps")
+            return None if bps is None else int(bps) / 10_000
+        return self.risk_limits(selected).max_drawdown_fraction
 
     def has_pending_for(self, mint: str, side: Side | None = None) -> bool:
         return any(
@@ -151,7 +208,7 @@ class PaperBroker:
         sol_usd_price: float | None = None,
     ) -> float:
         """Scale slowly with realized results while respecting per-position exposure."""
-        limits = RISK_LIMITS[mode]
+        limits = self.risk_limits(mode)
         if not self.initialized or self.starting_lamports <= 0:
             return limits.order_size_sol
         portfolio = self.snapshot(mode)
@@ -175,6 +232,72 @@ class PaperBroker:
         planned_lamports = max(1, min(grown_lamports, exposure_cap_lamports))
         return planned_lamports / LAMPORTS_PER_SOL
 
+    def can_fund_permitted_entry(
+        self,
+        mode: RiskMode,
+        *,
+        sol_usd_price: float | None = None,
+    ) -> tuple[bool | None, int | None]:
+        """Return whether current cash can fund the broker's actual next minimum entry.
+
+        ``None`` means required accounting evidence (currently SOL/USD for USDC books) is
+        unavailable. Unknown is deliberately distinct from an exhausted bankroll.
+        """
+
+        if not self.initialized:
+            return None, None
+        request = max(
+            1,
+            int(self.planned_order_size_sol(mode, sol_usd_price=sol_usd_price) * LAMPORTS_PER_SOL),
+        )
+        try:
+            required = self._account_minor_from_sol(
+                request + self.settings.network_fee_lamports + self.settings.priority_fee_lamports,
+                sol_usd_price,
+                ROUND_CEILING,
+            )
+        except ValueError:
+            return None, None
+        return required <= self.cash_lamports, required
+
+    def fresh_season_can_fund_entry(
+        self,
+        mode: RiskMode,
+        *,
+        sol_usd_price: float | None = None,
+    ) -> tuple[bool | None, int | None]:
+        """Check that resetting to the original bankroll would restore real capacity.
+
+        This prevents an undersized starting bankroll from generating empty rollover loops.
+        """
+
+        if not self.initialized or self.starting_lamports <= 0:
+            return None, None
+        limits = self.risk_limits(mode)
+        account_cap = int(
+            self.starting_lamports * limits.max_exposure_fraction / limits.max_open_positions
+        )
+        try:
+            exposure_cap_lamports = self._sol_lamports_from_account_minor(
+                account_cap,
+                sol_usd_price,
+            )
+            request = max(
+                1,
+                min(
+                    int(limits.order_size_sol * LAMPORTS_PER_SOL),
+                    exposure_cap_lamports,
+                ),
+            )
+            required = self._account_minor_from_sol(
+                request + self.settings.network_fee_lamports + self.settings.priority_fee_lamports,
+                sol_usd_price,
+                ROUND_CEILING,
+            )
+        except ValueError:
+            return None, None
+        return required <= self.starting_lamports, required
+
     def _entry_assessment(
         self, decision: Decision, sol_usd_price: float | None
     ) -> tuple[str | None, int | None, int | None]:
@@ -188,13 +311,14 @@ class PaperBroker:
             return "position_already_open", None, None
         if self.has_pending_for(decision.mint):
             return "order_already_pending", None, None
-        limits = RISK_LIMITS[decision.risk_mode]
+        limits = self.risk_limits(decision.risk_mode)
         portfolio = self.snapshot(decision.risk_mode)
         capacity_positions = self._capacity_positions(portfolio)
         pending_buys = [order for order in self.pending.values() if order.side == Side.BUY]
         if len(capacity_positions) + len(pending_buys) >= limits.max_open_positions:
             return "portfolio_capacity_reached", None, None
-        if portfolio.drawdown_fraction >= limits.max_drawdown_fraction:
+        drawdown_limit = self.drawdown_limit_fraction(decision.risk_mode)
+        if drawdown_limit is not None and portfolio.drawdown_fraction >= drawdown_limit:
             return "portfolio_drawdown_limit_reached", None, None
         request = int((decision.planned_order_size_sol or limits.order_size_sol) * LAMPORTS_PER_SOL)
         try:
@@ -356,6 +480,97 @@ class PaperBroker:
             cancelled += 1
         return cancelled
 
+    def cancel_pending_buys(self, now: datetime, reason: str) -> int:
+        """Freeze new exposure without discarding an exit already crossing its latency window."""
+
+        cancelled = 0
+        for order in list(self.pending.values()):
+            if order.side != Side.BUY:
+                continue
+            order.status = OrderStatus.CANCELLED
+            order.failure_reason = reason
+            order.filled_at = now
+            self.database.save_order(order)
+            self.pending.pop(order.order_id, None)
+            cancelled += 1
+        return cancelled
+
+    def cancel_pending_sells(self, now: datetime, reason: str) -> int:
+        """Retire unfilled exits at an explicit bounded manual season boundary."""
+
+        cancelled = 0
+        for order in list(self.pending.values()):
+            if order.side != Side.SELL:
+                continue
+            order.status = OrderStatus.CANCELLED
+            order.failure_reason = reason
+            order.filled_at = now
+            self.database.save_order(order)
+            self.pending.pop(order.order_id, None)
+            cancelled += 1
+        return cancelled
+
+    def schedule_profile_transition_exits(self, now: datetime) -> int:
+        """Request real paper exits for every position with a fresh executable route."""
+
+        scheduled = 0
+        portfolio = self.snapshot(persist_peak=False)
+        for observed in portfolio.positions:
+            if observed.market_status != PositionMarketStatus.ACTIVE or self.has_pending_for(
+                observed.mint, Side.SELL
+            ):
+                continue
+            position = self.positions.get(observed.mint)
+            if position is None:
+                continue
+            order = PaperOrder(
+                order_id=uuid.uuid4().hex,
+                mint=position.mint,
+                symbol=position.symbol,
+                side=Side.SELL,
+                requested_token_units=position.token_units,
+                created_at=now,
+                fill_after=now + timedelta(milliseconds=self.settings.exit_latency_ms),
+                failure_reason="scheduled_reason:manual_profile_change",
+                risk_mode_at_entry=position.risk_mode_at_entry,
+            )
+            self.pending[order.order_id] = order
+            self.database.save_order(order)
+            scheduled += 1
+        return scheduled
+
+    def unresolved_position_records(
+        self,
+        now: datetime,
+        *,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Describe inventory without pretending its last indication was an executable sale."""
+
+        portfolio = self.snapshot(persist_peak=False)
+        return [
+            {
+                "position_id": position.position_id,
+                "mint": position.mint,
+                "symbol": position.symbol,
+                "token_units": position.token_units,
+                "entry_cost_minor": position.entry_cost_lamports,
+                "book_value_minor": position.book_value_lamports,
+                "last_known_mark_minor": position.last_mark_lamports,
+                "last_marked_at": (
+                    position.last_marked_at.isoformat() if position.last_marked_at else None
+                ),
+                "market_status": position.market_status.value,
+                "mark_blockers": list(position.mark_blockers),
+                "quote_currency": self.quote_currency.value,
+                "quote_decimals": self.quote_decimals,
+                "retirement_reason": reason,
+                "retired_at": now.isoformat(),
+                "was_executed": False,
+            }
+            for position in portfolio.positions
+        ]
+
     def _fill(
         self,
         order: PaperOrder,
@@ -419,6 +634,10 @@ class PaperBroker:
             if sell_position is not None and sell_position.entry_cost_lamports
             else None
         )
+        manual_profile_exit = (
+            order.side == Side.SELL
+            and order.failure_reason == "scheduled_reason:manual_profile_change"
+        )
         receipt = FillReceipt(
             fill_id=uuid.uuid4().hex,
             order_id=order.order_id,
@@ -451,7 +670,13 @@ class PaperBroker:
             account_currency=self.quote_currency,
             account_decimals=self.quote_decimals,
             sol_usd_price=sol_usd_price if self.quote_currency == QuoteCurrency.USDC else None,
-            exit_assessment=sell_position.exit_assessment if sell_position else None,
+            # A user-requested boundary is an honest paper fill, but it is not evidence that the
+            # old exit policy selected the timing. Keep it out of exit-policy audit metrics.
+            exit_assessment=(
+                sell_position.exit_assessment
+                if sell_position is not None and not manual_profile_exit
+                else None
+            ),
             position_opened_at=sell_position.opened_at if sell_position else None,
             entry_risk_mode=sell_position.risk_mode_at_entry if sell_position else None,
             peak_account_minor=sell_position.peak_mark_lamports if sell_position else 0,
@@ -638,7 +863,7 @@ class PaperBroker:
         position = self.positions.get(state.mint)
         if position is None or self.has_pending_for(state.mint, Side.SELL):
             return
-        limits = self._effective_exit_limits(position, mode)
+        limits = self._position_exit_limits(position, mode)
         assessment = assess_exit(
             position=position,
             features=features,
@@ -664,6 +889,13 @@ class PaperBroker:
             )
             self.pending[order.order_id] = order
             self.database.save_order(order)
+
+    def _position_exit_limits(self, position: Position, mode: RiskMode) -> RiskLimits:
+        current = self.risk_limits(mode)
+        if self.season_profile is not None:
+            # Exact seasons never combine a later code default with their frozen policy.
+            return current
+        return self._effective_exit_limits(position, mode)
 
     @staticmethod
     def _effective_exit_limits(position: Position, mode: RiskMode) -> RiskLimits:
@@ -734,12 +966,13 @@ class PaperBroker:
         sol_usd_price: float | None,
     ) -> str | None:
         """Recheck limits at fill time in case mode or portfolio state changed."""
-        limits = RISK_LIMITS[mode]
+        limits = self.risk_limits(mode)
         portfolio = self.snapshot(mode)
         capacity_positions = self._capacity_positions(portfolio)
         if len(capacity_positions) >= limits.max_open_positions:
             return "portfolio_capacity_reached"
-        if portfolio.drawdown_fraction >= limits.max_drawdown_fraction:
+        drawdown_limit = self.drawdown_limit_fraction(mode)
+        if drawdown_limit is not None and portfolio.drawdown_fraction >= drawdown_limit:
             return "portfolio_drawdown_limit_reached"
         try:
             required = self._account_minor_from_sol(
@@ -853,7 +1086,7 @@ class PaperBroker:
         if persist_peak and peak > previous_peak:
             self.database.set_setting("peak_equity_lamports", peak)
         drawdown = 0.0 if peak <= 0 else max(0.0, min(1.0, 1 - equity / peak))
-        limit = RISK_LIMITS[mode].max_drawdown_fraction if mode is not None else None
+        limit = self.drawdown_limit_fraction(mode)
         risk_halted = limit is not None and drawdown >= limit
         return PortfolioSnapshot(
             initialized=self.initialized,
@@ -929,16 +1162,33 @@ class PaperBroker:
 
     def reset(self) -> None:
         summary = self.season_summary() if self.initialized else None
-        self.database.reset_paper_state(summary)
+        now = datetime.now(UTC)
+        unresolved = (
+            self.unresolved_position_records(now, reason="manual_reset") if self.initialized else []
+        )
+        self.database.reset_paper_state(
+            summary,
+            unresolved_positions=unresolved,
+            comparable=not unresolved,
+        )
         self.positions.clear()
         self.pending.clear()
         self.traded_mints.clear()
         self.starting_lamports = 0
         self.initialized = False
         self.season_id = None
+        self.season_profile = None
         self._last_equity_recorded_at = None
 
-    def rollover(self, now: datetime) -> tuple[str, str]:
+    def rollover(
+        self,
+        now: datetime,
+        *,
+        next_profile: dict[str, Any] | None = None,
+        terminal_reason: str = "auto_drawdown",
+        next_running: bool = True,
+        comparable: bool = True,
+    ) -> tuple[str, str]:
         """Atomically archive this paper season and fund an identical new one."""
 
         if not self.initialized or not self.season_id:
@@ -947,17 +1197,34 @@ class PaperBroker:
             raise RuntimeError("automatic rollover cannot discard pending paper orders")
         previous_season_id = str(self.season_id)
         next_season_id = "season-" + uuid.uuid4().hex
+        resolved_profile = (
+            dict(next_profile)
+            if next_profile is not None
+            else dict(self.season_profile)
+            if self.season_profile
+            else None
+        )
+        if resolved_profile is not None:
+            resolved_profile["locked_at"] = now.isoformat() if next_running else None
+        summary = self.season_summary()
+        unresolved = self.unresolved_position_records(now, reason=terminal_reason)
         self.database.rollover_paper_state(
-            season_summary=self.season_summary(),
+            season_summary=summary,
             next_season_id=next_season_id,
             starting_minor=self.starting_lamports,
             quote_currency=self.quote_currency.value,
             rolled_over_at=now,
+            next_season_profile=resolved_profile,
+            terminal_reason=terminal_reason,
+            next_trading_enabled=next_running,
+            unresolved_positions=unresolved,
+            comparable=comparable and not unresolved,
         )
         self.positions.clear()
         self.pending.clear()
         self.traded_mints.clear()
         self.season_id = next_season_id
+        self.season_profile = resolved_profile
         self._last_equity_recorded_at = now
         return previous_season_id, next_season_id
 

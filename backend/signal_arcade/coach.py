@@ -30,8 +30,8 @@ from .providers.http import HttpProviders
 
 logger = logging.getLogger(__name__)
 
-COACH_PROMPT_VERSION = "coach-shadow-v1"
-COACH_SCHEMA_VERSION = "coach-shadow-schema-v1"
+COACH_PROMPT_VERSION = "coach-shadow-v2"
+COACH_SCHEMA_VERSION = "coach-shadow-schema-v2"
 COACH_REVIEW_INTERVAL_OUTCOMES = 25
 COACH_FIRST_REVIEW_OUTCOMES = 80
 COACH_MINIMUM_DISCOVERY_SAMPLES = 20
@@ -55,6 +55,14 @@ _FEATURE_LABELS = {
     "execution": "weaker execution quality",
     "confidence": "lower evidence confidence",
     "momentum": "weak short-term momentum",
+    "single_trade_wallet_ratio": "one-trade wallets dominate participation",
+    "round_trip_wallet_ratio": "many wallets rapidly buy and sell",
+    "round_trip_volume_ratio": "round-trip wallets dominate volume",
+    "net_quote_flow_ratio": "gross volume produces little net flow",
+    "side_alternation_ratio": "buys and sells alternate unusually often",
+    "quantized_amount_repeat_ratio": "trade sizes cluster unusually tightly",
+    "slot_concentration_hhi": "activity concentrates into few slots",
+    "price_direction_consistency": "the price path is unusually one-way",
 }
 
 _ENTRY_RULES: tuple[tuple[str, str, float], ...] = (
@@ -70,6 +78,14 @@ _ENTRY_RULES: tuple[tuple[str, str, float], ...] = (
     ("danger", ">=", 0.30),
     ("execution", "<=", 0.85),
     ("confidence", "<=", 0.72),
+    ("single_trade_wallet_ratio", ">=", 0.90),
+    ("round_trip_wallet_ratio", ">=", 0.35),
+    ("round_trip_volume_ratio", ">=", 0.50),
+    ("net_quote_flow_ratio", "<=", 0.20),
+    ("side_alternation_ratio", ">=", 0.75),
+    ("quantized_amount_repeat_ratio", ">=", 0.40),
+    ("slot_concentration_hhi", ">=", 0.30),
+    ("price_direction_consistency", ">=", 0.90),
 )
 
 
@@ -402,6 +418,7 @@ class AiCoach:
             if active is not None
             else "waiting"
         )
+        qualification_gates = _coach_qualification_gates(active)
         recent_hypotheses = []
         for item in self.hypotheses[:6]:
             view = item.model_dump(mode="json")
@@ -423,6 +440,9 @@ class AiCoach:
             "outcomes_until_review": max(0, next_at - seen) if active is None else 0,
             "minimum_forward_samples": COACH_MINIMUM_FORWARD_SAMPLES,
             "minimum_forward_seasons": COACH_MINIMUM_FORWARD_SEASONS,
+            "qualification_gates": qualification_gates,
+            "qualification_passed": sum(gate["state"] == "passed" for gate in qualification_gates),
+            "qualification_total": len(qualification_gates),
             "recent_hypotheses": recent_hypotheses,
             "recent_reviews": [item.model_dump(mode="json") for item in self.reviews[:3]],
             "guardrails": [
@@ -434,6 +454,101 @@ class AiCoach:
                 "Experiments are isolated by risk mode and fee/provider configuration",
             ],
         }
+
+
+def _coach_qualification_gates(
+    hypothesis: CoachHypothesis | None,
+) -> list[dict[str, Any]]:
+    """Describe Shadow experiment proof; it never implies that influence exists."""
+
+    def gate(
+        gate_id: str,
+        label: str,
+        current: float | int | bool | None,
+        target: float | int | bool,
+        comparison: str,
+        passed: bool,
+        unit: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        return {
+            "id": gate_id,
+            "label": label,
+            "current": current,
+            "target": target,
+            "comparison": comparison,
+            "state": "passed" if passed else "collecting" if current is None else "not_met",
+            "unit": unit,
+            "detail": detail,
+        }
+
+    exists = hypothesis is not None
+    usable = hypothesis.forward_usable_count if hypothesis else None
+    availability = hypothesis.forward_availability_fraction if hypothesis else None
+    seasons = hypothesis.forward_season_count if hypothesis else None
+    uplift_floor = hypothesis.forward_uplift_lower_bound if hypothesis else None
+    return [
+        gate(
+            "experiment_selected",
+            "Bounded experiment selected",
+            exists,
+            True,
+            "=",
+            exists,
+            "boolean",
+            "The local model may select only from deterministic allowlisted experiments.",
+        ),
+        gate(
+            "forward_outcomes",
+            "New forward outcomes",
+            usable,
+            COACH_MINIMUM_FORWARD_SAMPLES,
+            ">=",
+            usable is not None and usable >= COACH_MINIMUM_FORWARD_SAMPLES,
+            "count",
+            "Only outcomes created after the idea was proposed may support it.",
+        ),
+        gate(
+            "outcome_coverage",
+            "Forward outcome coverage",
+            availability,
+            COACH_MINIMUM_AVAILABILITY,
+            ">=",
+            availability is not None and availability >= COACH_MINIMUM_AVAILABILITY,
+            "fraction",
+            "Unavailable executable exits prevent an experiment from looking safer than it is.",
+        ),
+        gate(
+            "independent_seasons",
+            "Independent seasons",
+            seasons,
+            COACH_MINIMUM_FORWARD_SEASONS,
+            ">=",
+            seasons is not None and seasons >= COACH_MINIMUM_FORWARD_SEASONS,
+            "count",
+            "The idea must survive more than one paper season.",
+        ),
+        gate(
+            "uplift_floor",
+            "Conservative forward value",
+            uplift_floor,
+            COACH_MINIMUM_UPLIFT,
+            ">",
+            uplift_floor is not None and uplift_floor > COACH_MINIMUM_UPLIFT,
+            "fraction",
+            "The confidence-adjusted forward improvement must exceed one percentage point.",
+        ),
+        gate(
+            "promising",
+            "Shadow proof complete",
+            hypothesis.state == CoachExperimentState.PROMISING if hypothesis else None,
+            True,
+            "=",
+            hypothesis is not None and hypothesis.state == CoachExperimentState.PROMISING,
+            "boolean",
+            "Promising is a research milestone only; current Coach influence remains zero.",
+        ),
+    ]
 
 
 def _build_candidates(

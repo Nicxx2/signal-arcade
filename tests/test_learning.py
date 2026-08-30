@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from signal_arcade.database import Database
 from signal_arcade.intelligence.features import TokenState
-from signal_arcade.intelligence.learning import LearningEngine
+from signal_arcade.intelligence.learning import FEATURE_NAMES, LearningEngine
 from signal_arcade.models import (
     DataValue,
     Decision,
@@ -37,6 +37,14 @@ def make_decision(now: datetime, mint: str, opportunity: float = 0.8) -> Decisio
         "momentum_1m": data(now, 0.2),
         "drawdown_5m": data(now, 0.05),
         "virtual_quote_reserve_sol": data(now, 30),
+        "single_trade_wallet_ratio": data(now, 0.8),
+        "round_trip_wallet_ratio": data(now, 0.1),
+        "round_trip_volume_ratio": data(now, 0.15),
+        "net_quote_flow_ratio": data(now, 0.6),
+        "side_alternation_ratio": data(now, 0.4),
+        "quantized_amount_repeat_ratio": data(now, 0.2),
+        "slot_concentration_hhi": data(now, 0.1),
+        "price_direction_consistency": data(now, 0.7),
     }
     snapshot = FeatureSnapshot(
         mint=mint,
@@ -93,7 +101,7 @@ def make_state(mint: str) -> TokenState:
 
 def qualified_model(version: str, prediction: float, outcomes_seen: int) -> LearningModel:
     return LearningModel(
-        version=f"learner-v3-{version}",
+        version=f"learner-v4-{version}",
         outcomes_seen=outcomes_seen,
         risk_mode=RiskMode.BALANCED,
         sample_count=80,
@@ -102,24 +110,10 @@ def qualified_model(version: str, prediction: float, outcomes_seen: int) -> Lear
         training_count=50,
         validation_count=26,
         embargoed_count=4,
-        feature_names=[
-            "opportunity",
-            "danger",
-            "execution",
-            "confidence",
-            "buy_ratio",
-            "wallet_breadth",
-            "concentration",
-            "repetition",
-            "coordination",
-            "curve_progress",
-            "momentum",
-            "drawdown",
-            "reserve_depth",
-        ],
-        means=[0.0] * 13,
-        scales=[1.0] * 13,
-        coefficients=[prediction, *([0.0] * 13)],
+        feature_names=list(FEATURE_NAMES),
+        means=[0.0] * len(FEATURE_NAMES),
+        scales=[1.0] * len(FEATURE_NAMES),
+        coefficients=[prediction, *([0.0] * len(FEATURE_NAMES))],
         validation_rmse=0.05,
         naive_rmse=0.2,
         learner_correlation=0.5,
@@ -147,9 +141,16 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
         learner.register(make_decision(now, "mint-demo"), make_state("mint-demo"), live=False)
         is False
     )
+    live_decision = make_decision(now, "mint-live").model_copy(
+        update={
+            "season_id": "season-balanced-default",
+            "season_profile_fingerprint": "a" * 64,
+            "configuration_fingerprint": "balanced-learning-lineage",
+        }
+    )
     assert (
         learner.register(
-            make_decision(now, "mint-live"),
+            live_decision,
             state,
             live=True,
             evaluation_actionable=True,
@@ -162,6 +163,10 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
     assert learner.has_pending_mint("not-observed") is False
     assert learner.observations["mint-live"].baseline_actionable is True
     assert learner.observations["mint-live"].evaluation_actionable is False
+    assert learner.observations["mint-live"].season_id == "season-balanced-default"
+    assert learner.observations["mint-live"].season_profile_fingerprint == "a" * 64
+    persisted = {item.mint: item for item in database.list_learning_observations()}
+    assert persisted["mint-live"].season_profile_fingerprint == "a" * 64
 
     improved = make_state("mint-live")
     improved.virtual_quote_reserves = 45_000_000_000
@@ -198,6 +203,28 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
     assert database.list_learning_observations()[0].status == LearningObservationStatus.COMPLETE
     database.reset_paper_state()
     assert len(database.list_learning_observations()) == 1
+    database.close()
+
+
+def test_incomplete_integrity_evidence_never_becomes_zero_filled_learning(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    decision = make_decision(now, "missing-integrity")
+    decision.feature_snapshot.values["round_trip_volume_ratio"] = DataValue(
+        value=None,
+        unit="fraction",
+        as_of=now,
+        sources=["test"],
+        freshness_seconds=0,
+        quality=0.2,
+        missing_reason="wallet_or_trade_amount_unavailable",
+    )
+
+    assert learner.register(decision, make_state(decision.mint), live=True) is False
+    assert decision.mint not in learner.observations
     database.close()
 
 
@@ -344,15 +371,25 @@ def test_model_history_keeps_protected_and_newest_versions(settings) -> None:  #
     database.close()
 
 
-def test_legacy_refit_model_cannot_be_newly_activated(settings) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize(
+    "legacy_version",
+    ["learner-v1-80-legacy", "learner-v3-80-pre-integrity"],
+)
+def test_legacy_refit_model_cannot_be_newly_activated(
+    settings,
+    legacy_version: str,
+) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
-    legacy = qualified_model("legacy", 0.2, 80).model_copy(
-        update={"version": "learner-v1-80-legacy"}
-    )
+    legacy = qualified_model("legacy", 0.2, 80).model_copy(update={"version": legacy_version})
     database.save_learning_model(legacy)
     learner = LearningEngine(database, settings)
 
-    assert learner.status(demo_mode=False)["activation_available"] is False
+    unavailable_status = learner.status(demo_mode=False)
+    assert unavailable_status["activation_available"] is False
+    unavailable_gates = {gate["id"]: gate for gate in unavailable_status["qualification_gates"]}
+    assert unavailable_gates["current_outcome_availability"]["state"] == "not_met"
+    assert unavailable_gates["activation_ready"]["state"] == "not_met"
+    assert unavailable_status["qualification_passed"] < unavailable_status["qualification_total"]
     with pytest.raises(ValueError, match="newest challenger"):
         learner.set_mode(LearningMode.ACTIVE)
     database.close()
@@ -413,7 +450,12 @@ def test_entry_activation_requires_recent_executable_outcome_availability(settin
 
     availability = learner.entry_outcome_availability()
     assert availability["availability_fraction"] < 0.70
-    assert learner.status(demo_mode=False)["activation_available"] is False
+    unavailable_status = learner.status(demo_mode=False)
+    assert unavailable_status["activation_available"] is False
+    unavailable_gates = {gate["id"]: gate for gate in unavailable_status["qualification_gates"]}
+    assert unavailable_gates["current_outcome_availability"]["state"] == "not_met"
+    assert unavailable_gates["activation_ready"]["state"] == "not_met"
+    assert unavailable_status["qualification_passed"] < unavailable_status["qualification_total"]
     with pytest.raises(ValueError, match="forward and suspension gates"):
         learner.set_mode(LearningMode.ACTIVE)
 
@@ -422,7 +464,11 @@ def test_entry_activation_requires_recent_executable_outcome_availability(settin
     recovered.exit_value_lamports = 1_100_000
     recovered.missing_reason = None
     assert learner.entry_outcome_availability()["availability_fraction"] >= 0.70
-    assert learner.status(demo_mode=False)["activation_available"] is True
+    recovered_status = learner.status(demo_mode=False)
+    assert recovered_status["activation_available"] is True
+    recovered_gates = {gate["id"]: gate for gate in recovered_status["qualification_gates"]}
+    assert recovered_gates["current_outcome_availability"]["state"] == "passed"
+    assert recovered_gates["activation_ready"]["state"] == "passed"
     database.close()
 
 
@@ -587,6 +633,13 @@ def test_active_learner_returns_to_shadow_when_risk_or_configuration_changes(
     learner._activate_model(model)
     learner.mode = LearningMode.ACTIVE
 
+    # A drawdown-only season boundary calls set_risk_mode with the same personality. It must not
+    # deactivate the compatible Challenger or create a false new learning cohort.
+    learner.set_risk_mode(RiskMode.BALANCED)
+    assert learner.mode == LearningMode.ACTIVE
+    assert learner.active_model is not None
+    assert learner.active_model.version == model.version
+
     learner.set_risk_mode(RiskMode.SAFE)
     assert learner.mode == LearningMode.SHADOW
     assert learner.active_model is None
@@ -634,6 +687,14 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
                 "momentum": 0.2,
                 "drawdown": 0.05,
                 "reserve_depth": math.log1p(30) / math.log(1_001),
+                "single_trade_wallet_ratio": 0.8,
+                "round_trip_wallet_ratio": 0.1,
+                "round_trip_volume_ratio": 0.15,
+                "net_quote_flow_ratio": 0.6,
+                "side_alternation_ratio": 0.4,
+                "quantized_amount_repeat_ratio": 0.2,
+                "slot_concentration_hhi": 0.1,
+                "price_direction_consistency": 0.7,
             },
             token_units=1,
             entry_cost_lamports=1_000_000,

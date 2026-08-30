@@ -1408,6 +1408,43 @@ def test_full_queue_backpressures_held_events_instead_of_dropping_them(tmp_path:
     orchestrator.database.close()
 
 
+def test_full_queue_marks_only_the_dropped_candidate_integrity_window(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    orchestrator.running = True
+    orchestrator.event_queue = asyncio.PriorityQueue(maxsize=1)
+    now = datetime.now(UTC)
+    queued_mint = "queued-candidate"
+    dropped_mint = "dropped-candidate"
+    orchestrator.features.tokens[queued_mint] = TokenState(mint=queued_mint, last_event_at=now)
+    orchestrator.features.tokens[dropped_mint] = TokenState(mint=dropped_mint, last_event_at=now)
+    queued = MarketEvent(
+        event_id="queued-candidate-trade",
+        source="test",
+        kind=EventKind.TRADE,
+        mint=queued_mint,
+        received_at=now,
+        payload={"is_buy": True},
+    )
+    dropped = queued.model_copy(
+        update={"event_id": "dropped-candidate-trade", "mint": dropped_mint}
+    )
+
+    async def exercise() -> None:
+        await orchestrator.enqueue_event(queued)
+        await orchestrator.enqueue_event(dropped)
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+
+    assert orchestrator.events_dropped == 1
+    assert dropped_mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
+    assert queued_mint not in orchestrator._integrity_mint_gap_at  # noqa: SLF001
+    assert orchestrator._integrity_learning_window_complete(dropped_mint, now) is False  # noqa: SLF001
+    assert orchestrator._integrity_learning_window_complete(queued_mint, now) is True  # noqa: SLF001
+    orchestrator.database.close()
+
+
 def test_worker_fast_forwards_expired_candidate_ticks_but_not_protected_events(
     tmp_path: Path,
 ) -> None:
@@ -1446,6 +1483,7 @@ def test_worker_fast_forwards_expired_candidate_ticks_but_not_protected_events(
     assert orchestrator.events_processed == 0
     assert orchestrator.expired_candidate_events == 1
     assert orchestrator.events_dropped == 1
+    assert mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
     assert orchestrator._expired_candidate_event(0, expired, now) is False  # noqa: SLF001
     orchestrator.database.close()
 
@@ -1475,6 +1513,264 @@ def test_candidate_scoring_cooldown_adapts_only_when_queue_pressure_is_extreme(
     for sequence in range(9):
         orchestrator.event_queue.put_nowait((2, sequence, event))
     assert orchestrator._candidate_decision_cooldown_seconds() == 30  # noqa: SLF001
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_integrity_learning_waits_for_full_clean_window_after_candidate_shedding(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    affected = "affected-mint"
+    unrelated = "unrelated-mint"
+
+    assert orchestrator._integrity_learning_window_complete(affected, now) is True  # noqa: SLF001
+    orchestrator._note_integrity_mint_gap(affected, now)  # noqa: SLF001
+    assert orchestrator._integrity_learning_window_complete(affected, now) is False  # noqa: SLF001
+    assert orchestrator._integrity_learning_window_complete(unrelated, now) is True  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(affected, now + timedelta(seconds=299))
+        is False
+    )
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(affected, now + timedelta(seconds=300))
+        is True
+    )
+    assert affected not in orchestrator._integrity_mint_gap_at  # noqa: SLF001
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_integrity_learning_waits_after_source_start_and_provider_reconnect(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=False, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    mint = "continuity-mint"
+    orchestrator.solana.connected = True
+    orchestrator._mark_integrity_stream_gap(now)  # noqa: SLF001
+
+    assert orchestrator._integrity_learning_window_complete(mint, now) is False  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(mint, now + timedelta(seconds=300)) is True
+    )
+
+    # A reconnect counter may rise at the start of a long outage. Disconnected time must not
+    # satisfy the clean-window requirement before the provider actually recovers.
+    orchestrator.solana.connected = False
+    orchestrator.solana.reconnects += 1
+    disconnected_at = now + timedelta(seconds=301)
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(mint, disconnected_at) is False
+    )
+    recovered_at = disconnected_at + timedelta(seconds=600)
+    orchestrator.solana.connected = True
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(mint, recovered_at) is False
+    )
+    assert orchestrator._integrity_stream_gap_at == recovered_at  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(
+            mint, recovered_at + timedelta(seconds=299)
+        )
+        is False
+    )
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(
+            mint, recovered_at + timedelta(seconds=300)
+        )
+        is True
+    )
+
+    orchestrator.solana.connected = False
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(
+            mint, recovered_at + timedelta(seconds=600)
+        )
+        is False
+    )
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_stream_incident_observer_starts_integrity_window_at_confirmed_recovery(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=False, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    disconnected_at = datetime(2026, 1, 1, tzinfo=UTC)
+    recovered_at = disconnected_at + timedelta(minutes=10)
+
+    async def exercise() -> None:
+        await orchestrator._update_stream_incident(  # noqa: SLF001
+            disconnected_at,
+            {"reconnects": 1, "connected": False, "last_error": "temporary"},
+        )
+        assert orchestrator._integrity_stream_was_healthy is False  # noqa: SLF001
+        await orchestrator._update_stream_incident(  # noqa: SLF001
+            recovered_at,
+            {"reconnects": 1, "connected": True, "last_error": None},
+        )
+        assert orchestrator._integrity_stream_was_healthy is True  # noqa: SLF001
+        assert orchestrator._integrity_stream_gap_at == recovered_at  # noqa: SLF001
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+    orchestrator.database.close()
+
+
+def test_failed_worker_batch_marks_each_represented_mint_without_global_pause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path,
+        demo_mode=True,
+        event_batch_size=10,
+        event_batch_wait_ms=1,
+        _env_file=None,
+    )
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    first_mint = "first-failed-mint"
+    second_mint = "second-failed-mint"
+    first = MarketEvent(
+        event_id="first-failed-event",
+        source="test",
+        kind=EventKind.TRADE,
+        mint=first_mint,
+        received_at=now,
+        payload={"is_buy": True},
+    )
+    second = first.model_copy(update={"event_id": "second-failed-event", "mint": second_mint})
+    handled = 0
+
+    async def fail_partway_through_batch(_event: MarketEvent) -> None:
+        nonlocal handled
+        handled += 1
+        if handled == 2:
+            raise RuntimeError("test batch failure")
+
+    monkeypatch.setattr(orchestrator, "_handle_persisted_event", fail_partway_through_batch)
+
+    async def exercise() -> None:
+        orchestrator.event_queue.put_nowait((2, 1, first))
+        orchestrator.event_queue.put_nowait((2, 2, second))
+        worker = asyncio.create_task(orchestrator._event_worker_loop())  # noqa: SLF001
+        await asyncio.wait_for(orchestrator.event_queue.join(), timeout=2)
+        orchestrator.stop_event.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+
+    assert handled == 2
+    assert first_mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
+    assert second_mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
+    assert orchestrator._integrity_stream_gap_at is None  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete("unrelated", now) is True
+    )
+    incidents = orchestrator.database.list_incidents(10)
+    assert any(incident.scope == "market_event_worker" for incident in incidents)
+    orchestrator.database.close()
+
+
+def test_failed_worker_batch_with_unknown_mint_fails_closed_source_wide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path,
+        demo_mode=True,
+        event_batch_wait_ms=1,
+        _env_file=None,
+    )
+    orchestrator = Orchestrator(settings)
+    event = MarketEvent(
+        event_id="unknown-failed-event",
+        source="test",
+        kind=EventKind.CREATE,
+        mint=None,
+        received_at=datetime.now(UTC),
+        payload={},
+    )
+
+    async def fail_event(_event: MarketEvent) -> None:
+        raise RuntimeError("test unidentified failure")
+
+    monkeypatch.setattr(orchestrator, "_handle_persisted_event", fail_event)
+
+    async def exercise() -> None:
+        orchestrator.event_queue.put_nowait((1, 1, event))
+        worker = asyncio.create_task(orchestrator._event_worker_loop())  # noqa: SLF001
+        await asyncio.wait_for(orchestrator.event_queue.join(), timeout=2)
+        orchestrator.stop_event.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+
+    assert orchestrator._integrity_stream_gap_at is not None  # noqa: SLF001
+    assert orchestrator._integrity_mint_gap_at == {}  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete(
+            "unrelated", orchestrator._integrity_stream_gap_at
+        )
+        is False
+    )
+    orchestrator.database.close()
+
+
+def test_source_restart_begins_a_new_integrity_continuity_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=False, _env_file=None)
+    orchestrator = Orchestrator(settings)
+
+    async def idle_source(_handler: object, stop: asyncio.Event) -> None:
+        await stop.wait()
+
+    monkeypatch.setattr(orchestrator.solana, "run", idle_source)
+
+    async def exercise() -> None:
+        before = datetime.now(UTC)
+        await orchestrator._start_source()  # noqa: SLF001
+        assert orchestrator._integrity_stream_gap_at is not None  # noqa: SLF001
+        assert orchestrator._integrity_stream_gap_at >= before  # noqa: SLF001
+        orchestrator.source_stop.set()
+        assert orchestrator.source_task is not None
+        await orchestrator.source_task
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+    orchestrator.database.close()
+
+
+def test_integrity_gap_tracking_fails_closed_at_bounded_cardinality(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    orchestrator._max_integrity_gap_mints = 1  # noqa: SLF001
+    now = datetime.now(UTC)
+
+    orchestrator._note_integrity_mint_gap("first", now)  # noqa: SLF001
+    orchestrator._note_integrity_mint_gap("second", now + timedelta(seconds=1))  # noqa: SLF001
+
+    assert orchestrator._integrity_mint_gap_at == {}  # noqa: SLF001
+    assert orchestrator._integrity_stream_gap_at == now + timedelta(seconds=1)  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._integrity_learning_window_complete("unrelated", now + timedelta(seconds=2))
+        is False
+    )
 
     asyncio.run(orchestrator.http.close())
     orchestrator.database.close()
@@ -1582,11 +1878,16 @@ def test_concurrent_leaderboard_views_share_one_immutable_history_scan(
         limit: int = 100,
         *,
         positions: list[Position] | None = None,
+        quote_currency: str | None = None,
+        quote_decimals: int | None = None,
     ) -> dict[str, object]:
         calls.append(positions)
+        assert quote_currency == "SOL"
+        assert quote_decimals == 9
         time.sleep(0.05)
         return {
             "sort": sort,
+            "available_rows": limit,
             "summary": {"closed_trades": 0},
             "rows": [{"rank": rank} for rank in range(limit)],
         }
@@ -1603,5 +1904,6 @@ def test_concurrent_leaderboard_views_share_one_immutable_history_scan(
     assert len(calls) == 1
     assert calls[0] == []
     assert all(len(result["rows"]) == 2 for result in results)  # type: ignore[arg-type]
+    assert all(result["available_rows"] == 500 for result in results)
     asyncio.run(orchestrator.http.close())
     orchestrator.database.close()

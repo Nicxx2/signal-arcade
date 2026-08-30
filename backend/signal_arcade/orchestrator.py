@@ -33,7 +33,9 @@ from .models import (
     PaperOrder,
     PortfolioSnapshot,
     Position,
+    ProfileTransitionStrategy,
     QuoteCurrency,
+    RiskLimits,
     RiskMode,
     Side,
 )
@@ -49,6 +51,12 @@ from .providers.http import SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, HttpProviders
 from .providers.solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, SolanaLogProvider
 from .quota import QuotaBroker
 from .redaction import redact_secrets
+from .risk_profiles import (
+    DrawdownPolicy,
+    SeasonProfile,
+    build_season_profile,
+    season_profile_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +71,13 @@ AUTO_NEW_SEASON_DEFAULT_GRACE_SECONDS = 24 * 60 * 60
 AUTO_NEW_SEASON_GRACE_SECONDS = AUTO_NEW_SEASON_DEFAULT_GRACE_SECONDS
 AUTO_NEW_SEASON_MIN_GRACE_SECONDS = 60 * 60
 AUTO_NEW_SEASON_MAX_GRACE_SECONDS = 24 * 60 * 60
-AUTO_NEW_SEASON_STARTUP_DATA_GRACE_SECONDS = 2 * 60
+AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS = 5 * 60
+AUTO_NEW_SEASON_MAX_CONTINUITY_GAP_SECONDS = 15
+AUTO_NEW_SEASON_CLOCK_CHECKPOINT_SECONDS = 30
 _STREAM_INCIDENT_GRACE_SECONDS = 15.0
 _QUEUE_INCIDENT_GRACE_SECONDS = 15.0
 _QUEUE_INCIDENT_QUIET_SECONDS = 10.0
+_INTEGRITY_LEARNING_CLEAN_WINDOW_SECONDS = 5 * 60
 _POSITION_WATCHDOG_FREE_MIN_SECONDS = 8.0
 _POSITION_WATCHDOG_PAID_MIN_SECONDS = 2.0
 _POSITION_WATCHDOG_MAX_SECONDS = 60.0
@@ -76,6 +87,7 @@ _CANDIDATE_VERIFICATION_RETRY_SECONDS = 60.0
 _CANDIDATE_PRIORITY_FRACTION = 0.75
 _UPGRADE_AI_SETTLE_SECONDS = 32.0
 _UPGRADE_STORAGE_SETTLE_SECONDS = 30.0
+PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS = 90
 _UI_TOKEN_VALUE_NAMES = frozenset(
     {"trade_count_1m", "buy_ratio_5m", "curve_progress", "identity_source"}
 )
@@ -277,7 +289,17 @@ class Orchestrator:
             ),
         )
         self.broker = PaperBroker(self.database, settings)
-        self.risk_mode = RiskMode(self.database.get_setting("risk_mode", RiskMode.BALANCED.value))
+        stored_risk_mode = RiskMode(self.database.get_setting("risk_mode", RiskMode.BALANCED.value))
+        profile_risk_mode = (
+            self.broker.season_profile.get("risk_mode")
+            if self.broker.season_profile is not None
+            else None
+        )
+        self.risk_mode = RiskMode(profile_risk_mode or stored_risk_mode.value)
+        if self.risk_mode != stored_risk_mode:
+            # The exact current season is authoritative after a restart. A partially persisted
+            # global preference must never mutate the policy that already owns open positions.
+            self.database.set_setting("risk_mode", self.risk_mode.value)
         self.demo_mode = bool(self.database.get_setting("demo_mode", settings.demo_mode))
         self.learning = LearningEngine(
             self.database,
@@ -307,6 +329,11 @@ class Orchestrator:
         self.last_source_event_at: datetime | None = None
         self.last_processing_lag_seconds = 0.0
         self._last_drop_at: datetime | None = None
+        self._integrity_stream_gap_at: datetime | None = None
+        self._integrity_mint_gap_at: OrderedDict[str, datetime] = OrderedDict()
+        self._max_integrity_gap_mints = max(10_000, settings.event_queue_max * 4)
+        self._integrity_last_stream_reconnects = self.solana.reconnects
+        self._integrity_stream_was_healthy = False
         self._queue_pressure_started_at: datetime | None = None
         self._queue_pressure_detail = ""
         self._queue_pressure_metadata: dict[str, Any] = {}
@@ -341,17 +368,23 @@ class Orchestrator:
             )
         eligible_since = self.database.get_setting("auto_new_season_eligible_since")
         self._auto_new_season_eligible_since = _stored_datetime(eligible_since)
-        self._auto_new_season_startup_grace_until = (
-            datetime.now(UTC) + timedelta(seconds=AUTO_NEW_SEASON_STARTUP_DATA_GRACE_SECONDS)
-            if self._auto_new_season_eligible_since is not None
-            else None
-        )
+        paused_since = self.database.get_setting("auto_new_season_paused_since")
+        self._auto_new_season_paused_since = _stored_datetime(paused_since)
+        last_observed = self.database.get_setting("auto_new_season_last_observed_at")
+        self._auto_new_season_last_observed_at = _stored_datetime(last_observed)
+        self._auto_new_season_clock_saved_at = self._auto_new_season_last_observed_at
         last_rollover = self.database.get_setting("auto_new_season_last_rollover_at")
         self._auto_new_season_last_rollover_at = _stored_datetime(last_rollover)
+        stored_season_operation = self.database.get_setting("season_operation")
+        recovering_profile_transition = bool(
+            isinstance(stored_season_operation, dict)
+            and stored_season_operation.get("state") == "running"
+            and stored_season_operation.get("kind") == "profile_transition"
+        )
         if not self.broker.initialized:
             self.running = False
             self.database.set_setting("trading_enabled", False)
-        if not self.running:
+        if not self.running and not recovering_profile_transition:
             self.broker.cancel_pending_orders(datetime.now(UTC), "paper_engine_not_running")
         self.started_at: datetime | None = None
         self.last_decision_at: dict[str, datetime] = {}
@@ -382,7 +415,6 @@ class Orchestrator:
         self._stream_interrupt_reconnects = 0
         self._event_lock = asyncio.Lock()
         self._season_operation_lock = asyncio.Lock()
-        stored_season_operation = self.database.get_setting("season_operation")
         self._season_operation = (
             dict(stored_season_operation) if isinstance(stored_season_operation, dict) else None
         )
@@ -504,6 +536,12 @@ class Orchestrator:
 
     async def _start_source(self) -> None:
         self.source_stop = asyncio.Event()
+        if not self.demo_mode:
+            # A process start, explicit provider change, or source restart has no replay cursor.
+            # Recovery must be observed before the clean-window clock can start; otherwise a long
+            # startup outage could age this boundary before any live evidence actually arrives.
+            self._integrity_stream_was_healthy = False
+            self._mark_integrity_stream_gap(datetime.now(UTC))
         source = self.demo.run if self.demo_mode else self.solana.run
         self.source_task = asyncio.create_task(
             source(self.enqueue_event, self.source_stop),
@@ -511,6 +549,8 @@ class Orchestrator:
         )
 
     async def set_demo_mode(self, enabled: bool) -> None:
+        if self._profile_transition_active():
+            raise ValueError("wait for the profile transition before changing market source")
         if self.demo_mode == enabled:
             return
         async with self._event_lock:
@@ -588,6 +628,74 @@ class Orchestrator:
         if utilization >= 0.75:
             return max(self.settings.decision_cooldown_seconds, 15)
         return self.settings.decision_cooldown_seconds
+
+    def _mark_integrity_stream_gap(self, observed_at: datetime) -> None:
+        """Invalidate every token's integrity window after a source-wide continuity break."""
+
+        self._integrity_stream_gap_at = observed_at
+        # The newer global boundary supersedes every older token-local boundary.
+        self._integrity_mint_gap_at.clear()
+
+    def _note_integrity_mint_gap(self, mint: str | None, observed_at: datetime) -> None:
+        """Remember an incomplete token window without unnecessarily pausing unrelated tokens."""
+
+        if not mint:
+            # Without an identity the missing event could belong to any candidate.
+            self._mark_integrity_stream_gap(observed_at)
+            return
+        cutoff = observed_at - timedelta(seconds=_INTEGRITY_LEARNING_CLEAN_WINDOW_SECONDS)
+        while self._integrity_mint_gap_at:
+            oldest_mint, oldest_at = next(iter(self._integrity_mint_gap_at.items()))
+            if oldest_at > cutoff:
+                break
+            self._integrity_mint_gap_at.pop(oldest_mint, None)
+        if (
+            mint not in self._integrity_mint_gap_at
+            and len(self._integrity_mint_gap_at) >= self._max_integrity_gap_mints
+        ):
+            # Cardinality pressure must fail closed rather than evicting a still-dirty mint.
+            self._mark_integrity_stream_gap(observed_at)
+            return
+        self._integrity_mint_gap_at[mint] = observed_at
+        self._integrity_mint_gap_at.move_to_end(mint)
+
+    def _integrity_learning_window_complete(self, mint: str, decision_at: datetime) -> bool:
+        """Require source-wide and token-local continuity for the complete five-minute window."""
+
+        if not self.demo_mode:
+            provider_health = self.solana.health()
+            reconnects = int(provider_health.get("reconnects") or 0)
+            if reconnects > self._integrity_last_stream_reconnects:
+                self._integrity_last_stream_reconnects = reconnects
+                self._integrity_stream_was_healthy = False
+            healthy = bool(provider_health.get("connected")) and not provider_health.get(
+                "last_error"
+            )
+            if not healthy:
+                self._integrity_stream_was_healthy = False
+                return False
+            if not self._integrity_stream_was_healthy:
+                # This decision-side check closes the interval before the five-second incident
+                # observer can run. The horizon starts at confirmed recovery, never disconnect.
+                self._integrity_stream_was_healthy = True
+                self._mark_integrity_stream_gap(decision_at)
+            if self._integrity_stream_gap_at is None:
+                return False
+
+        if (
+            self._integrity_stream_gap_at is not None
+            and (decision_at - self._integrity_stream_gap_at).total_seconds()
+            < _INTEGRITY_LEARNING_CLEAN_WINDOW_SECONDS
+        ):
+            return False
+
+        mint_gap_at = self._integrity_mint_gap_at.get(mint)
+        if mint_gap_at is None:
+            return True
+        if (decision_at - mint_gap_at).total_seconds() < _INTEGRITY_LEARNING_CLEAN_WINDOW_SECONDS:
+            return False
+        self._integrity_mint_gap_at.pop(mint, None)
+        return True
 
     def _expired_candidate_event(self, priority: int, event: MarketEvent, now: datetime) -> bool:
         """Never spend scarce worker time scoring an already non-actionable candidate tick."""
@@ -771,6 +879,9 @@ class Orchestrator:
         healthy = bool(provider_health.get("connected")) and not provider_health.get("last_error")
         if reconnected_since_check:
             self._last_stream_reconnects = reconnects
+            if reconnects > self._integrity_last_stream_reconnects:
+                self._integrity_last_stream_reconnects = reconnects
+                self._integrity_stream_was_healthy = False
             detail = str(provider_health.get("last_error") or "Connection interrupted")
             if self._stream_incident_active:
                 await self._record_incident_safe(
@@ -785,6 +896,14 @@ class Orchestrator:
                     self._stream_interrupt_started_at = now
                 self._stream_interrupt_detail = detail
                 self._stream_interrupt_reconnects = reconnects
+
+        if not healthy:
+            self._integrity_stream_was_healthy = False
+        elif not self._integrity_stream_was_healthy:
+            # Begin the integrity horizon only after health is confirmed. This remains correct
+            # when an outage lasts longer than the horizon or reconnect counters update early.
+            self._integrity_stream_was_healthy = True
+            self._mark_integrity_stream_gap(now)
 
         if self._stream_incident_active:
             if healthy and await self._resolve_incidents_safe("solana_stream"):
@@ -848,8 +967,10 @@ class Orchestrator:
                 self.events_enqueued += 1
                 return
         self.events_dropped += 1
+        dropped_at = datetime.now(UTC)
+        self._note_integrity_mint_gap(event.mint, dropped_at)
         self._note_queue_pressure(
-            datetime.now(UTC),
+            dropped_at,
             detail=(
                 "Low-priority candidate events were shed. Held-position, pending-order and "
                 "saved outcome events use backpressure and are not silently dropped."
@@ -876,15 +997,21 @@ class Orchestrator:
             try:
                 try:
                     batch_now = datetime.now(UTC)
-                    working_batch = [
-                        item
-                        for item in batch
-                        if not self._expired_candidate_event(item[0], item[2], batch_now)
-                    ]
-                    expired_count = len(batch) - len(working_batch)
+                    expired_items: list[tuple[int, int, MarketEvent]] = []
+                    working_batch: list[tuple[int, int, MarketEvent]] = []
+                    for item in batch:
+                        target = (
+                            expired_items
+                            if self._expired_candidate_event(item[0], item[2], batch_now)
+                            else working_batch
+                        )
+                        target.append(item)
+                    expired_count = len(expired_items)
                     if expired_count:
                         self.expired_candidate_events += expired_count
                         self.events_dropped += expired_count
+                        for _priority, _sequence, expired_event in expired_items:
+                            self._note_integrity_mint_gap(expired_event.mint, batch_now)
                         self._note_queue_pressure(
                             batch_now,
                             detail=(
@@ -934,6 +1061,18 @@ class Orchestrator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    failed_at = datetime.now(UTC)
+                    failed_mints = {item[2].mint for item in batch}
+                    if None in failed_mints or "" in failed_mints:
+                        # An unidentified failed event could have left any candidate window
+                        # incomplete, so token-local accounting is not safe.
+                        self._mark_integrity_stream_gap(failed_at)
+                    else:
+                        # Replaying an arbitrary batch could duplicate broker side effects. Mark
+                        # every represented mint incomplete instead; clean unrelated tokens keep
+                        # learning and each affected token must rebuild a full five-minute window.
+                        for failed_mint in sorted(str(mint) for mint in failed_mints):
+                            self._note_integrity_mint_gap(failed_mint, failed_at)
                     logger.exception("Market event worker recovered from a batch failure")
                     self._event_worker_incident_active = True
                     await self._record_incident_safe(
@@ -992,6 +1131,7 @@ class Orchestrator:
             )
             should_evaluate = bool(
                 self.running
+                and not self._profile_transition_active()
                 and not self._maintenance_requested
                 and entry_candidate
                 and cooled_down
@@ -1008,7 +1148,10 @@ class Orchestrator:
                 return
             sol_usd_price = self._sol_usd_price(snapshot)
 
-            if self.running and is_trade and broker_tracked:
+            transition_exit_management = self._profile_transition_exit_management_active(
+                datetime.now(UTC)
+            )
+            if (self.running or transition_exit_management) and is_trade and broker_tracked:
                 receipts = await asyncio.to_thread(
                     self.broker.on_market_state,
                     state=state,
@@ -1031,9 +1174,24 @@ class Orchestrator:
                 )
             else:
                 receipts = []
+            if self._auto_new_season_eligible_since is not None and any(
+                receipt.side == Side.SELL for receipt in receipts
+            ):
+                # A position may revive and fill an exit between two five-second heartbeat
+                # checks. Treat the verified sell as a real recovery event so an old, already
+                # due countdown cannot immediately roll the freshly updated portfolio.
+                await asyncio.to_thread(
+                    self._set_auto_new_season_clock,
+                    None,
+                    None,
+                    None,
+                )
             decision: Decision | None = None
             order = None
             if should_evaluate:
+                integrity_learning_eligible = self._integrity_learning_window_complete(
+                    state.mint, event.received_at
+                )
                 planned_size = await asyncio.to_thread(
                     self.broker.planned_order_size_sol,
                     self.risk_mode,
@@ -1043,10 +1201,16 @@ class Orchestrator:
                     snapshot,
                     self.risk_mode,
                     planned_order_size_sol=planned_size,
+                    policy_limits=self.broker.risk_limits(self.risk_mode),
                 )
                 baseline_decision = baseline_decision.model_copy(
                     update={
                         "season_id": self.broker.season_id,
+                        "season_profile_fingerprint": (
+                            self.broker.season_profile.get("profile_fingerprint")
+                            if self.broker.season_profile is not None
+                            else None
+                        ),
                         "configuration_fingerprint": self._configuration_fingerprint(),
                     }
                 )
@@ -1062,13 +1226,13 @@ class Orchestrator:
                     )
                 decision = self.learning.assess(
                     baseline_decision,
-                    live=not self.demo_mode,
+                    live=not self.demo_mode and integrity_learning_eligible,
                     baseline_actionable=baseline_entry_actionable,
                 )
                 # The optional critic can only affect an entry the broker could actually submit.
                 # Skipping capacity/exposure-blocked candidates avoids wasting local inference and
                 # keeps qualification evidence aligned with decisions where a veto had value.
-                if baseline_entry_actionable:
+                if baseline_entry_actionable and integrity_learning_eligible:
                     decision = await self.ai_lab.assess_guarded(decision, state)
                 if (
                     decision.action == DecisionAction.ENTER
@@ -1100,14 +1264,15 @@ class Orchestrator:
                 if self._should_record_decision(decision):
                     await asyncio.to_thread(self.database.save_decision, decision)
                     self.last_recorded_decision[state.mint] = decision
-                await asyncio.to_thread(
-                    self.learning.register,
-                    baseline_decision,
-                    state,
-                    live=not self.demo_mode,
-                    evaluation_actionable=baseline_entry_actionable,
-                )
-                if baseline_entry_actionable:
+                if integrity_learning_eligible:
+                    await asyncio.to_thread(
+                        self.learning.register,
+                        baseline_decision,
+                        state,
+                        live=not self.demo_mode,
+                        evaluation_actionable=baseline_entry_actionable,
+                    )
+                if baseline_entry_actionable and integrity_learning_eligible:
                     self.ai_lab.enqueue_shadow(baseline_decision, state)
                 self.last_decision_at[state.mint] = event.received_at
             if decision is not None or order is not None or receipts:
@@ -1134,8 +1299,14 @@ class Orchestrator:
         return (decision.created_at - previous.created_at).total_seconds() >= 300
 
     def _configuration_fingerprint(self) -> str:
+        return self._configuration_fingerprint_for_mode(self.risk_mode)
+
+    def _configuration_fingerprint_for_mode(self, mode: RiskMode) -> str:
         payload = {
-            "risk_mode": self.risk_mode.value,
+            # Frozen evidence semantics are part of provenance. A schema change starts a new
+            # forward cohort while retaining every older observation and model for audit.
+            "learning_evidence_schema": "stream-integrity-v4",
+            "risk_mode": mode.value,
             "demo_mode": self.demo_mode,
             "fees": {
                 "pump_bps": self.settings.pump_fee_bps,
@@ -1855,7 +2026,7 @@ class Orchestrator:
             if state is None or snapshot is None or mint not in self.broker.positions:
                 continue
             sol_usd_price = self._sol_usd_price(snapshot)
-            if self.running:
+            if self.running or self._profile_transition_exit_management_active(now):
                 self.broker.reassess_position(
                     state=state,
                     features=snapshot,
@@ -1911,7 +2082,12 @@ class Orchestrator:
                         self._heartbeat_tick,
                         now,
                     )
-                    rollover = await asyncio.to_thread(self._auto_new_season_tick, now)
+                    profile_transition = await self._profile_transition_tick(now)
+                    rollover = (
+                        None
+                        if self._profile_transition_active()
+                        else await asyncio.to_thread(self._auto_new_season_tick, now)
+                    )
                 if receipts or expired or learning_updates or ai_updates:
                     await self.bus.publish(
                         {
@@ -1925,6 +2101,10 @@ class Orchestrator:
                     )
                 if rollover is not None:
                     await self.bus.publish({"type": "paper_season_rolled_over", **rollover})
+                if profile_transition is not None:
+                    await self.bus.publish(
+                        {"type": "paper_profile_transition_completed", **profile_transition}
+                    )
                 if not self.demo_mode:
                     provider_health = self.solana.health()
                     await self._update_stream_incident(now, provider_health)
@@ -1951,7 +2131,11 @@ class Orchestrator:
     ) -> tuple[list[FillReceipt], list[PaperOrder], int, int]:
         """Run the persistence-capable clock tick away from the HTTP event loop."""
         receipts: list[FillReceipt] = []
-        if self.running:
+        if self._profile_transition_active():
+            # Defence in depth for interrupted/legacy transitions: once an exits-only
+            # operation is durable, no stale entry may execute even if it somehow survived.
+            self.broker.cancel_pending_buys(now, "profile_transition_entry_guard")
+        if self.running or self._profile_transition_exit_management_active(now):
             active_mints = {order.mint for order in self.broker.pending.values()} | set(
                 self.broker.positions
             )
@@ -1985,15 +2169,275 @@ class Orchestrator:
                     )
                 )
         expired = self.broker.expire_stuck_orders(now)
+        if self._auto_new_season_eligible_since is not None and any(
+            receipt.side == Side.SELL for receipt in receipts
+        ):
+            # The clock worker can fill an exit without a new provider event. That recovery must
+            # invalidate the previous dormant observation window before the rollover tick runs.
+            self._set_auto_new_season_clock(None, None, None)
         learning_updates = self.learning.expire_checkpoints(now)
         ai_updates = self.ai_lab.expire_outcomes(now)
         return receipts, expired, learning_updates, ai_updates
+
+    async def _profile_transition_tick(self, now: datetime) -> dict[str, Any] | None:
+        """Advance one durable exits-only profile transition while `_event_lock` is held."""
+
+        operation = self._season_operation
+        if not self._profile_transition_active() or operation is None:
+            return None
+        operation_id = str(operation["operation_id"])
+        if not self.broker.initialized or not self.broker.season_id:
+            await self._update_season_operation(
+                operation_id,
+                state="failed",
+                stage="failed",
+                detail="The source paper season is no longer available; no new season was made.",
+            )
+            return None
+        if operation.get("source_season_id") != self.broker.season_id:
+            await self._update_season_operation(
+                operation_id,
+                state="failed",
+                stage="failed",
+                detail=(
+                    "The saved transition belongs to a different paper season; "
+                    "the current season remains preserved."
+                ),
+            )
+            return None
+
+        strategy = (
+            ProfileTransitionStrategy.END_NOW
+            if operation.get("transition_strategy") == ProfileTransitionStrategy.END_NOW.value
+            else ProfileTransitionStrategy.FINISH_SAFELY
+        )
+        manual_transition = strategy == ProfileTransitionStrategy.END_NOW
+        cancelled_manual_exits = 0
+        if manual_transition:
+            deadline = self._manual_profile_settlement_deadline(operation, now)
+            remaining_seconds = max(0, int((deadline - now).total_seconds()))
+            if now < deadline:
+                scheduled = self.broker.schedule_profile_transition_exits(now)
+                portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
+                if self.broker.pending or portfolio.positions:
+                    await self._update_profile_transition_progress(
+                        operation_id,
+                        stage="settling_manual_exits",
+                        detail=(
+                            "Trying real paper exits for executable holdings. "
+                            f"The bounded window has up to {remaining_seconds}s remaining; "
+                            "untradeable inventory will be recorded as unresolved."
+                        ),
+                        values={
+                            "manual_settlement_deadline": deadline.isoformat(),
+                            "manual_exits_scheduled": int(
+                                operation.get("manual_exits_scheduled") or 0
+                            )
+                            + scheduled,
+                            "manual_pending_exits": sum(
+                                order.side == Side.SELL for order in self.broker.pending.values()
+                            ),
+                            "manual_open_positions": len(portfolio.positions),
+                        },
+                    )
+                    return None
+            cancelled_manual_exits = self.broker.cancel_pending_sells(
+                now,
+                "manual_profile_change_settlement_expired",
+            )
+            portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
+        else:
+            if self.broker.pending:
+                await self._update_profile_transition_progress(
+                    operation_id,
+                    stage="draining_orders",
+                    detail="Waiting for preserved exit orders to finish safely.",
+                    values={
+                        "dormant_eligible_since": None,
+                        "dormant_paused_since": None,
+                        "dormant_last_observed_at": None,
+                    },
+                )
+                return None
+
+            portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
+            active = [
+                position
+                for position in portfolio.positions
+                if position.market_status.value != "dormant"
+            ]
+            if active:
+                await self._update_profile_transition_progress(
+                    operation_id,
+                    stage="draining_positions",
+                    detail=(
+                        f"Managing {len(active)} existing "
+                        f"{'position' if len(active) == 1 else 'positions'} under the old policy."
+                    ),
+                    values={
+                        "dormant_eligible_since": None,
+                        "dormant_paused_since": None,
+                        "dormant_last_observed_at": None,
+                    },
+                )
+                return None
+
+            if portfolio.positions:
+                if not self._rollover_market_data_healthy(now):
+                    paused_at = operation.get("dormant_paused_since") or now.isoformat()
+                    await self._update_profile_transition_progress(
+                        operation_id,
+                        stage="waiting_for_data",
+                        detail=(
+                            "Dormant holdings remain preserved while current market data is "
+                            "unhealthy."
+                        ),
+                        values={"dormant_paused_since": paused_at},
+                    )
+                    return None
+                eligible_since = _stored_datetime(operation.get("dormant_eligible_since"))
+                paused_since = _stored_datetime(operation.get("dormant_paused_since"))
+                if eligible_since is None:
+                    eligible_since = now
+                elif paused_since is not None:
+                    paused_seconds = max(0.0, (now - paused_since).total_seconds())
+                    eligible_since = (
+                        now
+                        if paused_seconds >= AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS
+                        else eligible_since + timedelta(seconds=paused_seconds)
+                    )
+                elapsed = max(0.0, (now - eligible_since).total_seconds())
+                if elapsed < self.auto_new_season_grace_seconds:
+                    await self._update_profile_transition_progress(
+                        operation_id,
+                        stage="waiting_for_dormant_recovery",
+                        detail=(
+                            "Waiting for dormant holdings to revive before retiring unresolved "
+                            "paper inventory."
+                        ),
+                        values={
+                            "dormant_eligible_since": eligible_since.isoformat(),
+                            "dormant_paused_since": None,
+                            "dormant_last_observed_at": now.isoformat(),
+                        },
+                        checkpoint_seconds=AUTO_NEW_SEASON_CLOCK_CHECKPOINT_SECONDS,
+                    )
+                    return None
+
+        if not self._rollover_pipeline_idle():
+            await self._update_profile_transition_progress(
+                operation_id,
+                stage="waiting_for_pipeline",
+                detail="Waiting for already-queued market evidence before changing seasons.",
+            )
+            return None
+
+        target = operation.get("target_profile")
+        try:
+            validated_target = SeasonProfile.model_validate(target)
+            RiskLimits.model_validate(validated_target.risk_limits)
+            if validated_target.profile_fingerprint != operation.get("target_profile_fingerprint"):
+                raise ValueError("saved target fingerprint does not match the operation")
+        except (TypeError, ValueError):
+            await self._update_season_operation(
+                operation_id,
+                state="failed",
+                stage="failed",
+                detail="The saved target profile is invalid; the old season remains preserved.",
+            )
+            return None
+        previous_running = bool(operation.get("previous_running"))
+        target_payload = validated_target.model_dump(mode="json")
+        target_payload["locked_at"] = now.isoformat() if previous_running else None
+        previous_season_id, next_season_id = await asyncio.to_thread(
+            self.broker.rollover,
+            now,
+            next_profile=target_payload,
+            terminal_reason=(
+                "profile_change_manual" if manual_transition else "profile_change_safe"
+            ),
+            next_running=previous_running,
+            comparable=not manual_transition,
+        )
+        target_mode = RiskMode(str(target_payload["risk_mode"]))
+        self.risk_mode = target_mode
+        self.learning.set_risk_mode(target_mode)
+        self.running = previous_running
+        self.started_at = now if previous_running else self.started_at
+        self.last_decision_at.clear()
+        self.last_recorded_decision.clear()
+        self._route_retry_at.clear()
+        self._route_retry_delay_seconds.clear()
+        self._ui_leaderboard_cache.clear()
+        self._ui_seasons_cache = None
+        await self._update_season_operation(
+            operation_id,
+            state="completed",
+            stage="completed",
+            detail=(
+                f"New {target_mode.value} season ready"
+                + (" and running." if previous_running else ". The engine remains stopped.")
+            ),
+            values={
+                "previous_season_id": previous_season_id,
+                "next_season_id": next_season_id,
+                "completed_profile_fingerprint": target_payload["profile_fingerprint"],
+                "unresolved_positions": len(portfolio.positions),
+                "cancelled_manual_exits": cancelled_manual_exits,
+            },
+        )
+        self.invalidate_snapshot_cache()
+        return {
+            "operation_id": operation_id,
+            "at": now.isoformat(),
+            "previous_season_id": previous_season_id,
+            "next_season_id": next_season_id,
+            "risk_mode": target_mode.value,
+        }
+
+    async def _update_profile_transition_progress(
+        self,
+        operation_id: str,
+        *,
+        stage: str,
+        detail: str,
+        values: dict[str, Any] | None = None,
+        checkpoint_seconds: float | None = None,
+    ) -> None:
+        current = self._season_operation
+        if current is None or str(current.get("operation_id")) != operation_id:
+            return
+        unchanged = current.get("stage") == stage and current.get("detail") == detail
+        if values:
+            for key, value in values.items():
+                if key == "dormant_last_observed_at" and checkpoint_seconds is not None:
+                    previous = _stored_datetime(current.get(key))
+                    observed = _stored_datetime(value)
+                    if (
+                        previous is not None
+                        and observed is not None
+                        and (observed - previous).total_seconds() < checkpoint_seconds
+                    ):
+                        continue
+                if current.get(key) != value:
+                    unchanged = False
+                    break
+        if unchanged:
+            return
+        await self._update_season_operation(
+            operation_id,
+            stage=stage,
+            detail=detail,
+            values=values,
+        )
 
     async def configure_auto_new_season(
         self,
         enabled: bool,
         grace_hours: int | None = None,
     ) -> dict[str, Any]:
+        if self._profile_transition_active():
+            raise ValueError("wait for the profile transition before changing season automation")
         # Serialize the user toggle with the heartbeat rollover. Disabling at the
         # end of a countdown must win cleanly instead of racing a background reset.
         # Validate the requested delay only after taking the same lock: concurrent
@@ -2024,25 +2468,133 @@ class Orchestrator:
                     "auto_new_season_enabled": enabled,
                     "auto_new_season_grace_seconds": grace_seconds,
                     "auto_new_season_eligible_since": None,
+                    "auto_new_season_paused_since": None,
+                    "auto_new_season_last_observed_at": None,
                 },
             )
             self.auto_new_season_enabled = enabled
             self.auto_new_season_grace_seconds = grace_seconds
             self._auto_new_season_eligible_since = None
-            self._auto_new_season_startup_grace_until = None
+            self._auto_new_season_paused_since = None
+            self._auto_new_season_last_observed_at = None
+            self._auto_new_season_clock_saved_at = None
             portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
             return self.season_automation_status(portfolio)
 
-    def _set_auto_new_season_eligible_since(self, value: datetime | None) -> None:
-        if self._auto_new_season_eligible_since == value:
+    def _set_auto_new_season_clock(
+        self,
+        eligible_since: datetime | None,
+        paused_since: datetime | None,
+        last_observed_at: datetime | None,
+    ) -> None:
+        if (
+            self._auto_new_season_eligible_since == eligible_since
+            and self._auto_new_season_paused_since == paused_since
+            and self._auto_new_season_last_observed_at == last_observed_at
+        ):
             return
-        self.database.set_setting(
-            "auto_new_season_eligible_since",
-            value.isoformat() if value else None,
+        self.database.set_settings(
+            {
+                "auto_new_season_eligible_since": (
+                    eligible_since.isoformat() if eligible_since else None
+                ),
+                "auto_new_season_paused_since": (
+                    paused_since.isoformat() if paused_since else None
+                ),
+                "auto_new_season_last_observed_at": (
+                    last_observed_at.isoformat() if last_observed_at else None
+                ),
+            }
         )
-        self._auto_new_season_eligible_since = value
-        if value is None:
-            self._auto_new_season_startup_grace_until = None
+        self._auto_new_season_eligible_since = eligible_since
+        self._auto_new_season_paused_since = paused_since
+        self._auto_new_season_last_observed_at = last_observed_at
+        self._auto_new_season_clock_saved_at = last_observed_at
+
+    def _set_auto_new_season_eligible_since(self, value: datetime | None) -> None:
+        self._set_auto_new_season_clock(
+            value,
+            None,
+            datetime.now(UTC) if value else None,
+        )
+
+    def _checkpoint_auto_new_season_clock(self, now: datetime) -> None:
+        self._auto_new_season_last_observed_at = now
+        saved_at = self._auto_new_season_clock_saved_at
+        should_save = bool(
+            saved_at is None
+            or (now - saved_at).total_seconds() < 0
+            or (now - saved_at).total_seconds() >= AUTO_NEW_SEASON_CLOCK_CHECKPOINT_SECONDS
+        )
+        if not should_save:
+            return
+        self.database.set_setting("auto_new_season_last_observed_at", now.isoformat())
+        self._auto_new_season_clock_saved_at = now
+
+    def _pause_auto_new_season_clock(self, now: datetime) -> None:
+        eligible_since = self._auto_new_season_eligible_since
+        if eligible_since is None:
+            return
+        paused_since = self._auto_new_season_paused_since
+        if paused_since is None:
+            paused_since = self._auto_new_season_last_observed_at or now
+        if paused_since > now:
+            paused_since = now
+        if (now - paused_since).total_seconds() >= AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS:
+            self._set_auto_new_season_clock(None, None, None)
+            return
+        if self._auto_new_season_paused_since is None:
+            self._set_auto_new_season_clock(
+                eligible_since,
+                paused_since,
+                self._auto_new_season_last_observed_at,
+            )
+
+    def _resume_auto_new_season_clock(self, now: datetime) -> None:
+        eligible_since = self._auto_new_season_eligible_since
+        paused_since = self._auto_new_season_paused_since
+        last_observed_at = self._auto_new_season_last_observed_at
+        if eligible_since is None:
+            self._set_auto_new_season_clock(now, None, now)
+            return
+
+        if paused_since is None and last_observed_at is not None:
+            continuity_gap = (now - last_observed_at).total_seconds()
+            if continuity_gap < 0:
+                # Preserve earned duration across a backwards host-clock correction.
+                self._set_auto_new_season_clock(
+                    eligible_since + timedelta(seconds=continuity_gap),
+                    None,
+                    now,
+                )
+                return
+            if continuity_gap > AUTO_NEW_SEASON_MAX_CONTINUITY_GAP_SECONDS:
+                paused_since = last_observed_at
+
+        if paused_since is not None:
+            paused_seconds = max(0.0, (now - paused_since).total_seconds())
+            resumed_since = (
+                now
+                if paused_seconds >= AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS
+                else eligible_since + timedelta(seconds=paused_seconds)
+            )
+            self._set_auto_new_season_clock(resumed_since, None, now)
+            return
+
+        self._checkpoint_auto_new_season_clock(now)
+
+    def _auto_new_season_elapsed_seconds(self, now: datetime) -> float | None:
+        eligible_since = self._auto_new_season_eligible_since
+        if eligible_since is None:
+            return None
+        observed_until = self._auto_new_season_paused_since or now
+        return max(
+            0.0,
+            min(
+                float(self.auto_new_season_grace_seconds),
+                (observed_until - eligible_since).total_seconds(),
+            ),
+        )
 
     def _rollover_pipeline_idle(self) -> bool:
         """Do not cross a season boundary ahead of evidence already being processed."""
@@ -2063,6 +2615,30 @@ class Orchestrator:
             and queue_utilization < 0.75
             and self.last_processing_lag_seconds <= self.settings.stale_market_seconds
         )
+
+    def _drawdown_halt_disabled(self) -> bool:
+        profile = self.broker.season_profile
+        policy = profile.get("drawdown_policy") if isinstance(profile, dict) else None
+        return bool(isinstance(policy, dict) and policy.get("kind") == "disabled")
+
+    def _fresh_rollover_sol_usd_price(self, now: datetime) -> float | None:
+        if self.broker.quote_currency != QuoteCurrency.USDC:
+            return None
+        if self.demo_mode:
+            return 150.0
+        newest = sorted(
+            self.features.tokens.values(),
+            key=lambda token: token.last_event_at or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        for state in newest:
+            snapshot = self.features.snapshot(state.mint, now)
+            if snapshot is None:
+                continue
+            price = self._sol_usd_price(snapshot)
+            if price is not None:
+                return price
+        return None
 
     def _auto_new_season_gate(
         self,
@@ -2087,7 +2663,8 @@ class Orchestrator:
             return "no_bankroll", "Waiting for a paper bankroll.", False
         if not self.running:
             return "engine_stopped", "Waiting—the paper engine is stopped.", False
-        if not portfolio.risk_halted:
+        exhaustion_mode = self._drawdown_halt_disabled()
+        if not exhaustion_mode and not portfolio.risk_halted:
             return (
                 "monitoring",
                 "Watching for a sustained drawdown pause; no rollover is needed.",
@@ -2113,8 +2690,55 @@ class Orchestrator:
                 "Waiting for healthy, current market data before judging holdings dormant.",
                 False,
             )
+        if exhaustion_mode:
+            sol_usd_price = self._fresh_rollover_sol_usd_price(now)
+            can_fund, required = self.broker.can_fund_permitted_entry(
+                self.risk_mode,
+                sol_usd_price=sol_usd_price,
+            )
+            if can_fund is None:
+                return (
+                    "waiting_for_data",
+                    "Waiting for fresh accounting evidence before judging bankroll capacity.",
+                    False,
+                )
+            if can_fund:
+                return (
+                    "monitoring",
+                    (
+                        "Drawdown halt is off; the bankroll can still fund a permitted entry "
+                        f"({required or 0} account minor units required)."
+                    ),
+                    False,
+                )
+            fresh_can_fund, fresh_required = self.broker.fresh_season_can_fund_entry(
+                self.risk_mode,
+                sol_usd_price=sol_usd_price,
+            )
+            if fresh_can_fund is None:
+                return (
+                    "waiting_for_data",
+                    "Waiting for fresh accounting evidence before testing a new bankroll.",
+                    False,
+                )
+            if not fresh_can_fund:
+                return (
+                    "monitoring",
+                    (
+                        "The configured starting bankroll cannot fund a permitted entry "
+                        f"({fresh_required or 0} account minor units required); automatic "
+                        "rollover is held to prevent empty-season loops."
+                    ),
+                    False,
+                )
         if portfolio.positions:
-            return "eligible", "All remaining holdings are dormant.", True
+            return (
+                "eligible",
+                "No affordable entry remains, but dormant holdings retain their recovery window.",
+                True,
+            )
+        if exhaustion_mode:
+            return "eligible", "No affordable entry or recoverable holding remains.", True
         return "eligible", "No active holdings remain.", True
 
     def season_automation_status(
@@ -2124,33 +2748,65 @@ class Orchestrator:
     ) -> dict[str, Any]:
         observed_at = now or datetime.now(UTC)
         state, detail, eligible = self._auto_new_season_gate(portfolio, observed_at)
-        eligible_since = self._auto_new_season_eligible_since if eligible else None
+        clock_visible = bool(eligible or state == "waiting_for_data")
+        eligible_since = self._auto_new_season_eligible_since if clock_visible else None
+        elapsed = self._auto_new_season_elapsed_seconds(observed_at) if clock_visible else None
+        remaining = (
+            max(0.0, self.auto_new_season_grace_seconds - elapsed) if elapsed is not None else None
+        )
         rollover_at = (
-            eligible_since + timedelta(seconds=self.auto_new_season_grace_seconds)
-            if eligible_since
+            observed_at + timedelta(seconds=remaining)
+            if eligible and remaining is not None
             else None
         )
-        remaining = max(0.0, (rollover_at - observed_at).total_seconds()) if rollover_at else None
-        if eligible and eligible_since is None:
+        exhaustion_mode = self._drawdown_halt_disabled()
+        if state == "waiting_for_data" and eligible_since is not None:
+            state = "paused"
+            verified_minutes = int((elapsed or 0.0) // 60)
+            total_minutes = self.auto_new_season_grace_seconds // 60
+            detail = (
+                "Automatic rollover is paused while market data catches up; "
+                f"{verified_minutes} of {total_minutes} verified minutes are preserved."
+            )
+        elif eligible and eligible_since is None:
             state = "confirming"
-            detail = "Confirming that the risk pause and dormant holdings persist."
+            detail = (
+                "Confirming genuine bankroll exhaustion without treating unknown data as zero."
+                if exhaustion_mode
+                else "Confirming that the risk pause and dormant holdings persist."
+            )
         elif remaining is not None and remaining > 0:
             state = "countdown"
             dormant = len(portfolio.positions)
-            hours = max(1, round(remaining / 3600))
+            remaining_minutes = max(1, (int(remaining) + 59) // 60)
+            duration = (
+                f"{max(1, (remaining_minutes + 59) // 60)}h"
+                if remaining_minutes >= 60
+                else f"{remaining_minutes}m"
+            )
             if dormant:
                 detail = (
                     f"{dormant} dormant holding{'s' if dormant != 1 else ''}; a new season "
-                    f"starts in about {hours}h if none revives."
+                    f"starts in about {duration} if none revives"
+                    f"{' and restores bankroll capacity' if exhaustion_mode else ''}."
                 )
             else:
-                detail = f"No active holdings remain; a new season starts in about {hours}h."
+                detail = (
+                    f"No affordable paper entry remains; exhaustion is confirmed in about "
+                    f"{duration}."
+                    if exhaustion_mode
+                    else f"No active holdings remain; a new season starts in about {duration}."
+                )
         elif eligible and rollover_at is not None:
             state = "due"
             detail = (
                 "Waiting for queued market evidence before starting the new season."
                 if not self._rollover_pipeline_idle()
-                else "The guarded rollover is due and will be attempted automatically."
+                else (
+                    "The bankroll-exhaustion rollover is due and will be attempted automatically."
+                    if exhaustion_mode
+                    else "The guarded rollover is due and will be attempted automatically."
+                )
             )
         return {
             "enabled": self.auto_new_season_enabled,
@@ -2158,6 +2814,12 @@ class Orchestrator:
             "detail": detail,
             "grace_seconds": self.auto_new_season_grace_seconds,
             "eligible_since": eligible_since.isoformat() if eligible_since else None,
+            "paused_since": (
+                self._auto_new_season_paused_since.isoformat()
+                if clock_visible and self._auto_new_season_paused_since
+                else None
+            ),
+            "verified_seconds": elapsed,
             "rollover_at": rollover_at.isoformat() if rollover_at else None,
             "remaining_seconds": remaining,
             "last_rollover_at": (
@@ -2173,34 +2835,29 @@ class Orchestrator:
         portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
         state, _, eligible = self._auto_new_season_gate(portfolio, now)
         if not eligible:
-            # A restarted live container commonly runs its first heartbeat just before the
-            # WebSocket yields a message. Preserve a previously earned countdown for at most
-            # two minutes, but never roll while data is unverified. A real outage then clears it.
-            startup_waiting_for_data = bool(
-                state == "waiting_for_data"
-                and self.last_source_event_at is None
-                and self._auto_new_season_eligible_since is not None
-                and self._auto_new_season_startup_grace_until is not None
-                and now < self._auto_new_season_startup_grace_until
-            )
-            if startup_waiting_for_data:
+            if state == "waiting_for_data":
+                self._pause_auto_new_season_clock(now)
                 return None
-            self._auto_new_season_startup_grace_until = None
-            self._set_auto_new_season_eligible_since(None)
+            self._set_auto_new_season_clock(None, None, None)
             return None
-        self._auto_new_season_startup_grace_until = None
-        if self._auto_new_season_eligible_since is None:
-            self._set_auto_new_season_eligible_since(now)
-            return None
-        if (
-            now - self._auto_new_season_eligible_since
-        ).total_seconds() < self.auto_new_season_grace_seconds:
+        self._resume_auto_new_season_clock(now)
+        elapsed = self._auto_new_season_elapsed_seconds(now) or 0.0
+        if elapsed < self.auto_new_season_grace_seconds:
             return None
         if not self._rollover_pipeline_idle():
             return None
 
-        previous_season_id, next_season_id = self.broker.rollover(now)
+        terminal_reason = (
+            "bankroll_exhausted" if self._drawdown_halt_disabled() else "auto_drawdown"
+        )
+        previous_season_id, next_season_id = self.broker.rollover(
+            now,
+            terminal_reason=terminal_reason,
+        )
         self._auto_new_season_eligible_since = None
+        self._auto_new_season_paused_since = None
+        self._auto_new_season_last_observed_at = None
+        self._auto_new_season_clock_saved_at = None
         self._auto_new_season_last_rollover_at = now
         self.started_at = now
         self.last_decision_at.clear()
@@ -2214,9 +2871,264 @@ class Orchestrator:
             "at": now.isoformat(),
             "previous_season_id": previous_season_id,
             "next_season_id": next_season_id,
+            "terminal_reason": terminal_reason,
         }
 
+    def _profile_transition_active(self) -> bool:
+        operation = self._season_operation
+        return bool(
+            operation
+            and operation.get("state") == "running"
+            and operation.get("kind") == "profile_transition"
+        )
+
+    @staticmethod
+    def _manual_profile_settlement_deadline(
+        operation: dict[str, Any],
+        now: datetime,
+    ) -> datetime:
+        """Return a restart-safe deadline that can never expand beyond 90 seconds."""
+
+        deadline = _stored_datetime(operation.get("manual_settlement_deadline"))
+        manual_started_at = _stored_datetime(operation.get("manual_settlement_started_at"))
+        if manual_started_at is None and deadline is not None:
+            # Backward-compatible recovery for an operation written before the dedicated
+            # manual timestamp existed. Its persisted deadline remains authoritative.
+            manual_started_at = deadline - timedelta(
+                seconds=PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS
+            )
+        manual_started_at = min(manual_started_at or now, now)
+        maximum_deadline = manual_started_at + timedelta(
+            seconds=PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS
+        )
+        return min(deadline, maximum_deadline) if deadline is not None else maximum_deadline
+
+    def _profile_transition_exit_management_active(self, now: datetime) -> bool:
+        """Keep old-policy exits active only inside the selected transition boundary."""
+
+        operation = self._season_operation
+        if not self._profile_transition_active() or operation is None:
+            return False
+        if operation.get("transition_strategy") != ProfileTransitionStrategy.END_NOW.value:
+            return True
+        return now < self._manual_profile_settlement_deadline(operation, now)
+
+    async def request_risk_mode(self, mode: RiskMode) -> dict[str, Any]:
+        """Backward-compatible request for a personality's canonical default profile."""
+
+        return await self.request_season_profile(mode, DrawdownPolicy())
+
+    async def request_season_profile(
+        self,
+        mode: RiskMode,
+        drawdown_policy: DrawdownPolicy,
+        *,
+        transition_strategy: ProfileTransitionStrategy = (ProfileTransitionStrategy.FINISH_SAFELY),
+    ) -> dict[str, Any]:
+        """Apply an unlocked profile or begin one durable exits-only transition."""
+
+        target = build_season_profile(
+            mode,
+            drawdown_policy=drawdown_policy,
+            learning_fingerprint=self._configuration_fingerprint_for_mode(mode),
+        ).model_dump(mode="json")
+
+        current_operation = self._season_operation
+        if current_operation and current_operation.get("state") == "running":
+            if (
+                current_operation.get("kind") == "profile_transition"
+                and current_operation.get("target_profile_fingerprint")
+                == target["profile_fingerprint"]
+            ):
+                current_strategy = (
+                    ProfileTransitionStrategy.END_NOW
+                    if current_operation.get("transition_strategy")
+                    == ProfileTransitionStrategy.END_NOW.value
+                    else ProfileTransitionStrategy.FINISH_SAFELY
+                )
+                if (
+                    transition_strategy == ProfileTransitionStrategy.END_NOW
+                    and current_strategy == ProfileTransitionStrategy.FINISH_SAFELY
+                ):
+                    async with self._event_lock:
+                        latest = self._season_operation
+                        if (
+                            latest is None
+                            or latest.get("operation_id") != current_operation.get("operation_id")
+                            or latest.get("state") != "running"
+                        ):
+                            if (
+                                self.broker.season_profile is not None
+                                and self.broker.season_profile.get("profile_fingerprint")
+                                == target["profile_fingerprint"]
+                            ):
+                                return {
+                                    "kind": "profile_preference",
+                                    "state": "completed",
+                                    "mode": mode.value,
+                                    "transition_required": False,
+                                }
+                            raise ValueError(
+                                "the previous profile transition just ended; try again"
+                            )
+                        if (
+                            latest.get("transition_strategy")
+                            == ProfileTransitionStrategy.END_NOW.value
+                        ):
+                            return dict(latest)
+                        now = datetime.now(UTC)
+                        updated = await self._update_season_operation(
+                            str(latest["operation_id"]),
+                            stage="settling_manual_exits",
+                            detail=(
+                                "Ending this season now: executable exits have a bounded "
+                                "settlement window; anything else will be recorded as unresolved."
+                            ),
+                            values={
+                                "transition_strategy": transition_strategy.value,
+                                "manual_settlement_started_at": now.isoformat(),
+                                "manual_settlement_deadline": (
+                                    now
+                                    + timedelta(
+                                        seconds=PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS
+                                    )
+                                ).isoformat(),
+                            },
+                        )
+                        return updated or dict(latest)
+                return dict(current_operation)
+            raise ValueError("wait for the current season operation to finish")
+
+        profile = self.broker.season_profile
+        locked = bool(profile is None or profile.get("locked_at") is not None)
+        if not self.broker.initialized or not locked:
+            self.set_season_profile(target)
+            return {
+                "kind": "profile_preference",
+                "state": "completed",
+                "mode": mode.value,
+                "transition_required": False,
+            }
+        if (
+            profile is not None
+            and profile.get("profile_fingerprint") == target["profile_fingerprint"]
+        ):
+            return {
+                "kind": "profile_preference",
+                "state": "completed",
+                "mode": mode.value,
+                "transition_required": False,
+            }
+
+        previous_running = self.running
+        operation: dict[str, Any] | None = None
+        try:
+            async with self._event_lock:
+                # Make the durable operation and the entry freeze one serialized boundary.
+                # The heartbeat cannot observe the former before the latter is enforced.
+                now = datetime.now(UTC)
+                previous_running = self.running
+                operation = await self._begin_season_operation(
+                    "profile_transition",
+                    "freezing_entries",
+                    "Freezing new entries before the current season drains safely.",
+                    values={
+                        "source_season_id": self.broker.season_id,
+                        "source_profile_fingerprint": (
+                            profile.get("profile_fingerprint") if profile else None
+                        ),
+                        "target_risk_mode": mode.value,
+                        "target_profile": target,
+                        "target_profile_fingerprint": target["profile_fingerprint"],
+                        "previous_running": previous_running,
+                        "transition_strategy": transition_strategy.value,
+                        "manual_settlement_started_at": (
+                            now.isoformat()
+                            if transition_strategy == ProfileTransitionStrategy.END_NOW
+                            else None
+                        ),
+                        "manual_settlement_deadline": (
+                            (
+                                now
+                                + timedelta(seconds=PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS)
+                            ).isoformat()
+                            if transition_strategy == ProfileTransitionStrategy.END_NOW
+                            else None
+                        ),
+                        "cancelled_pending_buys": 0,
+                        "dormant_eligible_since": None,
+                        "dormant_paused_since": None,
+                        "dormant_last_observed_at": None,
+                    },
+                )
+                cancelled = await asyncio.to_thread(
+                    self.broker.cancel_pending_buys,
+                    now,
+                    "profile_transition_cancelled_entry",
+                )
+                await asyncio.to_thread(
+                    self.database.set_settings,
+                    {
+                        "trading_enabled": False,
+                        "auto_new_season_eligible_since": None,
+                        "auto_new_season_paused_since": None,
+                        "auto_new_season_last_observed_at": None,
+                    },
+                )
+                self.running = False
+                self._auto_new_season_eligible_since = None
+                self._auto_new_season_paused_since = None
+                self._auto_new_season_last_observed_at = None
+                self._auto_new_season_clock_saved_at = None
+            operation_id = str(operation["operation_id"])
+            updated = await self._update_season_operation(
+                operation_id,
+                stage="draining",
+                detail="New entries are frozen. Existing positions remain under the old policy.",
+                values={"cancelled_pending_buys": cancelled},
+            )
+            return updated or operation
+        except Exception as exc:
+            if operation is None:
+                raise
+            self.running = previous_running
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    self.database.set_setting,
+                    "trading_enabled",
+                    previous_running,
+                )
+            await self._update_season_operation(
+                str(operation["operation_id"]),
+                state="failed",
+                stage="failed",
+                detail=f"The profile transition did not start: {redact_secrets(exc)}",
+            )
+            raise
+
     def set_risk_mode(self, mode: RiskMode) -> None:
+        profile = build_season_profile(
+            mode,
+            learning_fingerprint=self._configuration_fingerprint_for_mode(mode),
+        ).model_dump(mode="json")
+        self.set_season_profile(profile)
+
+    def set_season_profile(self, profile: dict[str, Any]) -> None:
+        validated = build_season_profile(
+            RiskMode(str(profile["risk_mode"])),
+            drawdown_policy=DrawdownPolicy.model_validate(profile["drawdown_policy"]),
+            learning_fingerprint=profile.get("learning_fingerprint"),
+        ).model_dump(mode="json")
+        mode = RiskMode(str(validated["risk_mode"]))
+        if self.broker.initialized and self.broker.season_profile is not None:
+            if self.broker.season_profile.get("locked_at") is not None:
+                raise ValueError("this season profile is locked; begin a profile transition")
+            assert self.broker.season_id is not None
+            self.database.update_current_season_profile(
+                str(self.broker.season_id),
+                validated,
+            )
+            self.broker.season_profile = validated
         self.risk_mode = mode
         self.database.set_setting("risk_mode", mode.value)
         self.learning.set_risk_mode(mode)
@@ -2254,6 +3166,8 @@ class Orchestrator:
         configuration: ProviderConfiguration,
         secret_changes: dict[str, str | None],
     ) -> dict[str, Any]:
+        if self._profile_transition_active():
+            raise ValueError("wait for the profile transition before changing market providers")
         previous_ws = self._provider_value("solana_ws")
         self.provider_secrets.update(secret_changes)
         self.provider_configuration = configuration
@@ -2320,6 +3234,50 @@ class Orchestrator:
         if not operation or operation.get("state") != "running":
             return
         kind = operation.get("kind")
+        if kind == "profile_transition":
+            now_datetime = datetime.now(UTC)
+            now = now_datetime.isoformat()
+            current = self.database.current_paper_season()
+            committed = bool(
+                current
+                and current.get("season_id") != operation.get("source_season_id")
+                and current.get("profile_fingerprint")
+                == operation.get("target_profile_fingerprint")
+            )
+            if committed:
+                operation.update(
+                    {
+                        "state": "completed",
+                        "stage": "restarted",
+                        "detail": "The profile transition committed before the app restarted.",
+                        "next_season_id": current["season_id"] if current else None,
+                        "updated_at": now,
+                        "completed_at": now,
+                    }
+                )
+            else:
+                # The old season remains authoritative. Keep its exit orders and holdings intact;
+                # the heartbeat resumes the durable drain after providers have recovered.
+                cancelled_buys = self.broker.cancel_pending_buys(
+                    now_datetime,
+                    "profile_transition_restart_entry_guard",
+                )
+                self.running = False
+                self.database.set_setting("trading_enabled", False)
+                operation.update(
+                    {
+                        "stage": "resuming_after_restart",
+                        "detail": (
+                            "The old season was preserved. Resuming its exits-only transition "
+                            "after market data recovers."
+                        ),
+                        "cancelled_pending_buys": int(operation.get("cancelled_pending_buys") or 0)
+                        + cancelled_buys,
+                        "updated_at": now,
+                    }
+                )
+            self.database.set_setting("season_operation", operation)
+            return
         completed = bool(
             (kind == "reset" and not self.broker.initialized)
             or (kind == "setup" and self.broker.initialized)
@@ -2417,14 +3375,14 @@ class Orchestrator:
                 "auto_new_season_eligible_since": (
                     eligible_since.isoformat() if eligible_since else None
                 ),
+                "auto_new_season_paused_since": None,
+                "auto_new_season_last_observed_at": now.isoformat() if eligible_since else None,
             }
         )
         self._auto_new_season_eligible_since = eligible_since
-        self._auto_new_season_startup_grace_until = (
-            now + timedelta(seconds=AUTO_NEW_SEASON_STARTUP_DATA_GRACE_SECONDS)
-            if eligible_since
-            else None
-        )
+        self._auto_new_season_paused_since = None
+        self._auto_new_season_last_observed_at = now if eligible_since else None
+        self._auto_new_season_clock_saved_at = now if eligible_since else None
         self._maintenance_operation = completed
         self._maintenance_requested = False
 
@@ -2477,10 +3435,8 @@ class Orchestrator:
             now = datetime.now(UTC)
             remaining: float | None = None
             if self._auto_new_season_eligible_since is not None:
-                rollover_at = self._auto_new_season_eligible_since + timedelta(
-                    seconds=self.auto_new_season_grace_seconds
-                )
-                remaining = max(0.0, (rollover_at - now).total_seconds())
+                elapsed = self._auto_new_season_elapsed_seconds(now) or 0.0
+                remaining = max(0.0, self.auto_new_season_grace_seconds - elapsed)
             operation = {
                 "operation_id": uuid.uuid4().hex,
                 "kind": "upgrade",
@@ -2505,12 +3461,16 @@ class Orchestrator:
                     # Preserve the remaining duration in the operation instead of allowing
                     # container downtime to count as proof that a season stayed dormant.
                     "auto_new_season_eligible_since": None,
+                    "auto_new_season_paused_since": None,
+                    "auto_new_season_last_observed_at": None,
                 },
             )
             self._maintenance_operation = operation
             self._maintenance_requested = True
             self._auto_new_season_eligible_since = None
-            self._auto_new_season_startup_grace_until = None
+            self._auto_new_season_paused_since = None
+            self._auto_new_season_last_observed_at = None
+            self._auto_new_season_clock_saved_at = None
             self._storage_maintenance_requested = False
             self.invalidate_snapshot_cache()
             await self.bus.publish({"type": "maintenance_operation", **operation})
@@ -2538,12 +3498,21 @@ class Orchestrator:
         eligible_since = self._restored_auto_season_eligible_since(operation, now)
         async with self._event_lock:
             await asyncio.to_thread(
-                self.database.set_setting,
-                "auto_new_season_eligible_since",
-                eligible_since.isoformat() if eligible_since else None,
+                self.database.set_settings,
+                {
+                    "auto_new_season_eligible_since": (
+                        eligible_since.isoformat() if eligible_since else None
+                    ),
+                    "auto_new_season_paused_since": None,
+                    "auto_new_season_last_observed_at": (
+                        now.isoformat() if eligible_since else None
+                    ),
+                },
             )
             self._auto_new_season_eligible_since = eligible_since
-            self._auto_new_season_startup_grace_until = None
+            self._auto_new_season_paused_since = None
+            self._auto_new_season_last_observed_at = now if eligible_since else None
+            self._auto_new_season_clock_saved_at = now if eligible_since else None
             self.running = bool(operation.get("previous_running")) and self.broker.initialized
             if self.running:
                 self.started_at = now
@@ -2663,6 +3632,7 @@ class Orchestrator:
         detail: str,
         *,
         reuse_same_kind: bool = False,
+        values: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with self._season_operation_lock:
             current = self._season_operation
@@ -2682,6 +3652,8 @@ class Orchestrator:
                 "updated_at": now,
                 "completed_at": None,
             }
+            if values:
+                operation.update(values)
             await asyncio.to_thread(
                 self.database.set_setting,
                 "season_operation",
@@ -2699,6 +3671,7 @@ class Orchestrator:
         state: str | None = None,
         stage: str | None = None,
         detail: str | None = None,
+        values: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         async with self._season_operation_lock:
             current = self._season_operation
@@ -2711,6 +3684,8 @@ class Orchestrator:
                 updated["stage"] = stage
             if detail is not None:
                 updated["detail"] = detail
+            if values:
+                updated.update(values)
             now = datetime.now(UTC).isoformat()
             updated["updated_at"] = now
             if state in {"completed", "failed"}:
@@ -2725,7 +3700,14 @@ class Orchestrator:
         await self.bus.publish({"type": "season_operation", **updated})
         return dict(updated)
 
-    async def setup_portfolio(self, quote_currency: QuoteCurrency, starting_minor: int) -> None:
+    async def setup_portfolio(
+        self,
+        quote_currency: QuoteCurrency,
+        starting_minor: int,
+        *,
+        risk_mode: RiskMode | None = None,
+        drawdown_policy: DrawdownPolicy | None = None,
+    ) -> None:
         operation = await self._begin_season_operation(
             "setup",
             "creating_bankroll",
@@ -2734,16 +3716,27 @@ class Orchestrator:
         operation_id = str(operation["operation_id"])
         try:
             async with self._event_lock:
+                selected_mode = risk_mode or self.risk_mode
+                profile = build_season_profile(
+                    selected_mode,
+                    drawdown_policy=drawdown_policy,
+                    learning_fingerprint=self._configuration_fingerprint_for_mode(selected_mode),
+                )
                 await asyncio.to_thread(
                     self.broker.initialize,
                     quote_currency,
                     starting_minor,
+                    profile.model_dump(mode="json"),
                 )
                 self.running = False
+                self.risk_mode = selected_mode
+                self.learning.set_risk_mode(selected_mode)
                 await asyncio.to_thread(
-                    self.database.set_setting,
-                    "trading_enabled",
-                    False,
+                    self.database.set_settings,
+                    {
+                        "trading_enabled": False,
+                        "risk_mode": selected_mode.value,
+                    },
                 )
                 self._ui_leaderboard_cache.clear()
                 self._ui_seasons_cache = None
@@ -2776,6 +3769,14 @@ class Orchestrator:
         operation_id = str(operation["operation_id"])
         try:
             async with self._event_lock:
+                if self.broker.season_id and self.broker.season_profile is not None:
+                    locked_profile = await asyncio.to_thread(
+                        self.database.lock_current_season_profile,
+                        str(self.broker.season_id),
+                        datetime.now(UTC),
+                    )
+                    if locked_profile is not None:
+                        self.broker.season_profile = locked_profile
                 self.running = True
                 self.started_at = datetime.now(UTC)
                 await asyncio.to_thread(
@@ -2827,6 +3828,8 @@ class Orchestrator:
         await self.bus.publish({"type": "paper_engine_started"})
 
     async def pause_trading(self) -> int:
+        if self._profile_transition_active():
+            raise ValueError("the engine is already in a protected exits-only transition")
         async with self._event_lock:
             # A manual stop/reset can coincide with storage maintenance. Keep all SQLite and
             # pending-order persistence off the HTTP event loop while the event lock prevents a
@@ -2836,11 +3839,15 @@ class Orchestrator:
                 {
                     "trading_enabled": False,
                     "auto_new_season_eligible_since": None,
+                    "auto_new_season_paused_since": None,
+                    "auto_new_season_last_observed_at": None,
                 },
             )
             self.running = False
             self._auto_new_season_eligible_since = None
-            self._auto_new_season_startup_grace_until = None
+            self._auto_new_season_paused_since = None
+            self._auto_new_season_last_observed_at = None
+            self._auto_new_season_clock_saved_at = None
             cancelled = await asyncio.to_thread(
                 self.broker.cancel_pending_orders,
                 datetime.now(UTC),
@@ -2996,6 +4003,11 @@ class Orchestrator:
             "demo_mode": self.demo_mode,
             "paper_only": True,
             "risk_mode": self.risk_mode.value,
+            "season_profile": self.broker.season_profile,
+            "season_profile_provenance": (
+                "exact" if self.broker.season_profile is not None else "legacy_unknown"
+            ),
+            "season_profile_catalog": season_profile_catalog(),
             "candidate_window_minutes": self.settings.candidate_window_minutes,
             "stale_market_seconds": self.settings.stale_market_seconds,
             "provider_health": provider_health,
@@ -3125,11 +4137,15 @@ class Orchestrator:
                 positions = [
                     position.model_copy(deep=True) for position in self.broker.positions.values()
                 ]
+                quote_currency = self.broker.quote_currency.value
+                quote_decimals = self.broker.quote_decimals
             result = await asyncio.to_thread(
                 self.leaderboard,
                 sort=sort,
                 limit=500,
                 positions=positions,
+                quote_currency=quote_currency,
+                quote_decimals=quote_decimals,
             )
             self._ui_leaderboard_cache[sort] = (time.monotonic(), result)
             return _leaderboard_response(result, limit)
@@ -3211,20 +4227,64 @@ class Orchestrator:
                 seasons.append(season)
 
             completed = [item for item in seasons if item["status"] == "completed"]
-            win_rates = [item["win_rate"] for item in completed if item["win_rate"] is not None]
+            comparable_completed = [item for item in completed if item.get("comparable", True)]
+            win_rates = [
+                item["win_rate"] for item in comparable_completed if item["win_rate"] is not None
+            ]
             returns = [
                 item["net_return_fraction"]
-                for item in completed
+                for item in comparable_completed
                 if item["net_return_fraction"] is not None
             ]
+            profile_counts: dict[str, dict[str, Any]] = {}
+            for item in seasons:
+                profile = item.get("profile")
+                fingerprint = item.get("profile_fingerprint")
+                if not isinstance(profile, dict) or not isinstance(fingerprint, str):
+                    continue
+                entry = profile_counts.setdefault(
+                    fingerprint,
+                    {
+                        "profile_fingerprint": fingerprint,
+                        "risk_mode": profile["risk_mode"],
+                        "drawdown_policy": profile["drawdown_policy"],
+                        "effective_drawdown_bps": profile["effective_drawdown_bps"],
+                        "season_count": 0,
+                    },
+                )
+                entry["season_count"] += 1
+
+            current_profile_fingerprint = next(
+                (
+                    item.get("profile_fingerprint")
+                    for item in seasons
+                    if item["status"] == "current"
+                ),
+                None,
+            )
+            profile_summaries: list[dict[str, Any]] = list(profile_counts.values())
+            profile_summaries.sort(
+                key=lambda item: (
+                    str(item["risk_mode"]),
+                    item["effective_drawdown_bps"] is None,
+                    int(item["effective_drawdown_bps"] or 0),
+                )
+            )
             result = {
                 "generated_at": generated_at.isoformat(),
                 "seasons": seasons,
+                "current_profile_fingerprint": current_profile_fingerprint,
+                "profiles": profile_summaries,
                 "summary": {
                     "season_count": len(seasons),
                     "completed_seasons": len(completed),
-                    "profitable_seasons": sum(item["net_pnl_minor"] > 0 for item in completed),
-                    "losing_seasons": sum(item["net_pnl_minor"] < 0 for item in completed),
+                    "comparable_seasons": len(comparable_completed),
+                    "profitable_seasons": sum(
+                        item["net_pnl_minor"] > 0 for item in comparable_completed
+                    ),
+                    "losing_seasons": sum(
+                        item["net_pnl_minor"] < 0 for item in comparable_completed
+                    ),
                     "average_win_rate": (sum(win_rates) / len(win_rates) if win_rates else None),
                     "best_return_fraction": max(returns) if returns else None,
                 },
@@ -3238,6 +4298,8 @@ class Orchestrator:
         limit: int = 100,
         *,
         positions: list[Position] | None = None,
+        quote_currency: str | None = None,
+        quote_decimals: int | None = None,
     ) -> dict[str, Any]:
         fills = self.database.list_fills(100_000)
         orders = {order.order_id: order for order in self.database.list_orders()}
@@ -3340,6 +4402,10 @@ class Orchestrator:
             else (lambda row: row["closed_at"] or row["opened_at"])
         )
         visible_rows.sort(key=key, reverse=sort != "loss")
+        result_currency = quote_currency or self.broker.quote_currency.value
+        result_decimals = (
+            quote_decimals if quote_decimals is not None else self.broker.quote_decimals
+        )
         peak_captures = [
             row["peak_capture_fraction"]
             for row in closed
@@ -3348,8 +4414,10 @@ class Orchestrator:
         return {
             "sort": sort,
             "rows": visible_rows[:limit],
+            "available_rows": len(visible_rows),
             "summary": {
                 "closed_trades": len(closed),
+                "open_trades": sum(row["status"] == "open" for row in rows),
                 "wins": sum(row["pnl_minor"] > 0 for row in closed),
                 "losses": sum(row["pnl_minor"] < 0 for row in closed),
                 "total_realized_pnl_minor": sum(row["pnl_minor"] for row in closed),
@@ -3364,6 +4432,8 @@ class Orchestrator:
                     sum(peak_captures) / len(peak_captures) if peak_captures else None
                 ),
                 "total_fees_minor": sum(row["fees_minor"] for row in rows),
+                "quote_currency": result_currency,
+                "quote_decimals": result_decimals,
             },
         }
 
@@ -3439,7 +4509,9 @@ class Orchestrator:
             # writer on a long-running database. Never make that wait freeze health or polling.
             await asyncio.to_thread(self.broker.reset)
             self._auto_new_season_eligible_since = None
-            self._auto_new_season_startup_grace_until = None
+            self._auto_new_season_paused_since = None
+            self._auto_new_season_last_observed_at = None
+            self._auto_new_season_clock_saved_at = None
             self.last_decision_at.clear()
             self.last_recorded_decision.clear()
             self._ui_leaderboard_cache.clear()

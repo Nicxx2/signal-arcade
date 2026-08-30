@@ -3,11 +3,31 @@
 ## Lifecycle
 
 A fresh database has no virtual cash and the paper engine is stopped. The user first creates a
-SOL or USDC bankroll, then explicitly starts the engine. Stopping is non-destructive: pending
+SOL or USDC bankroll, chooses Safer, Balanced or Aggressive and may leave the advanced portfolio
+drawdown halt at its personality default, set a custom 1–99% value, or disable that halt. The
+resulting profile remains editable only until the first season genuinely starts. The user then
+explicitly starts the engine. Stopping is non-destructive: pending
 orders are cancelled, no decision or fill can be created, and cash, fills, and token quantities
 remain in SQLite. The market feed continues updating retained token state and sell-side position
 marks. Resume clears decision cooldowns, reassesses every holding against the freshest non-stale
 state and restores exit risk management.
+
+One season always has one immutable profile. After lock, changing either personality or drawdown
+policy starts a durable exits-only transition rather than mutating the running experiment. New
+entries stop, unfilled buys cancel, and active/dormant positions plus pending sells remain attached
+to the exact policy context that opened them. The old season archives only when it is legitimately
+settleable; its successor receives the canonical fresh bankroll. A normal automatic rollover
+inherits the exact profile unless the user explicitly requested a different one.
+
+The confirmation offers two explicit boundaries. **Finish safely** keeps the original exit policy
+in control and gives dormant inventory the configured recovery window. **End season now** gives
+fresh executable holdings a bounded 90-second opportunity to produce ordinary latency-, fee- and
+impact-aware paper sell receipts. It never turns a last-known mark into a sale. Any holding still
+untradeable at that boundary is archived as immutable unresolved inventory with its token units,
+book cost, last-known indication, evidence time and blockers. The season remains visible but is
+excluded from best-season and performance comparisons; a user-requested exit is also excluded from
+exit-policy proof. The archive, unresolved records and clean successor season commit atomically and
+the durable deadline survives restart.
 
 ## Fill timing
 
@@ -81,9 +101,10 @@ retried when fresh route evidence returns. Pump-curve holdings exit before the c
 migration boundary when possible; a completed curve waits until a decoded PumpSwap state confirms
 the new route.
 
-Changing the risk slider can tighten an existing position but cannot loosen the stop, trailing,
-migration, review, or absolute limits that applied when it entered. New positions use the newly
-selected mode.
+Changing risk personality never rewrites a live position. Entry mode and policy provenance stay
+with the holding across its normal reassessment, heartbeat/watchdog, stop, trailing, learned
+timing, pending-sell and restart paths. The requested profile becomes active only after the clean
+season boundary.
 
 Each mint can be entered once per paper season. This prevents repeated qualification during one
 trend from turning evaluation into churn. Resetting the paper portfolio clears that guard and
@@ -95,6 +116,22 @@ capital contribution. Open positions continue to be supervised even when availab
 new entries fail closed at the exposure, drawdown, or cash gate. To add more paper runway, start a
 new season and choose a fresh bankroll. The season's portfolio journal resets, while live Learning
 Lab observations and immutable model versions remain available to the next season.
+
+Disabling portfolio drawdown does not disable stop loss, trailing protection, maximum hold,
+position/exposure caps, stale-data, mint, route, execution or accounting safety. It lets the
+season continue until the broker can prove that current cash cannot fund any permitted minimum
+entry and no active position, pending order or still-recoverable dormant holding can restore that
+capacity. Dormant assets keep their existing recovery/grace opportunity and never receive an
+invented zero exit. Missing conversion, provider health or executable evidence is unknown—not
+bankruptcy—and pauses the test. Only healthy, sustained proof may end such a season as
+`bankroll_exhausted`; an ordinary enforced halt ends as `auto_drawdown`.
+
+Results defaults to the exact current profile. Custom drawdown variants, disabled drawdown and
+other personalities remain separate for every count, chart, trend and summary. All Seasons is a
+chronological mixed-profile history, not a single-strategy aggregate. Pre-migration seasons whose
+profile cannot be proven are retained as Legacy / Unknown and excluded from modern like-for-like
+claims. Manually ended seasons and any season with unresolved inventory are likewise retained for
+audit but excluded from improvement, best-return, profitability and average-win-rate claims.
 
 The scanner does not wait for current positions to close. Every incoming event first refreshes
 the matching open position and applies the adaptive exit and permanent risk rules;

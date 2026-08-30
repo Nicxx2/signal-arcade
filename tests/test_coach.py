@@ -13,7 +13,7 @@ from signal_arcade.coach import (
     _build_candidates,
     _evaluate_hypothesis,
 )
-from signal_arcade.database import Database
+from signal_arcade.database import SCHEMA_VERSION, Database
 from signal_arcade.models import (
     CoachExperimentKind,
     CoachExperimentState,
@@ -112,6 +112,14 @@ def _observation(
             "momentum": momentum,
             "drawdown": 0.05,
             "reserve_depth": 0.7,
+            "single_trade_wallet_ratio": 0.5,
+            "round_trip_wallet_ratio": 0.05,
+            "round_trip_volume_ratio": 0.1,
+            "net_quote_flow_ratio": 0.7,
+            "side_alternation_ratio": 0.4,
+            "quantized_amount_repeat_ratio": 0.15,
+            "slot_concentration_hhi": 0.1,
+            "price_direction_consistency": 0.6,
         },
         token_units=1_000,
         entry_cost_lamports=25_000_000,
@@ -202,6 +210,57 @@ def test_candidate_screening_is_bounded_and_never_applied() -> None:
     assert hypothesis.influence_applied is False
     assert "action" not in hypothesis.model_dump()
     assert "position_size" not in hypothesis.model_dump()
+
+
+def test_market_integrity_rule_is_only_a_forward_test_candidate() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = []
+    for index in range(30):
+        observation = _observation(
+            index,
+            now + timedelta(seconds=index),
+            momentum=0.10,
+        )
+        rows.append(
+            observation.model_copy(
+                update={
+                    "features": {
+                        **observation.features,
+                        "single_trade_wallet_ratio": 0.96,
+                    }
+                }
+            )
+        )
+
+    candidates = _build_candidates(rows, RiskMode.BALANCED, "fp", set())
+    integrity = [item for item in candidates if item.feature_name == "single_trade_wallet_ratio"]
+    assert len(integrity) == 1
+    assert integrity[0].kind == CoachExperimentKind.ENTRY_VETO
+    assert integrity[0].uplift_lower_bound > 0
+
+
+def test_single_suspicious_launch_cannot_create_integrity_experiment() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = []
+    for index in range(19):
+        observation = _observation(
+            index,
+            now + timedelta(seconds=index),
+            momentum=0.10,
+        )
+        rows.append(
+            observation.model_copy(
+                update={
+                    "features": {
+                        **observation.features,
+                        "single_trade_wallet_ratio": 0.99,
+                    }
+                }
+            )
+        )
+
+    candidates = _build_candidates(rows, RiskMode.BALANCED, "fp", set())
+    assert all(item.feature_name != "single_trade_wallet_ratio" for item in candidates)
 
 
 def test_discovery_with_poor_exit_coverage_cannot_consume_a_forward_slot() -> None:
@@ -321,6 +380,10 @@ def test_inconclusive_result_is_retained_but_releases_the_context_slot(tmp_path:
     assert status["state"] == "waiting"
     assert status["recent_hypotheses"][0]["state"] == "inconclusive"
     assert status["recent_hypotheses"][0]["context_active"] is True
+    gates = {gate["id"]: gate for gate in status["qualification_gates"]}
+    assert gates["experiment_selected"]["state"] == "not_met"
+    assert gates["forward_outcomes"]["state"] == "collecting"
+    assert status["qualification_passed"] < status["qualification_total"]
     later_rows = [
         _observation(index, hypothesis.cutoff_at + timedelta(seconds=index + 1))
         for index in range(120)
@@ -548,7 +611,10 @@ def test_schema_six_upgrade_adds_coach_storage_without_touching_settings(tmp_pat
         ).fetchall()
     }
     assert {"coach_reviews", "coach_hypotheses"}.issubset(tables)
-    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 7  # noqa: SLF001
+    assert (
+        upgraded._conn.execute("PRAGMA user_version").fetchone()[0]  # noqa: SLF001
+        == SCHEMA_VERSION
+    )
     upgraded.close()
 
 

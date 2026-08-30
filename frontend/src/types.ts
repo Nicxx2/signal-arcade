@@ -1,8 +1,29 @@
 export type RiskMode = "safe" | "balanced" | "aggressive";
+export type ProfileTransitionStrategy = "finish_safely" | "end_now";
 export type DecisionAction = "enter" | "watch" | "pass" | "abstain";
 export type QuoteCurrency = "SOL" | "USDC";
 export type LearningMode = "off" | "shadow" | "active";
 export type AiDecisionMode = "off" | "shadow" | "guarded";
+
+export type DrawdownPolicyKind = "default" | "custom" | "disabled";
+
+export interface DrawdownPolicy {
+  kind: DrawdownPolicyKind;
+  custom_threshold_bps: number | null;
+}
+
+export interface SeasonProfile {
+  schema_version: number;
+  provenance: "exact";
+  risk_mode: RiskMode;
+  risk_policy_version: string;
+  risk_limits: Record<string, number | string>;
+  drawdown_policy: DrawdownPolicy;
+  effective_drawdown_bps: number | null;
+  profile_fingerprint: string;
+  learning_fingerprint: string | null;
+  locked_at: string | null;
+}
 
 export interface DataValue {
   value: number | string | boolean | null;
@@ -45,6 +66,7 @@ export interface Decision {
   feature_snapshot: FeatureSnapshot;
   model_version: string;
   season_id: string | null;
+  season_profile_fingerprint?: string | null;
   configuration_fingerprint: string | null;
   planned_order_size_sol: number | null;
   learning_assessment: {
@@ -266,6 +288,17 @@ export interface LearningModelSummary {
   qualified: boolean;
 }
 
+export interface ReadinessGate {
+  id: string;
+  label: string;
+  current: number | boolean | null;
+  target: number | boolean;
+  comparison: ">=" | "<=" | ">" | "=";
+  state: "passed" | "collecting" | "not_met";
+  unit: "count" | "fraction" | "number" | "boolean" | "milliseconds";
+  detail: string;
+}
+
 export interface LearningStatus {
   mode: LearningMode;
   state: "paused" | "collecting" | "challenger_testing" | "ready" | "active";
@@ -335,6 +368,9 @@ export interface LearningStatus {
     suspended_at?: string;
   };
   activation_available: boolean;
+  qualification_gates?: ReadinessGate[];
+  qualification_passed?: number;
+  qualification_total?: number;
   lessons: Array<{
     feature: string;
     label: string;
@@ -382,6 +418,9 @@ export interface AiQualification {
   uplift_lower_bound: number | null;
   p95_latency_ms: number | null;
   maximum_p95_latency_ms: number;
+  gates?: ReadinessGate[];
+  passed?: number;
+  total?: number;
 }
 
 export interface AiCriticAssessment {
@@ -407,6 +446,7 @@ export interface AiCriticAssessment {
   counterfactual_uplift: number | null;
   outcome_missing_reason: string | null;
   resolved_at: string | null;
+  season_profile_fingerprint?: string | null;
 }
 
 export interface AiLabStatus {
@@ -498,6 +538,9 @@ export interface CoachStatus {
   outcomes_until_review: number;
   minimum_forward_samples: number;
   minimum_forward_seasons: number;
+  qualification_gates?: ReadinessGate[];
+  qualification_passed?: number;
+  qualification_total?: number;
   recent_hypotheses: CoachHypothesis[];
   recent_reviews: CoachReview[];
   guardrails: string[];
@@ -568,14 +611,19 @@ export interface LeaderboardRow {
 export interface Leaderboard {
   sort: "profit" | "loss" | "recent";
   rows: LeaderboardRow[];
+  available_rows: number;
   summary: {
     closed_trades: number;
+    open_trades: number;
     wins: number;
     losses: number;
     total_realized_pnl_minor: number;
     audited_exits: number;
     winner_reversals: number;
     average_peak_capture_fraction: number | null;
+    total_fees_minor: number;
+    quote_currency: QuoteCurrency;
+    quote_decimals: number;
   };
 }
 
@@ -603,14 +651,48 @@ export interface PaperSeason {
   win_rate: number | null;
   net_return_fraction: number | null;
   duration_seconds: number;
+  risk_mode: RiskMode | null;
+  profile_fingerprint: string | null;
+  profile: SeasonProfile | null;
+  profile_provenance: "exact" | "legacy_unknown";
+  profile_locked_at: string | null;
+  terminal_reason: string | null;
+  result_quality?: "complete" | "unresolved";
+  comparable?: boolean;
+  unresolved_inventory?: Array<{
+    position_id: string;
+    mint: string;
+    symbol: string;
+    token_units: number;
+    entry_cost_minor: number;
+    book_value_minor: number;
+    last_known_mark_minor: number;
+    last_marked_at: string | null;
+    market_status: "active" | "exit_blocked" | "dormant";
+    mark_blockers: string[];
+    quote_currency: QuoteCurrency;
+    quote_decimals: number;
+    retirement_reason: string;
+    retired_at: string;
+    was_executed: false;
+  }>;
 }
 
 export interface Seasons {
   generated_at: string;
   seasons: PaperSeason[];
+  current_profile_fingerprint: string | null;
+  profiles: Array<{
+    profile_fingerprint: string;
+    risk_mode: RiskMode;
+    drawdown_policy: DrawdownPolicy;
+    effective_drawdown_bps: number | null;
+    season_count: number;
+  }>;
   summary: {
     season_count: number;
     completed_seasons: number;
+    comparable_seasons?: number;
     profitable_seasons: number;
     losing_seasons: number;
     average_win_rate: number | null;
@@ -620,10 +702,12 @@ export interface Seasons {
 
 export interface SeasonAutomation {
   enabled: boolean;
-  state: "off" | "maintenance" | "no_bankroll" | "engine_stopped" | "monitoring" | "pending_orders" | "managing_positions" | "waiting_for_data" | "operation_pending" | "confirming" | "countdown" | "due";
+  state: "off" | "maintenance" | "no_bankroll" | "engine_stopped" | "monitoring" | "pending_orders" | "managing_positions" | "waiting_for_data" | "operation_pending" | "confirming" | "countdown" | "paused" | "due";
   detail: string;
   grace_seconds: number;
   eligible_since: string | null;
+  paused_since?: string | null;
+  verified_seconds?: number | null;
   rollover_at: string | null;
   remaining_seconds: number | null;
   last_rollover_at: string | null;
@@ -631,13 +715,20 @@ export interface SeasonAutomation {
 
 export interface SeasonOperation {
   operation_id: string;
-  kind: "reset" | "setup" | "start";
+  kind: "reset" | "setup" | "start" | "profile_transition";
   state: "running" | "completed" | "failed";
   stage: string;
   detail: string;
   started_at: string;
   updated_at: string;
   completed_at: string | null;
+  target_risk_mode?: RiskMode;
+  target_profile_fingerprint?: string;
+  previous_running?: boolean;
+  transition_strategy?: ProfileTransitionStrategy;
+  manual_settlement_started_at?: string | null;
+  manual_settlement_deadline?: string | null;
+  unresolved_positions?: number;
 }
 
 export interface MaintenanceOperation {
@@ -669,6 +760,9 @@ export interface Snapshot {
   demo_mode: boolean;
   paper_only: boolean;
   risk_mode: RiskMode;
+  season_profile: SeasonProfile | null;
+  season_profile_provenance: "exact" | "legacy_unknown";
+  season_profile_catalog: SeasonProfile[];
   candidate_window_minutes: number;
   stale_market_seconds: number;
   provider_health: Record<string, unknown>;

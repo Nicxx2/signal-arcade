@@ -59,6 +59,13 @@ class RiskMode(StrEnum):
     AGGRESSIVE = "aggressive"
 
 
+class ProfileTransitionStrategy(StrEnum):
+    """How a locked season should reach the next exact risk profile."""
+
+    FINISH_SAFELY = "finish_safely"
+    END_NOW = "end_now"
+
+
 class QuoteCurrency(StrEnum):
     SOL = "SOL"
     USDC = "USDC"
@@ -202,6 +209,7 @@ class Decision(BaseModel):
     planned_order_size_sol: float | None = Field(default=None, gt=0)
     learning_assessment: LearningAssessment | None = None
     season_id: str | None = None
+    season_profile_fingerprint: str | None = None
     configuration_fingerprint: str | None = None
 
 
@@ -251,6 +259,9 @@ class LearningObservation(BaseModel):
     execution_score: float | None = Field(default=None, ge=0, le=1)
     confidence_score: float | None = Field(default=None, ge=0, le=1)
     season_id: str | None = None
+    # Direct profile provenance makes retained learning rows independently auditable even when
+    # several drawdown experiments intentionally share one personality learning cohort.
+    season_profile_fingerprint: str | None = None
     configuration_fingerprint: str | None = None
 
 
@@ -326,6 +337,7 @@ class AiCriticAssessment(BaseModel):
     outcome_missing_reason: str | None = None
     resolved_at: datetime | None = None
     season_id: str | None = None
+    season_profile_fingerprint: str | None = None
     configuration_fingerprint: str | None = None
 
 

@@ -1,4 +1,4 @@
-import type { AiDecisionMode, AiLabStatus, AiModelDownload, Decision, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
+import type { AiDecisionMode, AiLabStatus, AiModelDownload, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000): Promise<T> {
   const controller = new AbortController();
@@ -32,10 +32,10 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000):
 export const api = {
   health: () => request<HealthStatus>("/api/v1/health", undefined, 2_500),
   snapshot: () => request<Snapshot>("/api/v1/snapshot"),
-  setRisk: (mode: RiskMode) =>
+  setRisk: (mode: RiskMode, drawdown_policy: DrawdownPolicy = { kind: "default", custom_threshold_bps: null }, transition_strategy: ProfileTransitionStrategy = "finish_safely") =>
     request<{ mode: RiskMode }>("/api/v1/risk", {
       method: "PUT",
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, drawdown_policy, transition_strategy }),
     }),
   setSeasonAutomation: (enabled: boolean, grace_hours?: number) =>
     request<SeasonAutomation>("/api/v1/season-automation", {
@@ -87,10 +87,10 @@ export const api = {
     request<Leaderboard>(`/api/v1/leaderboard?sort=${sort}`, { signal }),
   seasons: (signal?: AbortSignal) => request<Seasons>("/api/v1/seasons", { signal }),
   decision: (id: string) => request<Decision>(`/api/v1/decisions/${id}`),
-  setupPortfolio: (quote_currency: QuoteCurrency, starting_amount: string) =>
+  setupPortfolio: (quote_currency: QuoteCurrency, starting_amount: string, risk_mode: RiskMode, drawdown_policy: DrawdownPolicy) =>
     request<{ initialized: true; quote_currency: QuoteCurrency; starting_minor: number; running: false }>("/api/v1/portfolio/setup", {
       method: "POST",
-      body: JSON.stringify({ quote_currency, starting_amount }),
+      body: JSON.stringify({ quote_currency, starting_amount, risk_mode, drawdown_policy }),
     }),
   startEngine: () =>
     request<{ running: true }>("/api/v1/engine/start", { method: "POST" }),

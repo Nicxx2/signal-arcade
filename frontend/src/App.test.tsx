@@ -2,7 +2,33 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, expect, test, vi } from "vitest";
 
 import App from "./App";
-import type { Decision, Snapshot } from "./types";
+import type { Decision, Fill, Position, Snapshot } from "./types";
+
+const arenaLayoutKey = "signal-arcade-arena-layout-v1";
+const learningUiKey = "signal-arcade-learning-ui-v1";
+const dismissedMaintenanceNoticeKey = "signal-arcade-dismissed-maintenance-notice-v1";
+
+const activePosition: Position = {
+  position_id: "position-personalized",
+  mint: "mint-personalized",
+  symbol: "PERSONALIZED",
+  token_units: 1_000,
+  entry_cost_lamports: 25_000_000,
+  book_value_lamports: 24_000_000,
+  opened_at: new Date().toISOString(),
+  last_mark_lamports: 26_000_000,
+  unrealized_pnl_lamports: 1_000_000,
+  last_marked_at: new Date().toISOString(),
+  mark_age_seconds: 0,
+  mark_is_stale: false,
+  mark_is_executable: true,
+  mark_blockers: [],
+  market_status: "active",
+  risk_mode_at_entry: "balanced",
+  peak_mark_lamports: 26_000_000,
+  peak_marked_at: new Date().toISOString(),
+  exit_assessment: null,
+};
 
 const decision: Decision = {
   decision_id: "decision-aaa",
@@ -57,6 +83,24 @@ const snapshot: Snapshot = {
   demo_mode: true,
   paper_only: true,
   risk_mode: "balanced",
+  season_profile: {
+    schema_version: 1,
+    provenance: "exact",
+    risk_mode: "balanced",
+    risk_policy_version: "risk-limits-v1",
+    risk_limits: { max_open_positions: 4, max_exposure_fraction: 0.12 },
+    drawdown_policy: { kind: "default", custom_threshold_bps: null },
+    effective_drawdown_bps: 1500,
+    profile_fingerprint: "balanced-default-profile",
+    learning_fingerprint: "balanced-learning",
+    locked_at: new Date().toISOString(),
+  },
+  season_profile_provenance: "exact",
+  season_profile_catalog: [
+    { schema_version: 1, provenance: "exact", risk_mode: "safe", risk_policy_version: "risk-limits-v1", risk_limits: { max_open_positions: 2, max_exposure_fraction: 0.05 }, drawdown_policy: { kind: "default", custom_threshold_bps: null }, effective_drawdown_bps: 800, profile_fingerprint: "safe-default-profile", learning_fingerprint: "safe-learning", locked_at: null },
+    { schema_version: 1, provenance: "exact", risk_mode: "balanced", risk_policy_version: "risk-limits-v1", risk_limits: { max_open_positions: 4, max_exposure_fraction: 0.12 }, drawdown_policy: { kind: "default", custom_threshold_bps: null }, effective_drawdown_bps: 1500, profile_fingerprint: "balanced-default-profile", learning_fingerprint: "balanced-learning", locked_at: null },
+    { schema_version: 1, provenance: "exact", risk_mode: "aggressive", risk_policy_version: "risk-limits-v1", risk_limits: { max_open_positions: 6, max_exposure_fraction: 0.2 }, drawdown_policy: { kind: "default", custom_threshold_bps: null }, effective_drawdown_bps: 2500, profile_fingerprint: "aggressive-default-profile", learning_fingerprint: "aggressive-learning", locked_at: null },
+  ],
   candidate_window_minutes: 30,
   stale_market_seconds: 20,
   provider_health: { connected: true, synthetic: true },
@@ -246,9 +290,40 @@ const snapshot: Snapshot = {
   },
 };
 
+function qualifiedLearningModel(version: string): NonNullable<Snapshot["learning"]["latest_model"]> {
+  return {
+    version,
+    created_at: new Date().toISOString(),
+    outcomes_seen: 120,
+    risk_mode: "balanced",
+    configuration_fingerprint: "config-test",
+    sample_count: 120,
+    resolved_count: 110,
+    outcome_availability_fraction: 0.9,
+    training_count: 80,
+    validation_count: 30,
+    embargoed_count: 10,
+    validation_rmse: 0.08,
+    naive_rmse: 0.1,
+    learner_correlation: 0.2,
+    baseline_correlation: 0.1,
+    learner_top_mean_return: 0.04,
+    baseline_top_mean_return: 0.01,
+    overall_mean_return: 0.01,
+    validation_in_distribution_fraction: 0.98,
+    policy_validation_count: 30,
+    policy_veto_count: 8,
+    policy_winner_veto_count: 0,
+    policy_mean_uplift: 0.03,
+    policy_uplift_lower_bound: 0.012,
+    qualified: true,
+  };
+}
+
 afterEach(() => {
   cleanup();
   window.sessionStorage.clear();
+  window.localStorage.clear();
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -486,6 +561,32 @@ test("confirms a storage policy save without waiting for background refresh", as
   );
 });
 
+test("requires explicit confirmation before a market source archives the current season", async () => {
+  const fetchMock = vi.fn().mockImplementation((input: string) => {
+    if (input === "/api/v1/mode") return new Promise(() => undefined);
+    return Promise.resolve({ ok: true, json: async () => snapshot });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("radio", { name: /Solana mainnet/ }));
+  expect(screen.getByRole("alertdialog", { name: "Switch to Solana mainnet?" })).toHaveTextContent("archives the current paper season");
+  expect(fetchMock.mock.calls.some(([path]) => path === "/api/v1/mode")).toBe(false);
+
+  fireEvent.click(screen.getByRole("button", { name: "Keep Synthetic demo" }));
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("radio", { name: /Solana mainnet/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Switch and archive season" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/v1/mode",
+    expect.objectContaining({ method: "PUT", body: JSON.stringify({ demo_mode: false }) }),
+  ));
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+});
+
 test("keeps future AI influence stages visible but unavailable", async () => {
   const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
   vi.stubGlobal("fetch", fetchMock);
@@ -493,14 +594,14 @@ test("keeps future AI influence stages visible but unavailable", async () => {
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("AI Decision Lab")).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /Qualified Coach/ })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Show AI Decision Lab details" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Shadow Reviews" }));
+  expect(screen.getAllByText("Shadow Decision Reviews").length).toBeGreaterThan(1);
   expect(screen.getByRole("button", { name: /Qualified Coach/ })).toBeDisabled();
   expect(screen.getByRole("button", { name: /Live Critic/ })).toBeDisabled();
-  expect(screen.getByRole("tooltip", { name: /available only after Shadow earns enough forward/ })).toBeInTheDocument();
+  expect(screen.getByRole("tooltip", { name: /Coach proof progress is shown above/ })).toBeInTheDocument();
   expect(screen.getByRole("tooltip", { name: /considered only after Qualified Coach proves useful/ })).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: /Shadow/ }));
+  expect(screen.getByRole("button", { name: /Live Critic/ })).toHaveTextContent("No readiness measure yet");
+  fireEvent.click(screen.getByRole("button", { name: /^ShadowObserves/ }));
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
     "/api/v1/ai-lab/mode",
@@ -515,15 +616,360 @@ test("keeps detailed learning evidence tidy until requested", async () => {
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   const evidenceToggle = screen.getByRole("button", { name: "Show learning evidence" });
-  const boundariesToggle = screen.getByRole("button", { name: "Show permanent boundaries" });
+  const proofToggle = screen.getByRole("button", { name: "Show road to influence" });
   expect(evidenceToggle).toHaveAttribute("aria-expanded", "false");
-  expect(boundariesToggle).toHaveAttribute("aria-expanded", "false");
+  expect(proofToggle).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("Forward test")).not.toBeInTheDocument();
+  expect(screen.queryByText("Learning can become selective; it cannot become reckless")).not.toBeInTheDocument();
 
   fireEvent.click(evidenceToggle);
   expect(screen.getByText("Forward test")).toBeInTheDocument();
   expect(screen.getByText("What it is noticing")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: "Safety" }));
+  expect(screen.getByText("Learning can become selective; it cannot become reckless")).toBeInTheDocument();
+});
+
+test("organizes the Learning Lab by player and remembers its per-device layout", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  const first = render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByText("Acts on fresh market evidence")).not.toBeInTheDocument();
+  expect(screen.queryByText("Forward test")).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  const evidenceToggle = screen.getByRole("button", { name: "Show learning evidence" });
+  expect(evidenceToggle).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(evidenceToggle);
+  expect(screen.getByText("Forward test")).toBeInTheDocument();
+  await waitFor(() => expect(JSON.parse(window.localStorage.getItem(learningUiKey) ?? "null")).toMatchObject({
+    version: 2,
+    initialized: true,
+    activeView: "challenger",
+    expandedSections: ["learning_evidence"],
+  }));
+  first.unmount();
+
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByRole("tab", { name: "Challenger" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.getByRole("button", { name: "Hide learning evidence" })).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText("Forward test")).toBeInTheDocument();
+});
+
+test("migrates the old Learning layout to a clean collapsed Overview", async () => {
+  window.localStorage.setItem(learningUiKey, JSON.stringify({
+    version: 1,
+    initialized: true,
+    expandedSections: ["baseline", "challenger", "local_ai", "coach", "challenger_proof", "learning_evidence"],
+    seenMilestoneIds: ["already-seen"],
+  }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByText("Forward test")).not.toBeInTheDocument();
+  await waitFor(() => expect(JSON.parse(window.localStorage.getItem(learningUiKey) ?? "null")).toMatchObject({
+    version: 2,
+    activeView: "overview",
+    expandedSections: [],
+    seenMilestoneIds: ["already-seen"],
+  }));
+
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  expect(screen.getByRole("button", { name: "Show learning evidence" })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: "Show road to influence" })).toHaveAttribute("aria-expanded", "false");
+});
+
+test("brings a remembered Learning sub-tab into view on narrow screens", async () => {
+  window.localStorage.setItem(learningUiKey, JSON.stringify({
+    version: 2,
+    initialized: true,
+    activeView: "safety",
+    expandedSections: [],
+    seenMilestoneIds: [],
+  }));
+  const scrollSpy = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  const safety = screen.getByRole("tab", { name: "Safety" });
+  expect(safety).toHaveAttribute("aria-selected", "true");
+  expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
+});
+
+test("supports keyboard navigation between Learning sub-tabs", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  const overview = screen.getByRole("tab", { name: "Overview" });
+  fireEvent.keyDown(overview, { key: "ArrowRight" });
+  const baseline = screen.getByRole("tab", { name: "Baseline" });
+  expect(baseline).toHaveAttribute("aria-selected", "true");
+  await waitFor(() => expect(baseline).toHaveFocus());
+  expect(screen.getByText("Acts on fresh market evidence")).toBeInTheDocument();
+  fireEvent.keyDown(baseline, { key: "End" });
+  const safety = screen.getByRole("tab", { name: "Safety" });
+  expect(safety).toHaveAttribute("aria-selected", "true");
+  await waitFor(() => expect(safety).toHaveFocus());
+});
+
+test("falls back safely when Learning preferences are corrupt or unavailable", async () => {
+  window.localStorage.setItem(learningUiKey, "{not-json");
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (key: string, value: string) {
+    if (key === learningUiKey) throw new DOMException("Storage unavailable", "SecurityError");
+    window.localStorage.setItem(key, value);
+  });
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+  fireEvent.click(screen.getByRole("tab", { name: "Baseline" }));
+  expect(screen.getByText("Acts on fresh market evidence")).toBeInTheDocument();
+  await waitFor(() => expect(setItem).toHaveBeenCalledWith(learningUiKey, expect.any(String)));
+  setItem.mockRestore();
+});
+
+test("synchronizes Learning layout preferences changed in another browser tab", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  window.localStorage.setItem(learningUiKey, JSON.stringify({
+    version: 2,
+    initialized: true,
+    activeView: "coach",
+    expandedSections: [],
+    seenMilestoneIds: [],
+  }));
+  fireEvent(window, new StorageEvent("storage", { key: learningUiKey }));
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+
+  await waitFor(() => expect(screen.getByRole("tab", { name: "AI Coach" })).toHaveAttribute("aria-selected", "true"));
+  expect(screen.getByText("Slow, allowlisted experiments for the fast engine · Shadow-only")).toBeInTheDocument();
+});
+
+test("keeps a new milestone unread until the persisted Overview is actually visited", async () => {
+  const readySnapshot = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      state: "ready" as const,
+      activation_available: true,
+      latest_model: qualifiedLearningModel("challenger-overview-notice"),
+    },
+  } satisfies Snapshot;
+  window.localStorage.setItem(learningUiKey, JSON.stringify({
+    version: 2,
+    initialized: true,
+    activeView: "challenger",
+    expandedSections: [],
+    seenMilestoneIds: [],
+  }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readySnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByRole("tab", { name: "Challenger" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByText("Qualified Challenger ready")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
+
+  fireEvent.click(screen.getByRole("tab", { name: /Overview/ }));
+  expect(screen.getByText("Qualified Challenger ready")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
+});
+
+test("shows authoritative proof gates separately from the next Challenger evaluation", async () => {
+  const proofSnapshot = {
+    ...snapshot,
+    demo_mode: false,
+    learning: {
+      ...snapshot.learning,
+      collecting_from_current_source: true,
+      state: "ready" as const,
+      activation_available: true,
+      outcomes_until_next_training: 4,
+      latest_model: {
+        version: "challenger-ready-1",
+        created_at: new Date().toISOString(),
+        outcomes_seen: 113,
+        risk_mode: "balanced",
+        configuration_fingerprint: "balanced-ready",
+        sample_count: 113,
+        resolved_count: 113,
+        outcome_availability_fraction: 0.74,
+        training_count: 80,
+        validation_count: 25,
+        embargoed_count: 8,
+        validation_rmse: 0.08,
+        naive_rmse: 0.1,
+        learner_correlation: 0.2,
+        baseline_correlation: 0.1,
+        learner_top_mean_return: 0.04,
+        baseline_top_mean_return: 0.01,
+        overall_mean_return: 0.01,
+        validation_in_distribution_fraction: 0.98,
+        policy_validation_count: 30,
+        policy_veto_count: 8,
+        policy_winner_veto_count: 0,
+        policy_mean_uplift: 0.03,
+        policy_uplift_lower_bound: 0.012,
+        qualified: true,
+      },
+      qualification_passed: 2,
+      qualification_total: 2,
+      qualification_gates: [
+        { id: "usable", label: "Usable outcomes", current: 113, target: 80, comparison: ">=" as const, state: "passed" as const, unit: "count" as const, detail: "Independent fee-inclusive outcomes." },
+        { id: "coverage", label: "Current executable coverage", current: 0.74, target: 0.7, comparison: ">=" as const, state: "passed" as const, unit: "fraction" as const, detail: "Current exits remain measurable." },
+      ],
+    },
+  } satisfies Snapshot;
+  window.localStorage.setItem(learningUiKey, JSON.stringify({ version: 2, initialized: true, activeView: "overview", expandedSections: [], seenMilestoneIds: [] }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => proofSnapshot }));
+  const first = render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByText("Qualified Challenger ready")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  expect(screen.getByText("Minimum 80 met · 4 more usable outcomes until the next challenger")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Show road to influence" }));
+  expect(screen.getByText("2 / 2 proof gates")).toBeInTheDocument();
+  expect(screen.getByText("Current executable coverage")).toBeInTheDocument();
+  expect(screen.getByText(/next evaluation timing is separate/i)).toBeInTheDocument();
+  await waitFor(() => expect(JSON.parse(window.localStorage.getItem(learningUiKey) ?? "null").seenMilestoneIds).toContain("challenger-ready-challenger-ready-1"));
+  first.unmount();
+
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title");
+});
+
+test("does not announce historical Learning milestones on first use", async () => {
+  const historical = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      state: "ready" as const,
+      activation_available: true,
+      latest_model: { version: "historical-ready", qualified: true } as NonNullable<Snapshot["learning"]["latest_model"]>,
+    },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => historical }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
+});
+
+test("does not describe an already active Challenger as waiting to be enabled", async () => {
+  const activeSnapshot = {
+    ...snapshot,
+    demo_mode: false,
+    learning: {
+      ...snapshot.learning,
+      mode: "active" as const,
+      state: "active" as const,
+      collecting_from_current_source: true,
+      activation_available: true,
+      latest_model: qualifiedLearningModel("challenger-active-1"),
+      active_model: qualifiedLearningModel("challenger-active-1"),
+    },
+  } satisfies Snapshot;
+  window.localStorage.setItem(learningUiKey, JSON.stringify({ version: 2, initialized: true, activeView: "overview", expandedSections: [], seenMilestoneIds: [] }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => activeSnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByText("Qualified Challenger active")).toBeInTheDocument();
+  expect(screen.queryByText("Qualified Challenger ready")).not.toBeInTheDocument();
+});
+
+test("acknowledges only milestones that were actually visible", async () => {
+  const hypotheses = ["one", "two", "three"].map((suffix) => ({
+    hypothesis_id: `coach-${suffix}`,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    cutoff_at: new Date().toISOString(),
+    kind: "entry_veto" as const,
+    state: "testing" as const,
+    title: `Coach idea ${suffix}`,
+    rationale: "A bounded Shadow experiment.",
+    risk_mode: "balanced" as const,
+    model_name: "qwen3.5:4b",
+    feature_name: "momentum_1m",
+    operator: "<=" as const,
+    threshold: -0.05,
+    hold_seconds: null,
+    discovery_observed_count: 120,
+    discovery_usable_count: 100,
+    discovery_availability_fraction: 0.83,
+    discovery_mean_uplift: 0.03,
+    discovery_uplift_lower_bound: 0.012,
+    forward_observed_count: 10,
+    forward_usable_count: 8,
+    forward_availability_fraction: 0.8,
+    forward_season_count: 1,
+    forward_mean_uplift: null,
+    forward_uplift_lower_bound: null,
+    forward_uplift_upper_bound: null,
+    minimum_forward_samples: 60,
+    minimum_availability_fraction: 0.7,
+    last_evaluated_at: new Date().toISOString(),
+    influence_applied: false as const,
+    context_active: true,
+  }));
+  const crowdedSnapshot = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      state: "ready" as const,
+      activation_available: true,
+      latest_model: qualifiedLearningModel("challenger-crowded"),
+    },
+    coach: { ...snapshot.coach, state: "testing" as const, recent_hypotheses: hypotheses },
+    ai_lab: {
+      ...snapshot.ai_lab,
+      qualification: {
+        ...snapshot.ai_lab.qualification,
+        qualified: true,
+        configuration_fingerprint: "qualified-config",
+      },
+    },
+  } satisfies Snapshot;
+  window.localStorage.setItem(learningUiKey, JSON.stringify({ version: 2, initialized: true, activeView: "overview", expandedSections: [], seenMilestoneIds: [] }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => crowdedSnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  await waitFor(() => {
+    const seen = JSON.parse(window.localStorage.getItem(learningUiKey) ?? "null").seenMilestoneIds as string[];
+    expect(seen).toEqual(expect.arrayContaining([
+      "challenger-ready-challenger-crowded",
+      "coach-coach-one-testing",
+      "coach-coach-two-testing",
+    ]));
+    expect(seen).not.toContain("coach-coach-three-testing");
+    expect(seen).not.toContain("ai-shadow-proof-qualified-config");
+  });
 });
 
 test("labels a persisted legacy guarded mode without unlocking future roadmap stages", async () => {
@@ -537,8 +983,8 @@ test("labels a persisted legacy guarded mode without unlocking future roadmap st
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Shadow Reviews" }));
   expect(screen.getByText("Qualified Coach (legacy)")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Show AI Decision Lab details" }));
   expect(screen.getByRole("button", { name: /Qualified Coach/ })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: /^Off/ }));
 
@@ -589,7 +1035,7 @@ test("shows bounded local AI failures as safely ignored instead of raw errors", 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  fireEvent.click(screen.getByRole("button", { name: "Show AI Decision Lab details" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Shadow Reviews" }));
   expect(screen.getByText("Timed out")).toBeInTheDocument();
   expect(screen.getByText("Ignored safely")).toBeInTheDocument();
   expect(screen.getByText(/missed its bounded time budget/)).toBeInTheDocument();
@@ -651,6 +1097,40 @@ test("removes an installed local model only after inline confirmation", async ()
     "/api/v1/ai-lab/models",
     expect.objectContaining({ method: "DELETE", body: JSON.stringify({ model: "qwen3.5:4b" }) }),
   ));
+});
+
+test("serializes local model mutations across every model row", async () => {
+  const installedSnapshot: Snapshot = {
+    ...snapshot,
+    ai_lab: {
+      ...snapshot.ai_lab,
+      selected_model: "qwen3.5:4b",
+      selected_model_installed: true,
+      catalog: [
+        { ...snapshot.ai_lab.catalog[0]!, installed: true, installed_bytes: 3_400_000_000, digest: "digest-four" },
+        { ...snapshot.ai_lab.catalog[0]!, name: "qwen3.5:2b", label: "Qwen 3.5 · 2B", installed: true, installed_bytes: 2_000_000_000, digest: "digest-two" },
+      ],
+    },
+  };
+  const fetchMock = vi.fn().mockImplementation((input: string) => {
+    if (input === "/api/v1/ai-lab/model") return new Promise(() => undefined);
+    return Promise.resolve({ ok: true, json: async () => installedSnapshot });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show local AI models" }));
+  expect(screen.getAllByRole("button", { name: "Remove" }).some((button) => button.title.includes("turns the AI Decision Lab off"))).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Select" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/v1/ai-lab/model",
+    expect.objectContaining({ method: "PUT", body: JSON.stringify({ model: "qwen3.5:2b" }) }),
+  ));
+  expect(screen.getByRole("button", { name: "Select" })).toBeDisabled();
+  screen.getAllByRole("button", { name: "Remove" }).forEach((button) => expect(button).toBeDisabled());
 });
 
 test("keeps core settings visible while secondary model and provider details stay tidy", async () => {
@@ -785,6 +1265,100 @@ test("shows host update commands only after preparation is ready and can resume 
   expect(await screen.findByRole("button", { name: "Prepare for upgrade" })).toBeEnabled();
 });
 
+test("shows only a recent completion for the running version and remembers dismissal", async () => {
+  const now = new Date().toISOString();
+  const completedOperation = {
+    operation_id: "upgrade-completed-current",
+    kind: "upgrade" as const,
+    state: "completed" as const,
+    stage: "restarted",
+    detail: "The app restarted safely.",
+    started_at: now,
+    updated_at: now,
+    ready_at: now,
+    completed_at: now,
+    prepared_version: "1.4.3",
+    restarted_version: snapshot.version,
+    previous_running: true,
+    auto_season_remaining_seconds: 3_600,
+    cancelled_pending_orders: 0,
+    interrupted_ai_downloads: 0,
+  };
+  const completedSnapshot: Snapshot = { ...snapshot, maintenance_operation: completedOperation };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => completedSnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.getByText(`Updated safely from v1.4.3 to v${snapshot.version}.`)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss update confirmation" }));
+  expect(screen.queryByText(`Updated safely from v1.4.3 to v${snapshot.version}.`)).not.toBeInTheDocument();
+  expect(window.localStorage.getItem(dismissedMaintenanceNoticeKey)).toBe(completedOperation.operation_id);
+
+  cleanup();
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.queryByText(`Updated safely from v1.4.3 to v${snapshot.version}.`)).not.toBeInTheDocument();
+});
+
+test("hides stale or malformed maintenance completions and labels same-version restarts accurately", async () => {
+  const now = new Date().toISOString();
+  const baseOperation = {
+    operation_id: "upgrade-completed-edge",
+    kind: "upgrade" as const,
+    state: "completed" as const,
+    stage: "restarted",
+    detail: "The app restarted safely.",
+    started_at: now,
+    updated_at: now,
+    ready_at: now,
+    completed_at: now,
+    prepared_version: snapshot.version,
+    restarted_version: snapshot.version,
+    previous_running: true,
+    auto_season_remaining_seconds: null,
+    cancelled_pending_orders: 0,
+    interrupted_ai_downloads: 0,
+  };
+  let current: Snapshot = {
+    ...snapshot,
+    maintenance_operation: { ...baseOperation, restarted_version: "1.7.2" },
+  };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => ({ ok: true, json: async () => current })));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.queryByText(/Updated safely from/)).not.toBeInTheDocument();
+
+  cleanup();
+  current = { ...snapshot, maintenance_operation: { ...baseOperation, completed_at: "not-a-date" } };
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.queryByText(/Restarted safely on/)).not.toBeInTheDocument();
+
+  cleanup();
+  current = {
+    ...snapshot,
+    maintenance_operation: {
+      ...baseOperation,
+      completed_at: new Date(Date.parse(snapshot.server_time) - 25 * 60 * 60 * 1_000).toISOString(),
+    },
+  };
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.queryByText(/Restarted safely on/)).not.toBeInTheDocument();
+
+  cleanup();
+  current = { ...snapshot, maintenance_operation: baseOperation };
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.getByText(`Restarted safely on v${snapshot.version}.`)).toBeInTheDocument();
+});
+
 test("shows ranked realized results with a link back to entry evidence", async () => {
   const fetchMock = vi.fn().mockImplementation(async (input: string) => {
     if (input.startsWith("/api/v1/leaderboard")) {
@@ -792,7 +1366,8 @@ test("shows ranked realized results with a link back to entry evidence", async (
         ok: true,
         json: async () => ({
           sort: "profit",
-          summary: { closed_trades: 1, wins: 1, losses: 0, total_realized_pnl_minor: 500_000_000, audited_exits: 1, winner_reversals: 0, average_peak_capture_fraction: 0.8 },
+          available_rows: 1,
+          summary: { closed_trades: 1, open_trades: 0, wins: 1, losses: 0, total_realized_pnl_minor: 500_000_000, audited_exits: 1, winner_reversals: 0, average_peak_capture_fraction: 0.8, total_fees_minor: 30_000, quote_currency: "SOL", quote_decimals: 9 },
           rows: [{
             mint: "mint-winner", symbol: "WIN", status: "closed", pnl_minor: 500_000_000, last_known_pnl_minor: 500_000_000,
             return_fraction: 0.5, fees_minor: 30_000, opened_at: new Date().toISOString(),
@@ -815,12 +1390,50 @@ test("shows ranked realized results with a link back to entry evidence", async (
 
   expect(await screen.findByText("Wins, losses, and the evidence behind them.")).toBeInTheDocument();
   expect(screen.getByText("WIN")).toBeInTheDocument();
-  expect(screen.getByText("+0.500 SOL")).toBeInTheDocument();
+  expect(screen.getAllByText("+0.500 SOL")).toHaveLength(2);
+  expect(screen.getByText("Realized net P/L").closest("article")).toHaveTextContent("+0.500 SOL");
+  expect(screen.getByText("Simulated fees").closest("article")).toHaveTextContent("0.00003 SOL");
+  expect(screen.getByText(/Most profit and Most loss rank closed trades/i)).toBeInTheDocument();
+  expect(screen.getByText(/1 of 1 closed trade includes saved exit evidence/i)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /Why it bought/i })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Open WIN on GMGN" })).toHaveAttribute("href", "https://gmgn.ai/sol/token/mint-winner");
   fireEvent.click(screen.getByRole("button", { name: "Take profit" }));
   expect(screen.getByText("Why it sold")).toBeInTheDocument();
   expect(screen.getByText("5m buy ratio 41% · 1m momentum -4.0%")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Take profit" }).closest(".leaderboard-outcome")).not.toBeNull();
+  expect(screen.getByText("0.00003 SOL fees")).toHaveClass("leaderboard-mobile-fee");
+});
+
+test("labels capped current-season trade views and explains where open positions appear", async () => {
+  const now = new Date().toISOString();
+  const closedRow = {
+    mint: "mint-capped", symbol: "CAP", status: "closed" as const, pnl_minor: 10_000_000, last_known_pnl_minor: 10_000_000,
+    return_fraction: 0.1, fees_minor: 50_000, opened_at: now, closed_at: now, hold_seconds: 30,
+    exit_reason: "take_profit", exit_assessment: null, peak_return_fraction: 0.1, peak_capture_fraction: null,
+    entry_risk_mode: "balanced" as const, entry_decision_id: null, mark_is_stale: false,
+    market_status: "closed" as const, mark_is_executable: true, quote_currency: "SOL" as const, quote_decimals: 9,
+  };
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      const recent = input.includes("sort=recent");
+      return { ok: true, json: async () => ({
+        sort: recent ? "recent" : "profit",
+        available_rows: recent ? 130 : 125,
+        summary: { closed_trades: 125, open_trades: 5, wins: 60, losses: 65, total_realized_pnl_minor: -1_000_000, audited_exits: 125, winner_reversals: 8, average_peak_capture_fraction: 0.5, total_fees_minor: 4_000_000, quote_currency: "SOL", quote_decimals: 9 },
+        rows: [recent ? { ...closedRow, mint: "mint-open", symbol: "OPEN", status: "open", closed_at: null, exit_reason: null, market_status: "active" } : closedRow],
+      }) };
+    }
+    return { ok: true, json: async () => snapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  expect(await screen.findByText("Showing 1 of 125 closed trades, highest net results first.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Latest" }));
+  expect(await screen.findByText("Showing 1 of 130 current-season trades, newest first.")).toBeInTheDocument();
+  expect(screen.getByText("Still open")).toBeInTheDocument();
 });
 
 test("keeps trades as the default Results view and compares durable paper seasons", async () => {
@@ -848,6 +1461,7 @@ test("keeps trades as the default Results view and compares durable paper season
   fireEvent.click(screen.getByRole("button", { name: "Results" }));
   expect(await screen.findByText("Wins, losses, and the evidence behind them.")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Trades" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText("Exit evidence and winner reversals will appear after the first closed trade.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Seasons" }));
   expect(await screen.findByText("Is the strategy improving each season?")).toBeInTheDocument();
@@ -855,7 +1469,84 @@ test("keeps trades as the default Results view and compares durable paper season
   expect(screen.getByText("Ended 1.200 SOL")).toBeInTheDocument();
   expect(screen.getByText("Now 105.00 USDC")).toBeInTheDocument();
   expect(screen.getByText("Building the baseline")).toBeInTheDocument();
+  expect(screen.getByText("Best completed").parentElement).toHaveTextContent("Season 1 · +20.0%");
   expect(screen.getByRole("img", { name: /Season 1: 67% win rate; Season 2: 50% win rate/ })).toBeInTheDocument();
+});
+
+test("filters every season view by exact profile and marks all-profile history as mixed", async () => {
+  const now = new Date().toISOString();
+  const balancedDefault = snapshot.season_profile!;
+  const balancedOff = {
+    ...balancedDefault,
+    drawdown_policy: { kind: "disabled" as const, custom_threshold_bps: null },
+    effective_drawdown_bps: null,
+    profile_fingerprint: "balanced-off-profile",
+  };
+  const aggressiveDefault = snapshot.season_profile_catalog.find((profile) => profile.risk_mode === "aggressive")!;
+  const makeSeason = (season_number: number, profile: typeof balancedDefault, status: "current" | "completed", net: number) => ({
+    season_id: `profile-season-${season_number}`, season_number, started_at: now,
+    ended_at: status === "current" ? null : now, quote_currency: "SOL" as const, quote_decimals: 9,
+    starting_minor: 1_000_000_000, ending_equity_minor: 1_000_000_000 + net,
+    last_known_ending_equity_minor: 1_000_000_000 + net, peak_equity_minor: 1_100_000_000,
+    realized_pnl_minor: net, net_pnl_minor: net, total_fees_minor: 1_000_000,
+    closed_trades: status === "current" ? 0 : 10, wins: status === "current" ? 0 : 6,
+    losses: status === "current" ? 0 : 4, break_even: 0, ending_drawdown_fraction: 0.1,
+    open_positions: status === "current" ? 1 : 0, status,
+    win_rate: status === "current" ? null : 0.6, net_return_fraction: net / 1_000_000_000,
+    duration_seconds: 3_600, risk_mode: profile.risk_mode,
+    profile_fingerprint: profile.profile_fingerprint, profile, profile_provenance: "exact" as const,
+    profile_locked_at: profile.locked_at, terminal_reason: status === "current" ? null : "manual_reset",
+  });
+  const seasons = [
+    makeSeason(1, balancedDefault, "completed", -100_000_000),
+    makeSeason(2, balancedOff, "completed", 500_000_000),
+    makeSeason(3, aggressiveDefault, "completed", 400_000_000),
+    makeSeason(4, balancedDefault, "current", 0),
+  ];
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      return { ok: true, json: async () => ({ sort: "profit", summary: { closed_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null, total_fees_minor: 0 }, rows: [] }) };
+    }
+    if (input === "/api/v1/seasons") {
+      return { ok: true, json: async () => ({
+        generated_at: now,
+        current_profile_fingerprint: balancedDefault.profile_fingerprint,
+        profiles: [
+          { profile_fingerprint: balancedDefault.profile_fingerprint, risk_mode: "balanced", drawdown_policy: balancedDefault.drawdown_policy, effective_drawdown_bps: 1_500, season_count: 2 },
+          { profile_fingerprint: balancedOff.profile_fingerprint, risk_mode: "balanced", drawdown_policy: balancedOff.drawdown_policy, effective_drawdown_bps: null, season_count: 1 },
+          { profile_fingerprint: aggressiveDefault.profile_fingerprint, risk_mode: "aggressive", drawdown_policy: aggressiveDefault.drawdown_policy, effective_drawdown_bps: 2_500, season_count: 1 },
+        ],
+        seasons,
+        summary: { season_count: 4, completed_seasons: 3, profitable_seasons: 2, losing_seasons: 1, average_win_rate: 0.6, best_return_fraction: 0.5 },
+      }) };
+    }
+    return { ok: true, json: async () => snapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
+  const selector = await screen.findByLabelText("Season profile");
+  expect(screen.getByText("Season 1")).toBeInTheDocument();
+  expect(screen.getByText("Season 4")).toBeInTheDocument();
+  expect(screen.queryByText("Season 2")).not.toBeInTheDocument();
+  expect(Array.from(selector.querySelectorAll("optgroup"), (group) => group.label)).toEqual([
+    "Balanced profiles",
+    "Aggressive profiles",
+  ]);
+
+  fireEvent.change(selector, { target: { value: "all" } });
+  expect(screen.getByText("All seasons · mixed history")).toBeInTheDocument();
+  expect(screen.getByText("Season 2")).toBeInTheDocument();
+  expect(screen.getByText("Season 3")).toBeInTheDocument();
+  expect(screen.getByText("Mixed-profile history")).toBeInTheDocument();
+
+  fireEvent.change(selector, { target: { value: balancedOff.profile_fingerprint } });
+  expect(screen.getAllByText("Balanced · DD off")).toHaveLength(2);
+  expect(screen.getByText("Season 2")).toBeInTheDocument();
+  expect(screen.queryByText("Season 1")).not.toBeInTheDocument();
 });
 
 test("scales season history past 100 scorecards without hiding or deleting older seasons", async () => {
@@ -939,6 +1630,56 @@ test("scales season history past 100 scorecards without hiding or deleting older
   expect(allRows).toHaveLength(105);
   expect(allRows.at(-1)).toBe("Season 1");
   expect(screen.queryByText(/older scorecards safely retained/)).not.toBeInTheDocument();
+});
+
+test("bounds an extreme all-season chart while preserving endpoints, extremes, and missing-data gaps", async () => {
+  const now = new Date().toISOString();
+  const seasons = Array.from({ length: 1001 }, (_, index) => {
+    const seasonNumber = index + 1;
+    const current = seasonNumber === 1001;
+    const measured = seasonNumber % 97 !== 0;
+    const winRate = measured ? ((seasonNumber * 37) % 101) / 100 : null;
+    const netReturn = ((seasonNumber % 17) - 8) / 100;
+    return {
+      season_id: `long-season-${seasonNumber}`, season_number: seasonNumber, started_at: now,
+      ended_at: current ? null : now, quote_currency: "SOL", quote_decimals: 9,
+      starting_minor: 1_000_000_000, ending_equity_minor: 1_000_000_000 + Math.round(netReturn * 1_000_000_000),
+      last_known_ending_equity_minor: 1_000_000_000 + Math.round(netReturn * 1_000_000_000), peak_equity_minor: 1_100_000_000,
+      realized_pnl_minor: Math.round(netReturn * 1_000_000_000), net_pnl_minor: Math.round(netReturn * 1_000_000_000), total_fees_minor: 1_000_000,
+      closed_trades: measured ? 100 : 0, wins: winRate === null ? 0 : Math.round(winRate * 100), losses: winRate === null ? 0 : 100 - Math.round(winRate * 100), break_even: 0,
+      ending_drawdown_fraction: 0.08, open_positions: current ? 1 : 0, status: current ? "current" : "completed",
+      win_rate: winRate, net_return_fraction: netReturn, duration_seconds: 3_600,
+    };
+  });
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      return { ok: true, json: async () => ({ sort: "profit", available_rows: 0, summary: { closed_trades: 0, open_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null, total_fees_minor: 0, quote_currency: "SOL", quote_decimals: 9 }, rows: [] }) };
+    }
+    if (input === "/api/v1/seasons") {
+      return { ok: true, json: async () => ({ generated_at: now, seasons, summary: { season_count: 1001, completed_seasons: 1000, profitable_seasons: 471, losing_seasons: 470, average_win_rate: 0.5, best_return_fraction: 0.08 } }) };
+    }
+    return { ok: true, json: async () => snapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { container } = render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
+  fireEvent.click(await screen.findByRole("button", { name: "All" }));
+  expect(screen.getByRole("img", { name: /All 1001 seasons/ })).toBeInTheDocument();
+  const sampledPoints = container.querySelectorAll(".season-line-point");
+  expect(sampledPoints.length).toBeGreaterThan(100);
+  expect(sampledPoints.length).toBeLessThanOrEqual(240);
+  expect(screen.getByText(/representative trend points · all exact values remain below/i)).toBeInTheDocument();
+  const path = container.querySelector(".season-line-path")?.getAttribute("d") ?? "";
+  expect((path.match(/M/g) ?? []).length).toBeGreaterThan(1);
+  expect(container.querySelector(".season-line-point title")?.textContent).toContain("Season 1:");
+  expect(Array.from(container.querySelectorAll(".season-line-point title")).at(-1)?.textContent).toContain("Season 1001:");
+  const sampledTitles = Array.from(container.querySelectorAll(".season-line-point title"), (node) => node.textContent ?? "");
+  expect(sampledTitles.some((title) => title.includes("100.0% win rate"))).toBe(true);
+  expect(sampledTitles.some((title) => title.includes("0.00% win rate"))).toBe(true);
+  expect(screen.getByRole("table", { name: "Paper season scorecards" }).querySelectorAll(".season-identity")).toHaveLength(20);
 });
 
 test("keeps an all-season chart honest when no season has a closed outcome", async () => {
@@ -1150,6 +1891,46 @@ test("manages provider plans and write-only keys from settings", async () => {
   });
 });
 
+test("makes replacing and clearing a write-only provider key mutually exclusive", async () => {
+  const managedSnapshot: Snapshot = {
+    ...snapshot,
+    provider_settings: {
+      ...snapshot.provider_settings,
+      providers: {
+        ...snapshot.provider_settings.providers,
+        jupiter: { ...snapshot.provider_settings.providers.jupiter, api_key_configured: true },
+      },
+    },
+  };
+  const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+    if (path === "/api/v1/provider-settings" && init?.method === "PUT") {
+      return Promise.resolve({ ok: true, json: async () => ({ provider_settings: managedSnapshot.provider_settings, source_restarted: false, paper_engine_stopped: false }) });
+    }
+    return Promise.resolve({ ok: true, json: async () => managedSnapshot });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show data providers" }));
+  fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+  const removeKey = screen.getByLabelText("Remove saved Jupiter key");
+  fireEvent.click(removeKey);
+  expect(removeKey).toBeChecked();
+  fireEvent.change(screen.getByLabelText("API key"), { target: { value: "replacement-key" } });
+  expect(removeKey).not.toBeChecked();
+  fireEvent.click(screen.getByRole("button", { name: "Save providers" }));
+
+  await waitFor(() => {
+    const call = fetchMock.mock.calls.find(([path, init]) => path === "/api/v1/provider-settings" && init?.method === "PUT");
+    expect(call).toBeDefined();
+    const body = JSON.parse(String(call?.[1]?.body)) as { secrets: { jupiter_api_key?: string; clear: string[] } };
+    expect(body.secrets.jupiter_api_key).toBe("replacement-key");
+    expect(body.secrets.clear).not.toContain("jupiter_api_key");
+  });
+});
+
 test("builds both Solana endpoints from one guided provider key", async () => {
   const managedSnapshot: Snapshot = {
     ...snapshot,
@@ -1257,9 +2038,102 @@ test("fresh installs require a bankroll and do not start trading automatically",
   await act(async () => undefined);
   expect(fetchMock).toHaveBeenCalledWith("/api/v1/portfolio/setup", expect.objectContaining({
     method: "POST",
-    body: JSON.stringify({ quote_currency: "USDC", starting_amount: "1250" }),
+    body: JSON.stringify({ quote_currency: "USDC", starting_amount: "1250", risk_mode: "balanced", drawdown_policy: { kind: "default", custom_threshold_bps: null } }),
   }));
   expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/engine/start"))).toBe(false);
+});
+
+test("chooses a deliberate first-season personality and typed drawdown policy", async () => {
+  const fresh = {
+    ...snapshot,
+    running: false,
+    portfolio: { ...snapshot.portfolio, initialized: false, cash_lamports: 0, available_cash_lamports: 0, starting_lamports: 0, equity_lamports: 0 },
+  } satisfies Snapshot;
+  const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+    ok: true,
+    json: async () => path.includes("/portfolio/setup") ? { initialized: true } : fresh,
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("radio", { name: /Aggressive/ }));
+  fireEvent.click(screen.getByText("Advanced: portfolio drawdown halt"));
+  fireEvent.click(screen.getByRole("radio", { name: "Off" }));
+  fireEvent.click(screen.getByRole("button", { name: "Create paper bankroll" }));
+
+  await act(async () => undefined);
+  expect(fetchMock).toHaveBeenCalledWith("/api/v1/portfolio/setup", expect.objectContaining({
+    body: JSON.stringify({ quote_currency: "SOL", starting_amount: "10", risk_mode: "aggressive", drawdown_policy: { kind: "disabled", custom_threshold_bps: null } }),
+  }));
+});
+
+test("confirms a locked drawdown-only profile change before starting a new season", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("Advanced drawdown setting"));
+  fireEvent.click(screen.getByRole("radio", { name: /Off/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
+  expect(screen.getByRole("dialog", { name: /Balanced · DD off/ })).toBeInTheDocument();
+  expect(screen.getByRole("radio", { name: /Finish safely/ })).toBeChecked();
+  expect(screen.getByRole("dialog").parentElement).toHaveClass("profile-confirm-backdrop");
+  fireEvent.click(screen.getByRole("button", { name: "Change profile safely" }));
+
+  await act(async () => undefined);
+  expect(fetchMock).toHaveBeenCalledWith("/api/v1/risk", expect.objectContaining({
+    body: JSON.stringify({ mode: "balanced", drawdown_policy: { kind: "disabled", custom_threshold_bps: null }, transition_strategy: "finish_safely" }),
+  }));
+});
+
+test("can end a locked season now without implying fabricated exits", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("Advanced drawdown setting"));
+  fireEvent.click(screen.getByRole("radio", { name: /Off/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
+  fireEvent.click(screen.getByRole("radio", { name: /End season now/ }));
+  expect(screen.getByText(/never as a made-up fill, win or loss/i)).toBeInTheDocument();
+  expect(screen.getByText(/excluded from strategy comparisons/i)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "End season & change profile" }));
+
+  await act(async () => undefined);
+  expect(fetchMock).toHaveBeenCalledWith("/api/v1/risk", expect.objectContaining({
+    body: JSON.stringify({ mode: "balanced", drawdown_policy: { kind: "disabled", custom_threshold_bps: null }, transition_strategy: "end_now" }),
+  }));
+});
+
+test("cancels the centered profile dialog with Escape", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Advanced drawdown setting"));
+  fireEvent.click(screen.getByRole("radio", { name: /Off/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  fireEvent.keyDown(document, { key: "Escape" });
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+});
+
+test("canonicalizes a custom drawdown equal to the personality default", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("Advanced drawdown setting"));
+  fireEvent.click(screen.getByRole("radio", { name: /Custom/ }));
+  fireEvent.change(screen.getByLabelText("Custom drawdown percentage"), {
+    target: { value: "15" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
+
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.some(([path]) => path === "/api/v1/risk")).toBe(false);
 });
 
 test("stops and resumes the paper engine through explicit controls", async () => {
@@ -1282,11 +2156,12 @@ test("shows learning progress without mixing demo outcomes", async () => {
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("Experience earns influence—slowly.")).toBeInTheDocument();
+  expect(screen.getByText("Three players. One safely bounded team.")).toBeInTheDocument();
   expect(screen.getByText(/Switch to Solana mainnet when you want to collect/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByText("Demo experience stays separate")).toBeInTheDocument();
   expect(screen.getByText("0 / 80")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Use qualified learner" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Use qualified Challenger" })).toBeDisabled();
 
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   expect(screen.getByText(/learned experience remain/)).toBeInTheDocument();
@@ -1342,6 +2217,7 @@ test("separates the training minimum from progress toward the next challenger", 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByText("976 usable")).toBeInTheDocument();
   expect(screen.getByText("Minimum 80 met · 1 more usable outcome until the next challenger")).toBeInTheDocument();
   expect(screen.queryByText("976 / 80")).not.toBeInTheDocument();
@@ -1358,7 +2234,7 @@ test("shows the risk rule that caused a sell fill", async () => {
       mint: "mint-aaa",
       symbol: "AAA",
       side: "sell",
-      filled_at: new Date().toISOString(),
+      filled_at: "2026-08-30T10:18:35Z",
       token_units: 1_000,
       gross_sol_lamports: 20_000_000,
       protocol_fee_lamports: 250_000,
@@ -1388,7 +2264,93 @@ test("shows the risk rule that caused a sell fill", async () => {
 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+  expect(screen.getByRole("table", { name: "Current-season paper fill receipts" })).toBeInTheDocument();
+  expect(screen.getByRole("columnheader", { name: "Net flow" })).toBeInTheDocument();
   expect(screen.getByText("pump_curve · Stop loss")).toBeInTheDocument();
+  expect(screen.getByText("+0.01972 SOL")).toBeInTheDocument();
+  expect(screen.getByText("0.00025 SOL protocol · 0.00003 SOL network")).toBeInTheDocument();
+  expect(screen.getAllByText("0.20%").length).toBeGreaterThanOrEqual(2);
+  expect(screen.getAllByText("1.1s").length).toBeGreaterThanOrEqual(2);
+  expect(screen.getByText("1,100ms exact")).toBeInTheDocument();
+  expect(screen.getByText(/2026/)).toBeInTheDocument();
+  expect(screen.getByText("1 current-season receipt · newest first")).toBeInTheDocument();
+  const receiptSummary = screen.getByText("Visible receipts").closest(".stat-card");
+  expect(receiptSummary).toHaveTextContent("1");
+  expect(receiptSummary).toHaveTextContent("0 buys · 1 sell");
+  const row = screen.getByText("AAA").closest("[role='row']");
+  expect(row?.querySelectorAll("[role='cell']")).toHaveLength(7);
+  expect(Array.from(row?.querySelectorAll("[data-label]") ?? []).map((cell) => cell.getAttribute("data-label"))).toEqual([
+    "Time", "Token", "Side", "Net SOL", "Fees", "Impact", "Latency",
+  ]);
+});
+
+test("keeps an empty Replay honest without inventing execution statistics", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+  expect(screen.getByText("No fills yet")).toBeInTheDocument();
+  expect(screen.getByText("0 current-season receipts · newest first")).toBeInTheDocument();
+  expect(screen.getByText("Visible fees").closest(".stat-card")).toHaveTextContent("—");
+  expect(screen.getByText("Average impact").closest(".stat-card")).toHaveTextContent("—");
+  expect(screen.getByText("Median latency").closest(".stat-card")).toHaveTextContent("—");
+});
+
+test("keeps USDC buy receipts signed correctly at the latest-30 boundary", async () => {
+  const usdcBuy = {
+    fill_id: "usdc-buy",
+    order_id: "usdc-order",
+    mint: "mint-with-a-very-long-symbol",
+    symbol: "A-VERY-LONG-TOKEN-SYMBOL-THAT-MUST-WRAP",
+    side: "buy",
+    filled_at: "2026-08-30T10:18:35Z",
+    token_units: 1_000,
+    gross_sol_lamports: 1_200_000,
+    protocol_fee_lamports: 40_000,
+    network_fee_lamports: 10_000,
+    net_sol_lamports: 1_250_000,
+    price_impact_fraction: 0,
+    latency_ms: 18_882,
+    venue: "a-very-long-venue-name-that-must-wrap-without-overflow",
+    assumptions: [],
+    account_currency: "USDC",
+    account_decimals: 6,
+    account_gross_minor: 1_200_000,
+    account_protocol_fee_minor: 40_000,
+    account_network_fee_minor: 10_000,
+    account_net_minor: 1_250_000,
+    sol_usd_price: 150,
+    exit_assessment: null,
+    position_opened_at: null,
+    entry_risk_mode: "balanced",
+    peak_account_minor: 0,
+    realized_return_fraction: null,
+    peak_return_fraction: null,
+  } satisfies Fill;
+  const replaySnapshot: Snapshot = {
+    ...snapshot,
+    portfolio: { ...snapshot.portfolio, quote_currency: "USDC", quote_decimals: 6 },
+    fills: Array.from({ length: 30 }, (_, index) => ({
+      ...usdcBuy,
+      fill_id: `usdc-buy-${index}`,
+      order_id: `usdc-order-${index}`,
+    })),
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => replaySnapshot }));
+  render(<App />);
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+  expect(screen.getByText("Latest 30 current-season receipts · newest first")).toBeInTheDocument();
+  expect(screen.getByText(/newest 30 receipts/)).toBeInTheDocument();
+  expect(screen.getByText("Visible receipts").closest(".stat-card")).toHaveTextContent("30 buys · 0 sells · latest 30");
+  expect(screen.getAllByText("−1.25 USDC")).toHaveLength(30);
+  expect(screen.getAllByText("0.04 USDC protocol · 0.01 USDC network")).toHaveLength(30);
+  expect(screen.getAllByText("19s")).toHaveLength(31);
+  expect(screen.getAllByText("18,882ms exact")).toHaveLength(30);
+  expect(screen.getAllByLabelText("Latency 19s, 18,882 milliseconds exact")).toHaveLength(30);
+  expect(screen.getAllByText("A-VERY-LONG-TOKEN-SYMBOL-THAT-MUST-WRAP")).toHaveLength(30);
 });
 
 test("shows that stopped positions are preserved and offers resume", async () => {
@@ -1490,6 +2452,148 @@ test("keeps dormant holdings compact and reports that they do not use active slo
   fireEvent.click(toggle);
   expect(screen.getByRole("button", { name: "Hide Dormant positions" })).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByText("DORMANTCOIN")).toBeInTheDocument();
+});
+
+test("keeps Arena labels honest and links its decision preview to the full journal", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+
+  expect(await screen.findByText("this season")).toBeInTheDocument();
+  expect(screen.queryByText("all time")).not.toBeInTheDocument();
+  expect(screen.getByText("Radar is warming up")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "View all decisions" }));
+  expect(screen.getByText("Best signals first. Noise tucked away.")).toBeInTheDocument();
+});
+
+test("makes the Arena market radar compact by default on mobile and user-expandable", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+
+  const toggle = await screen.findByRole("button", { name: "Show Market radar" });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  expect(document.getElementById("market-radar-grid")).toHaveAttribute("hidden");
+  expect(screen.getByText("Radar is warming up")).not.toBeVisible();
+
+  fireEvent.click(toggle);
+  expect(screen.getByRole("button", { name: "Hide Market radar" })).toHaveAttribute("aria-expanded", "true");
+  expect(document.getElementById("market-radar-grid")).not.toHaveAttribute("hidden");
+  expect(screen.getByText("Radar is warming up")).toBeVisible();
+});
+
+test("remembers Arena collapse choices in this browser across remounts", async () => {
+  const personalized = {
+    ...snapshot,
+    portfolio: { ...snapshot.portfolio, positions: [activePosition] },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => personalized }));
+  const first = render(<App />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Hide Active positions" }));
+  fireEvent.click(screen.getByRole("button", { name: "Hide Market radar" }));
+  expect(document.getElementById("market-radar-grid")).toHaveClass("is-collapsed");
+  expect(document.getElementById("market-radar-grid")).toHaveAttribute("aria-hidden", "true");
+  fireEvent.click(screen.getByRole("button", { name: "Show Market radar" }));
+  expect(screen.getByRole("button", { name: "Hide Market radar" })).toHaveAttribute("aria-expanded", "true");
+  expect(document.getElementById("market-radar-grid")).not.toHaveClass("is-collapsed");
+  fireEvent.click(screen.getByRole("button", { name: "Hide Market radar" }));
+  await waitFor(() => expect(JSON.parse(window.localStorage.getItem(arenaLayoutKey) ?? "null")).toMatchObject({
+    version: 1,
+    marketRadarCollapsed: true,
+    collapsedPositionGroups: expect.arrayContaining(["active", "dormant"]),
+  }));
+  first.unmount();
+
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "Show Active positions" })).toHaveAttribute("aria-expanded", "false");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Show Market radar" })).toHaveAttribute("aria-expanded", "false"));
+  expect(screen.queryByText("PERSONALIZED")).not.toBeInTheDocument();
+});
+
+test("lets a saved desktop-style Arena layout override the mobile default", async () => {
+  vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+  window.localStorage.setItem(arenaLayoutKey, JSON.stringify({
+    version: 1,
+    marketRadarCollapsed: false,
+    collapsedPositionGroups: [],
+  }));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "Hide Market radar" })).toHaveAttribute("aria-expanded", "true");
+});
+
+test("ignores corrupt and unknown Arena layout values", async () => {
+  window.localStorage.setItem(arenaLayoutKey, "{not-json");
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  const corrupt = render(<App />);
+  expect(await screen.findByRole("button", { name: "Hide Market radar" })).toHaveAttribute("aria-expanded", "true");
+  corrupt.unmount();
+
+  window.localStorage.setItem(arenaLayoutKey, JSON.stringify({
+    version: 1,
+    marketRadarCollapsed: "not-a-boolean",
+    collapsedPositionGroups: ["unknown", 42],
+  }));
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "Hide Market radar" })).toHaveAttribute("aria-expanded", "true");
+});
+
+test("falls back safely when Arena layout storage is unavailable", async () => {
+  const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (key: string) {
+    if (key === arenaLayoutKey) throw new DOMException("Storage unavailable", "SecurityError");
+    return null;
+  });
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (key: string) {
+    if (key === arenaLayoutKey) throw new DOMException("Storage unavailable", "SecurityError");
+  });
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+
+  const toggle = await screen.findByRole("button", { name: "Hide Market radar" });
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(toggle);
+  expect(screen.getByRole("button", { name: "Show Market radar" })).toHaveAttribute("aria-expanded", "false");
+  expect(getItem).toHaveBeenCalledWith(arenaLayoutKey);
+  expect(setItem).toHaveBeenCalledWith(arenaLayoutKey, expect.any(String));
+});
+
+test("synchronizes Arena preferences changed in another browser tab", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "Hide Market radar" })).toBeInTheDocument();
+
+  window.localStorage.setItem(arenaLayoutKey, JSON.stringify({
+    version: 1,
+    marketRadarCollapsed: true,
+    collapsedPositionGroups: ["dormant"],
+  }));
+  fireEvent(window, new StorageEvent("storage", { key: arenaLayoutKey }));
+
+  await waitFor(() => expect(screen.getByRole("button", { name: "Show Market radar" })).toHaveAttribute("aria-expanded", "false"));
+});
+
+test("explains that a stopped engine still lets the empty market radar observe", async () => {
+  const stopped = { ...snapshot, running: false } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => stopped }));
+  render(<App />);
+
+  expect(await screen.findByText("Market observations continue while the paper engine is stopped; recent tokens will appear when enough evidence arrives.")).toBeInTheDocument();
+});
+
+test("explains the two Arena equity chart spacing modes", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+
+  const journey = await screen.findByRole("button", { name: "Journey" });
+  const elapsed = screen.getByRole("button", { name: "Elapsed time" });
+  expect(journey).toHaveAttribute("title", expect.stringContaining("collapses repetitive unchanged checkpoints"));
+  expect(elapsed).toHaveAttribute("title", expect.stringContaining("real waiting time"));
+  expect(screen.getByText(/unchanged waits collapsed/)).toBeInTheDocument();
+
+  fireEvent.click(elapsed);
+  expect(screen.getByText("True elapsed-time spacing · unchanged waits preserved")).toBeInTheDocument();
 });
 
 test("keeps connection failures in the compact status panel", async () => {
@@ -1658,8 +2762,9 @@ test("shows a forward-only AI coach experiment without implying trading influenc
 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  const coachCard = await screen.findByText("AI Coach Room");
-  expect(coachCard.closest("article")).toHaveTextContent("InfluenceNone");
-  expect(coachCard.closest("article")).toHaveTextContent("24 / 60 usable");
+  fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
+  const coachCard = screen.getByText("Slow, allowlisted experiments for the fast engine · Shadow-only").closest("article");
+  expect(coachCard).toHaveTextContent("InfluenceNone");
+  expect(coachCard).toHaveTextContent("24 / 60 usable");
   expect(screen.getByRole("progressbar", { name: "Coach forward-test progress" })).toHaveAttribute("aria-valuenow", "24");
 });

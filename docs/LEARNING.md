@@ -18,6 +18,34 @@ the same integer curve quote and configured protocol/network costs as the paper 
 horizon has no usable future observation within its grace period, it stays **unknown**; it is never
 silently treated as zero or as a loss.
 
+Starting with the `stream-integrity-v4` cohort, each eligible lesson also freezes structural
+market evidence available from the same five-minute Solana stream: the share of one-trade
+wallets, wallets that rapidly bought and sold, volume attributable to those round trips,
+absolute net quote flow relative to gross volume, buy/sell alternation, two-significant-digit
+amount clustering, slot concentration, and price-direction consistency. Transaction-signature
+bundling is retained for explanation when signature coverage is sufficient, but is not required
+by the first learner model.
+
+These are descriptive measurements, not a scam probability. Organic viral launches, market
+makers, copy bots and legitimate bundled transactions can each produce one or more similar
+patterns. The baseline therefore does not use the new measurements as a gate or score change.
+The challenger learns their relationship to later net outcomes, while the Coach may propose only
+an allowlisted shadow veto experiment that must pass the same independent forward-evidence
+process as every other coaching idea.
+
+Wallet, amount, slot and price coverage must each be sufficient before a new learner row is
+created. Process startup, a WebSocket reconnect, fallback activation or an explicit market-source
+change begins a fresh five-minute source-wide continuity window only after provider recovery is
+confirmed; disconnected time never ages the safeguard. Bounded queue shedding and an exceptional
+worker-batch failure start the same clean-window requirement only for represented mints, so
+unrelated tokens can continue to learn from complete evidence. A failed event with no identity or
+a saturated bounded gap tracker fails closed for the whole source. Failed batches are not replayed,
+avoiding duplicate broker side effects. Protected open-position and already-saved outcome events
+continue normally. Missing evidence remains `unknown`; it is never converted to zero. The evidence
+schema is included in the configuration fingerprint and the model family is `learner-v4`, so all
+older observations and models remain readable and auditable but cannot be mixed into the new
+forward cohort as if those fields and continuity guarantees had existed at the time.
+
 The five-minute net return remains the entry challenger's training target. The five horizons also
 form conservative hold-timing comparisons against the exact normal review for each mode: 5 minutes
 for Safe, 10 for Balanced, and 20 for Aggressive. Reported P/L remains unknown when no executable
@@ -31,13 +59,24 @@ Training begins after at least 80 usable live outcomes and reruns after ten addi
 Eighty samples are only enough to attempt a challenger; they are not proof of an edge.
 
 The local learner is a regularized linear model implemented locally with no cloud AI, GPU, or extra
-Python dependency. It uses bounded, named features already understood by the baseline. Older
+Python dependency. It uses bounded, named point-in-time features, including the new stream
+integrity evidence. Older
 observations form the training section and the newest third form a forward validation section,
 with at least 20 validation examples. Validation is chronological, never randomly shuffled. Any
 training outcome observed on or after the first validation decision is embargoed, so overlapping
 five-minute labels cannot leak future information across the split.
 
-A model is fitted only within one exact risk mode and decision-relevant configuration. A model
+A model is fitted only within one exact risk mode and decision-relevant configuration. Risk
+personality is the core learning cohort: Safer evidence cannot qualify Balanced or Aggressive,
+and changing personality never deletes the older cohort. The season-profile fingerprint is a
+separate comparison identity. Balanced Default DD, custom DD and DD Off seasons therefore share
+the Balanced learning lineage because the override changes portfolio admission, not the saved
+point-in-time token target, quote math, fees, feature vector or forward outcome. Each observation
+still freezes its season ID and exact profile fingerprint, and a candidate blocked by drawdown,
+cash, exposure, capacity or conversion is marked non-actionable instead of being credited to a
+Challenger veto.
+
+A model
 qualifies only when its untouched validation section:
 
 - comes from a recent 1,000-observation window with at least 70% executable five-minute outcomes;
@@ -115,8 +154,11 @@ current version has accumulated 30 unseen usable outcomes. This prevents a ten-o
 carousel while still allowing the learner to adapt over time.
 
 Changing risk mode or a decision-relevant provider/fee configuration immediately returns an
-Active learner to Shadow. Older model versions remain immutable audit records, while their saved
-observations can train a new generation only when their risk/configuration provenance matches.
+Active learner to Shadow. A drawdown-only season transition within the same personality does not
+create a false model generation or turn old observations into new evidence; compatible Active
+monitoring continues normally. Older model versions remain immutable audit records, while their
+saved observations can train a new generation only when their risk/configuration provenance
+matches.
 
 These bounds are cautious decision rules, not formal 95% guarantees: token launches can be
 correlated and returns are not normally distributed. The automatic response to a false alarm is

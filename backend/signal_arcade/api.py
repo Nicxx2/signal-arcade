@@ -20,11 +20,18 @@ from starlette.responses import Response
 
 from . import __version__
 from .config import Settings, load_settings
-from .models import AiDecisionMode, LearningMode, QuoteCurrency, RiskMode
+from .models import (
+    AiDecisionMode,
+    LearningMode,
+    ProfileTransitionStrategy,
+    QuoteCurrency,
+    RiskMode,
+)
 from .orchestrator import Orchestrator
 from .provider_settings import ProviderConfiguration, validate_endpoint
 from .providers.http import ProviderError
 from .redaction import redact_secrets
+from .risk_profiles import DrawdownPolicy, season_profile_catalog
 
 _DATABASE_HEALTH_TIMEOUT_SECONDS = 0.5
 
@@ -99,7 +106,11 @@ class ModeRequest(BaseModel):
 
 
 class RiskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     mode: RiskMode
+    drawdown_policy: DrawdownPolicy = Field(default_factory=DrawdownPolicy)
+    transition_strategy: ProfileTransitionStrategy = ProfileTransitionStrategy.FINISH_SAFELY
 
 
 class AutoNewSeasonRequest(BaseModel):
@@ -136,8 +147,12 @@ class UpgradePreparationRequest(BaseModel):
 
 
 class PortfolioSetupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     quote_currency: QuoteCurrency
     starting_amount: Decimal = Field(gt=0, le=1_000_000_000)
+    risk_mode: RiskMode | None = None
+    drawdown_policy: DrawdownPolicy = Field(default_factory=DrawdownPolicy)
 
 
 class StorageSettingsRequest(BaseModel):
@@ -325,10 +340,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return saved.model_dump(mode="json")
 
     @app.put("/api/v1/risk", dependencies=[Depends(normal_operation)])
-    async def set_risk(body: RiskRequest) -> dict[str, str]:
-        orchestrator.set_risk_mode(body.mode)
+    async def set_risk(body: RiskRequest) -> dict[str, Any]:
+        try:
+            result = await orchestrator.request_season_profile(
+                body.mode,
+                body.drawdown_policy,
+                transition_strategy=body.transition_strategy,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
-        return {"mode": body.mode.value}
+        return {"mode": body.mode.value, **result}
+
+    @app.get("/api/v1/risk-profiles")
+    async def risk_profiles() -> dict[str, Any]:
+        return {"schema_version": 1, "profiles": season_profile_catalog()}
 
     @app.put("/api/v1/season-automation", dependencies=[Depends(normal_operation)])
     async def set_season_automation(body: AutoNewSeasonRequest) -> dict[str, Any]:
@@ -396,7 +422,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.put("/api/v1/mode", dependencies=[Depends(normal_operation)])
     async def set_mode(body: ModeRequest) -> dict[str, bool]:
-        await orchestrator.set_demo_mode(body.demo_mode)
+        try:
+            await orchestrator.set_demo_mode(body.demo_mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
         return {"demo_mode": body.demo_mode}
 
@@ -438,7 +467,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if body.quote_currency == QuoteCurrency.SOL and body.starting_amount > 1_000_000:
             raise HTTPException(status_code=422, detail="SOL bankroll is unreasonably large")
         try:
-            await orchestrator.setup_portfolio(body.quote_currency, int(scaled))
+            await orchestrator.setup_portfolio(
+                body.quote_currency,
+                int(scaled),
+                risk_mode=body.risk_mode,
+                drawdown_policy=body.drawdown_policy,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
@@ -460,7 +494,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/engine/stop", dependencies=[Depends(normal_operation)])
     async def stop_engine() -> dict[str, Any]:
-        cancelled = await orchestrator.pause_trading()
+        try:
+            cancelled = await orchestrator.pause_trading()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
         return {"running": False, "cancelled_pending_orders": cancelled}
 

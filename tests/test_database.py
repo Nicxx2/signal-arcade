@@ -223,6 +223,34 @@ def test_initialized_portfolio_cannot_reset_without_a_durable_season_summary(
     database.close()
 
 
+def test_reset_cannot_retire_inventory_without_matching_audit_records(tmp_path: Path) -> None:
+    database = Database(tmp_path / "unresolved-audit.sqlite3")
+    database.initialize_portfolio("season-audit", 1_000_000_000, "SOL")
+    summary = {
+        "ending_equity_minor": 900_000_000,
+        "last_known_ending_equity_minor": 950_000_000,
+        "peak_equity_minor": 1_000_000_000,
+        "realized_pnl_minor": 0,
+        "net_pnl_minor": -100_000_000,
+        "total_fees_minor": 0,
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "break_even": 0,
+        "ending_drawdown_fraction": 0.1,
+        "open_positions": 1,
+    }
+
+    with pytest.raises(ValueError, match="must match unresolved inventory"):
+        database.reset_paper_state(summary)
+
+    assert database.get_setting("portfolio_initialized") is True
+    assert database.get_setting("season_id") == "season-audit"
+    assert database.ledger_balance("cash") == 1_000_000_000
+    assert database.list_paper_seasons()[0]["status"] == "current"
+    database.close()
+
+
 def test_history_pruning_keeps_non_trade_evidence(tmp_path: Path) -> None:
     database = Database(tmp_path / "arcade.sqlite3")
     now = datetime.now(UTC)

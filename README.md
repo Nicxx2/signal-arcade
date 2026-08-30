@@ -1,13 +1,13 @@
-# 🧠 Signal Arcade v1.6.6
+# 🧠 Signal Arcade v1.8.0
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
 Signal Arcade watches official Pump and PumpSwap program events, ranks opportunities with a fast
 deterministic engine, simulates fee-aware paper fills, and learns from what happened afterward.
 An optional local AI coach can observe the same saved outcomes without slowing or controlling the
-trading path.
+trading path. No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.6.6-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.8.0-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -20,28 +20,30 @@ trading path.
 
 ## 📸 See it in action
 
-These screenshots come from a running v1.6.4 paper season. They show genuine simulated results,
-including losing seasons and incomplete evidence rather than a guaranteed-profit demo.
+These screenshots come from the running v1.8.0 app. They show genuine paper results—including
+losing seasons, legacy history and evidence that is still collecting—instead of a staged
+guaranteed-profit demo.
 
 ### The Arena
 
-Paper equity, risk personality, unattended season continuity, positions and the latest decisions
-stay together without hiding the assumptions behind the score.
+Paper equity, the season-locked risk profile, drawdown policy, unattended continuity, positions
+and recent decisions stay together without hiding the assumptions behind the score.
 
 ![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/01-arena-overview.png)
 
 ### Season progress
 
-Compare win rate, drawdown, fees and net return across every retained paper season. Old history
-stays available while the chart scales to recent or selected ranges.
+Compare win rate, drawdown, fees and net return across every retained paper season. V1.8 seasons
+freeze their exact profile for like-for-like filters; preserved pre-profile seasons remain clearly
+labelled as legacy history.
 
 ![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/03-season-progress.png)
 
 ### Learning Lab and AI Coach Room
 
-The baseline remains in control until a challenger earns qualification on later unseen outcomes.
-The slow local AI coach proposes only deterministic, allowlisted experiments and collects forward
-evidence separately from historical screening.
+The deterministic baseline remains in control until a statistical challenger earns qualification
+on later unseen outcomes. The local AI coach proposes only bounded, allowlisted experiments and
+collects forward evidence separately from historical screening.
 
 ![Signal Arcade Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/04-learning-lab.png)
 
@@ -51,6 +53,10 @@ evidence separately from historical screening.
 ### Decision board
 
 ![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/02-decision-board.png)
+
+### Replay receipts and modeled friction
+
+![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/08-replay-receipts.png)
 
 ### Provider budgets and pacing
 
@@ -70,26 +76,31 @@ evidence separately from historical screening.
 
 ## ⚡ At a glance
 
-- 🎮 **Paper seasons** — Start with virtual SOL or USDC, let the engine run, and compare retained
-  season scorecards over time.
-- 🧠 **Fast, explainable decisions** — Opportunity, danger, confidence, execution and modeled
-  friction are saved with the exact point-in-time evidence used.
-- 📚 **A learner that must earn influence** — Challengers train on chronological outcomes,
-  validate without look-ahead leakage and automatically roll back if later evidence deteriorates.
-- 🤖 **Optional local AI coach** — Ollama runs asynchronously on ordinary CPU-first machines;
-  Shadow coaching cannot create, resize, delay or exit a paper position.
-- 🧾 **Auditable execution** — Immutable entry checkpoints, latency-aware fills, protocol fees,
-  modeled network fees, impact and double-entry accounting.
-- 🛡️ **Visible risk controls** — Safer, Balanced and Aggressive personalities never disable stale
-  data, mint safety, drawdown or structural route gates.
-- 🔄 **Unattended continuity** — Auto new season can wait from 1–24 hours and only rolls when a
-  sustained risk pause, dormant holdings and healthy data prove the current season cannot continue.
-- 🔌 **Keyless by default** — Public Solana RPC and DEX Screener work without subscriptions;
-  Helius, Alchemy, SolanaTracker RPC and custom free/paid limits are optional.
-- 📱 **Responsive web UI** — Live WebSocket updates automatically fall back to polling without
-  stopping the backend engine.
-- 🐳 **One Docker stack** — The app and private Ollama companion run together with persistent,
-  separately bounded data and model volumes.
+| Player | What it does | Influence in v1.8 |
+|---|---|---|
+| **Fast Baseline** | Scores fresh point-in-time evidence with deterministic rules | Runs the paper portfolio |
+| **Statistical Challenger** | Learns chronologically from fee-inclusive forward outcomes | Shadow until it passes every proof gate; monitored after activation |
+| **Local AI Coach** | Selects from deterministic, allowlisted experiments when the engine is quiet | Shadow only; cannot change a trade |
+
+- 🎮 **Comparable paper seasons** — Every new season locks one Safer, Balanced or Aggressive
+  profile and a typed drawdown policy. Profile changes can finish safely or use a bounded end-now
+  path that records unresolved inventory honestly and excludes manual endings from performance
+  claims.
+- 🧠 **Explainable decisions and fills** — Opportunity, danger, confidence, execution, fees,
+  impact and latency remain attached to the exact point-in-time evidence used.
+- 📚 **Learning must earn trust** — Challengers train and validate chronologically with outcome
+  embargoes, forward proof, minimum evidence and automatic rollback when later results deteriorate.
+- 🔎 **Manipulation-aware observations** — Wallet churn, rapid round trips, gross-versus-net flow,
+  trade regularity and evidence coverage inform shadow learning without becoming an unsupported
+  scam label or silently changing the baseline.
+- 🛡️ **Permanent safety boundaries** — A drawdown override changes only the portfolio halt. Stop,
+  exposure, stale-data, mint, route and executable-exit protections remain active.
+- 🔄 **Built for unattended runs** — Auto season rollover uses 1–24 hours of verified healthy,
+  dormant evidence; brief source interruptions pause the clock instead of becoming proof.
+- 🔌 **Keyless and local by default** — Public Solana RPC and DEX Screener work without accounts;
+  guided or custom providers and the private Ollama companion are optional.
+- 📱 **Responsive and resilient** — Desktop and mobile views use live updates with automatic
+  polling fallback, while persistent data and model volumes survive container updates.
 
 ---
 
@@ -109,7 +120,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.6.6
+    image: nicxx2/signal-arcade:1.8.0
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -255,7 +266,10 @@ evidence may extend a winner past its normal review point, but it cannot remove 
 - Small or lucky cohorts cannot activate a challenger.
 - Active learners continue monitoring later unseen outcomes and roll back on deterioration.
 - Demo tokens can never train or activate the live-paper learner.
-- Learning history persists across paper seasons while each season keeps its own scorecard.
+- Learning history persists across paper seasons and remains separated by risk personality.
+- Default, custom and disabled drawdown experiments keep distinct season scorecards while sharing
+  the same personality learning lineage; blocked opportunities are still recorded as
+  non-actionable and cannot inflate Challenger proof.
 
 See the full [Learning specification](https://github.com/Nicxx2/signal-arcade/blob/main/docs/LEARNING.md).
 

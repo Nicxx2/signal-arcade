@@ -73,10 +73,35 @@ removing positions; the observation feed remains online so Resume can reassess f
 fill, filled order, balanced ledger entries, position change, and realized P/L are
 one SQLite transaction; an injected failure rolls every effect back before in-memory state moves.
 
+Every modern paper season also stores one immutable profile snapshot: risk personality, the exact
+risk-limit values and policy version, typed portfolio-drawdown policy, effective threshold, and a
+stable profile fingerprint. A unique partial index permits only one current season. A locked
+profile change is a durable `profile_transition` operation: new buys freeze, unfilled buys cancel,
+owned positions and pending exits continue under their entry provenance, and the completed-season
+archive plus successor creation commit atomically. Restart reconciliation treats the old profile
+as authoritative before that boundary and the new profile as authoritative after it, so retries
+cannot create two current seasons. Pre-profile history remains visible as Legacy / Unknown rather
+than being guessed into a modern cohort.
+
+An explicit `end_now` transition stores a bounded settlement deadline in that same operation.
+Executable positions receive normal paper sell orders; any remaining position is copied into the
+append-only `unresolved_paper_positions` audit before live paper tables are cleared. Season rows
+carry separate result-quality and comparability fields, so a real manual fill remains accounting
+truth while neither user-selected timing nor unresolved inventory can be credited as strategy
+performance. Unknown transition values fail closed to the normal safe-drain behavior.
+
 Learning observations, model versions, AI assessments, and operational incidents also recover
 from SQLite. Learning and AI audit records intentionally survive a paper-bankroll reset. Demo
 events never train the statistical learner or qualify Guarded AI. Missing future observations
 remain unknown rather than becoming invented returns.
+
+Season and learning identity are deliberately separate. The season-profile fingerprint includes
+the drawdown experiment for apples-to-apples portfolio comparison. The decision-configuration
+fingerprint includes the risk personality and trade-learning inputs, but not the portfolio
+drawdown override. Default, custom and disabled drawdown seasons can therefore contribute honest
+forward evidence to the same personality Challenger while every observation retains its exact
+season and profile provenance. A portfolio-blocked entry is frozen as non-actionable and cannot be
+credited to a veto policy.
 
 ## Trust boundaries
 

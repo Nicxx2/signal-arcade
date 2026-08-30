@@ -141,6 +141,138 @@ def test_missing_enrichment_is_unknown_not_zero() -> None:
     assert snapshot.values["liquidity_usd"].missing_reason
 
 
+def test_stream_integrity_evidence_distinguishes_broad_buying_from_round_trips() -> None:
+    now = datetime.now(UTC)
+    mint = "Mint111111111111111111111111111111111111111"
+
+    organic = FeatureEngine()
+    organic.apply(
+        event(
+            "e1",
+            EventKind.CREATE,
+            now - timedelta(seconds=20),
+            {
+                "name": "Organic",
+                "symbol": "ORG",
+                "virtual_token_reserves": 1_073_000_000_000_000,
+                "virtual_sol_reserves": 30_000_000_000,
+                "real_token_reserves": 793_100_000_000_000,
+            },
+        )
+    )
+    for index in range(10):
+        trade = event(
+            f"e{index + 2}",
+            EventKind.TRADE,
+            now - timedelta(seconds=10 - index),
+            {
+                "is_buy": True,
+                "user": f"organic-wallet-{index}",
+                "token_amount": 1_000_000,
+                "sol_amount": 1_000_000 + index * 137_000,
+            },
+        ).model_copy(update={"signature": f"organic-signature-{index}"})
+        organic.apply(trade)
+    organic_snapshot = organic.snapshot(mint, now)
+    assert organic_snapshot is not None
+    assert organic_snapshot.number("single_trade_wallet_ratio") == 1.0
+    assert organic_snapshot.number("round_trip_wallet_ratio") == 0.0
+    assert organic_snapshot.number("round_trip_volume_ratio") == 0.0
+    assert organic_snapshot.number("net_quote_flow_ratio") == 1.0
+    assert organic_snapshot.number("side_alternation_ratio") == 0.0
+    assert organic_snapshot.number("multi_trade_signature_ratio") == 0.0
+
+    round_trips = FeatureEngine()
+    round_trips.apply(
+        event(
+            "e1",
+            EventKind.CREATE,
+            now - timedelta(seconds=20),
+            {
+                "name": "Loop",
+                "symbol": "LOOP",
+                "virtual_token_reserves": 1_073_000_000_000_000,
+                "virtual_sol_reserves": 30_000_000_000,
+                "real_token_reserves": 793_100_000_000_000,
+            },
+        )
+    )
+    for index in range(8):
+        wallet = f"loop-wallet-{index // 2}"
+        trade = event(
+            f"e{index + 2}",
+            EventKind.TRADE,
+            now - timedelta(seconds=8 - index),
+            {
+                "is_buy": index % 2 == 0,
+                "user": wallet,
+                "token_amount": 1_000_000,
+                "sol_amount": 2_000_000,
+            },
+        ).model_copy(update={"signature": f"loop-signature-{index // 2}"})
+        round_trips.apply(trade)
+    loop_snapshot = round_trips.snapshot(mint, now)
+    assert loop_snapshot is not None
+    assert loop_snapshot.number("single_trade_wallet_ratio") == 0.0
+    assert loop_snapshot.number("round_trip_wallet_ratio") == 1.0
+    assert loop_snapshot.number("round_trip_volume_ratio") == 1.0
+    assert loop_snapshot.number("net_quote_flow_ratio") == 0.0
+    assert loop_snapshot.number("side_alternation_ratio") == 1.0
+    assert loop_snapshot.number("quantized_amount_repeat_ratio") == 1.0
+    assert loop_snapshot.number("multi_trade_signature_ratio") == 1.0
+
+
+def test_stream_integrity_missing_fields_remain_unknown() -> None:
+    now = datetime.now(UTC)
+    engine = FeatureEngine()
+    for index in range(8):
+        engine.apply(
+            event(
+                f"e{index + 1}",
+                EventKind.TRADE,
+                now - timedelta(seconds=index),
+                {
+                    "is_buy": index % 2 == 0,
+                    "token_amount": 1_000_000,
+                },
+            )
+        )
+    snapshot = engine.snapshot("Mint111111111111111111111111111111111111111", now)
+    assert snapshot is not None
+    assert snapshot.values["single_trade_wallet_ratio"].value is None
+    assert snapshot.values["single_trade_wallet_ratio"].missing_reason
+    assert snapshot.values["net_quote_flow_ratio"].value is None
+    assert snapshot.values["net_quote_flow_ratio"].missing_reason
+    assert snapshot.values["multi_trade_signature_ratio"].value is None
+    assert snapshot.values["multi_trade_signature_ratio"].missing_reason
+
+
+def test_future_timestamp_cannot_leak_into_point_in_time_evidence() -> None:
+    now = datetime.now(UTC)
+    engine = FeatureEngine()
+    engine.apply(
+        event(
+            "e1",
+            EventKind.TRADE,
+            now + timedelta(seconds=1),
+            {
+                "is_buy": True,
+                "user": "future-wallet",
+                "token_amount": 1_000_000,
+                "sol_amount": 1_000_000,
+            },
+        )
+    )
+
+    before = engine.snapshot("Mint111111111111111111111111111111111111111", now)
+    after = engine.snapshot(
+        "Mint111111111111111111111111111111111111111", now + timedelta(seconds=1)
+    )
+    assert before is not None and before.number("trade_count_5m") == 0
+    assert before.values["single_trade_wallet_ratio"].value is None
+    assert after is not None and after.number("trade_count_5m") == 1
+
+
 def test_secondary_identity_is_display_only_and_never_overwrites_pump_identity() -> None:
     now = datetime.now(UTC)
     mint = "Mint111111111111111111111111111111111111111"
@@ -412,6 +544,26 @@ def test_decision_progresses_from_watch_to_evaluated() -> None:
     assert decision.action in {DecisionAction.ENTER, DecisionAction.PASS}
     assert decision.score.confidence >= 0.55
     assert decision.model_version == "baseline-v1.1"
+
+    # Integrity evidence is deliberately observational in v1.7. Extreme values must not alter
+    # the fast baseline until a separately qualified learner is explicitly activated.
+    extreme = snapshot.model_copy(deep=True)
+    for name in (
+        "single_trade_wallet_ratio",
+        "round_trip_wallet_ratio",
+        "round_trip_volume_ratio",
+        "side_alternation_ratio",
+        "quantized_amount_repeat_ratio",
+        "slot_concentration_hhi",
+        "price_direction_consistency",
+    ):
+        extreme.values[name].value = 1.0
+    extreme.values["net_quote_flow_ratio"].value = 0.0
+    extreme_decision = DecisionEngine().evaluate(extreme, RiskMode.AGGRESSIVE)
+    assert extreme_decision.action == decision.action
+    assert extreme_decision.score == decision.score
+    assert extreme_decision.reasons == decision.reasons
+    assert extreme_decision.blockers == decision.blockers
 
 
 def test_stale_data_forces_abstention() -> None:

@@ -49,12 +49,22 @@ HOLD_TIMING_WINDOW_OBSERVATIONS = 1_000
 RETRAIN_SAMPLE_INTERVAL = 10
 MAX_COMPLETED_OBSERVATIONS = 5_000
 MAX_MODEL_VERSIONS = 1_000
-LEARNER_VERSION_PREFIX = "learner-v3-"
+LEARNER_VERSION_PREFIX = "learner-v4-"
 ACTIVE_HEALTH_MINIMUM_SAMPLES = 30
 ACTIVE_HEALTH_WINDOW = 60
 ACTIVE_HEALTH_MINIMUM_AVAILABILITY = 0.70
 ACTIVE_HEALTH_HARM_MARGIN = 0.01
 ACTIVE_HEALTH_Z_SCORE = 1.96
+INTEGRITY_FEATURE_NAMES = (
+    "single_trade_wallet_ratio",
+    "round_trip_wallet_ratio",
+    "round_trip_volume_ratio",
+    "net_quote_flow_ratio",
+    "side_alternation_ratio",
+    "quantized_amount_repeat_ratio",
+    "slot_concentration_hhi",
+    "price_direction_consistency",
+)
 FEATURE_NAMES = (
     "opportunity",
     "danger",
@@ -69,6 +79,7 @@ FEATURE_NAMES = (
     "momentum",
     "drawdown",
     "reserve_depth",
+    *INTEGRITY_FEATURE_NAMES,
 )
 FEATURE_LABELS = {
     "opportunity": "baseline opportunity",
@@ -84,6 +95,14 @@ FEATURE_LABELS = {
     "momentum": "short-term momentum",
     "drawdown": "recent token drawdown",
     "reserve_depth": "on-chain reserve depth",
+    "single_trade_wallet_ratio": "one-trade wallet share",
+    "round_trip_wallet_ratio": "wallet round trips",
+    "round_trip_volume_ratio": "round-trip wallet volume",
+    "net_quote_flow_ratio": "net flow versus gross volume",
+    "side_alternation_ratio": "buy/sell alternation",
+    "quantized_amount_repeat_ratio": "clustered trade sizing",
+    "slot_concentration_hhi": "slot concentration",
+    "price_direction_consistency": "one-way price path",
 }
 STRUCTURAL_FLAGS = {
     "missing_curve_reserves",
@@ -254,6 +273,10 @@ class LearningEngine:
         except ValueError:
             return False
         feature_vector = _feature_vector(decision)
+        if feature_vector is None:
+            # The baseline can still act, but incomplete stream evidence must not become a
+            # fabricated all-zero learner row.
+            return False
         evaluation_model = (
             self.active_model
             if self.mode == LearningMode.ACTIVE
@@ -302,6 +325,7 @@ class LearningEngine:
             execution_score=decision.score.execution,
             confidence_score=decision.score.confidence,
             season_id=decision.season_id,
+            season_profile_fingerprint=decision.season_profile_fingerprint,
             configuration_fingerprint=decision.configuration_fingerprint,
         )
         self.observations[state.mint] = observation
@@ -416,6 +440,8 @@ class LearningEngine:
         if not live or model is None or not _model_shape_valid(model):
             return decision
         features = _feature_vector(decision)
+        if features is None:
+            return decision
         prediction = _predict(model, features)
         conservative = max(-1.0, min(10.0, prediction - model.validation_rmse))
         in_distribution = _within_model_support(model, features)
@@ -499,6 +525,12 @@ class LearningEngine:
             if latest is None
             else max(0, RETRAIN_SAMPLE_INTERVAL - (self.outcomes_seen - latest.outcomes_seen))
         )
+        qualification_gates = _entry_qualification_gates(
+            latest,
+            usable_outcomes=len(samples),
+            current_availability=entry_availability,
+            activation_available=activation_candidate is not None,
+        )
         return {
             "mode": self.mode.value,
             "state": state,
@@ -530,6 +562,9 @@ class LearningEngine:
             "active_model": _model_summary(self.active_model),
             "active_model_health": active_health,
             "activation_available": activation_candidate is not None,
+            "qualification_gates": qualification_gates,
+            "qualification_passed": sum(gate["state"] == "passed" for gate in qualification_gates),
+            "qualification_total": len(qualification_gates),
             "lessons": _lessons(latest),
             "guardrails": [
                 "Never trains on synthetic Demo Market data",
@@ -853,6 +888,7 @@ class LearningEngine:
             for observation in sorted(self.observations.values(), key=lambda item: item.created_at)
             if observation.risk_mode == selected_mode
             and observation.configuration_fingerprint == selected_configuration
+            and _observation_features_complete(observation)
             and key in observation.checkpoints
         ][-MODEL_WINDOW_OBSERVATIONS:]
         available_count = sum(
@@ -980,7 +1016,11 @@ class LearningEngine:
             ):
                 continue
             checkpoint = observation.checkpoints.get(key)
-            if checkpoint is not None and checkpoint.net_return is not None:
+            if (
+                checkpoint is not None
+                and checkpoint.net_return is not None
+                and _observation_features_complete(observation)
+            ):
                 rows.append((observation, checkpoint.net_return))
         return rows
 
@@ -998,6 +1038,7 @@ class LearningEngine:
             for observation in sorted(self.observations.values(), key=lambda item: item.created_at)
             if observation.risk_mode == target_mode
             and observation.configuration_fingerprint == target_configuration
+            and _observation_features_complete(observation)
             and key in observation.checkpoints
         ][-MODEL_WINDOW_OBSERVATIONS:]
         rows: list[tuple[LearningObservation, float]] = []
@@ -1183,8 +1224,25 @@ def _mean_lower_bound(values: list[float], *, z_score: float) -> float | None:
     return mean - z_score * math.sqrt(variance / len(values))
 
 
-def _feature_vector(decision: Decision) -> dict[str, float]:
+def _feature_vector(decision: Decision) -> dict[str, float] | None:
     values = decision.feature_snapshot
+    integrity: dict[str, float] = {}
+    for name in INTEGRITY_FEATURE_NAMES:
+        item = values.values.get(name)
+        if (
+            item is None
+            or item.value is None
+            or isinstance(item.value, bool)
+            or item.missing_reason is not None
+        ):
+            return None
+        try:
+            number = float(item.value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        integrity[name] = _clamp(number)
     reserve_sol = max(0.0, values.number("virtual_quote_reserve_sol"))
     return {
         "opportunity": decision.score.opportunity,
@@ -1200,7 +1258,15 @@ def _feature_vector(decision: Decision) -> dict[str, float]:
         "momentum": max(-1.0, min(1.0, values.number("momentum_1m"))),
         "drawdown": _clamp(values.number("drawdown_5m")),
         "reserve_depth": _clamp(math.log1p(reserve_sol) / math.log(1_001)),
+        **integrity,
     }
+
+
+def _observation_features_complete(observation: LearningObservation) -> bool:
+    return all(
+        name in observation.features and math.isfinite(observation.features[name])
+        for name in FEATURE_NAMES
+    )
 
 
 def _clamp(value: float) -> float:
@@ -1393,6 +1459,234 @@ def _model_summary(model: LearningModel | None) -> dict[str, Any] | None:
         "policy_uplift_lower_bound": model.policy_uplift_lower_bound,
         "qualified": model.qualified,
     }
+
+
+def _entry_qualification_gates(
+    model: LearningModel | None,
+    *,
+    usable_outcomes: int,
+    current_availability: dict[str, Any],
+    activation_available: bool,
+) -> list[dict[str, Any]]:
+    """Describe existing learner gates without making the UI reimplement policy."""
+
+    def gate(
+        gate_id: str,
+        label: str,
+        current: float | int | bool | None,
+        target: float | int | bool,
+        comparison: str,
+        passed: bool,
+        unit: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        return {
+            "id": gate_id,
+            "label": label,
+            "current": current,
+            "target": target,
+            "comparison": comparison,
+            "state": "passed" if passed else "collecting" if current is None else "not_met",
+            "unit": unit,
+            "detail": detail,
+        }
+
+    gates = [
+        gate(
+            "usable_outcomes",
+            "Usable outcomes",
+            usable_outcomes,
+            MINIMUM_TRAINING_SAMPLES,
+            ">=",
+            usable_outcomes >= MINIMUM_TRAINING_SAMPLES,
+            "count",
+            "Fee-inclusive five-minute outcomes available for the current risk and provider setup.",
+        )
+    ]
+    if model is None:
+        pending = (
+            (
+                "model_outcome_availability",
+                "Model outcome coverage",
+                ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                "fraction",
+            ),
+            ("validation_error", "Validation error", 0.0, "number"),
+            ("rank_fit", "Forward rank fit", 0.0, "number"),
+            ("top_return", "Top-group return", ENTRY_MINIMUM_TOP_RETURN, "fraction"),
+            ("top_uplift", "Top-group uplift", ENTRY_MINIMUM_TOP_UPLIFT, "fraction"),
+            (
+                "in_distribution",
+                "Familiar evidence",
+                ENTRY_MINIMUM_IN_DISTRIBUTION_FRACTION,
+                "fraction",
+            ),
+            ("policy_samples", "Actionable policy outcomes", ENTRY_MINIMUM_POLICY_SAMPLES, "count"),
+            ("policy_vetoes", "Tested vetoes", ENTRY_MINIMUM_POLICY_VETOES, "count"),
+            (
+                "policy_uplift_floor",
+                "Conservative veto value",
+                ENTRY_MINIMUM_POLICY_UPLIFT,
+                "fraction",
+            ),
+        )
+        gates.extend(
+            gate(
+                gate_id,
+                label,
+                None,
+                target,
+                (
+                    "<="
+                    if gate_id == "validation_error"
+                    else ">"
+                    if gate_id == "policy_uplift_floor"
+                    else ">="
+                ),
+                False,
+                unit,
+                "Available after the first chronological challenger is fitted.",
+            )
+            for gate_id, label, target, unit in pending
+        )
+    else:
+        error_target = model.naive_rmse * (1 - ENTRY_MINIMUM_RMSE_RELATIVE_IMPROVEMENT)
+        rank_target = max(0.10, model.baseline_correlation + 0.03)
+        top_uplift = model.learner_top_mean_return - model.baseline_top_mean_return
+        gates.extend(
+            [
+                gate(
+                    "model_outcome_availability",
+                    "Model outcome coverage",
+                    model.outcome_availability_fraction,
+                    ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                    ">=",
+                    model.outcome_availability_fraction >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                    "fraction",
+                    "Enough modeled entries had executable, fee-inclusive outcomes.",
+                ),
+                gate(
+                    "validation_error",
+                    "Validation error",
+                    model.validation_rmse,
+                    error_target,
+                    "<=",
+                    model.validation_rmse <= error_target,
+                    "number",
+                    "The challenger must beat the untouched naive forecast by at least 2%.",
+                ),
+                gate(
+                    "rank_fit",
+                    "Forward rank fit",
+                    model.learner_correlation,
+                    rank_target,
+                    ">=",
+                    model.learner_correlation >= rank_target,
+                    "number",
+                    "Forward ranking must be useful and improve on the Baseline association.",
+                ),
+                gate(
+                    "top_return",
+                    "Top-group return",
+                    model.learner_top_mean_return,
+                    ENTRY_MINIMUM_TOP_RETURN,
+                    ">=",
+                    model.learner_top_mean_return >= ENTRY_MINIMUM_TOP_RETURN,
+                    "fraction",
+                    "The highest-ranked untouched group must remain positive after costs.",
+                ),
+                gate(
+                    "top_uplift",
+                    "Top-group uplift",
+                    top_uplift,
+                    ENTRY_MINIMUM_TOP_UPLIFT,
+                    ">=",
+                    top_uplift >= ENTRY_MINIMUM_TOP_UPLIFT,
+                    "fraction",
+                    "The challenger top group must improve on the Baseline top group.",
+                ),
+                gate(
+                    "in_distribution",
+                    "Familiar evidence",
+                    model.validation_in_distribution_fraction,
+                    ENTRY_MINIMUM_IN_DISTRIBUTION_FRACTION,
+                    ">=",
+                    model.validation_in_distribution_fraction
+                    >= ENTRY_MINIMUM_IN_DISTRIBUTION_FRACTION,
+                    "fraction",
+                    "Almost all validation evidence must remain inside learned support.",
+                ),
+                gate(
+                    "policy_samples",
+                    "Actionable policy outcomes",
+                    model.policy_validation_count,
+                    ENTRY_MINIMUM_POLICY_SAMPLES,
+                    ">=",
+                    model.policy_validation_count >= ENTRY_MINIMUM_POLICY_SAMPLES,
+                    "count",
+                    "Only Baseline entries that could really have acted count toward veto proof.",
+                ),
+                gate(
+                    "policy_vetoes",
+                    "Tested vetoes",
+                    model.policy_veto_count,
+                    ENTRY_MINIMUM_POLICY_VETOES,
+                    ">=",
+                    model.policy_veto_count >= ENTRY_MINIMUM_POLICY_VETOES,
+                    "count",
+                    "The proposed protection must be exercised often enough to judge.",
+                ),
+                gate(
+                    "policy_uplift_floor",
+                    "Conservative veto value",
+                    model.policy_uplift_lower_bound,
+                    ENTRY_MINIMUM_POLICY_UPLIFT,
+                    ">",
+                    model.policy_uplift_lower_bound is not None
+                    and model.policy_uplift_lower_bound > ENTRY_MINIMUM_POLICY_UPLIFT,
+                    "fraction",
+                    "The confidence-adjusted value of the tested veto policy must be positive.",
+                ),
+            ]
+        )
+    gates.append(
+        gate(
+            "current_outcome_availability",
+            "Current executable coverage",
+            float(current_availability["availability_fraction"]),
+            float(current_availability["minimum_fraction"]),
+            ">=",
+            float(current_availability["availability_fraction"])
+            >= float(current_availability["minimum_fraction"]),
+            "fraction",
+            "Recent evidence must still be observable when the user chooses to activate.",
+        )
+    )
+    gates.append(
+        gate(
+            "current_observed_outcomes",
+            "Current coverage sample",
+            int(current_availability["observed_count"]),
+            MINIMUM_TRAINING_SAMPLES,
+            ">=",
+            int(current_availability["observed_count"]) >= MINIMUM_TRAINING_SAMPLES,
+            "count",
+            "Coverage needs a full recent sample before it can support activation.",
+        )
+    )
+    gates.append(
+        gate(
+            "activation_ready",
+            "Final safety approval",
+            activation_available,
+            True,
+            "=",
+            activation_available,
+            "boolean",
+            "The newest artifact, context, suspension history, and all proof gates agree.",
+        )
+    )
+    return gates
 
 
 def _lessons(model: LearningModel | None) -> list[dict[str, Any]]:

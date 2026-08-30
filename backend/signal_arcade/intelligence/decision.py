@@ -8,6 +8,7 @@ from ..models import (
     DecisionAction,
     DecisionScore,
     FeatureSnapshot,
+    RiskLimits,
     RiskMode,
 )
 
@@ -36,8 +37,9 @@ class DecisionEngine:
         mode: RiskMode,
         *,
         planned_order_size_sol: float | None = None,
+        policy_limits: RiskLimits | None = None,
     ) -> Decision:
-        limits = RISK_LIMITS[mode]
+        limits = policy_limits or RISK_LIMITS[mode]
         age = features.number("age_seconds")
         trades = features.number("trade_count_5m")
         trade_rate = features.number("trade_count_1m")

@@ -153,6 +153,9 @@ def _decision(now: datetime) -> Decision:
             data_confidence=0.8,
         ),
         planned_order_size_sol=0.025,
+        season_id="season-balanced-default",
+        season_profile_fingerprint="b" * 64,
+        configuration_fingerprint="balanced-learning-lineage",
     )
 
 
@@ -363,6 +366,8 @@ def test_ai_rejects_evidence_references_it_was_not_given(tmp_path: Path) -> None
         assert assessment is not None
         assert assessment.valid is False
         assert "not supplied" in (assessment.invalid_reason or "")
+        assert assessment.season_id == "season-balanced-default"
+        assert assessment.season_profile_fingerprint == "b" * 64
         old_assessment = assessment.model_copy(
             update={
                 "assessment_id": "old-prompt-assessment",
@@ -382,8 +387,13 @@ def test_ai_rejects_evidence_references_it_was_not_given(tmp_path: Path) -> None
     assert status["runtime_compute"] == "idle"
     http.ollama_model = "custom-local:latest"
     asyncio.run(lab.refresh_models())
-    assert lab.qualification()["curated_model"] is False
-    assert lab.qualification()["qualified"] is False
+    qualification = lab.qualification()
+    assert qualification["curated_model"] is False
+    assert qualification["qualified"] is False
+    gates = {gate["id"]: gate for gate in qualification["gates"]}
+    assert gates["curated_model"]["state"] == "not_met"
+    assert gates["uplift_floor"]["state"] == "collecting"
+    assert qualification["passed"] < qualification["total"]
     database.close()
 
 

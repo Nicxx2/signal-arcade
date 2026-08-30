@@ -4,6 +4,7 @@ import math
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import pairwise
 from threading import RLock
 from typing import Any
 
@@ -41,6 +42,7 @@ class TradeObservation:
     token_units: int
     quote_lamports: int
     price_sol: float
+    signature: str = ""
 
 
 @dataclass(slots=True)
@@ -315,6 +317,7 @@ class TokenState:
                 token_units=max(0, token_units),
                 quote_lamports=max(0, quote_lamports),
                 price_sol=max(0.0, price),
+                signature=event.signature or "",
             )
         )
 
@@ -548,10 +551,10 @@ class FeatureEngine:
         created = state.created_at or last_event
         age = max(0.0, (now - created).total_seconds())
         trades_1m = [
-            trade for trade in state.trades if (now - trade.received_at).total_seconds() <= 60
+            trade for trade in state.trades if 0 <= (now - trade.received_at).total_seconds() <= 60
         ]
         trades_5m = [
-            trade for trade in state.trades if (now - trade.received_at).total_seconds() <= 300
+            trade for trade in state.trades if 0 <= (now - trade.received_at).total_seconds() <= 300
         ]
         buys_1m = sum(trade.side == Side.BUY for trade in trades_1m)
         buys_5m = sum(trade.side == Side.BUY for trade in trades_5m)
@@ -571,6 +574,7 @@ class FeatureEngine:
         repeated_ratio = max(amounts.values(), default=0) / len(trades_5m) if trades_5m else 0.0
         slots = Counter(trade.slot for trade in trades_5m if trade.slot > 0)
         same_slot_ratio = max(slots.values(), default=0) / len(trades_5m) if trades_5m else 0.0
+        integrity = _stream_integrity_metrics(trades_5m)
         creator_sells = sum(
             trade.side == Side.SELL and trade.user == state.creator for trade in trades_5m
         )
@@ -662,6 +666,27 @@ class FeatureEngine:
         put("wallet_volume_hhi", hhi, "fraction")
         put("repeated_amount_ratio", repeated_ratio, "fraction")
         put("same_slot_ratio", same_slot_ratio, "fraction")
+        for key in (
+            "single_trade_wallet_ratio",
+            "round_trip_wallet_ratio",
+            "round_trip_volume_ratio",
+            "net_quote_flow_ratio",
+            "side_alternation_ratio",
+            "quantized_amount_repeat_ratio",
+            "slot_concentration_hhi",
+            "price_direction_consistency",
+            "multi_trade_signature_ratio",
+        ):
+            metric = integrity[key]
+            put(
+                key,
+                metric[0],
+                "fraction",
+                quality=metric[1],
+                missing_reason=metric[2],
+            )
+        put("known_wallet_trade_coverage", integrity["known_wallet_trade_coverage"][0], "fraction")
+        put("signed_trade_coverage", integrity["signed_trade_coverage"][0], "fraction")
         put("creator_sells_5m", creator_sells, "count")
         put("curve_progress", progress, "fraction")
         put("momentum_1m", momentum_1m, "fraction")
@@ -791,6 +816,179 @@ def _momentum(trades: list[TradeObservation]) -> float:
     if len(prices) < 2 or prices[0] <= 0:
         return 0.0
     return max(-1.0, min(10.0, prices[-1] / prices[0] - 1))
+
+
+IntegrityMetric = tuple[float | None, float, str | None]
+
+
+def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, IntegrityMetric]:
+    """Describe stream structure without assigning a scam label or changing a decision.
+
+    Every ratio is derived only from trades already present at the decision timestamp. Coverage
+    is kept separate so a missing wallet, amount, slot, price, or signature cannot masquerade as
+    reassuring zero evidence.
+    """
+
+    count = len(trades)
+    missing: IntegrityMetric = (None, 0.0, "insufficient_trade_evidence")
+    if count == 0:
+        return {
+            key: missing
+            for key in (
+                "single_trade_wallet_ratio",
+                "round_trip_wallet_ratio",
+                "round_trip_volume_ratio",
+                "net_quote_flow_ratio",
+                "side_alternation_ratio",
+                "quantized_amount_repeat_ratio",
+                "slot_concentration_hhi",
+                "price_direction_consistency",
+                "multi_trade_signature_ratio",
+                "known_wallet_trade_coverage",
+                "signed_trade_coverage",
+            )
+        }
+
+    known = [trade for trade in trades if trade.user and trade.user != "unknown"]
+    wallet_coverage = len(known) / count
+    wallet_counts = Counter(trade.user for trade in known)
+    wallet_sides: dict[str, set[Side]] = defaultdict(set)
+    for trade in known:
+        wallet_sides[trade.user].add(trade.side)
+    round_trip_wallets = {
+        wallet for wallet, sides in wallet_sides.items() if {Side.BUY, Side.SELL} <= sides
+    }
+    single_trade = (
+        sum(value == 1 for value in wallet_counts.values()) / len(wallet_counts)
+        if wallet_counts
+        else None
+    )
+    round_trip = len(round_trip_wallets) / len(wallet_counts) if wallet_counts else None
+
+    known_volume = sum(trade.quote_lamports for trade in known if trade.quote_lamports > 0)
+    round_trip_volume = (
+        sum(
+            trade.quote_lamports
+            for trade in known
+            if trade.quote_lamports > 0 and trade.user in round_trip_wallets
+        )
+        / known_volume
+        if known_volume > 0
+        else None
+    )
+    valued = [trade for trade in trades if trade.quote_lamports > 0]
+    amount_coverage = len(valued) / count
+    gross_quote = sum(trade.quote_lamports for trade in valued)
+    net_quote = sum(
+        trade.quote_lamports if trade.side == Side.BUY else -trade.quote_lamports
+        for trade in valued
+    )
+    net_flow = abs(net_quote) / gross_quote if gross_quote > 0 else None
+    amount_buckets = Counter(_amount_bucket(trade.quote_lamports) for trade in valued)
+    quantized_repetition = max(amount_buckets.values(), default=0) / len(valued) if valued else None
+
+    ordered = sorted(enumerate(trades), key=lambda row: (row[1].received_at, row[1].slot, row[0]))
+    ordered_trades = [trade for _, trade in ordered]
+    alternation = (
+        sum(left.side != right.side for left, right in pairwise(ordered_trades)) / (count - 1)
+        if count > 1
+        else None
+    )
+
+    known_slots = [trade.slot for trade in trades if trade.slot > 0]
+    slot_coverage = len(known_slots) / count
+    slot_counts = Counter(known_slots)
+    slot_hhi = (
+        sum((slot_count / len(known_slots)) ** 2 for slot_count in slot_counts.values())
+        if known_slots
+        else None
+    )
+
+    prices = [trade.price_sol for trade in ordered_trades if trade.price_sol > 0]
+    price_coverage = len(prices) / count
+    price_moves = [right - left for left, right in pairwise(prices) if right != left]
+    direction_consistency = (
+        max(
+            sum(move > 0 for move in price_moves),
+            sum(move < 0 for move in price_moves),
+        )
+        / len(price_moves)
+        if price_moves
+        else 0.0
+        if len(prices) >= 2
+        else None
+    )
+
+    signed = [trade.signature for trade in trades if trade.signature]
+    signature_coverage = len(signed) / count
+    signature_counts = Counter(signed)
+    bundled = (
+        sum(value for value in signature_counts.values() if value > 1) / len(signed)
+        if signed
+        else None
+    )
+
+    def metric(
+        value: float | None,
+        quality: float,
+        reason: str,
+        *,
+        minimum_quality: float = 0.0,
+    ) -> IntegrityMetric:
+        if value is None or quality < minimum_quality:
+            return None, max(0.0, min(1.0, quality)), reason
+        return max(0.0, min(1.0, value)), max(0.0, min(1.0, quality)), None
+
+    return {
+        "single_trade_wallet_ratio": metric(
+            single_trade, wallet_coverage, "wallet_identity_unavailable", minimum_quality=0.8
+        ),
+        "round_trip_wallet_ratio": metric(
+            round_trip, wallet_coverage, "wallet_identity_unavailable", minimum_quality=0.8
+        ),
+        "round_trip_volume_ratio": metric(
+            round_trip_volume,
+            min(wallet_coverage, amount_coverage),
+            "wallet_or_trade_amount_unavailable",
+            minimum_quality=0.8,
+        ),
+        "net_quote_flow_ratio": metric(
+            net_flow, amount_coverage, "trade_amount_unavailable", minimum_quality=0.8
+        ),
+        "side_alternation_ratio": metric(alternation, 1.0, "insufficient_trade_sequence"),
+        "quantized_amount_repeat_ratio": metric(
+            quantized_repetition,
+            amount_coverage,
+            "trade_amount_unavailable",
+            minimum_quality=0.8,
+        ),
+        "slot_concentration_hhi": metric(
+            slot_hhi, slot_coverage, "slot_evidence_unavailable", minimum_quality=0.8
+        ),
+        "price_direction_consistency": metric(
+            direction_consistency,
+            price_coverage,
+            "price_path_unavailable",
+            minimum_quality=0.8,
+        ),
+        "multi_trade_signature_ratio": metric(
+            bundled,
+            signature_coverage,
+            "signature_evidence_unavailable",
+            minimum_quality=0.8,
+        ),
+        "known_wallet_trade_coverage": (wallet_coverage, 1.0, None),
+        "signed_trade_coverage": (signature_coverage, 1.0, None),
+    }
+
+
+def _amount_bucket(value: int) -> int:
+    """Round a positive raw amount to two significant digits for sizing-pattern evidence."""
+
+    if value <= 0:
+        return 0
+    width = 10 ** max(0, int(math.floor(math.log10(value))) - 1)
+    return int(round(value / width) * width)
 
 
 def _drawdown(trades: list[TradeObservation]) -> float:

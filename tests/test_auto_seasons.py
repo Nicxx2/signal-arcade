@@ -13,15 +13,18 @@ from signal_arcade.models import (
     EventKind,
     LearningObservation,
     MarketEvent,
+    PaperOrder,
     Position,
     QuoteCurrency,
     RiskMode,
+    Side,
 )
 from signal_arcade.orchestrator import (
+    AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS,
     AUTO_NEW_SEASON_GRACE_SECONDS,
-    AUTO_NEW_SEASON_STARTUP_DATA_GRACE_SECONDS,
     Orchestrator,
 )
+from signal_arcade.risk_profiles import DrawdownPolicy, DrawdownPolicyKind
 
 
 def season_summary(*, open_positions: int = 0) -> dict[str, int | float]:
@@ -61,6 +64,26 @@ def learning_observation(now: datetime) -> LearningObservation:
     )
 
 
+def unresolved_inventory() -> dict[str, object]:
+    return {
+        "position_id": "position-retired",
+        "mint": "mint-retired",
+        "symbol": "RETIRED",
+        "token_units": 1,
+        "entry_cost_minor": 1,
+        "book_value_minor": 1,
+        "last_known_mark_minor": None,
+        "last_marked_at": None,
+        "market_status": "dormant",
+        "mark_blockers": ["no executable route"],
+        "quote_currency": "SOL",
+        "quote_decimals": 9,
+        "retirement_reason": "auto_drawdown",
+        "retired_at": datetime(2026, 8, 28, 12, tzinfo=UTC).isoformat(),
+        "was_executed": False,
+    }
+
+
 def dormant_position(now: datetime) -> Position:
     return Position(
         position_id="dormant-position",
@@ -79,6 +102,190 @@ def dormant_position(now: datetime) -> Position:
     )
 
 
+def drawdown_off_orchestrator(
+    tmp_path: Path,
+    *,
+    currency: QuoteCurrency = QuoteCurrency.SOL,
+) -> Orchestrator:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    asyncio.run(
+        orchestrator.setup_portfolio(
+            currency,
+            1_000_000_000,
+            risk_mode=RiskMode.BALANCED,
+            drawdown_policy=DrawdownPolicy(kind=DrawdownPolicyKind.DISABLED),
+        )
+    )
+    asyncio.run(orchestrator.resume_trading())
+    asyncio.run(orchestrator.configure_auto_new_season(True))
+    orchestrator.database.append_ledger(
+        "deplete-current-bankroll",
+        [
+            ("paper_loss", 999_999_999, 0, "Test bankroll depletion"),
+            ("cash", 0, 999_999_999, "Test bankroll depletion"),
+        ],
+    )
+    return orchestrator
+
+
+def test_drawdown_off_rolls_only_genuinely_exhausted_bankroll_and_inherits_profile(
+    tmp_path: Path,
+) -> None:
+    orchestrator = drawdown_off_orchestrator(tmp_path)
+    now = datetime.now(UTC)
+    source_profile = dict(orchestrator.broker.season_profile or {})
+
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    assert (
+        orchestrator.season_automation_status(
+            orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+            now,
+        )["state"]
+        == "countdown"
+    )
+    orchestrator._set_auto_new_season_eligible_since(  # noqa: SLF001
+        now - timedelta(seconds=AUTO_NEW_SEASON_GRACE_SECONDS)
+    )
+    rollover = orchestrator._auto_new_season_tick(now)  # noqa: SLF001
+
+    assert rollover is not None
+    assert rollover["terminal_reason"] == "bankroll_exhausted"
+    seasons = orchestrator.database.list_paper_seasons()
+    assert seasons[0]["terminal_reason"] == "bankroll_exhausted"
+    assert seasons[1]["profile"]["profile_fingerprint"] == source_profile["profile_fingerprint"]
+    assert seasons[1]["profile"]["drawdown_policy"]["kind"] == "disabled"
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_drawdown_off_dormant_recovery_and_restored_cash_cancel_exhaustion(
+    tmp_path: Path,
+) -> None:
+    orchestrator = drawdown_off_orchestrator(tmp_path)
+    now = datetime.now(UTC)
+    position = dormant_position(now)
+    orchestrator.broker.positions[position.mint] = position
+    orchestrator.database.save_position(position)
+
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_eligible_since == now  # noqa: SLF001
+
+    revived = position.model_copy(
+        update={
+            "last_marked_at": now + timedelta(minutes=5),
+            "mark_is_stale": False,
+            "mark_is_executable": True,
+        }
+    )
+    orchestrator.broker.positions[position.mint] = revived
+    orchestrator.database.save_position(revived)
+    assert orchestrator._auto_new_season_tick(now + timedelta(minutes=5)) is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_eligible_since is None  # noqa: SLF001
+
+    orchestrator.broker.positions.clear()
+    orchestrator.database.delete_position(revived.position_id)
+    orchestrator.database.append_ledger(
+        "recovered-proceeds",
+        [
+            ("cash", 100_000_000, 0, "Recovered paper proceeds"),
+            ("paper_recovery", 0, 100_000_000, "Recovered paper proceeds"),
+        ],
+    )
+    orchestrator._set_auto_new_season_eligible_since(  # noqa: SLF001
+        now - timedelta(hours=1)
+    )
+    assert orchestrator._auto_new_season_tick(now + timedelta(minutes=6)) is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_eligible_since is None  # noqa: SLF001
+    assert len(orchestrator.database.list_paper_seasons()) == 1
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_drawdown_off_usdc_missing_conversion_is_unknown_not_bankruptcy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = drawdown_off_orchestrator(tmp_path, currency=QuoteCurrency.USDC)
+    orchestrator.demo_mode = False
+    now = datetime.now(UTC)
+    monkeypatch.setattr(orchestrator, "_rollover_market_data_healthy", lambda _now: True)
+    orchestrator._set_auto_new_season_eligible_since(  # noqa: SLF001
+        now - timedelta(seconds=AUTO_NEW_SEASON_GRACE_SECONDS)
+    )
+
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    status = orchestrator.season_automation_status(
+        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+        now,
+    )
+    assert status["state"] == "paused"
+    assert "market data catches up" in status["detail"]
+    assert len(orchestrator.database.list_paper_seasons()) == 1
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_drawdown_off_does_not_roll_an_intrinsically_undersized_bankroll_forever(
+    tmp_path: Path,
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    asyncio.run(
+        orchestrator.setup_portfolio(
+            QuoteCurrency.SOL,
+            1,
+            risk_mode=RiskMode.BALANCED,
+            drawdown_policy=DrawdownPolicy(kind=DrawdownPolicyKind.DISABLED),
+        )
+    )
+    asyncio.run(orchestrator.resume_trading())
+    asyncio.run(orchestrator.configure_auto_new_season(True))
+    now = datetime.now(UTC)
+    orchestrator._set_auto_new_season_eligible_since(  # noqa: SLF001
+        now - timedelta(days=2)
+    )
+
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    status = orchestrator.season_automation_status(
+        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+        now,
+    )
+    assert status["state"] == "monitoring"
+    assert "empty-season loops" in status["detail"]
+    assert orchestrator._auto_new_season_eligible_since is None  # noqa: SLF001
+    assert len(orchestrator.database.list_paper_seasons()) == 1
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_drawdown_off_never_crosses_a_pending_exit(tmp_path: Path) -> None:
+    orchestrator = drawdown_off_orchestrator(tmp_path)
+    now = datetime.now(UTC)
+    order = PaperOrder(
+        order_id="pending-recovery-exit",
+        mint="recoverable-mint",
+        symbol="RECOVER",
+        side=Side.SELL,
+        requested_token_units=1,
+        fill_after=now,
+    )
+    orchestrator.broker.pending[order.order_id] = order
+    orchestrator.database.save_order(order)
+    orchestrator._set_auto_new_season_eligible_since(  # noqa: SLF001
+        now - timedelta(days=2)
+    )
+
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    status = orchestrator.season_automation_status(
+        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+        now,
+    )
+    assert status["state"] == "pending_orders"
+    assert order.order_id in orchestrator.broker.pending
+    assert len(orchestrator.database.list_paper_seasons()) == 1
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
 def test_atomic_rollover_archives_and_refunds_without_erasing_learning(tmp_path: Path) -> None:
     database = Database(tmp_path / "rollover.sqlite3")
     now = datetime(2026, 8, 27, 12, tzinfo=UTC)
@@ -92,6 +299,7 @@ def test_atomic_rollover_archives_and_refunds_without_erasing_learning(tmp_path:
         starting_minor=1_000_000_000,
         quote_currency="SOL",
         rolled_over_at=now + timedelta(days=1),
+        unresolved_positions=[unresolved_inventory()],
     )
 
     seasons = database.list_paper_seasons()
@@ -100,11 +308,16 @@ def test_atomic_rollover_archives_and_refunds_without_erasing_learning(tmp_path:
         (2, "current"),
     ]
     assert seasons[0]["open_positions"] == 1
+    assert seasons[0]["result_quality"] == "unresolved"
+    assert seasons[0]["comparable"] is False
+    assert seasons[0]["unresolved_inventory"][0]["mint"] == "mint-retired"
     assert seasons[1]["starting_minor"] == 1_000_000_000
     assert database.ledger_balance("cash") == 1_000_000_000
     assert database.get_setting("season_id") == "season-two"
     assert database.get_setting("trading_enabled") is True
     assert database.get_setting("auto_new_season_eligible_since") is None
+    assert database.get_setting("auto_new_season_paused_since") is None
+    assert database.get_setting("auto_new_season_last_observed_at") is None
     assert [item.observation_id for item in database.list_learning_observations()] == [
         "lesson-kept"
     ]
@@ -161,15 +374,16 @@ def test_auto_season_waits_full_grace_then_rolls_dormant_season(tmp_path: Path) 
     )
     assert status["state"] == "countdown"
     assert status["remaining_seconds"] == pytest.approx(3600)
-    assert (
-        orchestrator._auto_new_season_tick(  # noqa: SLF001
-            started + timedelta(seconds=AUTO_NEW_SEASON_GRACE_SECONDS - 1)
-        )
-        is None
+    almost_due = started + timedelta(seconds=AUTO_NEW_SEASON_GRACE_SECONDS - 1)
+    orchestrator._set_auto_new_season_clock(  # noqa: SLF001
+        started,
+        None,
+        almost_due,
     )
+    assert orchestrator._auto_new_season_tick(almost_due) is None  # noqa: SLF001
 
     rollover = orchestrator._auto_new_season_tick(  # noqa: SLF001
-        started + timedelta(seconds=AUTO_NEW_SEASON_GRACE_SECONDS + 1)
+        almost_due + timedelta(seconds=2)
     )
 
     assert rollover is not None
@@ -189,7 +403,7 @@ def test_auto_season_waits_full_grace_then_rolls_dormant_season(tmp_path: Path) 
     orchestrator.database.close()
 
 
-def test_auto_season_countdown_resets_on_stop_revival_or_unhealthy_data(
+def test_auto_season_countdown_resets_on_stop_or_revival_but_pauses_for_brief_data_gap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -216,26 +430,86 @@ def test_auto_season_countdown_resets_on_stop_revival_or_unhealthy_data(
         }
     )
     orchestrator.broker.positions[position.mint] = position
+    orchestrator._set_auto_new_season_clock(  # noqa: SLF001
+        now,
+        None,
+        now + timedelta(hours=2),
+    )
     status = orchestrator.season_automation_status(
         orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False), now
     )
     assert status["state"] == "managing_positions"
     assert orchestrator._auto_new_season_tick(now + timedelta(hours=2)) is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_eligible_since is None  # noqa: SLF001
 
     orchestrator.broker.positions.clear()
     monkeypatch.setattr(orchestrator, "_rollover_market_data_healthy", lambda _now: False)
-    assert orchestrator._auto_new_season_tick(now + timedelta(hours=3)) is None  # noqa: SLF001
-    assert orchestrator._auto_new_season_eligible_since is None  # noqa: SLF001
-    status = orchestrator.season_automation_status(
-        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False), now
+    paused_at = now + timedelta(hours=3)
+    orchestrator._set_auto_new_season_clock(  # noqa: SLF001
+        paused_at - timedelta(minutes=20),
+        None,
+        paused_at,
     )
-    assert status["state"] == "waiting_for_data"
+    assert orchestrator._auto_new_season_tick(paused_at) is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_eligible_since is not None  # noqa: SLF001
+    assert orchestrator._auto_new_season_paused_since == paused_at  # noqa: SLF001
+    status = orchestrator.season_automation_status(
+        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+        paused_at + timedelta(seconds=30),
+    )
+    assert status["state"] == "paused"
+    assert status["remaining_seconds"] == pytest.approx(AUTO_NEW_SEASON_GRACE_SECONDS - 20 * 60)
+
+    monkeypatch.setattr(orchestrator, "_rollover_market_data_healthy", lambda _now: True)
+    resumed_at = paused_at + timedelta(seconds=30)
+    assert orchestrator._auto_new_season_tick(resumed_at) is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_paused_since is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_eligible_since == (  # noqa: SLF001
+        paused_at - timedelta(minutes=20) + timedelta(seconds=30)
+    )
 
     asyncio.run(orchestrator.http.close())
     orchestrator.database.close()
 
 
-def test_restart_briefly_preserves_countdown_but_never_rolls_without_live_data(
+def test_due_countdown_waits_through_brief_data_pause_then_rolls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    now = datetime.now(UTC)
+    orchestrator.broker.initialize(QuoteCurrency.SOL, 1_000_000_000)
+    orchestrator.database.set_setting("peak_equity_lamports", 2_000_000_000)
+    orchestrator.running = True
+    asyncio.run(orchestrator.configure_auto_new_season(True))
+    orchestrator._set_auto_new_season_clock(  # noqa: SLF001
+        now - timedelta(seconds=AUTO_NEW_SEASON_GRACE_SECONDS),
+        None,
+        now,
+    )
+
+    monkeypatch.setattr(orchestrator, "_rollover_market_data_healthy", lambda _now: False)
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    paused = orchestrator.season_automation_status(
+        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+        now + timedelta(seconds=30),
+    )
+    assert paused["state"] == "paused"
+    assert paused["remaining_seconds"] == 0
+    assert len(orchestrator.database.list_paper_seasons()) == 1
+
+    monkeypatch.setattr(orchestrator, "_rollover_market_data_healthy", lambda _now: True)
+    rollover = orchestrator._auto_new_season_tick(  # noqa: SLF001
+        now + timedelta(seconds=30)
+    )
+    assert rollover is not None
+    assert len(orchestrator.database.list_paper_seasons()) == 2
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_restart_pauses_countdown_then_invalidates_it_after_sustained_missing_data(
     tmp_path: Path,
 ) -> None:
     now = datetime.now(UTC)
@@ -255,12 +529,52 @@ def test_restart_briefly_preserves_countdown_but_never_rolls_without_live_data(
     assert orchestrator.running is True
     assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
     assert orchestrator._auto_new_season_eligible_since == now - timedelta(hours=23)  # noqa: SLF001
+    assert orchestrator._auto_new_season_paused_since == now  # noqa: SLF001
     assert len(orchestrator.database.list_paper_seasons()) == 1
 
-    after_grace = now + timedelta(seconds=AUTO_NEW_SEASON_STARTUP_DATA_GRACE_SECONDS + 1)
-    assert orchestrator._auto_new_season_tick(after_grace) is None  # noqa: SLF001
+    after_sustained_gap = now + timedelta(
+        seconds=AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS + 1
+    )
+    assert orchestrator._auto_new_season_tick(after_sustained_gap) is None  # noqa: SLF001
     assert orchestrator._auto_new_season_eligible_since is None  # noqa: SLF001
+    assert orchestrator._auto_new_season_paused_since is None  # noqa: SLF001
     assert len(orchestrator.database.list_paper_seasons()) == 1
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_restart_restores_a_short_paused_countdown_without_counting_downtime(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    paused_since = now - timedelta(seconds=30)
+    eligible_since = paused_since - timedelta(minutes=20)
+    database = Database(tmp_path / "signal_arcade.sqlite3")
+    database.initialize_portfolio("season-one", 1_000_000_000, "SOL")
+    database.set_settings(
+        {
+            "peak_equity_lamports": 2_000_000_000,
+            "trading_enabled": True,
+            "demo_mode": True,
+            "auto_new_season_enabled": True,
+            "auto_new_season_eligible_since": eligible_since.isoformat(),
+            "auto_new_season_paused_since": paused_since.isoformat(),
+            "auto_new_season_last_observed_at": paused_since.isoformat(),
+        }
+    )
+    database.close()
+
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    assert orchestrator._auto_new_season_tick(now) is None  # noqa: SLF001
+    status = orchestrator.season_automation_status(
+        orchestrator.broker.snapshot(RiskMode.BALANCED, persist_peak=False),
+        now,
+    )
+    assert status["state"] == "countdown"
+    assert status["verified_seconds"] == pytest.approx(20 * 60)
+    assert status["remaining_seconds"] == pytest.approx(AUTO_NEW_SEASON_GRACE_SECONDS - 20 * 60)
+    assert orchestrator._auto_new_season_paused_since is None  # noqa: SLF001
 
     asyncio.run(orchestrator.http.close())
     orchestrator.database.close()

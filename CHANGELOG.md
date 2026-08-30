@@ -4,6 +4,119 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## Unreleased
+
+## 1.8.0 - 2026-08-30
+
+- Freeze each paper season to one immutable, versioned risk profile and use a restart-safe
+  exits-only transition for personality or drawdown changes.
+- Add backend-derived Safer, Balanced and Aggressive setup/Arena controls plus exact-profile
+  Results filtering, legacy-safe history and auditable terminal reasons.
+- Add typed Default, Custom and Disabled portfolio-drawdown policies; Off preserves every other
+  permanent safety gate and rolls only after genuine, healthy-evidence bankroll exhaustion.
+- Keep Challenger learning separated by personality rather than drawdown experiment, while
+  persisting exact season/profile provenance and excluding non-actionable entries from influence
+  proof.
+- Add explicit Finish Safely and End Season Now profile transitions. The bounded manual path uses
+  real paper exits only, archives untradeable inventory without fabricated fills, and excludes
+  user-forced or unresolved endings from like-for-like Results claims.
+
+## 1.7.6 - 2026-08-30
+
+- Add a compact Replay summary for the currently visible receipts, including buy/sell mix,
+  combined simulated fees, average recorded impact, and median paper-fill latency.
+- Make receipt cash direction explicit with signed net flow, show gross value plus separate protocol
+  and simulated network fees, and include the local calendar date beside every fill time.
+- State that Replay is current-season and transparently bound its live receipt list to the newest 30
+  while Results continues to summarize the complete current season.
+- Replace hidden narrow-screen receipt columns with accessible two-column cards so fees, impact,
+  latency, cash flow, token, side, and time remain available on phones and tablets.
+
+## 1.7.5 - 2026-08-30
+
+- Reorganize Learning into Overview, Baseline, Challenger, AI Coach, Shadow Reviews, and Safety
+  sub-tabs so only the selected player's information is visible at one time.
+- Start every device on the compact Overview, keep Challenger proof and evidence collapsed by
+  default, and remember the selected sub-tab and opened details locally on that device.
+- Preserve learning milestone attention until the Overview that contains it is actually visited,
+  with keyboard-accessible tabs and a horizontally scrollable narrow-screen layout.
+- Migrate the previous Learning layout safely without changing trading, learning, Coach, season,
+  provider, or stored evidence behavior.
+
+## 1.7.4 - 2026-08-30
+
+- Recompose Learning into clear Fast Baseline, Statistical Challenger, and Local AI Lab sections,
+  with per-device collapse preferences and compact always-visible player states.
+- Report the Challenger, AI Coach, and Shadow decision-review proof gates directly from the
+  backend so evaluation timing can never be mistaken for qualification or activation.
+- Add stable, acknowledged learning milestones and a subtle Learning-tab indicator for meaningful
+  proof, activation, suspension, and Coach experiment changes without replaying historical alerts.
+- Keep Qualified Coach and Live Critic explicitly unavailable: Coach Shadow progress is visible,
+  while Live Critic makes no readiness claim before that future feature exists.
+
+## 1.7.3 - 2026-08-30
+
+- Clarify that detailed trade results belong to the current season and show realized net P/L,
+  simulated fees, win/loss context and saved exit-audit coverage without changing execution.
+- Keep exit evidence and per-trade fees accessible on narrow mobile screens, explain when open
+  positions appear, and disclose when a bounded Results list is showing only part of a season.
+- Add the best completed season to the existing season read while preserving every scorecard.
+- Bound the all-season SVG to representative extrema-aware trend points, preserve missing-data
+  breaks and exact endpoints, and keep every exact season value available in the table below.
+
+## 1.7.2 - 2026-08-30
+
+- Start the five-minute source-integrity horizon only after a healthy WebSocket recovery is
+  confirmed, so a long outage can never age the safeguard while no evidence is arriving.
+- Fail closed for challenger and AI Coach learning after an exceptional event-worker batch
+  failure by marking every represented mint incomplete without replaying possible broker effects.
+- Escalate an unidentified failed event or bounded tracking saturation to a source-wide clean
+  window, while clean unrelated tokens remain eligible after identified token-local failures.
+- Start the corrected `stream-integrity-v4` forward cohort while retaining all previous evidence
+  and models for audit.
+
+## 1.7.1 - 2026-08-30
+
+- Require a complete fresh five-minute integrity window after process startup, WebSocket
+  reconnects, fallback activation and explicit market-source changes before the challenger or AI
+  Coach may accept a new lesson.
+- Track shed or expired candidate evidence per mint so an incomplete token is excluded without
+  unnecessarily pausing clean learning for every unrelated token.
+- Fail closed with a source-wide continuity reset if missing evidence has no mint or the bounded
+  per-mint tracker reaches its safety limit.
+- Start the corrected `stream-integrity-v3` forward cohort while retaining every earlier
+  observation and model for audit without mixing them into the corrected learner.
+
+## 1.7.0 - 2026-08-30
+
+- Add point-in-time market-integrity evidence from the existing Solana event stream: one-trade
+  wallet share, rapid wallet round trips, round-trip volume, gross-versus-net flow, side
+  alternation, clustered sizing, slot concentration, price-direction consistency and bundled
+  signature activity.
+- Keep these measures observational: they do not label a token as a scam and do not change the
+  transparent baseline, a safety gate, position size or exit policy.
+- Start a new forward-only learner cohort and `learner-v4` model family so older lessons remain
+  auditable without being zero-filled or retroactively reinterpreted under the new feature schema.
+- After a provider burst sheds low-priority candidate ticks, wait for a complete clean five-minute
+  stream window before starting a new challenger or local-AI assessment; the baseline and all
+  protected position, pending-order and saved-outcome processing continue unchanged.
+- Let the bounded AI Coach screen the new deterministic measures only as shadow entry-veto
+  experiments; every proposal still needs later fee-inclusive outcomes, coverage and independent
+  seasons before it can qualify.
+- Show the frozen integrity evidence and coverage in decision explanations, including explicit
+  unknown states when wallet, amount, slot, price or signature data is incomplete.
+
+## 1.6.7 - 2026-08-29
+
+- Preserve verified automatic-season countdown time through brief provider, queue and processing
+  interruptions instead of restarting the full delay after a transient data-health wobble.
+- Pause rollover while evidence is unhealthy, invalidate the observation window only after a
+  sustained five-minute interruption, and resume with an explicit verified-time status.
+- Reset the countdown when a holding genuinely revives, an exit fills, an order is pending, the
+  risk guard clears or the engine stops; a due rollover still waits for queued evidence safely.
+- Persist pause and continuity checkpoints across restarts and upgrade preparation so offline or
+  paused time cannot be mistaken for verified dormant-market observation.
+
 ## 1.6.6 - 2026-08-29
 
 - Add a two-step **Prepare for upgrade** workflow under Settings that quiesces paper actions at an

@@ -394,6 +394,7 @@ class AiDecisionLab:
             "input_payload": input_payload,
             "baseline_action": decision.action,
             "season_id": decision.season_id,
+            "season_profile_fingerprint": decision.season_profile_fingerprint,
             "configuration_fingerprint": decision.configuration_fingerprint,
             "token_units": outcome["token_units"],
             "entry_cost_lamports": outcome["entry_cost_lamports"],
@@ -626,6 +627,14 @@ class AiDecisionLab:
             and p95_latency is not None
             and p95_latency <= MAX_GUARDED_P95_LATENCY_MS
         )
+        gates = _ai_qualification_gates(
+            curated_model=curated_model,
+            resolved=len(measurable),
+            vetoes=len(vetoes),
+            valid_fraction=valid_fraction,
+            uplift_lower_bound=lower_bound,
+            p95_latency_ms=p95_latency,
+        )
         result = {
             "qualified": qualified,
             "curated_model": curated_model,
@@ -642,6 +651,9 @@ class AiDecisionLab:
             "uplift_lower_bound": lower_bound,
             "p95_latency_ms": p95_latency,
             "maximum_p95_latency_ms": MAX_GUARDED_P95_LATENCY_MS,
+            "gates": gates,
+            "passed": sum(gate["state"] == "passed" for gate in gates),
+            "total": len(gates),
         }
         self.qualification_cache = (cache_key, now, result)
         self.last_qualification_result = dict(result)
@@ -657,10 +669,18 @@ class AiDecisionLab:
             == current_configuration
         ):
             return dict(self.last_qualification_result)
+        curated_model = self.http.ollama_model in {str(item["name"]) for item in MODEL_CATALOG}
+        gates = _ai_qualification_gates(
+            curated_model=curated_model,
+            resolved=0,
+            vetoes=0,
+            valid_fraction=0.0,
+            uplift_lower_bound=None,
+            p95_latency_ms=None,
+        )
         return {
             "qualified": False,
-            "curated_model": self.http.ollama_model
-            in {str(item["name"]) for item in MODEL_CATALOG},
+            "curated_model": curated_model,
             "model_digest": None,
             "configuration_fingerprint": current_configuration,
             "assessments": 0,
@@ -674,6 +694,9 @@ class AiDecisionLab:
             "uplift_lower_bound": None,
             "p95_latency_ms": None,
             "maximum_p95_latency_ms": MAX_GUARDED_P95_LATENCY_MS,
+            "gates": gates,
+            "passed": sum(gate["state"] == "passed" for gate in gates),
+            "total": len(gates),
         }
 
     async def refresh_models(self) -> list[dict[str, Any]]:
@@ -1096,6 +1119,102 @@ def _critic_summary(payload: _CriticPayload, evidence: dict[str, Any]) -> str:
         if cited
         else "Evidence was insufficient for a reliable support or veto."
     )
+
+
+def _ai_qualification_gates(
+    *,
+    curated_model: bool,
+    resolved: int,
+    vetoes: int,
+    valid_fraction: float,
+    uplift_lower_bound: float | None,
+    p95_latency_ms: int | None,
+) -> list[dict[str, Any]]:
+    """Expose the existing Shadow proof contract without granting future influence."""
+
+    def gate(
+        gate_id: str,
+        label: str,
+        current: float | int | bool | None,
+        target: float | int | bool,
+        comparison: str,
+        passed: bool,
+        unit: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        return {
+            "id": gate_id,
+            "label": label,
+            "current": current,
+            "target": target,
+            "comparison": comparison,
+            "state": "passed" if passed else "collecting" if current is None else "not_met",
+            "unit": unit,
+            "detail": detail,
+        }
+
+    return [
+        gate(
+            "curated_model",
+            "Reviewed model",
+            curated_model,
+            True,
+            "=",
+            curated_model,
+            "boolean",
+            "Only a reviewed local model and its installed digest can earn proof.",
+        ),
+        gate(
+            "resolved_assessments",
+            "Measured Shadow outcomes",
+            resolved,
+            MINIMUM_RESOLVED_ASSESSMENTS,
+            ">=",
+            resolved >= MINIMUM_RESOLVED_ASSESSMENTS,
+            "count",
+            "Assessments count only after their fee-inclusive outcome is known.",
+        ),
+        gate(
+            "veto_outcomes",
+            "High-confidence veto outcomes",
+            vetoes,
+            MINIMUM_VETO_OUTCOMES,
+            ">=",
+            vetoes >= MINIMUM_VETO_OUTCOMES,
+            "count",
+            "The model needs enough measurable veto calls to judge their value.",
+        ),
+        gate(
+            "valid_fraction",
+            "Valid assessment rate",
+            valid_fraction,
+            MINIMUM_VALID_FRACTION,
+            ">=",
+            valid_fraction >= MINIMUM_VALID_FRACTION,
+            "fraction",
+            "Malformed, unsupported, or timed-out assessments count against reliability.",
+        ),
+        gate(
+            "uplift_floor",
+            "Conservative Shadow value",
+            uplift_lower_bound,
+            0.0,
+            ">",
+            uplift_lower_bound is not None and uplift_lower_bound > 0,
+            "fraction",
+            "The confidence-adjusted counterfactual value must be positive.",
+        ),
+        gate(
+            "latency",
+            "Real-time latency proof",
+            p95_latency_ms,
+            MAX_GUARDED_P95_LATENCY_MS,
+            "<=",
+            p95_latency_ms is not None and p95_latency_ms <= MAX_GUARDED_P95_LATENCY_MS,
+            "milliseconds",
+            "This legacy real-time target is evidence only; future Coach design may differ.",
+        ),
+    ]
 
 
 def _format_evidence(name: str, raw: Any) -> str:

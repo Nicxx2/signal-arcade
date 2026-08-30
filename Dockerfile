@@ -8,7 +8,7 @@ COPY frontend frontend
 RUN pnpm --filter signal-arcade-web build
 
 FROM python:3.12-slim AS runtime
-ARG SIGNAL_ARCADE_VERSION=1.6.6
+ARG SIGNAL_ARCADE_VERSION=1.8.0
 LABEL org.opencontainers.image.title="Signal Arcade" \
       org.opencontainers.image.description="A local-first Solana paper-trading and learning lab" \
       org.opencontainers.image.version="${SIGNAL_ARCADE_VERSION}" \
