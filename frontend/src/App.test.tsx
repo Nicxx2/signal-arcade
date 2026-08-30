@@ -1436,7 +1436,7 @@ test("labels capped current-season trade views and explains where open positions
   expect(screen.getByText("Still open")).toBeInTheDocument();
 });
 
-test("keeps trades as the default Results view and compares durable paper seasons", async () => {
+test("keeps trades as the default Results view and separates legacy currencies", async () => {
   const now = new Date().toISOString();
   const fetchMock = vi.fn().mockImplementation(async (input: string) => {
     if (input.startsWith("/api/v1/leaderboard")) {
@@ -1466,11 +1466,15 @@ test("keeps trades as the default Results view and compares durable paper season
   fireEvent.click(screen.getByRole("button", { name: "Seasons" }));
   expect(await screen.findByText("Is the strategy improving each season?")).toBeInTheDocument();
   expect(await screen.findByText("Season 2")).toBeInTheDocument();
-  expect(screen.getByText("Ended 1.200 SOL")).toBeInTheDocument();
+  expect(screen.queryByText("Season 1")).not.toBeInTheDocument();
   expect(screen.getByText("Now 105.00 USDC")).toBeInTheDocument();
-  expect(screen.getByText("Building the baseline")).toBeInTheDocument();
-  expect(screen.getByText("Best completed").parentElement).toHaveTextContent("Season 1 · +20.0%");
-  expect(screen.getByRole("img", { name: /Season 1: 67% win rate; Season 2: 50% win rate/ })).toBeInTheDocument();
+  expect(screen.getByText("Legacy policy unknown")).toBeInTheDocument();
+  expect(screen.queryByText("Best completed")).not.toBeInTheDocument();
+
+  fireEvent.change(screen.getByLabelText("Season comparison"), { target: { value: "all" } });
+  expect(screen.getByText("Ended 1.200 SOL")).toBeInTheDocument();
+  expect(screen.getByText("Mixed comparison history")).toBeInTheDocument();
+  expect(screen.queryByText("Best completed")).not.toBeInTheDocument();
 });
 
 test("filters every season view by exact profile and marks all-profile history as mixed", async () => {
@@ -1502,6 +1506,12 @@ test("filters every season view by exact profile and marks all-profile history a
     makeSeason(2, balancedOff, "completed", 500_000_000),
     makeSeason(3, aggressiveDefault, "completed", 400_000_000),
     makeSeason(4, balancedDefault, "current", 0),
+    {
+      ...makeSeason(5, balancedDefault, "completed", 10_000_000),
+      season_id: "profile-season-5-usdc",
+      quote_currency: "USDC" as const,
+      quote_decimals: 6,
+    },
   ];
   const fetchMock = vi.fn().mockImplementation(async (input: string) => {
     if (input.startsWith("/api/v1/leaderboard")) {
@@ -1517,7 +1527,7 @@ test("filters every season view by exact profile and marks all-profile history a
           { profile_fingerprint: aggressiveDefault.profile_fingerprint, risk_mode: "aggressive", drawdown_policy: aggressiveDefault.drawdown_policy, effective_drawdown_bps: 2_500, season_count: 1 },
         ],
         seasons,
-        summary: { season_count: 4, completed_seasons: 3, profitable_seasons: 2, losing_seasons: 1, average_win_rate: 0.6, best_return_fraction: 0.5 },
+        summary: { season_count: 5, completed_seasons: 4, profitable_seasons: 3, losing_seasons: 1, average_win_rate: 0.6, best_return_fraction: 0.5 },
       }) };
     }
     return { ok: true, json: async () => snapshot };
@@ -1528,25 +1538,32 @@ test("filters every season view by exact profile and marks all-profile history a
 
   fireEvent.click(screen.getByRole("button", { name: "Results" }));
   fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
-  const selector = await screen.findByLabelText("Season profile");
+  const selector = await screen.findByLabelText("Season comparison");
   expect(screen.getByText("Season 1")).toBeInTheDocument();
   expect(screen.getByText("Season 4")).toBeInTheDocument();
   expect(screen.queryByText("Season 2")).not.toBeInTheDocument();
+  expect(screen.queryByText("Season 5")).not.toBeInTheDocument();
   expect(Array.from(selector.querySelectorAll("optgroup"), (group) => group.label)).toEqual([
-    "Balanced profiles",
-    "Aggressive profiles",
+    "SOL seasons",
+    "USDC seasons",
   ]);
 
   fireEvent.change(selector, { target: { value: "all" } });
   expect(screen.getByText("All seasons · mixed history")).toBeInTheDocument();
   expect(screen.getByText("Season 2")).toBeInTheDocument();
   expect(screen.getByText("Season 3")).toBeInTheDocument();
-  expect(screen.getByText("Mixed-profile history")).toBeInTheDocument();
+  expect(screen.getByText("Season 5")).toBeInTheDocument();
+  expect(screen.getByText("Mixed comparison history")).toBeInTheDocument();
 
-  fireEvent.change(selector, { target: { value: balancedOff.profile_fingerprint } });
-  expect(screen.getAllByText("Balanced · DD off")).toHaveLength(2);
+  fireEvent.change(selector, { target: { value: `SOL:profile:${balancedOff.profile_fingerprint}` } });
+  expect(screen.getByText("Balanced · DD off")).toBeInTheDocument();
   expect(screen.getByText("Season 2")).toBeInTheDocument();
   expect(screen.queryByText("Season 1")).not.toBeInTheDocument();
+
+  fireEvent.change(selector, { target: { value: `USDC:profile:${balancedDefault.profile_fingerprint}` } });
+  expect(screen.getByText("USDC · Balanced · Default DD 15%")).toBeInTheDocument();
+  expect(screen.getByText("Season 5")).toBeInTheDocument();
+  expect(screen.queryByText("Season 4")).not.toBeInTheDocument();
 });
 
 test("scales season history past 100 scorecards without hiding or deleting older seasons", async () => {

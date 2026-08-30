@@ -83,6 +83,11 @@ as authoritative before that boundary and the new profile as authoritative after
 cannot create two current seasons. Pre-profile history remains visible as Legacy / Unknown rather
 than being guessed into a modern cohort.
 
+Results uses a separate comparison key composed of quote currency plus the immutable profile
+fingerprint. SOL and USDC scorecards therefore never share a best-season or improvement claim even
+when their personality and drawdown policy match. All-history and legacy views retain every row
+but suppress aggregate claims whenever currency or exact policy is mixed or unknown.
+
 An explicit `end_now` transition stores a bounded settlement deadline in that same operation.
 Executable positions receive normal paper sell orders; any remaining position is copied into the
 append-only `unresolved_paper_positions` audit before live paper tables are cleared. Season rows
@@ -98,10 +103,10 @@ remain unknown rather than becoming invented returns.
 Season and learning identity are deliberately separate. The season-profile fingerprint includes
 the drawdown experiment for apples-to-apples portfolio comparison. The decision-configuration
 fingerprint includes the risk personality and trade-learning inputs, but not the portfolio
-drawdown override. Default, custom and disabled drawdown seasons can therefore contribute honest
-forward evidence to the same personality Challenger while every observation retains its exact
-season and profile provenance. A portfolio-blocked entry is frozen as non-actionable and cannot be
-credited to a veto policy.
+drawdown override or bankroll currency. Default, custom and disabled drawdown seasons—and SOL or
+USDC bankrolls—can therefore contribute honest forward evidence to the same personality Challenger
+while every observation retains its exact season and profile provenance. A portfolio-blocked entry
+is frozen as non-actionable and cannot be credited to a veto policy.
 
 ## Trust boundaries
 

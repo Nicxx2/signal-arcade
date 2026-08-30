@@ -399,6 +399,18 @@ def test_auto_season_waits_full_grace_then_rolls_dormant_season(tmp_path: Path) 
         "completed",
         "current",
     ]
+    seasons = orchestrator.database.list_paper_seasons()
+    assert seasons[0]["profile"] is None
+    assert seasons[0]["profile_provenance"] == "legacy_unknown"
+    assert seasons[1]["profile_provenance"] == "exact"
+    assert seasons[1]["profile"]["risk_mode"] == "balanced"
+    assert seasons[1]["profile"]["drawdown_policy"]["kind"] == "default"
+    assert seasons[1]["profile"]["effective_drawdown_bps"] == 1_500
+    assert seasons[1]["profile"]["learning_fingerprint"] == (
+        orchestrator._configuration_fingerprint_for_mode(RiskMode.BALANCED)  # noqa: SLF001
+    )
+    assert seasons[1]["profile"]["locked_at"] is not None
+    assert orchestrator.broker.season_profile == seasons[1]["profile"]
     asyncio.run(orchestrator.http.close())
     orchestrator.database.close()
 

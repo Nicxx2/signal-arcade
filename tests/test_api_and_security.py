@@ -246,9 +246,29 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         assert first.status_code == 200
         first_body = first.json()
         assert first_body["summary"]["season_count"] == 1
+        assert first_body["summary"]["comparison_group_count"] == 1
+        assert first_body["summary"]["comparison_claims_available"] is True
         assert first_body["seasons"][0]["status"] == "current"
         assert first_body["seasons"][0]["net_return_fraction"] == 0
         assert first_body["current_profile_fingerprint"]
+        comparison_key = f"SOL:profile:{first_body['current_profile_fingerprint']}"
+        assert first_body["current_comparison_key"] == comparison_key
+        assert first_body["seasons"][0]["comparison_key"] == comparison_key
+        assert first_body["comparison_groups"] == [
+            {
+                "comparison_key": comparison_key,
+                "quote_currency": "SOL",
+                "profile_provenance": "exact",
+                "profile_fingerprint": first_body["current_profile_fingerprint"],
+                "risk_mode": "balanced",
+                "drawdown_policy": {
+                    "kind": "default",
+                    "custom_threshold_bps": None,
+                },
+                "effective_drawdown_bps": 1_500,
+                "season_count": 1,
+            }
+        ]
         assert first_body["profiles"] == [
             {
                 "profile_fingerprint": first_body["current_profile_fingerprint"],
@@ -282,12 +302,24 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
             ).status_code
             == 200
         )
-        seasons = client.get("/api/v1/seasons").json()["seasons"]
+        mixed_currency = client.get("/api/v1/seasons").json()
+        seasons = mixed_currency["seasons"]
         assert [(row["season_number"], row["status"]) for row in seasons] == [
             (1, "completed"),
             (2, "current"),
         ]
         assert seasons[1]["quote_currency"] == "USDC"
+        assert mixed_currency["current_comparison_key"] == (
+            f"USDC:profile:{mixed_currency['current_profile_fingerprint']}"
+        )
+        assert [group["quote_currency"] for group in mixed_currency["comparison_groups"]] == [
+            "SOL",
+            "USDC",
+        ]
+        assert [group["season_count"] for group in mixed_currency["comparison_groups"]] == [1, 1]
+        assert mixed_currency["summary"]["comparison_group_count"] == 2
+        assert mixed_currency["summary"]["comparison_claims_available"] is False
+        assert mixed_currency["profiles"][0]["season_count"] == 2
 
 
 def test_typed_drawdown_profiles_validate_and_persist_from_setup(settings) -> None:  # type: ignore[no-untyped-def]

@@ -81,6 +81,7 @@ const MAX_SEASON_HISTORY_POINTS = 240;
 
 type LearningSectionKey = typeof LEARNING_SECTION_KEYS[number];
 type LearningViewKey = typeof LEARNING_VIEW_KEYS[number];
+type SeasonComparisonGroup = NonNullable<SeasonsData["comparison_groups"]>[number];
 
 function loadDismissedMaintenanceNotice(): string | null {
   try {
@@ -1939,7 +1940,7 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
 
   return <>
     <section className="page-heading leaderboard-heading">
-      <div><span className="eyebrow"><Trophy size={14} /> Results board</span><h1>{view === "trades" ? "Wins, losses, and the evidence behind them." : "Is the strategy improving each season?"}</h1><p>{view === "trades" ? "Review this season's net-of-fee paper trades, then open the exact saved entry and exit evidence." : "Compare each paper bankroll using percentages that stay meaningful across SOL and USDC seasons."}</p></div>
+      <div><span className="eyebrow"><Trophy size={14} /> Results board</span><h1>{view === "trades" ? "Wins, losses, and the evidence behind them." : "Is the strategy improving each season?"}</h1><p>{view === "trades" ? "Review this season's net-of-fee paper trades, then open the exact saved entry and exit evidence." : "Compare like-for-like currencies and profiles while keeping every season scorecard available."}</p></div>
       <div className="results-controls">
         <div className="results-view-tabs" aria-label="Results view">
           <button className={view === "trades" ? "active" : ""} aria-pressed={view === "trades"} onClick={() => setView("trades")}>Trades</button>
@@ -2040,27 +2041,34 @@ function SeasonsView({ reportIssue, resolveIssue }: {
 
   // Keep the Results view readable during a rolling backend/frontend update: an older
   // cached response is valid legacy history, not a reason to blank the entire tab.
-  const profiles = data.profiles ?? [];
-  const currentProfileFingerprint = data.current_profile_fingerprint ?? null;
-  const exactProfileCount = profiles.length;
-  const legacyCount = data.seasons.filter((season) => season.profile_provenance !== "exact").length;
+  const comparisonGroups = data.comparison_groups?.length
+    ? data.comparison_groups
+    : deriveSeasonComparisonGroups(data.seasons);
+  const currentSeason = data.seasons.find((season) => season.status === "current") ?? null;
+  const currentComparisonKey = data.current_comparison_key
+    ?? (currentSeason ? seasonComparisonKey(currentSeason) : null);
   const resolvedProfileFilter = profileFilter === "current"
-    ? currentProfileFingerprint ?? "all"
+    ? currentComparisonKey ?? "all"
     : profileFilter;
   const filteredSeasons = resolvedProfileFilter === "all"
     ? data.seasons
-    : resolvedProfileFilter === "legacy"
-      ? data.seasons.filter((season) => season.profile_provenance !== "exact")
-      : data.seasons.filter((season) => season.profile_fingerprint === resolvedProfileFilter);
+    : data.seasons.filter((season) => seasonComparisonKey(season) === resolvedProfileFilter);
   const orderedSeasons = [...filteredSeasons].sort((left, right) => left.season_number - right.season_number);
   const completed = orderedSeasons.filter((season) => season.status === "completed");
   const comparableCompleted = completed.filter((season) => season.comparable !== false);
   const excludedCompletedCount = completed.length - comparableCompleted.length;
-  const mixedHistory = resolvedProfileFilter === "all" && (exactProfileCount + (legacyCount ? 1 : 0)) > 1;
+  const selectedComparison = resolvedProfileFilter === "all"
+    ? comparisonGroups.length === 1 ? comparisonGroups[0] ?? null : null
+    : comparisonGroups.find((group) => group.comparison_key === resolvedProfileFilter) ?? null;
+  const mixedHistory = resolvedProfileFilter === "all" && comparisonGroups.length > 1;
+  const legacyHistory = !mixedHistory && selectedComparison?.profile_provenance !== "exact";
+  const comparisonClaimsHidden = mixedHistory || legacyHistory;
   const trend = mixedHistory
-    ? { title: "Mixed-profile history", copy: "Choose one exact profile for a like-for-like performance trend.", tone: "neutral" as const }
+    ? { title: "Mixed comparison history", copy: "Choose one currency and exact profile for a like-for-like performance trend.", tone: "neutral" as const }
+    : legacyHistory
+      ? { title: "Legacy policy unknown", copy: "These scorecards remain available, but their exact policy cannot support an improvement claim.", tone: "neutral" as const }
     : seasonTrend(comparableCompleted);
-  const bestCompleted = mixedHistory ? null : comparableCompleted.reduce<PaperSeason | null>((best, season) => {
+  const bestCompleted = comparisonClaimsHidden ? null : comparableCompleted.reduce<PaperSeason | null>((best, season) => {
     if (season.net_return_fraction === null) return best;
     if (best === null || best.net_return_fraction === null || season.net_return_fraction > best.net_return_fraction) return season;
     return best;
@@ -2077,26 +2085,25 @@ function SeasonsView({ reportIssue, resolveIssue }: {
     : null;
   return <>
     <section className="season-profile-filter card">
-      <div><span>Compare profile</span><strong>{mixedHistory ? "All seasons · mixed history" : resolvedProfileFilter === "legacy" ? "Legacy / unknown" : seasonProfileOptionLabel(profiles.find((profile) => profile.profile_fingerprint === resolvedProfileFilter) ?? null)}</strong><small>{mixedHistory ? "These seasons used different policies; aggregate improvement claims are intentionally hidden." : "Every statistic, chart and scorecard below uses this same profile."}</small></div>
-      <label><span>Season profile</span><select value={profileFilter} onChange={(event) => { setProfileFilter(event.target.value); setHistoryLimit(20); }}>
-        {currentProfileFingerprint && <option value="current">Current profile</option>}
-        {(["safe", "balanced", "aggressive"] as RiskMode[]).map((mode) => {
-          const variants = profiles.filter((profile) => profile.risk_mode === mode);
-          return variants.length ? <optgroup label={`${riskModeLabel(mode)} profiles`} key={mode}>
-            {variants.map((profile) => <option value={profile.profile_fingerprint} key={profile.profile_fingerprint}>{seasonProfileOptionLabel(profile)} · {profile.season_count}</option>)}
+      <div><span>Compare seasons</span><strong>{mixedHistory ? "All seasons · mixed history" : seasonComparisonGroupLabel(selectedComparison)}</strong><small>{mixedHistory ? "These seasons used different currencies or policies; aggregate improvement claims are intentionally hidden." : legacyHistory ? "Currency matches, but the historical policy is unknown; comparison claims stay hidden." : "Every statistic, chart and scorecard below uses the same currency and exact profile."}</small></div>
+      <label><span>Season comparison</span><select value={profileFilter} onChange={(event) => { setProfileFilter(event.target.value); setHistoryLimit(20); }}>
+        {currentComparisonKey && <option value="current">Current comparison</option>}
+        {(["SOL", "USDC"] as QuoteCurrency[]).map((currency) => {
+          const variants = comparisonGroups.filter((group) => group.quote_currency === currency);
+          return variants.length ? <optgroup label={`${currency} seasons`} key={currency}>
+            {variants.map((group) => <option value={group.comparison_key} key={group.comparison_key}>{seasonComparisonGroupLabel(group, false)} · {group.season_count}</option>)}
           </optgroup> : null;
         })}
-        {legacyCount > 0 && <option value="legacy">Legacy / unknown · {legacyCount}</option>}
         <option value="all">All seasons</option>
       </select></label>
     </section>
-    {!orderedSeasons.length && <div className="leaderboard-table"><EmptyState icon={<History size={22} />} title="No seasons for this profile" copy="This retained profile has not produced a paper season yet." /></div>}
+    {!orderedSeasons.length && <div className="leaderboard-table"><EmptyState icon={<History size={22} />} title="No seasons for this comparison" copy="This retained currency and profile combination has not produced a paper season yet." /></div>}
     {!!orderedSeasons.length && <>
     <section className="stats-grid leaderboard-stats season-stats">
       <Stat label="Seasons" value={String(orderedSeasons.length)} hint="Filtered set" />
       <Stat label="Completed" value={String(completed.length)} />
-      <Stat label={mixedHistory ? "Profiles" : "Profitable"} value={mixedHistory ? String(exactProfileCount + (legacyCount ? 1 : 0)) : String(profitableCount)} hint={mixedHistory ? "Mixed history" : "Comparable seasons"} tone={!mixedHistory && profitableCount ? "good" : undefined} />
-      <Stat label="Average win rate" value={mixedHistory || averageWinRate === null ? "—" : percent(averageWinRate)} hint={mixedHistory ? "Select one profile" : "Comparable seasons"} />
+      <Stat label={mixedHistory ? "Groups" : "Profitable"} value={mixedHistory ? String(comparisonGroups.length) : String(profitableCount)} hint={mixedHistory ? "Mixed history" : legacyHistory ? "Raw scorecards" : "Comparable seasons"} tone={!comparisonClaimsHidden && profitableCount ? "good" : undefined} />
+      <Stat label="Average win rate" value={comparisonClaimsHidden || averageWinRate === null ? "—" : percent(averageWinRate)} hint={mixedHistory ? "Select one comparison" : legacyHistory ? "Exact policy unknown" : "Comparable seasons"} />
     </section>
     {excludedCompletedCount > 0 && <div className="season-comparison-note"><ShieldCheck size={15} /><span>{excludedCompletedCount} manually ended or unresolved season{excludedCompletedCount === 1 ? " is" : "s are"} retained below but excluded from best-season and performance comparisons.</span></div>}
     <section className="season-overview-grid">
@@ -3354,12 +3361,67 @@ function shortDrawdownLabel(profile: SeasonProfile) {
   const value = profile.effective_drawdown_bps === null ? "DD unknown" : `DD ${profile.effective_drawdown_bps / 100}%`;
   return profile.drawdown_policy.kind === "default" ? `${value} default` : `${value} custom`;
 }
-function seasonProfileOptionLabel(profile: SeasonsData["profiles"][number] | null) {
-  if (!profile) return "Profile unavailable";
-  const drawdown = profile.drawdown_policy.kind === "disabled"
+function seasonComparisonKey(season: PaperSeason) {
+  if (typeof season.comparison_key === "string" && season.comparison_key) {
+    return season.comparison_key;
+  }
+  const exact = season.profile_provenance === "exact"
+    && season.profile !== null
+    && typeof season.profile_fingerprint === "string";
+  return exact
+    ? `${season.quote_currency}:profile:${season.profile_fingerprint}`
+    : `${season.quote_currency}:legacy`;
+}
+function deriveSeasonComparisonGroups(seasons: PaperSeason[]): SeasonComparisonGroup[] {
+  const groups = new Map<string, SeasonComparisonGroup>();
+  for (const season of seasons) {
+    const comparisonKey = seasonComparisonKey(season);
+    const exact = season.profile_provenance === "exact"
+      && season.profile !== null
+      && typeof season.profile_fingerprint === "string";
+    const existing = groups.get(comparisonKey);
+    if (existing) {
+      existing.season_count += 1;
+      continue;
+    }
+    groups.set(comparisonKey, {
+      comparison_key: comparisonKey,
+      quote_currency: season.quote_currency,
+      profile_provenance: exact ? "exact" : "legacy_unknown",
+      profile_fingerprint: exact ? season.profile_fingerprint : null,
+      risk_mode: exact ? season.profile!.risk_mode : null,
+      drawdown_policy: exact ? season.profile!.drawdown_policy : null,
+      effective_drawdown_bps: exact ? season.profile!.effective_drawdown_bps : null,
+      season_count: 1,
+    });
+  }
+  return [...groups.values()].sort((left, right) => {
+    const currencyOrder = left.quote_currency.localeCompare(right.quote_currency);
+    if (currencyOrder !== 0) return currencyOrder;
+    if (left.profile_provenance !== right.profile_provenance) {
+      return left.profile_provenance === "exact" ? -1 : 1;
+    }
+    return RISK_MODES.indexOf(left.risk_mode ?? "balanced")
+      - RISK_MODES.indexOf(right.risk_mode ?? "balanced");
+  });
+}
+function seasonComparisonGroupLabel(
+  group: SeasonComparisonGroup | null,
+  includeCurrency = true,
+) {
+  if (!group) return "Comparison unavailable";
+  if (
+    group.profile_provenance !== "exact"
+    || group.risk_mode === null
+    || group.drawdown_policy === null
+  ) {
+    return `${includeCurrency ? `${group.quote_currency} · ` : ""}Legacy / unknown`;
+  }
+  const drawdown = group.drawdown_policy.kind === "disabled"
     ? "DD off"
-    : `${profile.drawdown_policy.kind === "default" ? "Default DD" : "Custom DD"} ${(profile.effective_drawdown_bps ?? 0) / 100}%`;
-  return `${riskModeLabel(profile.risk_mode)} · ${drawdown}`;
+    : `${group.drawdown_policy.kind === "default" ? "Default DD" : "Custom DD"} ${(group.effective_drawdown_bps ?? 0) / 100}%`;
+  const label = `${riskModeLabel(group.risk_mode)} · ${drawdown}`;
+  return includeCurrency ? `${group.quote_currency} · ${label}` : label;
 }
 function terminalReasonLabel(reason: string) {
   if (reason === "profile_change") return "Profile change";

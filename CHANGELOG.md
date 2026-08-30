@@ -6,6 +6,13 @@ would require a deliberate V2 release.
 
 ## Unreleased
 
+## 1.8.1 - 2026-08-30
+
+- Freeze the current personality's canonical profile when an automatic rollover follows a legacy
+  season, while preserving the historical season's honest legacy/unknown provenance.
+- Compare season performance only within the same currency and exact risk profile; mixed or
+  legacy history remains visible without producing unsupported best-season or improvement claims.
+
 ## 1.8.0 - 2026-08-30
 
 - Freeze each paper season to one immutable, versioned risk profile and use a restart-safe

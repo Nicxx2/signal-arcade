@@ -126,12 +126,13 @@ invented zero exit. Missing conversion, provider health or executable evidence i
 bankruptcy—and pauses the test. Only healthy, sustained proof may end such a season as
 `bankroll_exhausted`; an ordinary enforced halt ends as `auto_drawdown`.
 
-Results defaults to the exact current profile. Custom drawdown variants, disabled drawdown and
-other personalities remain separate for every count, chart, trend and summary. All Seasons is a
-chronological mixed-profile history, not a single-strategy aggregate. Pre-migration seasons whose
-profile cannot be proven are retained as Legacy / Unknown and excluded from modern like-for-like
-claims. Manually ended seasons and any season with unresolved inventory are likewise retained for
-audit but excluded from improvement, best-return, profitability and average-win-rate claims.
+Results defaults to the current currency and exact profile. SOL and USDC, custom drawdown variants,
+disabled drawdown and other personalities remain separate for every count, chart, trend and
+summary. All Seasons is chronological mixed-comparison history, not a single-strategy aggregate.
+Pre-migration seasons whose profile cannot be proven are retained by currency as Legacy / Unknown
+and excluded from modern like-for-like claims. Manually ended seasons and any season with
+unresolved inventory are likewise retained for audit but excluded from improvement, best-return,
+profitability and average-win-rate claims.
 
 The scanner does not wait for current positions to close. Every incoming event first refreshes
 the matching open position and applies the adaptive exit and permanent risk rules;

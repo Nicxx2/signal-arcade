@@ -72,9 +72,10 @@ and changing personality never deletes the older cohort. The season-profile fing
 separate comparison identity. Balanced Default DD, custom DD and DD Off seasons therefore share
 the Balanced learning lineage because the override changes portfolio admission, not the saved
 point-in-time token target, quote math, fees, feature vector or forward outcome. Each observation
-still freezes its season ID and exact profile fingerprint, and a candidate blocked by drawdown,
-cash, exposure, capacity or conversion is marked non-actionable instead of being credited to a
-Challenger veto.
+still freezes its season ID and exact profile fingerprint. SOL and USDC bankrolls also share that
+personality lineage: account denomination changes Results comparison and funding eligibility, not
+the forward token-return target. A candidate blocked by drawdown, cash, exposure, capacity or
+conversion is marked non-actionable instead of being credited to a Challenger veto.
 
 A model
 qualifies only when its untouched validation section:

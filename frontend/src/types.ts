@@ -656,6 +656,7 @@ export interface PaperSeason {
   profile: SeasonProfile | null;
   profile_provenance: "exact" | "legacy_unknown";
   profile_locked_at: string | null;
+  comparison_key?: string;
   terminal_reason: string | null;
   result_quality?: "complete" | "unresolved";
   comparable?: boolean;
@@ -682,6 +683,7 @@ export interface Seasons {
   generated_at: string;
   seasons: PaperSeason[];
   current_profile_fingerprint: string | null;
+  current_comparison_key?: string | null;
   profiles: Array<{
     profile_fingerprint: string;
     risk_mode: RiskMode;
@@ -689,10 +691,22 @@ export interface Seasons {
     effective_drawdown_bps: number | null;
     season_count: number;
   }>;
+  comparison_groups?: Array<{
+    comparison_key: string;
+    quote_currency: QuoteCurrency;
+    profile_provenance: "exact" | "legacy_unknown";
+    profile_fingerprint: string | null;
+    risk_mode: RiskMode | null;
+    drawdown_policy: DrawdownPolicy | null;
+    effective_drawdown_bps: number | null;
+    season_count: number;
+  }>;
   summary: {
     season_count: number;
     completed_seasons: number;
     comparable_seasons?: number;
+    comparison_group_count?: number;
+    comparison_claims_available?: boolean;
     profitable_seasons: number;
     losing_seasons: number;
     average_win_rate: number | null;

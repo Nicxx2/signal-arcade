@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.8.0
+# 🧠 Signal Arcade v1.8.1
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach can observe the same saved outcomes without slowing or controlling the
 trading path. No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.8.0-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.8.1-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -34,8 +34,8 @@ and recent decisions stay together without hiding the assumptions behind the sco
 ### Season progress
 
 Compare win rate, drawdown, fees and net return across every retained paper season. V1.8 seasons
-freeze their exact profile for like-for-like filters; preserved pre-profile seasons remain clearly
-labelled as legacy history.
+freeze their exact profile and currency for like-for-like filters; preserved pre-profile seasons
+remain clearly labelled as legacy history without unsupported comparison claims.
 
 ![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/03-season-progress.png)
 
@@ -120,7 +120,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.8.0
+    image: nicxx2/signal-arcade:1.8.1
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s

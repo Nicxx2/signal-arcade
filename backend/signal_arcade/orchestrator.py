@@ -2850,8 +2850,18 @@ class Orchestrator:
         terminal_reason = (
             "bankroll_exhausted" if self._drawdown_halt_disabled() else "auto_drawdown"
         )
+        next_profile: dict[str, Any] | None = None
+        if self.broker.season_profile is None:
+            # A pre-profile season has no exact policy to inherit. Freeze the current
+            # personality's canonical defaults at this new boundary instead of allowing the
+            # successor to remain legacy/unknown. Never relabel the historical source season.
+            next_profile = build_season_profile(
+                self.risk_mode,
+                learning_fingerprint=self._configuration_fingerprint_for_mode(self.risk_mode),
+            ).model_dump(mode="json")
         previous_season_id, next_season_id = self.broker.rollover(
             now,
+            next_profile=next_profile,
             terminal_reason=terminal_reason,
         )
         self._auto_new_season_eligible_since = None
@@ -4224,6 +4234,18 @@ class Orchestrator:
                 )
                 start = datetime.fromisoformat(season["started_at"])
                 season["duration_seconds"] = max(0.0, (end - start).total_seconds())
+                profile = season.get("profile")
+                fingerprint = season.get("profile_fingerprint")
+                exact_profile = bool(
+                    season.get("profile_provenance") == "exact"
+                    and isinstance(profile, dict)
+                    and isinstance(fingerprint, str)
+                )
+                season["comparison_key"] = (
+                    f"{season['quote_currency']}:profile:{fingerprint}"
+                    if exact_profile
+                    else f"{season['quote_currency']}:legacy"
+                )
                 seasons.append(season)
 
             completed = [item for item in seasons if item["status"] == "completed"]
@@ -4237,9 +4259,35 @@ class Orchestrator:
                 if item["net_return_fraction"] is not None
             ]
             profile_counts: dict[str, dict[str, Any]] = {}
+            comparison_counts: dict[str, dict[str, Any]] = {}
             for item in seasons:
                 profile = item.get("profile")
                 fingerprint = item.get("profile_fingerprint")
+                comparison_key = str(item["comparison_key"])
+                comparison = comparison_counts.setdefault(
+                    comparison_key,
+                    {
+                        "comparison_key": comparison_key,
+                        "quote_currency": item["quote_currency"],
+                        "profile_provenance": item["profile_provenance"],
+                        "profile_fingerprint": (
+                            fingerprint if isinstance(fingerprint, str) else None
+                        ),
+                        "risk_mode": (
+                            profile.get("risk_mode") if isinstance(profile, dict) else None
+                        ),
+                        "drawdown_policy": (
+                            profile.get("drawdown_policy") if isinstance(profile, dict) else None
+                        ),
+                        "effective_drawdown_bps": (
+                            profile.get("effective_drawdown_bps")
+                            if isinstance(profile, dict)
+                            else None
+                        ),
+                        "season_count": 0,
+                    },
+                )
+                comparison["season_count"] += 1
                 if not isinstance(profile, dict) or not isinstance(fingerprint, str):
                     continue
                 entry = profile_counts.setdefault(
@@ -4262,6 +4310,10 @@ class Orchestrator:
                 ),
                 None,
             )
+            current_comparison_key = next(
+                (item.get("comparison_key") for item in seasons if item["status"] == "current"),
+                None,
+            )
             profile_summaries: list[dict[str, Any]] = list(profile_counts.values())
             profile_summaries.sort(
                 key=lambda item: (
@@ -4270,15 +4322,33 @@ class Orchestrator:
                     int(item["effective_drawdown_bps"] or 0),
                 )
             )
+            comparison_summaries: list[dict[str, Any]] = list(comparison_counts.values())
+            comparison_summaries.sort(
+                key=lambda item: (
+                    str(item["quote_currency"]),
+                    item["profile_provenance"] != "exact",
+                    str(item["risk_mode"] or ""),
+                    item["effective_drawdown_bps"] is None,
+                    int(item["effective_drawdown_bps"] or 0),
+                )
+            )
+            comparison_claims_available = (
+                len(comparison_summaries) == 1
+                and comparison_summaries[0]["profile_provenance"] == "exact"
+            )
             result = {
                 "generated_at": generated_at.isoformat(),
                 "seasons": seasons,
                 "current_profile_fingerprint": current_profile_fingerprint,
+                "current_comparison_key": current_comparison_key,
                 "profiles": profile_summaries,
+                "comparison_groups": comparison_summaries,
                 "summary": {
                     "season_count": len(seasons),
                     "completed_seasons": len(completed),
                     "comparable_seasons": len(comparable_completed),
+                    "comparison_group_count": len(comparison_summaries),
+                    "comparison_claims_available": comparison_claims_available,
                     "profitable_seasons": sum(
                         item["net_pnl_minor"] > 0 for item in comparable_completed
                     ),
