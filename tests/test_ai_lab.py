@@ -273,7 +273,7 @@ def test_local_ai_payload_is_compact_and_excludes_token_marketing() -> None:
     evidence = decision_evidence_payload(decision)
     payload_json = json.dumps(decision_explanation_payload(decision), separators=(",", ":"))
 
-    assert PROMPT_VERSION == "ai-critic-v3"
+    assert PROMPT_VERSION == "ai-critic-v4"
     assert evidence["feature.buy_ratio_5m"] == {"value": 0.7}
     critic_evidence = critic_evidence_payload(decision)
     assert critic_evidence["buy_ratio_5m"] == 0.7

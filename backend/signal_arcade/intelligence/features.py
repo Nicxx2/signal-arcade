@@ -43,6 +43,30 @@ class TradeObservation:
     quote_lamports: int
     price_sol: float
     signature: str = ""
+    venue: str = "pump_curve"
+
+
+IntegrityMetric = tuple[float | None, float, str | None]
+
+
+@dataclass(slots=True)
+class RollingTradeMetrics:
+    """At-most-one-second structural view of the bounded five-minute trade window."""
+
+    computed_at: datetime
+    venue: str
+    trades_1m: tuple[TradeObservation, ...]
+    trades_5m: tuple[TradeObservation, ...]
+    buys_1m: int
+    buys_5m: int
+    buy_ratio: float
+    users: frozenset[str]
+    wallet_volume_hhi: float
+    repeated_amount_ratio: float
+    same_slot_ratio: float
+    integrity: dict[str, IntegrityMetric]
+    window_span_seconds: float
+    buffer_saturated: bool
 
 
 @dataclass(slots=True)
@@ -79,6 +103,8 @@ class TokenState:
     complete: bool = False
     fee_bps: int = 0
     trades: deque[TradeObservation] = field(default_factory=lambda: deque(maxlen=5_000))
+    last_evicted_trade: TradeObservation | None = None
+    rolling_trade_metrics: RollingTradeMetrics | None = None
     sources: set[str] = field(default_factory=set)
     enrichment: dict[str, Any] = field(default_factory=dict)
     enrichment_times: dict[str, datetime] = field(default_factory=dict)
@@ -308,6 +334,8 @@ class TokenState:
         price = self.price_sol
         if token_units > 0 and quote_lamports > 0:
             price = (quote_lamports / LAMPORTS_PER_SOL) / (token_units / PUMP_TOKEN_DECIMALS)
+        if self.trades.maxlen is not None and len(self.trades) >= self.trades.maxlen:
+            self.last_evicted_trade = self.trades[0]
         self.trades.append(
             TradeObservation(
                 received_at=event.received_at,
@@ -318,6 +346,7 @@ class TokenState:
                 quote_lamports=max(0, quote_lamports),
                 price_sol=max(0.0, price),
                 signature=event.signature or "",
+                venue=self.venue,
             )
         )
 
@@ -550,31 +579,18 @@ class FeatureEngine:
         route_freshness = reserve_freshness if position_mark else freshness
         created = state.created_at or last_event
         age = max(0.0, (now - created).total_seconds())
-        trades_1m = [
-            trade for trade in state.trades if 0 <= (now - trade.received_at).total_seconds() <= 60
-        ]
-        trades_5m = [
-            trade for trade in state.trades if 0 <= (now - trade.received_at).total_seconds() <= 300
-        ]
-        buys_1m = sum(trade.side == Side.BUY for trade in trades_1m)
-        buys_5m = sum(trade.side == Side.BUY for trade in trades_5m)
+        rolling = _rolling_trade_metrics(state, now)
+        trades_1m = list(rolling.trades_1m)
+        trades_5m = list(rolling.trades_5m)
+        buys_1m = rolling.buys_1m
+        buys_5m = rolling.buys_5m
         sells_5m = len(trades_5m) - buys_5m
-        buy_ratio = buys_5m / len(trades_5m) if trades_5m else 0.0
-        users = {trade.user for trade in trades_5m if trade.user != "unknown"}
-        wallet_volume: dict[str, int] = defaultdict(int)
-        for trade in trades_5m:
-            wallet_volume[trade.user] += trade.quote_lamports
-        total_volume = sum(wallet_volume.values())
-        hhi = (
-            sum((value / total_volume) ** 2 for value in wallet_volume.values())
-            if total_volume > 0
-            else 1.0
-        )
-        amounts = Counter(trade.quote_lamports for trade in trades_5m if trade.quote_lamports > 0)
-        repeated_ratio = max(amounts.values(), default=0) / len(trades_5m) if trades_5m else 0.0
-        slots = Counter(trade.slot for trade in trades_5m if trade.slot > 0)
-        same_slot_ratio = max(slots.values(), default=0) / len(trades_5m) if trades_5m else 0.0
-        integrity = _stream_integrity_metrics(trades_5m)
+        buy_ratio = rolling.buy_ratio
+        users = rolling.users
+        hhi = rolling.wallet_volume_hhi
+        repeated_ratio = rolling.repeated_amount_ratio
+        same_slot_ratio = rolling.same_slot_ratio
+        integrity = rolling.integrity
         creator_sells = sum(
             trade.side == Side.SELL and trade.user == state.creator for trade in trades_5m
         )
@@ -624,6 +640,31 @@ class FeatureEngine:
 
         sources = sorted(state.sources) or ["unknown"]
         values: dict[str, DataValue] = {}
+        rolling_freshness = max(0.0, (now - rolling.computed_at).total_seconds())
+        rolling_keys = {
+            "trade_count_1m",
+            "trade_count_5m",
+            "buys_1m",
+            "buys_5m",
+            "sells_5m",
+            "buy_ratio_5m",
+            "unique_wallets_5m",
+            "wallet_volume_hhi",
+            "repeated_amount_ratio",
+            "same_slot_ratio",
+            "known_wallet_trade_coverage",
+            "signed_trade_coverage",
+            "trade_window_span_seconds",
+            "trade_buffer_saturated",
+            "trade_density_5m",
+            "median_trade_quote_sol",
+            "creator_sells_5m",
+            "momentum_1m",
+            "momentum_5m",
+            "drawdown_5m",
+            "volume_5m_sol",
+            *integrity,
+        }
 
         def put(
             key: str,
@@ -639,9 +680,16 @@ class FeatureEngine:
             values[key] = DataValue(
                 value=value,
                 unit=unit,
-                as_of=item_as_of or last_event,
+                as_of=item_as_of
+                or (rolling.computed_at if key in rolling_keys else last_event),
                 sources=source_list or sources,
-                freshness_seconds=freshness if item_freshness is None else item_freshness,
+                freshness_seconds=(
+                    rolling_freshness
+                    if item_freshness is None and key in rolling_keys
+                    else freshness
+                    if item_freshness is None
+                    else item_freshness
+                ),
                 quality=max(0.0, min(1.0, quality)),
                 missing_reason=missing_reason,
             )
@@ -676,6 +724,11 @@ class FeatureEngine:
             "slot_concentration_hhi",
             "price_direction_consistency",
             "multi_trade_signature_ratio",
+            "microtrade_count_ratio",
+            "meaningful_volume_ratio",
+            "meaningful_wallet_ratio",
+            "price_path_efficiency",
+            "rapid_price_reversal_ratio",
         ):
             metric = integrity[key]
             put(
@@ -687,6 +740,26 @@ class FeatureEngine:
             )
         put("known_wallet_trade_coverage", integrity["known_wallet_trade_coverage"][0], "fraction")
         put("signed_trade_coverage", integrity["signed_trade_coverage"][0], "fraction")
+        put("trade_window_span_seconds", rolling.window_span_seconds, "seconds")
+        current_evicted = state.last_evicted_trade
+        trade_buffer_saturated = bool(
+            rolling.buffer_saturated
+            or (
+                current_evicted is not None
+                and current_evicted.venue == state.venue
+                and 0 <= (now - current_evicted.received_at).total_seconds() <= 300
+            )
+        )
+        put("trade_buffer_saturated", trade_buffer_saturated, "boolean")
+        put("trade_density_5m", min(1.0, len(trades_5m) / 3_600), "fraction")
+        median_trade = integrity["median_trade_quote_sol"]
+        put(
+            "median_trade_quote_sol",
+            median_trade[0],
+            "SOL",
+            quality=median_trade[1],
+            missing_reason=median_trade[2],
+        )
         put("creator_sells_5m", creator_sells, "count")
         put("curve_progress", progress, "fraction")
         put("momentum_1m", momentum_1m, "fraction")
@@ -811,14 +884,78 @@ class FeatureEngine:
             return [self._snapshot_state(state, now) for state in states]
 
 
+def _rolling_trade_metrics(state: TokenState, now: datetime) -> RollingTradeMetrics:
+    """Build one coherent venue-local window and reuse it briefly during dense bursts."""
+
+    cached = state.rolling_trade_metrics
+    if cached is not None and cached.venue == state.venue:
+        cache_age = (now - cached.computed_at).total_seconds()
+        if 0 <= cache_age < 1.0:
+            return cached
+
+    trades_5m = tuple(
+        trade
+        for trade in state.trades
+        if trade.venue == state.venue
+        and 0 <= (now - trade.received_at).total_seconds() <= 300
+    )
+    trades_1m = tuple(
+        trade
+        for trade in trades_5m
+        if (now - trade.received_at).total_seconds() <= 60
+    )
+    buys_1m = sum(trade.side == Side.BUY for trade in trades_1m)
+    buys_5m = sum(trade.side == Side.BUY for trade in trades_5m)
+    users = frozenset(trade.user for trade in trades_5m if trade.user != "unknown")
+    wallet_volume: dict[str, int] = defaultdict(int)
+    for trade in trades_5m:
+        wallet_volume[trade.user] += trade.quote_lamports
+    total_volume = sum(wallet_volume.values())
+    hhi = (
+        sum((value / total_volume) ** 2 for value in wallet_volume.values())
+        if total_volume > 0
+        else 1.0
+    )
+    amounts = Counter(trade.quote_lamports for trade in trades_5m if trade.quote_lamports > 0)
+    repeated_ratio = max(amounts.values(), default=0) / len(trades_5m) if trades_5m else 0.0
+    slots = Counter(trade.slot for trade in trades_5m if trade.slot > 0)
+    same_slot_ratio = max(slots.values(), default=0) / len(trades_5m) if trades_5m else 0.0
+    span = (
+        max(0.0, (trades_5m[-1].received_at - trades_5m[0].received_at).total_seconds())
+        if len(trades_5m) > 1
+        else 0.0
+    )
+    evicted = state.last_evicted_trade
+    buffer_saturated = bool(
+        evicted is not None
+        and evicted.venue == state.venue
+        and 0 <= (now - evicted.received_at).total_seconds() <= 300
+    )
+    result = RollingTradeMetrics(
+        computed_at=now,
+        venue=state.venue,
+        trades_1m=trades_1m,
+        trades_5m=trades_5m,
+        buys_1m=buys_1m,
+        buys_5m=buys_5m,
+        buy_ratio=buys_5m / len(trades_5m) if trades_5m else 0.0,
+        users=users,
+        wallet_volume_hhi=hhi,
+        repeated_amount_ratio=repeated_ratio,
+        same_slot_ratio=same_slot_ratio,
+        integrity=_stream_integrity_metrics(list(trades_5m)),
+        window_span_seconds=span,
+        buffer_saturated=buffer_saturated,
+    )
+    state.rolling_trade_metrics = result
+    return result
+
+
 def _momentum(trades: list[TradeObservation]) -> float:
     prices = [trade.price_sol for trade in trades if trade.price_sol > 0]
     if len(prices) < 2 or prices[0] <= 0:
         return 0.0
     return max(-1.0, min(10.0, prices[-1] / prices[0] - 1))
-
-
-IntegrityMetric = tuple[float | None, float, str | None]
 
 
 def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, IntegrityMetric]:
@@ -844,6 +981,12 @@ def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, Integ
                 "slot_concentration_hhi",
                 "price_direction_consistency",
                 "multi_trade_signature_ratio",
+                "microtrade_count_ratio",
+                "meaningful_volume_ratio",
+                "meaningful_wallet_ratio",
+                "median_trade_quote_sol",
+                "price_path_efficiency",
+                "rapid_price_reversal_ratio",
                 "known_wallet_trade_coverage",
                 "signed_trade_coverage",
             )
@@ -886,6 +1029,46 @@ def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, Integ
     net_flow = abs(net_quote) / gross_quote if gross_quote > 0 else None
     amount_buckets = Counter(_amount_bucket(trade.quote_lamports) for trade in valued)
     quantized_repetition = max(amount_buckets.values(), default=0) / len(valued) if valued else None
+    microtrade_lamports = 3_000_000
+    meaningful_lamports = 10_000_000
+    valued_amounts = sorted(trade.quote_lamports for trade in valued)
+    median_lamports = (
+        (
+            valued_amounts[len(valued_amounts) // 2]
+            if len(valued_amounts) % 2
+            else (
+                valued_amounts[len(valued_amounts) // 2 - 1]
+                + valued_amounts[len(valued_amounts) // 2]
+            )
+            / 2
+        )
+        if valued_amounts
+        else None
+    )
+    microtrade_ratio = (
+        sum(trade.quote_lamports <= microtrade_lamports for trade in valued) / len(valued)
+        if valued
+        else None
+    )
+    meaningful_volume_ratio = (
+        sum(
+            trade.quote_lamports
+            for trade in valued
+            if trade.quote_lamports >= meaningful_lamports
+        )
+        / gross_quote
+        if gross_quote > 0
+        else None
+    )
+    wallet_quote: dict[str, int] = defaultdict(int)
+    for trade in known:
+        if trade.quote_lamports > 0:
+            wallet_quote[trade.user] += trade.quote_lamports
+    meaningful_wallet_ratio = (
+        sum(value >= meaningful_lamports for value in wallet_quote.values()) / len(wallet_quote)
+        if wallet_quote
+        else None
+    )
 
     ordered = sorted(enumerate(trades), key=lambda row: (row[1].received_at, row[1].slot, row[0]))
     ordered_trades = [trade for _, trade in ordered]
@@ -916,6 +1099,18 @@ def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, Integ
         if price_moves
         else 0.0
         if len(prices) >= 2
+        else None
+    )
+    total_price_travel = sum(abs(move) for move in price_moves)
+    path_efficiency = (
+        abs(prices[-1] - prices[0]) / total_price_travel
+        if len(prices) >= 2 and total_price_travel > 0
+        else None
+    )
+    move_signs = [1 if move > 0 else -1 for move in price_moves]
+    reversal_ratio = (
+        sum(left != right for left, right in pairwise(move_signs)) / (len(move_signs) - 1)
+        if len(move_signs) > 1
         else None
     )
 
@@ -975,6 +1170,45 @@ def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, Integ
             bundled,
             signature_coverage,
             "signature_evidence_unavailable",
+            minimum_quality=0.8,
+        ),
+        "microtrade_count_ratio": metric(
+            microtrade_ratio,
+            amount_coverage,
+            "trade_amount_unavailable",
+            minimum_quality=0.8,
+        ),
+        "meaningful_volume_ratio": metric(
+            meaningful_volume_ratio,
+            amount_coverage,
+            "trade_amount_unavailable",
+            minimum_quality=0.8,
+        ),
+        "meaningful_wallet_ratio": metric(
+            meaningful_wallet_ratio,
+            min(wallet_coverage, amount_coverage),
+            "wallet_or_trade_amount_unavailable",
+            minimum_quality=0.8,
+        ),
+        "median_trade_quote_sol": (
+            None if median_lamports is None else median_lamports / LAMPORTS_PER_SOL,
+            amount_coverage,
+            (
+                None
+                if median_lamports is not None and amount_coverage >= 0.8
+                else "trade_amount_unavailable"
+            ),
+        ),
+        "price_path_efficiency": metric(
+            path_efficiency,
+            price_coverage,
+            "price_path_unavailable",
+            minimum_quality=0.8,
+        ),
+        "rapid_price_reversal_ratio": metric(
+            reversal_ratio,
+            price_coverage,
+            "price_path_unavailable",
             minimum_quality=0.8,
         ),
         "known_wallet_trade_coverage": (wallet_coverage, 1.0, None),

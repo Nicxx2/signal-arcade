@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from signal_arcade.models import RISK_LIMITS, DataValue, FeatureSnapshot, Position, RiskMode
 from signal_arcade.paper.exit_policy import assess_exit
+from signal_arcade.strategy import BASELINE_VERSION
 
 
 def _value(value: float, now: datetime) -> DataValue:
@@ -201,3 +202,33 @@ def test_stop_loss_keeps_priority_over_persistent_integrity_attribution() -> Non
     )
 
     assert (assessment.action, assessment.reason) == ("exit", "stop_loss")
+
+
+def test_current_hold_support_does_not_treat_dust_activity_as_durable_demand() -> None:
+    now = datetime.now(UTC)
+    limits = RISK_LIMITS[RiskMode.BALANCED]
+    synthetic = features(now)
+    synthetic.values["meaningful_volume_ratio"] = _value(0.0, now)
+    synthetic.values["meaningful_wallet_ratio"] = _value(0.0, now)
+    current = position(now, age_seconds=limits.max_hold_seconds + 1)
+    current.baseline_version_at_entry = BASELINE_VERSION
+    frozen = current.model_copy(update={"baseline_version_at_entry": "baseline-v1.4"})
+
+    current_assessment = assess_exit(
+        position=current,
+        features=synthetic,
+        now=now,
+        limits=limits,
+    )
+    frozen_assessment = assess_exit(
+        position=frozen,
+        features=synthetic,
+        now=now,
+        limits=limits,
+    )
+
+    assert (current_assessment.action, current_assessment.reason) == ("exit", "time_exit")
+    assert (frozen_assessment.action, frozen_assessment.reason) == (
+        "hold",
+        "adaptive_extension",
+    )

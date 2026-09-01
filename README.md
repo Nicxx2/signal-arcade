@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.9.1
+# 🧠 Signal Arcade v1.9.2
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach can observe the same saved outcomes without slowing or controlling the
 trading path. No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.9.1-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.9.2-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -20,9 +20,9 @@ trading path. No wallet keys, live orders, paid provider or cloud AI are require
 
 ## 📸 See it in action
 
-These captures come from the running v1.9.1 app. They show genuine paper results—including wins,
-losses, excluded legacy history and evidence that is still collecting—instead of a staged
-guaranteed-profit demo.
+These captures come from the visually equivalent v1.9.1 interface. They show genuine paper
+results—including wins, losses, excluded legacy history and evidence that is still
+collecting—instead of a staged guaranteed-profit demo.
 
 ### The Arena
 
@@ -84,15 +84,15 @@ matching Challenger skill as a normal contender; it never replaces a Champion or
 
 | Player | What it does | Influence in v1.9 |
 |---|---|---|
-| **Fast Baseline** | Scores fresh evidence, corroborates integrity patterns and sizes inside hard limits | Runs the paper portfolio |
+| **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | One explicit consent activates a qualified Entry champion; later skills can join only after independent forward proof and remain monitored |
 | **Local AI Coach** | Rotates through bounded Entry, Manipulation, Sizing and Exit studies when the engine is quiet | Research only; a proved idea needs explicit permission and a fresh Challenger tournament before it could ever influence |
 
-- 🛡️ **Corroborated integrity** — Baseline v1.4 combines wallet loops, net flow, coordinated trade
-  structure, price-path evidence and concentrated one-trade activity without calling any one
-  pattern a scam. It waits for a usable integrity sample and holds an extreme unresolved warning
-  while continuing to learn from the same on-chain stream—no paid provider or extra holder crawl
-  is required.
+- 🛡️ **Corroborated integrity** — Baseline v1.5 combines wallet loops, net flow, coordinated trade
+  structure, price-path evidence, economic trade size and meaningful wallet/volume participation
+  without calling any one pattern a scam. An uninterrupted venue-local evidence window is
+  authoritative: incomplete or shed candidate data waits instead of looking clean, while older
+  locked seasons retain their exact policy.
 - 🎮 **Comparable paper seasons** — Every new season locks one Safer, Balanced or Aggressive
   profile, a typed drawdown policy, currency and exact virtual bankroll. One next-season editor can
   change them together. Profile changes can finish safely or use a bounded end-now path; manual
@@ -107,8 +107,8 @@ matching Challenger skill as a normal contender; it never replaces a Champion or
   integrity coverage, and an extreme isolated warning must resolve before the Baseline acts;
   raw point-in-time measurements remain available to the Challenger and Coach.
 - 📐 **Auditable adaptive paper sizing** — Clean mature evidence may use more of realized bankroll,
-  while moderate uncertainty receives a smaller exploratory amount, suspicious evidence stays
-  bounded, and cash, exposure, reservations and price impact remain hard limits.
+  while moderate uncertainty receives a smaller exploratory amount, currently suspicious
+  candidates are passed over, and cash, exposure, reservations and price impact remain hard limits.
 - 🛡️ **Permanent safety boundaries** — A drawdown override changes only the portfolio halt. Stop,
   exposure, stale-data, mint, route and executable-exit protections remain active.
 - 🔄 **Built for unattended runs** — Auto season rollover uses 1–24 hours of verified healthy,
@@ -137,7 +137,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.9.1
+    image: nicxx2/signal-arcade:1.9.2
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s

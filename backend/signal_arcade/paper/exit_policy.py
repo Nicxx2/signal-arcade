@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from ..models import ExitAction, ExitAssessment, FeatureSnapshot, Position, RiskLimits
+from ..strategy import BASELINE_VERSION
 
 POLICY_VERSION = "adaptive-exit-v1"
 ROUTE_BLOCKERS = {
@@ -29,7 +30,11 @@ def _available_number(features: FeatureSnapshot, key: str) -> float | None:
         return None
 
 
-def hold_support(features: FeatureSnapshot) -> tuple[float, list[str], int]:
+def hold_support(
+    features: FeatureSnapshot,
+    *,
+    baseline_version: str | None = None,
+) -> tuple[float, list[str], int]:
     """Return transparent continuation support from fresh, observable evidence only."""
 
     buy_ratio = _available_number(features, "buy_ratio_5m")
@@ -38,12 +43,31 @@ def hold_support(features: FeatureSnapshot) -> tuple[float, list[str], int]:
     trades = _available_number(features, "trade_count_1m")
     drawdown = _available_number(features, "drawdown_5m")
     concentration = _available_number(features, "wallet_volume_hhi")
+    economic_credit = 1.0
+    if baseline_version == BASELINE_VERSION:
+        meaningful_volume = _available_number(features, "meaningful_volume_ratio")
+        meaningful_wallets = _available_number(features, "meaningful_wallet_ratio")
+        economic_credit = _clamp(
+            min(
+                meaningful_volume if meaningful_volume is not None else 0.0,
+                meaningful_wallets if meaningful_wallets is not None else 0.0,
+            )
+            / 0.60
+        )
 
     components = {
-        "buy": 0.0 if buy_ratio is None else _clamp((buy_ratio - 0.35) / 0.35),
-        "momentum": 0.0 if momentum is None else _clamp((momentum + 0.10) / 0.45),
-        "wallets": 0.0 if wallets is None else _clamp(wallets / 20),
-        "trades": 0.0 if trades is None else _clamp(trades / 20),
+        "buy": (
+            0.0
+            if buy_ratio is None
+            else _clamp((buy_ratio - 0.35) / 0.35) * economic_credit
+        ),
+        "momentum": (
+            0.0
+            if momentum is None
+            else _clamp((momentum + 0.10) / 0.45) * economic_credit
+        ),
+        "wallets": 0.0 if wallets is None else _clamp(wallets / 20) * economic_credit,
+        "trades": 0.0 if trades is None else _clamp(trades / 20) * economic_credit,
         "drawdown": 0.0 if drawdown is None else 1 - _clamp(drawdown / 0.35),
         "concentration": (
             0.0 if concentration is None else 1 - _clamp((concentration - 0.08) / 0.42)
@@ -68,11 +92,13 @@ def hold_support(features: FeatureSnapshot) -> tuple[float, list[str], int]:
         evidence.append(f"5m drawdown {drawdown:.1%}")
     if wallets is not None:
         evidence.append(f"{int(wallets)} unique wallets in 5m")
+    if baseline_version == BASELINE_VERSION:
+        evidence.append(f"economically meaningful activity credit {economic_credit:.0%}")
     available = sum(
         value is not None
         for value in (buy_ratio, momentum, wallets, trades, drawdown, concentration)
     )
-    return score, evidence[:4], available
+    return score, evidence[:5], available
 
 
 def assess_exit(
@@ -101,7 +127,10 @@ def assess_exit(
         peak_mark / position.entry_cost_lamports - 1 if position.entry_cost_lamports else -1.0
     )
     peak_drawdown = 0.0 if peak_mark <= 0 else _clamp(1 - position.last_mark_lamports / peak_mark)
-    support, evidence, available_signals = hold_support(features)
+    support, evidence, available_signals = hold_support(
+        features,
+        baseline_version=position.baseline_version_at_entry,
+    )
 
     def result(action: str, reason: str, extra: str | None = None) -> ExitAssessment:
         details = [*evidence]

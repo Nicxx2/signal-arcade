@@ -4,6 +4,26 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.9.2 - 2026-09-01
+
+- Add Baseline v1.5 / integrity gates v3: raw trade count and wallet breadth now receive only the
+  economic credit supported by meaningful on-chain quote flow, while dust-trade share, median
+  size, meaningful volume/wallet participation, path efficiency and rapid reversals become
+  coverage-aware evidence. No single small trade or chart shape is a manipulation verdict;
+  current entries wait or pass only when sufficiently complete independent evidence corroborates.
+- Make the same uninterrupted five-minute candidate window authoritative for current Baseline
+  decisions, Challenger lessons, the local Critic and Coach research. Reconnects, represented
+  queue shedding, venue changes and a saturated bounded trade buffer fail closed without
+  rewriting old v1.1–v1.4 seasons, positions, observations or artifacts.
+- Keep structural computation bounded during event bursts with a one-second venue-local cache,
+  exclude pre-migration trades from post-migration measurements, and preserve exact freshness and
+  missing-data provenance. Held, pending and saved-outcome events keep their protected queue path.
+- Prevent synthetic-looking raw activity from earning a long adaptive hold or a larger paper size
+  in the new strategy. Persistent corroborated warnings may still request an exit only across
+  time-separated fresh executable checkpoints; one burst can neither buy nor force a sale.
+- Start `challenger-features-v3`, Coach research v4 and AI Critic v4 forward cohorts. Older evidence
+  remains readable and auditable but cannot silently qualify under fields it never observed.
+
 ## 1.9.1 - 2026-09-01
 
 - Add Baseline v1.4 uncertainty handling: a new entry waits until integrity evidence reaches its

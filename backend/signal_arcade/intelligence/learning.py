@@ -64,7 +64,7 @@ MAX_MODEL_VERSIONS = 1_000
 MAX_CLOCK_CHECKPOINTS_PER_TICK = 20
 LEARNER_VERSION_PREFIX = "learner-v4-"
 SKILL_ARTIFACT_VERSION_PREFIX = "challenger-skill-v1-"
-FEATURE_SCHEMA_VERSION = "challenger-features-v2"
+FEATURE_SCHEMA_VERSION = "challenger-features-v3"
 TOURNAMENT_MINIMUM_COMMON_OUTCOMES = 30
 TOURNAMENT_MAXIMUM_COMMON_OUTCOMES = 120
 TOURNAMENT_MINIMUM_AVAILABILITY = 0.70
@@ -87,6 +87,13 @@ INTEGRITY_FEATURE_NAMES = (
     "quantized_amount_repeat_ratio",
     "slot_concentration_hhi",
     "price_direction_consistency",
+    "microtrade_count_ratio",
+    "meaningful_volume_ratio",
+    "meaningful_wallet_ratio",
+    "median_trade_quote_sol",
+    "price_path_efficiency",
+    "rapid_price_reversal_ratio",
+    "trade_density_5m",
 )
 MANIPULATION_FEATURE_NAMES = (
     "danger",
@@ -157,6 +164,14 @@ COACH_MANIPULATION_RULES: tuple[tuple[str, CoachOperator, float], ...] = (
     ("quantized_amount_repeat_ratio", ">=", 0.40),
     ("slot_concentration_hhi", ">=", 0.30),
     ("price_direction_consistency", ">=", 0.90),
+    ("microtrade_count_ratio", ">=", 0.75),
+    ("microtrade_count_ratio", ">=", 0.90),
+    ("meaningful_volume_ratio", "<=", 0.35),
+    ("meaningful_wallet_ratio", "<=", 0.35),
+    ("median_trade_quote_sol", "<=", 0.005),
+    ("price_path_efficiency", "<=", 0.15),
+    ("rapid_price_reversal_ratio", ">=", 0.60),
+    ("trade_density_5m", ">=", 0.70),
 )
 COACH_MANIPULATION_COMBINATIONS: tuple[
     tuple[tuple[str, CoachOperator, float], tuple[str, CoachOperator, float]], ...
@@ -176,6 +191,18 @@ COACH_MANIPULATION_COMBINATIONS: tuple[
     (
         ("price_direction_consistency", ">=", 0.90),
         ("net_quote_flow_ratio", "<=", 0.20),
+    ),
+    (
+        ("microtrade_count_ratio", ">=", 0.75),
+        ("meaningful_volume_ratio", "<=", 0.35),
+    ),
+    (
+        ("meaningful_wallet_ratio", "<=", 0.35),
+        ("median_trade_quote_sol", "<=", 0.005),
+    ),
+    (
+        ("price_path_efficiency", "<=", 0.15),
+        ("rapid_price_reversal_ratio", ">=", 0.60),
     ),
 )
 SIZING_MINIMUM_POLICY_CHANGES = 5
@@ -218,6 +245,13 @@ FEATURE_LABELS = {
     "quantized_amount_repeat_ratio": "clustered trade sizing",
     "slot_concentration_hhi": "slot concentration",
     "price_direction_consistency": "one-way price path",
+    "microtrade_count_ratio": "dust-sized trade share",
+    "meaningful_volume_ratio": "economically meaningful volume share",
+    "meaningful_wallet_ratio": "economically meaningful wallet share",
+    "median_trade_quote_sol": "median trade size",
+    "price_path_efficiency": "price-path efficiency",
+    "rapid_price_reversal_ratio": "rapid price reversals",
+    "trade_density_5m": "five-minute trade density",
 }
 STRUCTURAL_FLAGS = {
     "missing_curve_reserves",

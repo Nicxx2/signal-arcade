@@ -37,6 +37,7 @@ from ..models import (
 from ..risk_profiles import SeasonProfile, upgrade_season_profile_strategy
 from ..strategy import (
     BASELINE_VERSION,
+    CORROBORATED_BASELINE_VERSION,
     LEARNABLE_BASELINE_VERSIONS,
     LEGACY_BASELINE_VERSION,
     SIZING_POLICY_VERSION,
@@ -77,7 +78,10 @@ def _integrity_reference_size_multiplier(
         return 0.60
     if state == MarketIntegrityState.SEVERE:
         return 0.50
-    if baseline_version == BASELINE_VERSION and state == MarketIntegrityState.UNCERTAIN:
+    if baseline_version in {
+        CORROBORATED_BASELINE_VERSION,
+        BASELINE_VERSION,
+    } and state == MarketIntegrityState.UNCERTAIN:
         return UNCERTAIN_INTEGRITY_SIZE_MULTIPLIER
     return 1.0
 
@@ -374,6 +378,11 @@ class PaperBroker:
         else:
             per_slot_fraction = limits.max_exposure_fraction / limits.max_open_positions
             confidence_to_scale = _clamp_fraction((quality - 0.58) / 0.34)
+            if baseline_version == BASELINE_VERSION:
+                meaningful_volume = decision.feature_snapshot.number("meaningful_volume_ratio")
+                meaningful_wallets = decision.feature_snapshot.number("meaningful_wallet_ratio")
+                economic_quality = _clamp_fraction(min(meaningful_volume, meaningful_wallets))
+                confidence_to_scale *= _clamp_fraction(0.25 + economic_quality)
             target_fraction = per_slot_fraction * (0.25 + 0.75 * confidence_to_scale)
             desired_size_sol = self._realized_account_target_sol(
                 target_fraction,
@@ -382,6 +391,8 @@ class PaperBroker:
             )
             desired_size_sol = max(base_size_sol, desired_size_sol)
             reasons.append("Clean, mature evidence allows bounded sizing from realized bankroll")
+            if baseline_version == BASELINE_VERSION:
+                reasons.append("Economically meaningful activity bounds any size increase")
 
         selected_size_sol, maximum_size_sol, constraints = self._bounded_entry_size_sol(
             decision,

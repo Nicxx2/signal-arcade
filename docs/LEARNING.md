@@ -18,23 +18,26 @@ the same integer curve quote and configured protocol/network costs as the paper 
 horizon has no usable future observation within its grace period, it stays **unknown**; it is never
 silently treated as zero or as a loss.
 
-Starting with the `stream-integrity-v4` cohort, each eligible lesson also freezes structural
+Starting with the `stream-integrity-v5` cohort, each eligible lesson also freezes structural
 market evidence available from the same five-minute Solana stream: the share of one-trade
 wallets, wallets that rapidly bought and sold, volume attributable to those round trips,
 absolute net quote flow relative to gross volume, buy/sell alternation, two-significant-digit
-amount clustering, slot concentration, and price-direction consistency. Transaction-signature
-bundling is retained for explanation when signature coverage is sufficient, but is not required
-by the first learner model.
+amount clustering, slot concentration, price-direction consistency, dust-trade share, median
+native-SOL trade size, meaningful volume and wallet participation, trade density, price-path
+efficiency, and rapid reversals. Transaction-signature bundling remains available to deterministic
+integrity and explanation when coverage is sufficient.
 
 These are descriptive measurements, not a scam probability. Organic viral launches, market
 makers, copy bots and legitimate bundled transactions can each produce one or more similar
-patterns. Baseline v1.4 therefore waits for a mature sample, holds an entry when one isolated
-warning is extreme, and reduces moderate unresolved evidence before corroboration can classify it
-as suspicious or severe. Older locked v1.1/v1.2/v1.3 seasons retain their exact policy; v1.1 keeps
+patterns. Baseline v1.5 therefore requires complete economic/path fields and uninterrupted event
+continuity, holds an entry when one isolated warning is extreme, and blocks a current entry only
+after independent corroboration classifies it as suspicious or severe. Older locked
+v1.1/v1.2/v1.3/v1.4 seasons retain their exact policy; v1.1 keeps
 the original observational-only path, v1.2 keeps its original four integrity categories, and v1.3
 adds one concentrated-dispersion category only when extreme wallet-volume
 concentration and overwhelming one-trade participation occur together; either signal alone is
-insufficient. The challenger still receives the frozen raw measurements and
+insufficient. v1.4 adds its mature-sample and isolated-warning treatment without adopting the new
+economic/path gate. The challenger still receives the frozen raw measurements and
 learns their relationship to later net outcomes, while the Coach may propose only an allowlisted
 shadow veto experiment that must pass the same independent forward-evidence process as every
 other coaching idea.
@@ -48,7 +51,8 @@ unrelated tokens can continue to learn from complete evidence. A failed event wi
 a saturated bounded gap tracker fails closed for the whole source. Failed batches are not replayed,
 avoiding duplicate broker side effects. Protected open-position and already-saved outcome events
 continue normally. Missing evidence remains `unknown`; it is never converted to zero. The evidence
-schema is included in the configuration fingerprint and the model family is `learner-v4`, so all
+schema is included in the configuration fingerprint and the feature family is
+`challenger-features-v3`, so all
 older observations and models remain readable and auditable but cannot be mixed into the new
 forward cohort as if those fields and continuity guarantees had existed at the time.
 

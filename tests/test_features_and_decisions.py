@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Event
 
 import pytest
-from signal_arcade.intelligence.decision import DecisionEngine
+from signal_arcade.intelligence.decision import DecisionEngine, assess_market_integrity
 from signal_arcade.intelligence.features import FeatureEngine
 from signal_arcade.models import (
     DataValue,
@@ -18,11 +19,13 @@ from signal_arcade.models import (
 )
 from signal_arcade.strategy import (
     BASELINE_VERSION,
+    CORROBORATED_BASELINE_VERSION,
     INTEGRITY_POLICY_VERSION,
     LEGACY_BASELINE_VERSION,
     PREVIOUS_BASELINE_VERSION,
     PREVIOUS_INTEGRITY_POLICY_VERSION,
     RECENT_BASELINE_VERSION,
+    RECENT_INTEGRITY_POLICY_VERSION,
 )
 
 
@@ -36,6 +39,226 @@ def event(event_id: str, kind: EventKind, now: datetime, payload: dict[str, obje
         received_at=now,
         payload=payload,
     )
+
+
+def _mark_integrity_window_complete(snapshot, now: datetime) -> None:  # type: ignore[no-untyped-def]
+    snapshot.values["integrity_window_complete"] = DataValue(
+        value=True,
+        unit="boolean",
+        as_of=now,
+        sources=["test:event_pipeline"],
+        freshness_seconds=0,
+        quality=1,
+    )
+
+
+def test_synthetic_economic_activity_requires_corroboration_and_blocks_current_entry() -> None:
+    now = datetime.now(UTC)
+    start = now - timedelta(seconds=60)
+    mint = "Mint111111111111111111111111111111111111111"
+    engine = FeatureEngine()
+    engine.apply(
+        event(
+            "e1",
+            EventKind.CREATE,
+            start,
+            {
+                "name": "Synthetic",
+                "symbol": "SYN",
+                "virtual_token_reserves": 1_073_000_000_000_000,
+                "virtual_sol_reserves": 30_000_000_000,
+                "real_token_reserves": 793_100_000_000_000,
+            },
+        )
+    )
+    for index in range(30):
+        engine.apply(
+            event(
+                f"e{index + 2}",
+                EventKind.TRADE,
+                now - timedelta(seconds=29 - index),
+                {
+                    "is_buy": index % 2 == 0,
+                    "user": f"dust-wallet-{index}",
+                    "sol_amount": 1_000_000,
+                    "token_amount": 1_000_000_000 if index % 2 == 0 else 2_000_000_000,
+                    "virtual_token_reserves": 1_000_000_000_000_000,
+                    "virtual_sol_reserves": 30_000_000_000,
+                    "real_token_reserves": 700_000_000_000_000,
+                },
+            )
+        )
+    snapshot = engine.snapshot(mint, now)
+    assert snapshot is not None
+    _mark_integrity_window_complete(snapshot, now)
+    assert snapshot.values["microtrade_count_ratio"].value == 1
+    assert snapshot.values["meaningful_volume_ratio"].value == 0
+    assert snapshot.values["meaningful_wallet_ratio"].value == 0
+    assert snapshot.values["median_trade_quote_sol"].value == pytest.approx(0.001)
+
+    assessment = assess_market_integrity(snapshot)
+    assert "synthetic_economic_activity" in assessment.categories
+    assert "rapid_price_reversion" in assessment.categories
+    assert assessment.state in {MarketIntegrityState.SUSPICIOUS, MarketIntegrityState.SEVERE}
+    decision = DecisionEngine().evaluate(snapshot, RiskMode.AGGRESSIVE)
+    assert decision.action == DecisionAction.PASS
+    assert set(decision.blockers).intersection(
+        {"market_integrity_suspicious", "market_integrity_severe"}
+    )
+
+    # A small median trade is a clue, not a verdict. With independent economic and path evidence
+    # restored to ordinary values, that lone metric remains clean.
+    isolated = snapshot.model_copy(deep=True)
+    ordinary = {
+        "wallet_volume_hhi": 0.05,
+        "single_trade_wallet_ratio": 0.40,
+        "round_trip_wallet_ratio": 0.0,
+        "round_trip_volume_ratio": 0.0,
+        "net_quote_flow_ratio": 0.80,
+        "side_alternation_ratio": 0.20,
+        "quantized_amount_repeat_ratio": 0.10,
+        "slot_concentration_hhi": 0.05,
+        "price_direction_consistency": 0.60,
+        "multi_trade_signature_ratio": 0.0,
+        "microtrade_count_ratio": 0.10,
+        "meaningful_volume_ratio": 0.90,
+        "meaningful_wallet_ratio": 0.90,
+        "median_trade_quote_sol": 0.002,
+        "price_path_efficiency": 0.60,
+        "rapid_price_reversal_ratio": 0.20,
+    }
+    for name, value in ordinary.items():
+        isolated.values[name].value = value
+        isolated.values[name].quality = 1
+        isolated.values[name].missing_reason = None
+    isolated_assessment = assess_market_integrity(isolated)
+    assert isolated_assessment.state == MarketIntegrityState.CLEAN
+    assert isolated_assessment.category_count == 0
+
+    missing_economic = isolated.model_copy(deep=True)
+    missing_economic.values["meaningful_volume_ratio"].value = None
+    missing_economic.values["meaningful_volume_ratio"].quality = 0
+    missing_economic.values["meaningful_volume_ratio"].missing_reason = "test_missing"
+    missing_decision = DecisionEngine().evaluate(missing_economic, RiskMode.AGGRESSIVE)
+    assert missing_decision.integrity_assessment is not None
+    assert missing_decision.integrity_assessment.state == MarketIntegrityState.UNCERTAIN
+    assert "market_integrity_evidence_not_mature" in missing_decision.blockers
+
+
+def test_integrity_window_and_venue_boundaries_fail_closed_only_for_current_policy() -> None:
+    now = datetime.now(UTC)
+    engine = FeatureEngine()
+    mint = "Mint111111111111111111111111111111111111111"
+    for index in range(24):
+        engine.apply(
+            event(
+                f"e{index + 1}",
+                EventKind.TRADE,
+                now - timedelta(seconds=40 - index),
+                {
+                    "is_buy": True,
+                    "user": f"wallet-{index}",
+                    "sol_amount": 30_000_000,
+                    "token_amount": 1_000_000_000,
+                    "virtual_token_reserves": 1_000_000_000_000_000,
+                    "virtual_sol_reserves": 30_000_000_000,
+                    "real_token_reserves": 700_000_000_000_000,
+                },
+            )
+        )
+    snapshot = engine.snapshot(mint, now)
+    assert snapshot is not None
+    snapshot.values["age_seconds"].value = 45
+    snapshot.values["integrity_window_complete"] = DataValue(
+        value=False,
+        unit="boolean",
+        as_of=now,
+        sources=["test:event_pipeline"],
+        freshness_seconds=0,
+        quality=1,
+        missing_reason="candidate_event_shed",
+    )
+    current = DecisionEngine().evaluate(snapshot, RiskMode.AGGRESSIVE)
+    assert "market_integrity_evidence_not_mature" in current.blockers
+    frozen = DecisionEngine().evaluate(
+        snapshot,
+        RiskMode.AGGRESSIVE,
+        baseline_version=CORROBORATED_BASELINE_VERSION,
+    )
+    assert "market_integrity_evidence_not_mature" not in frozen.blockers
+
+    amm_event = event(
+        "e100",
+        EventKind.TRADE,
+        now + timedelta(seconds=2),
+        {
+            "event_name": "BuyEvent",
+            "is_buy": True,
+            "user": "amm-wallet",
+            "quote_mint": "So11111111111111111111111111111111111111112",
+            "pool": "Pool111111111111111111111111111111111111111",
+            "pool_base_token_reserves": 2_000_000_000,
+            "pool_quote_token_reserves": 4_000_000_000,
+            "quote_amount_in": 20_000_000,
+            "base_amount_out": 1_000_000_000,
+        },
+    ).model_copy(update={"source": "solana:pAMMBay6"})
+    engine.apply(amm_event)
+    migrated = engine.snapshot(mint, now + timedelta(seconds=3))
+    assert migrated is not None
+    assert migrated.venue == "pump_swap"
+    assert migrated.values["trade_count_5m"].value == 1
+
+
+def test_trade_window_cache_is_bounded_and_reports_live_buffer_saturation() -> None:
+    now = datetime.now(UTC)
+    engine = FeatureEngine()
+    mint = "Mint111111111111111111111111111111111111111"
+    first = event(
+        "e1",
+        EventKind.TRADE,
+        now,
+        {
+            "is_buy": True,
+            "user": "one",
+            "sol_amount": 20_000_000,
+            "token_amount": 1_000_000_000,
+            "virtual_token_reserves": 1_000_000_000_000_000,
+            "virtual_sol_reserves": 30_000_000_000,
+        },
+    )
+    engine.apply(first)
+    initial = engine.snapshot(mint, now)
+    assert initial is not None and initial.values["trade_count_5m"].value == 1
+    engine.apply(
+        first.model_copy(
+            update={
+                "event_id": "e2",
+                "received_at": now + timedelta(milliseconds=100),
+                "payload": {**first.payload, "user": "two"},
+            }
+        )
+    )
+    cached = engine.snapshot(mint, now + timedelta(milliseconds=100))
+    refreshed = engine.snapshot(mint, now + timedelta(seconds=1, milliseconds=100))
+    assert cached is not None and cached.values["trade_count_5m"].value == 1
+    assert refreshed is not None and refreshed.values["trade_count_5m"].value == 2
+
+    state = engine.tokens[mint]
+    state.trades = deque(state.trades, maxlen=2)
+    for index in range(3, 5):
+        engine.apply(
+            first.model_copy(
+                update={
+                    "event_id": f"e{index}",
+                    "received_at": now + timedelta(seconds=index),
+                    "payload": {**first.payload, "user": f"wallet-{index}"},
+                }
+            )
+        )
+    saturated = engine.snapshot(mint, now + timedelta(seconds=5))
+    assert saturated is not None
+    assert saturated.values["trade_buffer_saturated"].value is True
 
 
 def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
@@ -550,6 +773,14 @@ def test_decision_progresses_from_watch_to_evaluated() -> None:
         "Mint111111111111111111111111111111111111111", start + timedelta(seconds=25)
     )
     assert snapshot is not None
+    snapshot.values["integrity_window_complete"] = DataValue(
+        value=True,
+        unit="boolean",
+        as_of=start + timedelta(seconds=25),
+        sources=["test"],
+        freshness_seconds=0,
+        quality=1,
+    )
     decision = DecisionEngine().evaluate(
         snapshot,
         RiskMode.AGGRESSIVE,
@@ -594,13 +825,19 @@ def test_decision_progresses_from_watch_to_evaluated() -> None:
     assert "market_integrity_evidence_not_mature" in short_sample.blockers
     assert short_sample.action == DecisionAction.PASS
 
-    # A season already locked to v1.3 keeps its original fast-entry behavior after upgrade.
+    # Seasons already locked to older Baselines keep their exact behavior after upgrade.
     recent_short_sample = DecisionEngine().evaluate(
         extreme,
         RiskMode.AGGRESSIVE,
         baseline_version=RECENT_BASELINE_VERSION,
     )
     assert "market_integrity_evidence_not_mature" not in recent_short_sample.blockers
+    corroborated_short_sample = DecisionEngine().evaluate(
+        extreme,
+        RiskMode.AGGRESSIVE,
+        baseline_version=CORROBORATED_BASELINE_VERSION,
+    )
+    assert "market_integrity_evidence_not_mature" not in corroborated_short_sample.blockers
 
     mature_extreme = extreme.model_copy(deep=True)
     mature_extreme.values["trade_count_5m"].value = 30
@@ -672,7 +909,7 @@ def test_decision_progresses_from_watch_to_evaluated() -> None:
         baseline_version=RECENT_BASELINE_VERSION,
     )
     assert recent_isolated.integrity_assessment is not None
-    assert recent_isolated.integrity_assessment.policy_version == INTEGRITY_POLICY_VERSION
+    assert recent_isolated.integrity_assessment.policy_version == RECENT_INTEGRITY_POLICY_VERSION
     assert "market_integrity_uncertain_high_risk" not in recent_isolated.blockers
 
     moderate_isolated = isolated.model_copy(deep=True)

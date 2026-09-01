@@ -24,6 +24,7 @@ from .intelligence.features import FeatureEngine, TokenState
 from .intelligence.learning import FEATURE_SCHEMA_VERSION, LearningEngine
 from .models import (
     AiDecisionMode,
+    DataValue,
     Decision,
     DecisionAction,
     EventKind,
@@ -1216,6 +1217,32 @@ class Orchestrator:
             snapshot = self.features.snapshot(state.mint, event.received_at)
             if snapshot is None:
                 return
+            integrity_window_complete = self._integrity_learning_window_complete(
+                state.mint, event.received_at
+            )
+            trade_buffer = snapshot.values.get("trade_buffer_saturated")
+            if trade_buffer is not None and trade_buffer.value is True:
+                integrity_window_complete = False
+            snapshot = snapshot.model_copy(
+                update={
+                    "values": {
+                        **snapshot.values,
+                        "integrity_window_complete": DataValue(
+                            value=integrity_window_complete,
+                            unit="boolean",
+                            as_of=event.received_at,
+                            sources=["event_pipeline"],
+                            freshness_seconds=0.0,
+                            quality=1.0,
+                            missing_reason=(
+                                None
+                                if integrity_window_complete
+                                else "complete_five_minute_window_unavailable"
+                            ),
+                        ),
+                    }
+                }
+            )
             sol_usd_price = self._sol_usd_price(snapshot)
 
             transition_exit_management = self._profile_transition_exit_management_active(
@@ -1259,9 +1286,7 @@ class Orchestrator:
             decision: Decision | None = None
             order = None
             if should_evaluate:
-                integrity_learning_eligible = self._integrity_learning_window_complete(
-                    state.mint, event.received_at
-                )
+                integrity_learning_eligible = integrity_window_complete
                 planned_size = await asyncio.to_thread(
                     self.broker.planned_order_size_sol,
                     self.risk_mode,
@@ -1481,7 +1506,7 @@ class Orchestrator:
         payload: dict[str, Any] = {
             # Frozen evidence semantics are part of provenance. A schema change starts a new
             # forward cohort while retaining every older observation and model for audit.
-            "learning_evidence_schema": "stream-integrity-v4",
+            "learning_evidence_schema": "stream-integrity-v5",
             "risk_mode": mode.value,
             "demo_mode": self.demo_mode,
             "fees": {

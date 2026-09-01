@@ -31,8 +31,8 @@ from .redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ai-critic-v3"
-SCHEMA_VERSION = "ai-critic-schema-v3"
+PROMPT_VERSION = "ai-critic-v4"
+SCHEMA_VERSION = "ai-critic-schema-v4"
 MINIMUM_RESOLVED_ASSESSMENTS = 200
 MINIMUM_VETO_OUTCOMES = 20
 MAX_GUARDED_P95_LATENCY_MS = 2_500
@@ -53,6 +53,7 @@ RISK_FLAGS = {
     "drawdown",
     "data_quality",
     "cost_edge",
+    "synthetic_activity",
     "none",
 }
 
@@ -1049,6 +1050,15 @@ def critic_evidence_payload(decision: Decision) -> dict[str, Any]:
         "drawdown_5m",
         "virtual_quote_reserve_sol",
         "observed_fee_bps",
+        "microtrade_count_ratio",
+        "meaningful_volume_ratio",
+        "meaningful_wallet_ratio",
+        "median_trade_quote_sol",
+        "price_path_efficiency",
+        "rapid_price_reversal_ratio",
+        "trade_density_5m",
+        "trade_window_span_seconds",
+        "integrity_window_complete",
     }
     for name in sorted(feature_names):
         item = decision.feature_snapshot.values.get(name)
@@ -1094,6 +1104,15 @@ _EVIDENCE_LABELS = {
     "drawdown_5m": "5-minute drawdown",
     "virtual_quote_reserve_sol": "reserve depth",
     "observed_fee_bps": "observed fee",
+    "microtrade_count_ratio": "dust-sized trade share",
+    "meaningful_volume_ratio": "meaningful volume share",
+    "meaningful_wallet_ratio": "meaningful wallet share",
+    "median_trade_quote_sol": "median trade size",
+    "price_path_efficiency": "price-path efficiency",
+    "rapid_price_reversal_ratio": "rapid price reversals",
+    "trade_density_5m": "five-minute trade density",
+    "trade_window_span_seconds": "observed trade-window span",
+    "integrity_window_complete": "five-minute evidence continuity",
 }
 
 

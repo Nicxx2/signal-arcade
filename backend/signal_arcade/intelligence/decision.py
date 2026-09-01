@@ -18,6 +18,7 @@ from ..strategy import (
     INTEGRITY_POLICY_VERSION,
     LEGACY_BASELINE_VERSION,
     PREVIOUS_INTEGRITY_POLICY_VERSION,
+    RECENT_INTEGRITY_POLICY_VERSION,
     SUPPORTED_BASELINE_VERSIONS,
     UNCERTAIN_INTEGRITY_HOLD_SCORE,
     integrity_policy_for_baseline,
@@ -76,6 +77,18 @@ class DecisionEngine:
 
         velocity_signal = _clamp(trade_rate / 30)
         participation_signal = _clamp(unique / 24)
+        if active_version == BASELINE_VERSION:
+            meaningful_volume = _usable_fraction(features, "meaningful_volume_ratio")
+            meaningful_wallets = _usable_fraction(features, "meaningful_wallet_ratio")
+            economic_activity = min(
+                meaningful_volume if meaningful_volume is not None else 0.0,
+                meaningful_wallets if meaningful_wallets is not None else 0.0,
+            )
+            # A wall of dust-sized transfers must not manufacture opportunity or participation.
+            # Genuine activity receives full credit; mixed evidence is discounted, not erased.
+            activity_credit = 0.25 + 0.75 * _clamp(economic_activity / 0.60)
+            velocity_signal *= activity_credit
+            participation_signal *= activity_credit
         balance_signal = _clamp((buy_ratio - 0.42) / 0.35)
         progress_signal = _clamp(progress / 0.70)
         momentum_signal = _clamp(momentum / 0.35) * _clamp((1.5 - momentum) / 1.2)
@@ -149,16 +162,25 @@ class DecisionEngine:
         blockers = list(features.hard_flags)
         if integrity is not None and integrity.state == MarketIntegrityState.SEVERE:
             blockers.append("market_integrity_severe")
+        if (
+            active_version == BASELINE_VERSION
+            and integrity is not None
+            and integrity.state == MarketIntegrityState.SUSPICIOUS
+        ):
+            blockers.append("market_integrity_suspicious")
         if active_version == BASELINE_VERSION and integrity is not None:
             # New launches may satisfy the fast trader's basic 15-second gate before the
-            # manipulation classifier has a complete sample.  v1.4 waits for that fuller
+            # manipulation classifier has a complete sample.  v1.5 waits for that fuller
             # evidence instead of treating "not yet known" as safe.  Once mature, one extreme
             # isolated signal remains uncertain rather than being mislabeled as manipulation,
             # but the Baseline waits for it to clear or gain corroboration before entering.
+            window_complete = _integrity_window_complete(features)
             integrity_is_mature = (
                 integrity.sample_count >= INTEGRITY_MIN_SAMPLE_COUNT
                 and age >= INTEGRITY_MIN_AGE_SECONDS
                 and integrity.coverage >= INTEGRITY_MIN_COVERAGE
+                and window_complete
+                and _current_integrity_core_complete(features)
             )
             if not integrity_is_mature:
                 blockers.append("market_integrity_evidence_not_mature")
@@ -241,6 +263,7 @@ def assess_market_integrity(
 
     if policy_version not in {
         PREVIOUS_INTEGRITY_POLICY_VERSION,
+        RECENT_INTEGRITY_POLICY_VERSION,
         INTEGRITY_POLICY_VERSION,
     }:
         raise ValueError(f"unsupported integrity policy version: {policy_version}")
@@ -257,11 +280,22 @@ def assess_market_integrity(
         "price_direction_consistency",
         "multi_trade_signature_ratio",
     )
-    if policy_version == INTEGRITY_POLICY_VERSION:
+    if policy_version in {RECENT_INTEGRITY_POLICY_VERSION, INTEGRITY_POLICY_VERSION}:
         metric_names = (
             "wallet_volume_hhi",
             "single_trade_wallet_ratio",
             *metric_names,
+        )
+    if policy_version == INTEGRITY_POLICY_VERSION:
+        metric_names = (
+            *metric_names,
+            "microtrade_count_ratio",
+            "meaningful_volume_ratio",
+            "meaningful_wallet_ratio",
+            "median_trade_quote_sol",
+            "price_path_efficiency",
+            "rapid_price_reversal_ratio",
+            "trade_density_5m",
         )
     available: dict[str, tuple[float, float]] = {}
     for name in metric_names:
@@ -280,7 +314,7 @@ def assess_market_integrity(
         category_scores["wallet_loops"] = wallet_score
         evidence.append("Repeated wallet round trips dominate participation or volume")
 
-    if policy_version == INTEGRITY_POLICY_VERSION:
+    if policy_version in {RECENT_INTEGRITY_POLICY_VERSION, INTEGRITY_POLICY_VERSION}:
         # Neither concentration nor one-trade participation is suspicious by itself. Together,
         # at extreme levels, they describe a distinct dispersed-activity risk: most wallets appear
         # only once while very little of the traded value is economically independent. Keeping it
@@ -326,6 +360,44 @@ def assess_market_integrity(
         category_scores["trade_structure"] = structure_score
         evidence.append("Trade timing, ordering, or sizing repeats in a coordinated pattern")
 
+    if policy_version == INTEGRITY_POLICY_VERSION:
+        economic_signals = sorted(
+            (
+                _risk_above(available.get("microtrade_count_ratio"), 0.65, 0.95),
+                _risk_below(available.get("meaningful_volume_ratio"), 0.55, 0.12),
+                _risk_below(available.get("meaningful_wallet_ratio"), 0.55, 0.15),
+                _risk_below(available.get("median_trade_quote_sol"), 0.020, 0.003),
+                _risk_above(available.get("trade_density_5m"), 0.65, 0.95),
+            ),
+            reverse=True,
+        )
+        economic_score = (
+            sum(economic_signals[:3]) / 3
+            if economic_signals[2] >= 0.35
+            else economic_signals[0] * 0.35
+        )
+        if economic_score >= 0.55:
+            category_scores["synthetic_economic_activity"] = economic_score
+            evidence.append(
+                "High displayed activity is dominated by dust-sized, economically weak flow"
+            )
+
+        reversion_signals = sorted(
+            (
+                _risk_below(available.get("price_path_efficiency"), 0.30, 0.08),
+                _risk_above(available.get("rapid_price_reversal_ratio"), 0.45, 0.75),
+            ),
+            reverse=True,
+        )
+        reversion_score = (
+            sum(reversion_signals) / 2
+            if reversion_signals[1] >= 0.35
+            else reversion_signals[0] * 0.35
+        )
+        if reversion_score >= 0.55:
+            category_scores["rapid_price_reversion"] = reversion_score
+            evidence.append("The price repeatedly reverses while generating little net progress")
+
     path_score = _risk_above(available.get("price_direction_consistency"), 0.84, 0.98)
     if path_score >= 0.55:
         category_scores["price_path"] = path_score
@@ -341,10 +413,24 @@ def assess_market_integrity(
         and age_seconds >= INTEGRITY_MIN_AGE_SECONDS
         and coverage >= INTEGRITY_MIN_COVERAGE
     )
+    if policy_version == INTEGRITY_POLICY_VERSION:
+        eligible = (
+            eligible
+            and _integrity_window_complete(features)
+            and _current_integrity_core_complete(features)
+        )
 
     if not eligible:
         state = MarketIntegrityState.UNCERTAIN
-        evidence.insert(0, "More time, trades, or complete stream fields are needed")
+        if policy_version == INTEGRITY_POLICY_VERSION and not _integrity_window_complete(features):
+            evidence.insert(0, "A complete uninterrupted five-minute event window is needed")
+        elif (
+            policy_version == INTEGRITY_POLICY_VERSION
+            and not _current_integrity_core_complete(features)
+        ):
+            evidence.insert(0, "Complete economic-size and price-path fields are needed")
+        else:
+            evidence.insert(0, "More time, trades, or complete stream fields are needed")
     elif category_count >= 3 and score >= 0.70:
         state = MarketIntegrityState.SEVERE
     elif category_count >= 2 and score >= 0.55:
@@ -383,6 +469,38 @@ def _integrity_metric(features: FeatureSnapshot, name: str) -> tuple[float, floa
     except (TypeError, ValueError):
         return None
     return _clamp(numeric), value.quality
+
+
+def _usable_fraction(features: FeatureSnapshot, name: str) -> float | None:
+    return_value = _integrity_metric(features, name)
+    return None if return_value is None else return_value[0]
+
+
+def _integrity_window_complete(features: FeatureSnapshot) -> bool:
+    item = features.values.get("integrity_window_complete")
+    saturated = features.values.get("trade_buffer_saturated")
+    return bool(
+        item is not None
+        and item.value is True
+        and item.missing_reason is None
+        and item.quality >= 0.75
+        and not (saturated is not None and saturated.value is True)
+    )
+
+
+def _current_integrity_core_complete(features: FeatureSnapshot) -> bool:
+    return all(
+        _integrity_metric(features, name) is not None
+        for name in (
+            "microtrade_count_ratio",
+            "meaningful_volume_ratio",
+            "meaningful_wallet_ratio",
+            "median_trade_quote_sol",
+            "price_path_efficiency",
+            "rapid_price_reversal_ratio",
+            "trade_density_5m",
+        )
+    )
 
 
 def _risk_above(metric: tuple[float, float] | None, start: float, full: float) -> float:

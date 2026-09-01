@@ -6,7 +6,7 @@
 Pump + PumpSwap logs ──> pinned Anchor decoder ──> bounded priority queue
                                                         │ batched SQLite journal
                                                         v
-                                              point-in-time features
+                                   venue-local, bounded point-in-time features
                                       │        │                │
                             learning outcome   decision journal WebSocket UI
                                       │        │
@@ -64,8 +64,13 @@ persisted in batches. A short sparse-feed batching wait is skipped whenever back
 so a recovered public feed drains immediately. When overwhelmed, the app retains
 held/pending/learning-critical activity,
 sheds untracked low-priority trades, and records a persistent incident rather than allowing
-unbounded memory or database pressure. UI notifications have their own bounded queue and the
-normal five-second snapshot poll repairs missed notifications. Duplicate events are ignored.
+unbounded memory or database pressure. Baseline v1.5 treats a represented candidate drop, source
+reconnect or live five-minute trade-buffer eviction as incomplete integrity evidence; that mint
+waits through a fresh continuity window rather than learning from or trading on a partial sample.
+Rolling structural metrics are cached for at most one second during bursts, while reserve/route
+state and critical position events remain authoritative. UI notifications have their own bounded
+queue and the normal five-second snapshot poll repairs missed notifications. Duplicate events are
+ignored.
 Ollama reachability is monitored independently; its absence disables local assessments and
 explanations without stopping market processing, the baseline strategy, exits, or accounting.
 

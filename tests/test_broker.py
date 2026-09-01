@@ -30,6 +30,7 @@ from signal_arcade.strategy import (
     PREVIOUS_BASELINE_VERSION,
     PREVIOUS_INTEGRITY_POLICY_VERSION,
     RECENT_BASELINE_VERSION,
+    RECENT_INTEGRITY_POLICY_VERSION,
     SIZING_POLICY_VERSION,
 )
 
@@ -73,6 +74,13 @@ def make_integrity_features(
         "slot_concentration_hhi": 0.75 if severe else 0.08,
         "price_direction_consistency": 0.99 if severe else 0.55,
         "multi_trade_signature_ratio": 0.7 if severe else 0.0,
+        "microtrade_count_ratio": 0.95 if severe else 0.10,
+        "meaningful_volume_ratio": 0.10 if severe else 0.90,
+        "meaningful_wallet_ratio": 0.10 if severe else 0.90,
+        "median_trade_quote_sol": 0.002 if severe else 0.03,
+        "price_path_efficiency": 0.05 if severe else 0.65,
+        "rapid_price_reversal_ratio": 0.90 if severe else 0.20,
+        "trade_density_5m": 0.95 if severe else 0.05,
     }
     for name, value in values.items():
         snapshot.values[name] = DataValue(
@@ -83,6 +91,14 @@ def make_integrity_features(
             freshness_seconds=0,
             quality=1,
         )
+    snapshot.values["integrity_window_complete"] = DataValue(
+        value=True,
+        unit="boolean",
+        as_of=now,
+        sources=["test"],
+        freshness_seconds=0,
+        quality=1,
+    )
     return snapshot
 
 
@@ -1123,6 +1139,7 @@ def test_current_uncertain_size_is_rechecked_at_fill_without_rewriting_v13(
     recent = make_current_decision(now, "v13-uncertain-reference-fill")
     recent.model_version = RECENT_BASELINE_VERSION
     recent.integrity_assessment = uncertainty.model_copy(deep=True)
+    recent.integrity_assessment.policy_version = RECENT_INTEGRITY_POLICY_VERSION
     recent_order = broker.submit_decision(recent)
     assert recent_order is not None
     monkeypatch.setattr(broker._fill_decisions, "evaluate", lambda *args, **kwargs: recent)

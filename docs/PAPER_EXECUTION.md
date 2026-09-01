@@ -80,13 +80,14 @@ The UI separates total cash from pending-order reservations, available cash, and
 sell-side value. A mark older than the configured 90-second position window is shown as last-known
 but excluded from headline equity; this prevents hours-old prices from being reported as current
 profit. Closed proceeds return to the bankroll, so the next decision always plans from
-what is actually available. Baseline v1.4 starts from the personality's cautious reference size.
-Only mature clean evidence may target more of the realized bankroll, and every selected amount is
-bounded by per-position exposure, remaining total exposure, reserved/available cash and observed
-price impact. Suspicious evidence sizes down; moderate unresolved evidence uses 70% of the
-reference; incomplete or extremely ambiguous evidence waits instead of entering. Unrealized marks
-cannot enlarge a new order, and the policy never tries to consume unused exposure merely because
-capacity exists.
+what is actually available. Baseline v1.5 starts from the personality's cautious reference size.
+Only mature clean evidence with economically meaningful participation may target more of the
+realized bankroll, and every selected amount is bounded by per-position exposure, remaining total
+exposure, reserved/available cash and observed price impact. Current suspicious evidence blocks;
+moderate unresolved evidence uses 70% of the reference; incomplete or extremely ambiguous evidence
+waits instead of entering. Unrealized marks cannot enlarge a new order, and the policy never tries
+to consume unused exposure merely because capacity exists. Older positions and seasons retain
+their exact entry-generation behavior.
 
 If the user has explicitly activated a qualified Challenger, its Sizing skill remains subordinate
 to that planner. It can choose only a previously proved 0.5×, 1×, 1.5× or 2× counterfactual and can
@@ -112,6 +113,11 @@ A position with sufficiently complete, strong evidence may continue until the mo
 absolute ceiling. The latest assessment, support score, evidence, entry mode, and executable peak
 mark persist with the position and survive restart.
 
+For Baseline v1.5 positions, buy balance, momentum, wallet breadth and velocity earn hold support
+only in proportion to economically meaningful volume and wallet participation. A synthetic-looking
+wall of dust activity therefore cannot extend a position by itself. Earlier positions retain their
+entry-generation behavior.
+
 Stop loss, a recent creator sale, a newly failed mint-safety check, pre-migration route protection,
 multi-signal deterioration, trailing profit after a mode-specific gain, and the absolute ceiling
 schedule exits without learner discretion. A profit target starts protection rather than imposing
@@ -119,11 +125,11 @@ a fixed ceiling: a healthy winner can run, while a retracement from its saved pe
 If the evidence set is incomplete or weak at the normal review point, the broker exits instead of
 granting an extension.
 
-For positions opened by Baseline v1.2, v1.3 or v1.4, manipulation evidence can also request an exit only
-after it persists across time-separated checkpoints. One alarming snapshot cannot sell a position;
-uncertain evidence neither advances the warning nor pretends recovery, while a mature clean sample
-resets it. The counters and timestamps persist across restart. Existing route safety still decides
-whether the requested exit can produce a real paper fill.
+For positions opened by Baseline v1.2, v1.3, v1.4 or v1.5, manipulation evidence can also request
+an exit only after it persists across time-separated checkpoints. One alarming snapshot cannot
+sell a position; uncertain evidence neither advances the warning nor pretends recovery, while a
+mature clean sample resets it. The counters and timestamps persist across restart. Existing route
+safety still decides whether the requested exit can produce a real paper fill.
 
 Stale state or an unconfirmed route never creates a fabricated fill. A position can therefore
 remain open past any clock threshold when no trustworthy executable route exists; it is labelled

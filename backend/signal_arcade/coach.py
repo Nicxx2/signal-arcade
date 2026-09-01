@@ -42,8 +42,8 @@ from .strategy import LEARNABLE_BASELINE_VERSIONS
 
 logger = logging.getLogger(__name__)
 
-COACH_PROMPT_VERSION = "coach-research-v3"
-COACH_SCHEMA_VERSION = "coach-research-schema-v3"
+COACH_PROMPT_VERSION = "coach-research-v4"
+COACH_SCHEMA_VERSION = "coach-research-schema-v4"
 COACH_REVIEW_INTERVAL_OUTCOMES = 25
 COACH_FIRST_REVIEW_OUTCOMES = 80
 COACH_MINIMUM_DISCOVERY_SAMPLES = 20
@@ -78,6 +78,13 @@ _FEATURE_LABELS = {
     "quantized_amount_repeat_ratio": "trade sizes cluster unusually tightly",
     "slot_concentration_hhi": "activity concentrates into few slots",
     "price_direction_consistency": "the price path is unusually one-way",
+    "microtrade_count_ratio": "dust-sized trades dominate activity",
+    "meaningful_volume_ratio": "little volume is economically meaningful",
+    "meaningful_wallet_ratio": "few wallets contribute meaningful value",
+    "median_trade_quote_sol": "the median trade is exceptionally small",
+    "price_path_efficiency": "price travel creates little durable progress",
+    "rapid_price_reversal_ratio": "the price reverses unusually often",
+    "trade_density_5m": "trade density is exceptionally high",
 }
 
 

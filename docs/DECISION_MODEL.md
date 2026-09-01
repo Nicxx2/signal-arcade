@@ -8,27 +8,33 @@ of intelligence or profitability.
 Each `DataValue` stores its value, unit, observation time, sources, freshness, quality, and a
 missing-data reason. Rolling features include trade velocity, buy/sell balance, unique wallets,
 wallet-volume concentration, repeated amounts, same-slot coordination, creator sells, curve
-progress, momentum, drawdown, reserves, observed fees, and optional DEX context.
+progress, momentum, drawdown, reserves, observed fees, and optional DEX context. Baseline v1.5
+also records native-SOL median trade size, dust-trade share, economically meaningful volume and
+wallet participation, trade density, price-path efficiency, rapid reversals, venue-local window
+span and bounded-buffer saturation.
 
 Decision explanations retain a separate market-integrity evidence layer derived only from
 the already-received five-minute stream: one-trade wallet share, wallet round trips and their
 volume, net flow versus gross activity, side alternation, clustered sizing, slot concentration,
 price-direction consistency and multi-trade signatures. Coverage and missing reasons are saved
-with each value. Baseline v1.4 classifies these measurements only after minimum time, trade and
-coverage requirements and will not enter before that integrity sample is mature. One isolated
+with each value. Baseline v1.5 adds an economic-activity category only when several size/flow
+measurements agree, plus a separate rapid-reversion category. It requires minimum time, trades,
+field coverage and an uninterrupted five-minute event window; queue shedding, a reconnect or a
+still-live bounded-buffer eviction remains Unknown rather than looking clean. One isolated
 pattern remains uncertain; an extreme isolated warning must clear or gain corroboration before
-entry, while moderate uncertainty may use only a reduced exploratory amount. Suspicious or severe
-conclusions require corroboration across independent wallet-loop, concentrated-dispersion,
-net-flow, trade-structure and price-path categories. Concentrated dispersion itself requires both
+entry. Suspicious and severe current conclusions block entry. Conclusions require corroboration
+across independent wallet-loop, concentrated-dispersion, net-flow, trade-structure, economic-flow
+and price-path categories. Concentrated dispersion itself requires both
 extreme wallet-volume concentration and overwhelming one-trade participation, so neither a lone
-whale nor an organic broad launch is condemned. Severe evidence blocks entry and suspicious
-evidence raises deterministic danger and reduces size. Locked v1.1/v1.2/v1.3 seasons retain their
-frozen behavior until a legitimate successor season begins.
+whale nor an organic broad launch is condemned. Both suspicious and severe evidence block a new
+v1.5 entry and raise deterministic danger. Locked v1.1/v1.2/v1.3/v1.4 seasons retain their frozen
+behavior until a legitimate successor season begins.
 
 ## Scores
 
 - Opportunity combines velocity, participation, buy balance, curve progress, and non-extreme
-  momentum.
+  momentum. In v1.5 raw velocity and wallet breadth are discounted unless meaningful economic
+  participation supports them, so thousands of dust transfers cannot manufacture a top score.
 - Danger combines concentration, repetition, same-slot coordination, creator selling,
   drawdown, and parabolic momentum.
 - Execution estimates the selected paper size relative to effective quote reserves.
@@ -67,11 +73,11 @@ forward evidence gate qualifies that exact model; if qualified, it can only turn
 It cannot add score, create a trade, increase size, manage an exit, or bypass a permanent gate.
 
 The Safe/Balanced/Aggressive slider changes the reference size, evidence thresholds, acceptable
-danger and impact, portfolio exposure, drawdown stop, and exit widths. Baseline v1.4 may size a
+danger and impact, portfolio exposure, drawdown stop, and exit widths. Baseline v1.5 may size a
 mature clean entry above that reference from realized bankroll only. It remains bounded by the
 mode's per-position and total exposure, available cash, pending reservations and observed reserve
-depth; moderate uncertain evidence is reduced to 70% of the reference and cannot size up. It never
-disables structural safety gates.
+depth; economic activity also bounds any increase. Moderate uncertain evidence is reduced to 70%
+of the reference and cannot size up. It never disables structural safety gates.
 
 ## Permanent abstention gates
 
