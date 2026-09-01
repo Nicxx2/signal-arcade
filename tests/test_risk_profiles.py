@@ -9,7 +9,16 @@ from signal_arcade.models import RiskMode
 from signal_arcade.risk_profiles import (
     DrawdownPolicy,
     DrawdownPolicyKind,
+    SeasonProfile,
     build_season_profile,
+    upgrade_season_profile_strategy,
+)
+from signal_arcade.strategy import (
+    BASELINE_VERSION,
+    LEGACY_BASELINE_VERSION,
+    PREVIOUS_BASELINE_VERSION,
+    PREVIOUS_INTEGRITY_POLICY_VERSION,
+    RECENT_BASELINE_VERSION,
 )
 
 
@@ -22,6 +31,60 @@ def test_profile_fingerprint_is_stable_and_behavior_specific() -> None:
     assert first.profile_fingerprint != safer.profile_fingerprint
     assert first.effective_drawdown_bps == 1_500
     assert first.risk_limits["max_open_positions"] == 4
+    assert first.baseline_version == BASELINE_VERSION
+
+
+def test_legacy_profile_stays_frozen_until_successor_upgrade() -> None:
+    current = build_season_profile(RiskMode.BALANCED).model_dump(mode="json")
+    legacy = dict(current)
+    legacy.pop("baseline_version")
+    legacy.pop("integrity_policy_version")
+    legacy.pop("sizing_policy_version")
+    parsed = SeasonProfile.model_validate(legacy)
+
+    upgraded = upgrade_season_profile_strategy(legacy)
+
+    assert parsed.baseline_version == LEGACY_BASELINE_VERSION
+    assert upgraded.baseline_version == BASELINE_VERSION
+    assert upgraded.profile_fingerprint == current["profile_fingerprint"]
+    assert upgraded.learning_fingerprint is None
+
+
+def test_previous_profile_upgrades_only_as_a_new_strategy_successor() -> None:
+    previous = build_season_profile(
+        RiskMode.BALANCED,
+        learning_fingerprint="previous-learning-cohort",
+    ).model_dump(mode="json")
+    previous["baseline_version"] = PREVIOUS_BASELINE_VERSION
+    previous["integrity_policy_version"] = PREVIOUS_INTEGRITY_POLICY_VERSION
+    previous["profile_fingerprint"] = "previous-v12-profile-fingerprint"
+    previous_profile = SeasonProfile.model_validate(previous)
+
+    upgraded = upgrade_season_profile_strategy(previous)
+
+    assert previous_profile.baseline_version == PREVIOUS_BASELINE_VERSION
+    assert previous_profile.learning_fingerprint == "previous-learning-cohort"
+    assert upgraded.baseline_version == BASELINE_VERSION
+    assert upgraded.profile_fingerprint != previous_profile.profile_fingerprint
+    assert upgraded.learning_fingerprint is None
+
+
+def test_recent_profile_upgrades_without_mutating_its_frozen_source() -> None:
+    recent = build_season_profile(
+        RiskMode.BALANCED,
+        learning_fingerprint="recent-learning-cohort",
+    ).model_dump(mode="json")
+    recent["baseline_version"] = RECENT_BASELINE_VERSION
+    recent["profile_fingerprint"] = "recent-v13-profile-fingerprint"
+    frozen_source = SeasonProfile.model_validate(recent)
+
+    upgraded = upgrade_season_profile_strategy(recent)
+
+    assert frozen_source.baseline_version == RECENT_BASELINE_VERSION
+    assert frozen_source.learning_fingerprint == "recent-learning-cohort"
+    assert upgraded.baseline_version == BASELINE_VERSION
+    assert upgraded.profile_fingerprint != frozen_source.profile_fingerprint
+    assert upgraded.learning_fingerprint is None
 
 
 def test_drawdown_policy_is_typed_and_bounded() -> None:
@@ -148,7 +211,7 @@ def test_new_season_persists_exact_profile_without_relabelling_legacy(tmp_path: 
     connection.close()
 
     migrated = Database(legacy_path)
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 11
     legacy = migrated.list_paper_seasons()[0]
     assert legacy["profile"] is None
     assert legacy["profile_provenance"] == "legacy_unknown"

@@ -16,9 +16,12 @@ No SolanaTracker subscription is required. Users can place a private RPC URL in 
 Solana HTTP/WebSocket settings without adding provider-specific code.
 
 The Settings UI accepts one write-only API key for the bundled Helius, Alchemy, and SolanaTracker
-RPC presets and constructs that provider's mainnet HTTP and WebSocket URLs automatically. Custom
-RPC or paid-plan users can instead enter explicit endpoints and limits. Selecting Public RPC
-clears saved UI endpoint overrides and restores the environment-configured or bundled endpoint.
+RPC presets and normally constructs that provider's mainnet HTTP and WebSocket URLs automatically.
+The Helius Economy preset instead keeps keyed Helius for paced HTTP safety lookups and clears only
+the saved WebSocket override, restoring the environment-configured/bundled public stream. Custom
+RPC or paid-plan users can enter explicit endpoints and limits. Selecting Public RPC clears both
+saved endpoint overrides. The UI reports the effective HTTP/stream hosts and whether each came from
+a saved override or the environment/default configuration.
 
 Helius, SolanaTracker RPC, and other compatible keyed RPC services do not introduce a different
 Pump data vocabulary. They transport the same standard Solana `logsSubscribe` and
@@ -57,16 +60,20 @@ the newer on-chain event stream.
 |---|---|---|
 | Solana public RPC | 100 requests/10 seconds/IP; 40/10 seconds per RPC method | 120 tracked HTTP calls/minute; one WebSocket with two subscriptions |
 | Helius Free | 10 RPC requests/second; 1M credits/month; standard WSS costs 2 credits/0.1 MB uncompressed | 600/minute; 500k tracked HTTP calls/month, leaving at least half the published credits outside the HTTP budget |
+| Helius Economy | Same Helius Free HTTP allowance; live stream uses the configured default/public endpoint instead | 600/minute and 500k tracked Helius HTTP calls/month; public streaming is best-effort and remains subject to Solana public limits |
 | Alchemy Free | 30M CU/month; `getAccountInfo` costs 10 CU; Solana WSS costs 0.0002 CU/byte | 3,000/minute; 1.5M tracked HTTP calls/month (15M CU), leaving at least 15M CU outside the HTTP budget |
 | SolanaTracker RPC Free | 10 general requests/second; 500k credits/month; 2 WebSocket connections | 300/minute; 250k tracked HTTP calls/month, then 10% routine reserve |
 | Jupiter keyless | 0.5 requests/second | 30/minute; adapter is idle in V1 |
 | Jupiter Free key | 1 request/second, unlimited credits | 60/minute; adapter is idle in V1 |
 
-The keyed Solana presets leave at least half the published allowance outside Signal Arcade's HTTP
-budget because WebSocket data consumes provider credits by uncompressed byte. This is a reserve,
-not a guarantee: Pump and PumpSwap traffic varies, and Signal Arcade cannot see streamed-byte
-usage, account-wide usage, other applications using the key, or billing adjustments. Confirm the
-real projection in the provider dashboard after a representative day. Paid Jupiter presets match
+The full keyed Solana presets leave at least half the published allowance outside Signal Arcade's
+HTTP budget because WebSocket data can consume provider credits by uncompressed byte. With the
+bundled public default, Helius Economy keeps the WebSocket traffic off Helius; an operator-supplied
+environment default may have its own billing. Public endpoints are rate-limited, best-effort and
+not intended as guaranteed production infrastructure. These are reserves, not guarantees: Signal
+Arcade cannot see account-wide usage, other applications using a key, or billing adjustments.
+Confirm the real projection in the provider dashboard after a representative day. Paid Jupiter
+presets match
 its published included-credit tiers, but a smaller custom hard cap is safer when a key is shared.
 
 Sources: [Solana public endpoints](https://solana.com/docs/references/clusters),

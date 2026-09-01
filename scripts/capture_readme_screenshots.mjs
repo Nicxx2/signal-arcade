@@ -193,7 +193,13 @@ await captureViewport("03-season-progress.png");
 
 await clickButton("Learning");
 await waitFor("document.body.innerText.includes('Learning')");
+await clickButton("Challenger");
+await waitFor("document.body.innerText.includes('Challenger control')");
 await captureViewport("04-learning-lab.png");
+
+await clickButton("AI Coach");
+await waitFor("document.body.innerText.includes('AI Coach')");
+await captureViewport("09-ai-coach-room.png");
 
 await clickButton("Replay");
 await waitFor("document.body.innerText.includes('The score is net of the friction.')");
@@ -224,4 +230,4 @@ await clickButton("Arena");
 await captureViewport("07-mobile-arena.png");
 
 socket.close();
-console.log("Captured 8 Signal Arcade README screenshots.");
+console.log("Captured 9 Signal Arcade README screenshots.");

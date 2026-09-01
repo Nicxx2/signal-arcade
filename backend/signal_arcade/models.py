@@ -32,6 +32,15 @@ class DecisionAction(StrEnum):
     ABSTAIN = "abstain"
 
 
+class MarketIntegrityState(StrEnum):
+    """Deterministic stream-integrity conclusion available at a decision timestamp."""
+
+    CLEAN = "clean"
+    UNCERTAIN = "uncertain"
+    SUSPICIOUS = "suspicious"
+    SEVERE = "severe"
+
+
 class ExitAction(StrEnum):
     HOLD = "hold"
     WAIT = "wait"
@@ -77,6 +86,15 @@ class LearningMode(StrEnum):
     ACTIVE = "active"
 
 
+class ChallengerSkill(StrEnum):
+    """Independently proven capabilities that make up the statistical Challenger."""
+
+    ENTRY = "entry"
+    MANIPULATION = "manipulation"
+    SIZING = "sizing"
+    EXIT = "exit"
+
+
 class AiDecisionMode(StrEnum):
     OFF = "off"
     SHADOW = "shadow"
@@ -96,6 +114,8 @@ class LearningObservationStatus(StrEnum):
 
 class CoachExperimentKind(StrEnum):
     ENTRY_VETO = "entry_veto"
+    MANIPULATION_VETO = "manipulation_veto"
+    SIZING_MULTIPLIER = "sizing_multiplier"
     EARLIER_REVIEW = "earlier_review"
 
 
@@ -104,6 +124,16 @@ class CoachExperimentState(StrEnum):
     PROMISING = "promising"
     INCONCLUSIVE = "inconclusive"
     NOT_SUPPORTED = "not_supported"
+
+
+class CoachCondition(BaseModel):
+    """One deterministic, allowlisted condition used by a Coach research policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feature_name: str = Field(min_length=1, max_length=80)
+    operator: Literal["<=", ">="]
+    threshold: float
 
 
 class DataValue(BaseModel):
@@ -175,6 +205,32 @@ class LearningAssessment(BaseModel):
     verdict: str
 
 
+class IntegrityAssessment(BaseModel):
+    """Coverage-aware market-integrity receipt used by versioned Baseline generations."""
+
+    policy_version: str
+    state: MarketIntegrityState
+    score: float = Field(ge=0, le=1)
+    coverage: float = Field(ge=0, le=1)
+    sample_count: int = Field(ge=0)
+    category_count: int = Field(ge=0)
+    categories: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class SizingAssessment(BaseModel):
+    """Auditable sizing result; every larger order remains bounded by hard capacity."""
+
+    policy_version: str
+    base_size_sol: float = Field(gt=0)
+    desired_size_sol: float = Field(gt=0)
+    selected_size_sol: float = Field(gt=0)
+    maximum_size_sol: float | None = Field(default=None, gt=0)
+    account_allocation_fraction: float = Field(ge=0, le=1)
+    constraints: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
 class ExitAssessment(BaseModel):
     """Latest transparent, persisted explanation for an open-position action."""
 
@@ -205,9 +261,12 @@ class Decision(BaseModel):
     reasons: list[str]
     blockers: list[str]
     feature_snapshot: FeatureSnapshot
-    model_version: str = "baseline-v1"
+    model_version: str = "baseline-v1.1"
     planned_order_size_sol: float | None = Field(default=None, gt=0)
+    integrity_assessment: IntegrityAssessment | None = None
+    sizing_assessment: SizingAssessment | None = None
     learning_assessment: LearningAssessment | None = None
+    challenger_assessments: dict[str, dict[str, Any]] = Field(default_factory=dict)
     season_id: str | None = None
     season_profile_fingerprint: str | None = None
     configuration_fingerprint: str | None = None
@@ -219,6 +278,41 @@ class LearningCheckpoint(BaseModel):
     net_return: float | None = Field(default=None, ge=-1, le=10)
     exit_value_lamports: int | None = Field(default=None, ge=0)
     missing_reason: str | None = None
+    route_source: str | None = None
+    route_event_id: str | None = None
+    reserve_observed_at: datetime | None = None
+    reserve_age_seconds: float | None = Field(default=None, ge=0)
+
+
+class ChallengerEvaluationReceipt(BaseModel):
+    """Prediction frozen before an outcome, suitable for common-forward tournaments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_version: str
+    skill: ChallengerSkill
+    evaluated_at: datetime
+    prediction: float | None = Field(default=None, ge=-10, le=10)
+    conservative_value: float | None = Field(default=None, ge=-10, le=10)
+    in_distribution: bool = False
+    proposed_action: str
+    baseline_actionable: bool = False
+    parameters: dict[str, float | int | bool | str | None] = Field(default_factory=dict)
+
+
+class ChallengerSizeTrial(BaseModel):
+    """One bounded size counterfactual quoted at entry and later on the same route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    multiplier: float = Field(gt=0, le=4)
+    budget_lamports: int = Field(gt=0)
+    token_units: int | None = Field(default=None, gt=0)
+    entry_cost_lamports: int | None = Field(default=None, gt=0)
+    entry_price_impact_fraction: float | None = Field(default=None, ge=0, le=1)
+    eligible_at_entry: bool = False
+    entry_missing_reason: str | None = None
+    checkpoints: dict[str, LearningCheckpoint] = Field(default_factory=dict)
 
 
 class LearningObservation(BaseModel):
@@ -239,6 +333,10 @@ class LearningObservation(BaseModel):
     entry_price_impact_fraction: float = Field(ge=0, le=1)
     fee_bps: int = Field(ge=0, le=10_000)
     checkpoints: dict[str, LearningCheckpoint] = Field(default_factory=dict)
+    checkpoint_attempts: dict[str, int] = Field(default_factory=dict)
+    challenger_evaluations: dict[str, ChallengerEvaluationReceipt] = Field(default_factory=dict)
+    active_skill_versions: dict[str, str] = Field(default_factory=dict)
+    size_trials: dict[str, ChallengerSizeTrial] = Field(default_factory=dict)
     status: LearningObservationStatus = LearningObservationStatus.PENDING
     source_mode: str = "solana_mainnet"
     # Frozen at decision time for genuinely prequential monitoring. These defaults keep
@@ -263,6 +361,8 @@ class LearningObservation(BaseModel):
     # several drawdown experiments intentionally share one personality learning cohort.
     season_profile_fingerprint: str | None = None
     configuration_fingerprint: str | None = None
+    baseline_version: str = "baseline-v1.1"
+    feature_schema_version: str = "challenger-features-v1"
 
 
 class LearningModel(BaseModel):
@@ -298,6 +398,85 @@ class LearningModel(BaseModel):
     policy_mean_uplift: float | None = Field(default=None, ge=-10, le=10)
     policy_uplift_lower_bound: float | None = Field(default=None, ge=-10, le=10)
     qualified: bool = False
+
+
+class ChallengerSkillArtifact(BaseModel):
+    """Immutable, versioned proof artifact for one Challenger capability.
+
+    This is deliberately additive to ``LearningModel``. Existing v4 entry artifacts remain
+    readable and auditable while the multi-skill Challenger earns new champions independently.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    schema_version: str = "challenger-skill-v1"
+    skill: ChallengerSkill
+    created_at: datetime = Field(default_factory=utc_now)
+    risk_mode: RiskMode
+    configuration_fingerprint: str
+    baseline_version: str
+    feature_schema_version: str
+    evidence_started_at: datetime | None = None
+    evidence_ended_at: datetime | None = None
+    outcomes_seen: int = Field(default=0, ge=0)
+    sample_count: int = Field(default=0, ge=0)
+    training_count: int = Field(default=0, ge=0)
+    validation_count: int = Field(default=0, ge=0)
+    embargoed_count: int = Field(default=0, ge=0)
+    feature_names: list[str] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, float | int | bool | None] = Field(default_factory=dict)
+    dependency_versions: dict[str, str] = Field(default_factory=dict)
+    qualified: bool = False
+    qualification_reasons: list[str] = Field(default_factory=list)
+
+
+class ChallengerChampionEvent(BaseModel):
+    """Bounded, durable record of one honest Champion milestone."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str
+    occurred_at: datetime = Field(default_factory=utc_now)
+    skill: ChallengerSkill
+    kind: Literal["first_champion", "promoted", "defended", "inconclusive"]
+    candidate_version: str
+    previous_champion_version: str | None = None
+    champion_version: str
+    common_observed_count: int = Field(default=0, ge=0)
+    common_usable_count: int = Field(default=0, ge=0)
+    availability_fraction: float = Field(default=0, ge=0, le=1)
+    # A difference between two individually bounded policy values can reach +/-11.
+    mean_uplift: float | None = None
+    uplift_lower_bound: float | None = None
+
+
+class ChallengerSkillState(BaseModel):
+    """Durable candidate/champion/activation state for one exact learning cohort."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cohort_key: str
+    skill: ChallengerSkill
+    risk_mode: RiskMode
+    configuration_fingerprint: str
+    baseline_version: str
+    feature_schema_version: str
+    latest_candidate_version: str | None = None
+    testing_version: str | None = None
+    champion_version: str | None = None
+    active_version: str | None = None
+    active_dependencies: dict[str, str] = Field(default_factory=dict)
+    common_forward_count: int = Field(default=0, ge=0)
+    joined_at: datetime | None = None
+    suspended_version: str | None = None
+    suspension_reason: str | None = None
+    suspended_at: datetime | None = None
+    rejected_versions: list[str] = Field(default_factory=list)
+    last_tournament: dict[str, float | int | bool | str | None] = Field(default_factory=dict)
+    champion_journey: list[ChallengerChampionEvent] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class AiCriticAssessment(BaseModel):
@@ -352,6 +531,9 @@ class CoachReview(BaseModel):
     outcomes_seen: int = Field(ge=0)
     risk_mode: RiskMode
     configuration_fingerprint: str
+    baseline_version: str = "baseline-v1.1"
+    feature_schema_version: str = "challenger-features-v1"
+    dependency_versions: dict[str, str] = Field(default_factory=dict)
     model_name: str
     model_digest: str = ""
     prompt_version: str
@@ -377,17 +559,24 @@ class CoachHypothesis(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
     cutoff_at: datetime
     kind: CoachExperimentKind
+    skill: ChallengerSkill = ChallengerSkill.ENTRY
     state: CoachExperimentState = CoachExperimentState.TESTING
     title: str = Field(max_length=120)
     rationale: str = Field(max_length=240)
     risk_mode: RiskMode
     configuration_fingerprint: str
+    baseline_version: str = "baseline-v1.1"
+    feature_schema_version: str = "challenger-features-v1"
+    dependency_versions: dict[str, str] = Field(default_factory=dict)
     model_name: str
     model_digest: str = ""
     feature_name: str | None = None
     operator: Literal["<=", ">="] | None = None
     threshold: float | None = None
+    conditions: list[CoachCondition] = Field(default_factory=list, max_length=3)
     hold_seconds: int | None = Field(default=None, gt=0)
+    baseline_hold_seconds: int | None = Field(default=None, gt=0)
+    size_multiplier: float | None = Field(default=None, ge=0.5, le=2.0)
     discovery_observed_count: int = Field(ge=0)
     discovery_usable_count: int = Field(ge=0)
     discovery_availability_fraction: float = Field(ge=0, le=1)
@@ -400,10 +589,37 @@ class CoachHypothesis(BaseModel):
     forward_mean_uplift: float | None = Field(default=None, ge=-10, le=10)
     forward_uplift_lower_bound: float | None = Field(default=None, ge=-10, le=10)
     forward_uplift_upper_bound: float | None = Field(default=None, ge=-10, le=10)
+    forward_observation_ids: list[str] = Field(default_factory=list, max_length=240)
+    forward_values: list[float] = Field(default_factory=list, max_length=240)
+    forward_season_counts: dict[str, int] = Field(default_factory=dict)
     minimum_forward_samples: int = Field(default=60, gt=0)
     minimum_availability_fraction: float = Field(default=0.70, ge=0, le=1)
     last_evaluated_at: datetime | None = None
+    resolved_at: datetime | None = None
+    resolution_reason: str | None = Field(default=None, max_length=120)
+    contribution_state: Literal[
+        "research_only",
+        "ready",
+        "waiting_for_champion",
+        "handed_off",
+        "stale",
+    ] = "research_only"
+    contributed_artifact_version: str | None = Field(default=None, max_length=180)
     influence_applied: Literal[False] = False
+
+    @model_validator(mode="after")
+    def migrate_legacy_coach_shape(self) -> CoachHypothesis:
+        """Keep v2 Coach records readable without granting them v3 contribution authority."""
+
+        if self.kind == CoachExperimentKind.EARLIER_REVIEW:
+            self.skill = ChallengerSkill.EXIT
+        elif self.kind == CoachExperimentKind.MANIPULATION_VETO:
+            self.skill = ChallengerSkill.MANIPULATION
+        elif self.kind == CoachExperimentKind.SIZING_MULTIPLIER:
+            self.skill = ChallengerSkill.SIZING
+        else:
+            self.skill = ChallengerSkill.ENTRY
+        return self
 
 
 class OperationalIncident(BaseModel):
@@ -519,6 +735,7 @@ class PaperOrder(BaseModel):
     failure_reason: str | None = None
     # Added after V1 launch; None keeps older pending-order records loadable.
     risk_mode_at_entry: RiskMode | None = None
+    baseline_version_at_entry: str = "baseline-v1.1"
 
 
 class FillReceipt(BaseModel):
@@ -596,9 +813,17 @@ class Position(BaseModel):
     # These fields are persisted inside the existing JSON record, so older databases
     # migrate through defaults without a destructive schema rewrite.
     risk_mode_at_entry: RiskMode | None = None
+    baseline_version_at_entry: str = "baseline-v1.1"
     peak_mark_lamports: int = Field(default=0, ge=0)
     peak_marked_at: datetime | None = None
     exit_assessment: ExitAssessment | None = None
+    integrity_warning_count: int = Field(default=0, ge=0)
+    integrity_warning_since: datetime | None = None
+    # This is the last distinct market-evidence timestamp that advanced the warning. Heartbeat
+    # re-reads of the same snapshot cannot manufacture persistence.
+    integrity_last_warning_at: datetime | None = None
+    integrity_last_evaluated_at: datetime | None = None
+    integrity_last_state: MarketIntegrityState = MarketIntegrityState.UNCERTAIN
 
 
 class PortfolioSnapshot(BaseModel):

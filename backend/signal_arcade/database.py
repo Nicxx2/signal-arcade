@@ -10,8 +10,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .models import (
     AiCriticAssessment,
+    ChallengerChampionEvent,
+    ChallengerSkillArtifact,
+    ChallengerSkillState,
     CoachHypothesis,
     CoachReview,
     Decision,
@@ -24,7 +29,9 @@ from .models import (
     Position,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
+TERMINAL_POLICY_VERSION = "executable-boundary-v2"
+CHALLENGER_JOURNEY_SETTING_PREFIX = "challenger_champion_journey_v1:"
 
 
 class Database:
@@ -163,6 +170,28 @@ class Database:
                     );
                     CREATE INDEX idx_learning_models_created
                         ON learning_models(created_at);
+                    CREATE TABLE challenger_skill_artifacts (
+                        version TEXT PRIMARY KEY,
+                        skill TEXT NOT NULL,
+                        risk_mode TEXT NOT NULL,
+                        configuration_fingerprint TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        qualified INTEGER NOT NULL,
+                        record_json TEXT NOT NULL
+                    );
+                    CREATE INDEX idx_challenger_artifacts_context
+                        ON challenger_skill_artifacts(
+                            skill, risk_mode, configuration_fingerprint, created_at
+                        );
+                    CREATE TABLE challenger_skill_states (
+                        cohort_key TEXT NOT NULL,
+                        skill TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        record_json TEXT NOT NULL,
+                        PRIMARY KEY(cohort_key, skill)
+                    );
+                    CREATE INDEX idx_challenger_states_updated
+                        ON challenger_skill_states(updated_at);
                     CREATE TABLE ai_critic_assessments (
                         assessment_id TEXT PRIMARY KEY,
                         decision_id TEXT NOT NULL,
@@ -246,6 +275,20 @@ class Database:
                         result_quality TEXT NOT NULL DEFAULT 'complete'
                             CHECK(result_quality IN ('complete','unresolved')),
                         comparable INTEGER NOT NULL DEFAULT 1 CHECK(comparable IN (0,1)),
+                        accounting_status TEXT NOT NULL DEFAULT 'current'
+                            CHECK(accounting_status IN (
+                                'current','complete','complete_with_writeoffs',
+                                'incomplete_unknown','empty','legacy'
+                            )),
+                        terminal_policy_version TEXT NOT NULL
+                            DEFAULT 'executable-boundary-v2',
+                        boundary_type TEXT NOT NULL DEFAULT 'open',
+                        meaningful_activity INTEGER NOT NULL DEFAULT 0
+                            CHECK(meaningful_activity IN (0,1)),
+                        write_off_count INTEGER NOT NULL DEFAULT 0
+                            CHECK(write_off_count >= 0),
+                        write_off_entry_minor INTEGER NOT NULL DEFAULT 0
+                            CHECK(write_off_entry_minor >= 0),
                         status TEXT NOT NULL CHECK(status IN ('current','completed'))
                     );
                     CREATE INDEX idx_paper_seasons_number
@@ -499,6 +542,89 @@ class Database:
                         """
                     )
                     version = 9
+                if version < 10:
+                    # Preserve every historical scorecard exactly as written. Additive terminal
+                    # metadata lets new boundaries distinguish genuine zero-value write-offs from
+                    # unknown provider/app state without rebuilding the season table.
+                    columns = {
+                        str(row[1])
+                        for row in self._conn.execute("PRAGMA table_info(paper_seasons)")
+                    }
+                    if "accounting_status" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN accounting_status TEXT "
+                            "NOT NULL DEFAULT 'legacy'"
+                        )
+                    if "terminal_policy_version" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN terminal_policy_version TEXT "
+                            "NOT NULL DEFAULT 'legacy-v1'"
+                        )
+                    if "boundary_type" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN boundary_type TEXT "
+                            "NOT NULL DEFAULT 'legacy'"
+                        )
+                    if "meaningful_activity" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN meaningful_activity INTEGER "
+                            "NOT NULL DEFAULT 0"
+                        )
+                    if "write_off_count" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN write_off_count INTEGER "
+                            "NOT NULL DEFAULT 0"
+                        )
+                    if "write_off_entry_minor" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE paper_seasons ADD COLUMN write_off_entry_minor INTEGER "
+                            "NOT NULL DEFAULT 0"
+                        )
+                    # The open season will be closed by the new versioned boundary policy. Past
+                    # completed seasons stay legacy and are never silently reclassified.
+                    self._conn.execute(
+                        """UPDATE paper_seasons SET accounting_status='current',
+                                  terminal_policy_version=?,boundary_type='open'
+                           WHERE status='current'""",
+                        (TERMINAL_POLICY_VERSION,),
+                    )
+                    # Completed rows predate the terminal-evidence contract. Their accounting
+                    # remains visible, but an older comparable flag cannot authorize modern
+                    # best-season or improvement claims.
+                    self._conn.execute(
+                        "UPDATE paper_seasons SET comparable=0 WHERE status='completed'"
+                    )
+                    version = 10
+                if version < 11:
+                    # Multi-skill Challenger evidence is additive. Legacy v4 entry models and
+                    # observations remain immutable and readable in their original tables.
+                    self._conn.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS challenger_skill_artifacts (
+                            version TEXT PRIMARY KEY,
+                            skill TEXT NOT NULL,
+                            risk_mode TEXT NOT NULL,
+                            configuration_fingerprint TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            qualified INTEGER NOT NULL,
+                            record_json TEXT NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_challenger_artifacts_context
+                            ON challenger_skill_artifacts(
+                                skill, risk_mode, configuration_fingerprint, created_at
+                            );
+                        CREATE TABLE IF NOT EXISTS challenger_skill_states (
+                            cohort_key TEXT NOT NULL,
+                            skill TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            record_json TEXT NOT NULL,
+                            PRIMARY KEY(cohort_key, skill)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_challenger_states_updated
+                            ON challenger_skill_states(updated_at);
+                        """
+                    )
+                    version = 11
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def health_check(self) -> bool:
@@ -692,6 +818,8 @@ class Database:
             "paper_seasons": "SELECT COUNT(*) FROM paper_seasons",
             "learning_observations": "SELECT COUNT(*) FROM learning_observations",
             "learning_models": "SELECT COUNT(*) FROM learning_models",
+            "challenger_skill_artifacts": "SELECT COUNT(*) FROM challenger_skill_artifacts",
+            "challenger_skill_states": "SELECT COUNT(*) FROM challenger_skill_states",
             "ai_critic_assessments": "SELECT COUNT(*) FROM ai_critic_assessments",
             "coach_reviews": "SELECT COUNT(*) FROM coach_reviews",
             "coach_hypotheses": "SELECT COUNT(*) FROM coach_hypotheses",
@@ -824,8 +952,9 @@ class Database:
             """INSERT INTO paper_seasons(
                    season_id,season_number,started_at,quote_currency,quote_decimals,
                    starting_minor,peak_equity_minor,risk_mode,profile_fingerprint,
-                   profile_json,profile_locked_at,status
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'current')""",
+                   profile_json,profile_locked_at,accounting_status,
+                   terminal_policy_version,boundary_type,status
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'current')""",
             (
                 season_id,
                 number,
@@ -842,8 +971,95 @@ class Database:
                     else None
                 ),
                 profile_locked_at,
+                "current",
+                TERMINAL_POLICY_VERSION,
+                "open",
             ),
         )
+
+    def reconfigure_unstarted_portfolio(
+        self,
+        *,
+        season_id: str,
+        quote_currency: str,
+        starting_minor: int,
+        season_profile: dict[str, Any],
+    ) -> None:
+        """Atomically edit a never-started bankroll without creating an empty season."""
+
+        if starting_minor <= 0:
+            raise ValueError("starting bankroll must be positive")
+        now = datetime.now().astimezone().isoformat()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT status,profile_locked_at FROM paper_seasons
+                   WHERE season_id=?""",
+                (season_id,),
+            ).fetchone()
+            if row is None or str(row["status"]) != "current":
+                raise RuntimeError("paper season is not current")
+            if row["profile_locked_at"] is not None:
+                raise ValueError("paper season is already active")
+            activity_queries = (
+                "SELECT COUNT(*) FROM fills",
+                "SELECT COUNT(*) FROM paper_orders",
+                "SELECT COUNT(*) FROM positions",
+                "SELECT COUNT(*) FROM decisions",
+            )
+            for query in activity_queries:
+                if int(self._conn.execute(query).fetchone()[0]):
+                    raise RuntimeError("unstarted paper season contains unexpected activity")
+
+            self._conn.execute("DELETE FROM ledger_entries")
+            self._conn.execute("DELETE FROM equity_points")
+            self._conn.execute("DELETE FROM equity_rollups")
+            self._insert_ledger(
+                season_id,
+                now,
+                [
+                    ("cash", starting_minor, 0, "Initial virtual bankroll"),
+                    ("capital", 0, starting_minor, "Initial virtual bankroll"),
+                ],
+            )
+            decimals = 9 if quote_currency == "SOL" else 6
+            self._upsert_settings(
+                [
+                    ("quote_currency", quote_currency),
+                    ("starting_lamports", starting_minor),
+                    ("realized_pnl_lamports", 0),
+                    ("peak_equity_lamports", starting_minor),
+                    ("equity_peak_basis", "executable-route-v1"),
+                    ("risk_mode", season_profile["risk_mode"]),
+                ],
+                now,
+            )
+            updated = self._conn.execute(
+                """UPDATE paper_seasons SET quote_currency=?,quote_decimals=?,
+                          starting_minor=?,peak_equity_minor=?,risk_mode=?,
+                          profile_fingerprint=?,profile_json=?,profile_locked_at=NULL,
+                          accounting_status='current',terminal_policy_version=?,
+                          boundary_type='open',meaningful_activity=0,
+                          write_off_count=0,write_off_entry_minor=0
+                   WHERE season_id=? AND status='current' AND profile_locked_at IS NULL""",
+                (
+                    quote_currency,
+                    decimals,
+                    starting_minor,
+                    starting_minor,
+                    season_profile["risk_mode"],
+                    season_profile["profile_fingerprint"],
+                    json.dumps(season_profile, separators=(",", ":"), sort_keys=True),
+                    TERMINAL_POLICY_VERSION,
+                    season_id,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("paper season changed concurrently")
+            self._conn.execute(
+                """INSERT INTO equity_points(
+                       recorded_at,equity_lamports,cash_lamports) VALUES(?,?,?)""",
+                (now, starting_minor, starting_minor),
+            )
 
     def ensure_current_season(
         self,
@@ -895,6 +1111,7 @@ class Database:
             season["profile"] = json.loads(raw_profile) if raw_profile else None
             season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
             season["comparable"] = bool(season.get("comparable", 1))
+            season["meaningful_activity"] = bool(season.get("meaningful_activity", 0))
             season["unresolved_inventory"] = unresolved_by_season.get(str(season["season_id"]), [])
             seasons.append(season)
         return seasons
@@ -911,6 +1128,7 @@ class Database:
         season["profile"] = json.loads(raw_profile) if raw_profile else None
         season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
         season["comparable"] = bool(season.get("comparable", 1))
+        season["meaningful_activity"] = bool(season.get("meaningful_activity", 0))
         season["unresolved_inventory"] = []
         return season
 
@@ -1208,6 +1426,146 @@ class Database:
         self._invalidate_storage_cache()
         return removed
 
+    def save_challenger_artifact(self, artifact: ChallengerSkillArtifact) -> None:
+        """Persist an immutable skill artifact; a version can never be overwritten."""
+
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                "SELECT record_json FROM challenger_skill_artifacts WHERE version=?",
+                (artifact.version,),
+            ).fetchone()
+            payload = artifact.model_dump_json()
+            if existing is not None:
+                if ChallengerSkillArtifact.model_validate_json(existing[0]) != artifact:
+                    raise ValueError("challenger artifact version already contains different data")
+                return
+            self._conn.execute(
+                "INSERT INTO challenger_skill_artifacts VALUES(?,?,?,?,?,?,?)",
+                (
+                    artifact.version,
+                    artifact.skill.value,
+                    artifact.risk_mode.value,
+                    artifact.configuration_fingerprint,
+                    artifact.created_at.isoformat(),
+                    int(artifact.qualified),
+                    payload,
+                ),
+            )
+        self._invalidate_storage_cache()
+
+    def list_challenger_artifacts(self) -> list[ChallengerSkillArtifact]:
+        with self._reader_lock:
+            rows = self._reader_conn.execute(
+                "SELECT record_json FROM challenger_skill_artifacts ORDER BY created_at"
+            ).fetchall()
+        return [ChallengerSkillArtifact.model_validate_json(row[0]) for row in rows]
+
+    def save_challenger_skill_state(self, state: ChallengerSkillState) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO challenger_skill_states VALUES(?,?,?,?)
+                   ON CONFLICT(cohort_key,skill) DO UPDATE SET
+                   updated_at=excluded.updated_at,record_json=excluded.record_json""",
+                (
+                    state.cohort_key,
+                    state.skill.value,
+                    state.updated_at.isoformat(),
+                    # Keep the established state payload readable by pre-journey v11 builds.
+                    # The additive journal lives in a settings sidecar that those builds ignore.
+                    state.model_dump_json(exclude={"champion_journey"}),
+                ),
+            )
+            self._upsert_settings(
+                [
+                    (
+                        self._challenger_journey_setting_key(state),
+                        [event.model_dump(mode="json") for event in state.champion_journey],
+                    )
+                ],
+                state.updated_at.isoformat(),
+            )
+        self._invalidate_storage_cache()
+
+    def list_challenger_skill_states(self) -> list[ChallengerSkillState]:
+        states: list[ChallengerSkillState] = []
+        normalize: list[ChallengerSkillState] = []
+        with self._reader_lock:
+            rows = self._reader_conn.execute(
+                "SELECT record_json FROM challenger_skill_states ORDER BY updated_at"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row[0])
+                embedded_format = "champion_journey" in payload
+                embedded_journey = payload.pop("champion_journey", [])
+                state = ChallengerSkillState.model_validate(payload)
+                sidecar = self._reader_conn.execute(
+                    "SELECT value_json FROM settings WHERE key=?",
+                    (self._challenger_journey_setting_key(state),),
+                ).fetchone()
+                journey_payload = (
+                    json.loads(sidecar["value_json"]) if sidecar is not None else embedded_journey
+                )
+                journey = [
+                    ChallengerChampionEvent.model_validate(event) for event in journey_payload
+                ]
+                hydrated = state.model_copy(update={"champion_journey": journey})
+                states.append(hydrated)
+                if embedded_format:
+                    normalize.append(hydrated)
+        # Normalize any short-lived embedded format written during development. This is atomic per
+        # state and leaves a strict, rollback-readable payload plus its durable sidecar.
+        for state in normalize:
+            self.save_challenger_skill_state(state)
+        return states
+
+    @staticmethod
+    def _challenger_journey_setting_key(state: ChallengerSkillState) -> str:
+        return f"{CHALLENGER_JOURNEY_SETTING_PREFIX}{state.cohort_key}:{state.skill.value}"
+
+    def prune_challenger_artifacts(
+        self,
+        max_artifacts: int,
+        *,
+        preserve_versions: set[str] | None = None,
+    ) -> list[str]:
+        """Bound immutable candidates while retaining champions, active, and audit versions."""
+
+        if max_artifacts < 1:
+            raise ValueError("max_artifacts must be positive")
+        protected = set(preserve_versions or set())
+        with self._lock, self._conn:
+            for row in self._conn.execute("SELECT record_json FROM challenger_skill_states"):
+                state = ChallengerSkillState.model_validate_json(row[0])
+                protected.update(
+                    version
+                    for version in (
+                        state.latest_candidate_version,
+                        state.champion_version,
+                        state.testing_version,
+                        state.active_version,
+                        state.suspended_version,
+                    )
+                    if version
+                )
+            versions = [
+                str(row[0])
+                for row in self._conn.execute(
+                    "SELECT version FROM challenger_skill_artifacts ORDER BY created_at DESC"
+                ).fetchall()
+            ]
+            keep = {version for version in versions if version in protected}
+            for version in versions:
+                if len(keep) >= max_artifacts:
+                    break
+                keep.add(version)
+            removed = [version for version in versions if version not in keep]
+            self._conn.executemany(
+                "DELETE FROM challenger_skill_artifacts WHERE version=?",
+                ((version,) for version in removed),
+            )
+        self._invalidate_storage_cache()
+        return removed
+
     def save_ai_assessment(self, assessment: AiCriticAssessment) -> None:
         with self._lock, self._conn:
             self._conn.execute(
@@ -1282,7 +1640,15 @@ class Database:
                 "SELECT record_json FROM coach_reviews ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [CoachReview.model_validate_json(row[0]) for row in rows]
+        reviews: list[CoachReview] = []
+        for row in rows:
+            try:
+                reviews.append(CoachReview.model_validate_json(row[0]))
+            except ValidationError:
+                # Coach history is optional research. One damaged legacy row must never stop
+                # the deterministic engine or prevent the remaining valid audit trail loading.
+                continue
+        return reviews
 
     def save_coach_hypothesis(self, hypothesis: CoachHypothesis) -> None:
         with self._lock, self._conn:
@@ -1308,7 +1674,59 @@ class Database:
                 "SELECT record_json FROM coach_hypotheses ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [CoachHypothesis.model_validate_json(row[0]) for row in rows]
+        hypotheses: list[CoachHypothesis] = []
+        for row in rows:
+            try:
+                hypotheses.append(CoachHypothesis.model_validate_json(row[0]))
+            except ValidationError:
+                continue
+        return hypotheses
+
+    def save_coach_selection(
+        self,
+        review: CoachReview,
+        hypothesis: CoachHypothesis,
+    ) -> bool:
+        """Atomically persist one review and its unique bounded research hypothesis."""
+
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                """SELECT 1 FROM coach_hypotheses
+                   WHERE risk_mode=? AND configuration_fingerprint=?
+                   AND json_extract(record_json,'$.signature')=? LIMIT 1""",
+                (
+                    hypothesis.risk_mode.value,
+                    hypothesis.configuration_fingerprint,
+                    hypothesis.signature,
+                ),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._conn.execute(
+                "INSERT OR IGNORE INTO coach_reviews VALUES(?,?,?,?,?,?)",
+                (
+                    review.review_id,
+                    review.created_at.isoformat(),
+                    review.risk_mode.value,
+                    review.configuration_fingerprint,
+                    int(review.valid),
+                    review.model_dump_json(),
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO coach_hypotheses VALUES(?,?,?,?,?,?,?)",
+                (
+                    hypothesis.hypothesis_id,
+                    hypothesis.created_at.isoformat(),
+                    hypothesis.state.value,
+                    hypothesis.kind.value,
+                    hypothesis.risk_mode.value,
+                    hypothesis.configuration_fingerprint,
+                    hypothesis.model_dump_json(),
+                ),
+            )
+        self._invalidate_storage_cache()
+        return True
 
     def recent_learning_observations(self, limit: int = 1_000) -> list[LearningObservation]:
         if limit < 1:
@@ -1330,18 +1748,30 @@ class Database:
         if max_reviews < 1 or max_hypotheses < 1:
             raise ValueError("coach retention limits must be positive")
         with self._lock, self._conn:
-            reviews = self._conn.execute(
-                """DELETE FROM coach_reviews WHERE review_id NOT IN (
-                       SELECT review_id FROM coach_reviews ORDER BY created_at DESC LIMIT ?
-                   )""",
-                (max_reviews,),
-            ).rowcount
             hypotheses = self._conn.execute(
                 """DELETE FROM coach_hypotheses WHERE hypothesis_id NOT IN (
                        SELECT hypothesis_id FROM coach_hypotheses
                        ORDER BY created_at DESC LIMIT ?
+                   ) AND NOT (
+                       state='testing'
+                       OR (
+                           state='promising'
+                           AND COALESCE(
+                               json_extract(record_json,'$.contribution_state'),
+                               'research_only'
+                           ) IN ('ready','waiting_for_champion')
+                       )
                    )""",
                 (max_hypotheses,),
+            ).rowcount
+            reviews = self._conn.execute(
+                """DELETE FROM coach_reviews WHERE review_id NOT IN (
+                       SELECT review_id FROM coach_reviews ORDER BY created_at DESC LIMIT ?
+                   ) AND review_id NOT IN (
+                       SELECT json_extract(record_json,'$.coach_review_id')
+                       FROM coach_hypotheses
+                   )""",
+                (max_reviews,),
             ).rowcount
         self._invalidate_storage_cache()
         return {"reviews": max(0, reviews), "hypotheses": max(0, hypotheses)}
@@ -1871,14 +2301,18 @@ class Database:
                     raise RuntimeError("initialized paper portfolio has no season id")
                 if season_summary is None:
                     raise RuntimeError("active paper season must be summarized before reset")
-                self._validate_unresolved_inventory(season_summary, unresolved_positions)
+                self._validate_unresolved_inventory(
+                    season_summary,
+                    unresolved_positions,
+                    recorded_at=now,
+                )
                 self._archive_active_season(
                     str(season_id),
                     season_summary,
                     now,
                     terminal_reason=terminal_reason,
-                    result_quality=("unresolved" if unresolved_positions else "complete"),
-                    comparable=comparable and not unresolved_positions,
+                    terminal_positions=unresolved_positions,
+                    comparable=comparable,
                 )
                 self._insert_unresolved_positions(
                     str(season_id),
@@ -1934,14 +2368,18 @@ class Database:
             if not previous_season_id:
                 raise RuntimeError("initialized paper portfolio has no season id")
 
-            self._validate_unresolved_inventory(season_summary, unresolved_positions)
+            self._validate_unresolved_inventory(
+                season_summary,
+                unresolved_positions,
+                recorded_at=now,
+            )
             self._archive_active_season(
                 str(previous_season_id),
                 season_summary,
                 now,
                 terminal_reason=terminal_reason,
-                result_quality=("unresolved" if unresolved_positions else "complete"),
-                comparable=comparable and not unresolved_positions,
+                terminal_positions=unresolved_positions,
+                comparable=comparable,
             )
             self._insert_unresolved_positions(
                 str(previous_season_id),
@@ -2001,18 +2439,49 @@ class Database:
         ended_at: str,
         *,
         terminal_reason: str,
-        result_quality: str = "complete",
+        terminal_positions: Sequence[dict[str, Any]] = (),
         comparable: bool = True,
     ) -> None:
-        if result_quality not in {"complete", "unresolved"}:
-            raise ValueError("paper season result quality is invalid")
+        write_offs = [
+            item for item in terminal_positions if item.get("terminal_disposition") == "write_off"
+        ]
+        unknown = [
+            item for item in terminal_positions if item.get("terminal_disposition") != "write_off"
+        ]
+        meaningful_activity = bool(season_summary.get("meaningful_activity"))
+        accounting_status = (
+            "incomplete_unknown"
+            if unknown
+            else "complete_with_writeoffs"
+            if write_offs
+            else "empty"
+            if not meaningful_activity
+            else "complete"
+        )
+        result_quality = "unresolved" if unknown else "complete"
+        comparison_eligible = bool(
+            comparable
+            and meaningful_activity
+            and accounting_status in {"complete", "complete_with_writeoffs"}
+        )
+        boundary_type = self._terminal_boundary_type(terminal_reason)
+        write_off_entry_minor = sum(
+            max(0, int(item.get("entry_cost_minor") or 0)) for item in write_offs
+        )
+        # A confirmed zero-value terminal disposition is a real paper loss, even though it is not
+        # a fabricated sell fill. Include it in season win-rate accounting while leaving the
+        # immutable fill journal and learning outcomes untouched.
+        closed_trades = int(season_summary["closed_trades"]) + len(write_offs)
+        losses = int(season_summary["losses"]) + len(write_offs)
         updated = self._conn.execute(
             """UPDATE paper_seasons SET
                    ended_at=?,ending_equity_minor=?,last_known_ending_equity_minor=?,
                    peak_equity_minor=?,realized_pnl_minor=?,net_pnl_minor=?,
                    total_fees_minor=?,closed_trades=?,wins=?,losses=?,break_even=?,
                    ending_drawdown_fraction=?,open_positions=?,terminal_reason=?,
-                   result_quality=?,comparable=?,status='completed'
+                   result_quality=?,comparable=?,accounting_status=?,
+                   terminal_policy_version=?,boundary_type=?,meaningful_activity=?,
+                   write_off_count=?,write_off_entry_minor=?,status='completed'
                WHERE season_id=? AND status='current'""",
             (
                 ended_at,
@@ -2022,20 +2491,38 @@ class Database:
                 int(season_summary["realized_pnl_minor"]),
                 int(season_summary["net_pnl_minor"]),
                 int(season_summary["total_fees_minor"]),
-                int(season_summary["closed_trades"]),
+                closed_trades,
                 int(season_summary["wins"]),
-                int(season_summary["losses"]),
+                losses,
                 int(season_summary["break_even"]),
                 max(0.0, min(1.0, float(season_summary["ending_drawdown_fraction"]))),
                 int(season_summary["open_positions"]),
                 terminal_reason,
                 result_quality,
-                int(comparable),
+                int(comparison_eligible),
+                accounting_status,
+                TERMINAL_POLICY_VERSION,
+                boundary_type,
+                int(meaningful_activity),
+                len(write_offs),
+                write_off_entry_minor,
                 season_id,
             ),
         ).rowcount
         if updated != 1:
             raise RuntimeError("active paper season summary row is missing")
+
+    @staticmethod
+    def _terminal_boundary_type(terminal_reason: str) -> str:
+        if terminal_reason == "profile_change_manual":
+            return "end_now"
+        if terminal_reason == "profile_change_safe":
+            return "finish_safely"
+        if terminal_reason in {"auto_drawdown", "auto_drawdown_rollover", "bankroll_exhausted"}:
+            return "automatic"
+        if terminal_reason == "manual_reset":
+            return "reset"
+        return "other"
 
     def _insert_unresolved_positions(
         self,
@@ -2053,6 +2540,9 @@ class Database:
                 raise ValueError("unresolved paper inventory requires position and mint ids")
             if position.get("was_executed") is not False:
                 raise ValueError("unresolved paper inventory cannot be recorded as executed")
+            disposition = str(position.get("terminal_disposition") or "unknown")
+            if disposition not in {"write_off", "unknown"}:
+                raise ValueError("terminal paper inventory disposition is invalid")
             record = {**position, "season_id": season_id, "recorded_at": recorded_at}
             self._conn.execute(
                 """INSERT INTO unresolved_paper_positions(
@@ -2072,6 +2562,8 @@ class Database:
     def _validate_unresolved_inventory(
         season_summary: dict[str, Any],
         positions: Sequence[dict[str, Any]],
+        *,
+        recorded_at: str,
     ) -> None:
         """Require one honest audit record for every position retired without a fill."""
 
@@ -2080,6 +2572,57 @@ class Database:
             raise ValueError("paper season open position count cannot be negative")
         if open_positions != len(positions):
             raise ValueError("paper season open positions must match unresolved inventory records")
+        try:
+            boundary_at = datetime.fromisoformat(recorded_at)
+        except ValueError as exc:
+            raise ValueError("terminal paper inventory boundary time is invalid") from exc
+        position_ids: set[str] = set()
+        mints: set[str] = set()
+        for position in positions:
+            position_id = str(position.get("position_id") or "")
+            mint = str(position.get("mint") or "")
+            if not position_id or not mint:
+                raise ValueError("terminal paper inventory requires position and mint ids")
+            if position_id in position_ids or mint in mints:
+                raise ValueError("terminal paper inventory records must be unique")
+            position_ids.add(position_id)
+            mints.add(mint)
+            if position.get("was_executed") is not False:
+                raise ValueError("terminal paper inventory cannot be recorded as executed")
+            disposition = str(position.get("terminal_disposition") or "unknown")
+            if disposition not in {"write_off", "unknown"}:
+                raise ValueError("terminal paper inventory disposition is invalid")
+            if disposition != "write_off":
+                continue
+            evidence = position.get("terminal_evidence")
+            probe = evidence.get("probe") if isinstance(evidence, dict) else None
+            probe_record = probe if isinstance(probe, dict) else {}
+            try:
+                confirmations = int(probe_record.get("consecutive") or 0)
+                slot = int(probe_record.get("slot") or 0)
+                first_observed_at = datetime.fromisoformat(
+                    str(probe_record.get("first_observed_at") or "")
+                )
+                observed_at = datetime.fromisoformat(str(probe_record.get("observed_at") or ""))
+                evidence_seconds = (observed_at - first_observed_at).total_seconds()
+                evidence_age_seconds = (boundary_at - observed_at).total_seconds()
+            except (AttributeError, TypeError, ValueError):
+                confirmations = 0
+                slot = 0
+                evidence_seconds = -1.0
+                evidence_age_seconds = -1.0
+            valid_write_off = bool(
+                isinstance(evidence, dict)
+                and evidence.get("policy") == "two-fresh-route-probes"
+                and evidence.get("global_market_healthy") is True
+                and probe_record.get("outcome") == "unavailable"
+                and confirmations >= 2
+                and slot > 0
+                and 0 < evidence_seconds <= 180
+                and 0 <= evidence_age_seconds <= 180
+            )
+            if not valid_write_off:
+                raise ValueError("terminal paper write-off requires confirmed route evidence")
 
     def _clear_paper_tables(self) -> None:
         for table in (

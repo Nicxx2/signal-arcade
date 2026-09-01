@@ -17,6 +17,9 @@ export interface SeasonProfile {
   provenance: "exact";
   risk_mode: RiskMode;
   risk_policy_version: string;
+  baseline_version?: string;
+  integrity_policy_version?: string;
+  sizing_policy_version?: string;
   risk_limits: Record<string, number | string>;
   drawdown_policy: DrawdownPolicy;
   effective_drawdown_bps: number | null;
@@ -69,6 +72,25 @@ export interface Decision {
   season_profile_fingerprint?: string | null;
   configuration_fingerprint: string | null;
   planned_order_size_sol: number | null;
+  integrity_assessment?: {
+    policy_version: string;
+    state: "clean" | "uncertain" | "suspicious" | "severe";
+    score: number;
+    coverage: number;
+    sample_count: number;
+    category_count: number;
+    categories: string[];
+    evidence: string[];
+  } | null;
+  sizing_assessment?: {
+    policy_version: string;
+    base_size_sol: number;
+    desired_size_sol: number;
+    selected_size_sol: number;
+    account_allocation_fraction: number;
+    constraints: string[];
+    reasons: string[];
+  } | null;
   learning_assessment: {
     model_version: string;
     predicted_net_return: number;
@@ -112,9 +134,15 @@ export interface Position {
   mark_blockers: string[];
   market_status: "active" | "exit_blocked" | "dormant";
   risk_mode_at_entry: RiskMode | null;
+  baseline_version_at_entry?: string;
   peak_mark_lamports: number;
   peak_marked_at: string | null;
   exit_assessment: ExitAssessment | null;
+  integrity_warning_count?: number;
+  integrity_warning_since?: string | null;
+  integrity_last_warning_at?: string | null;
+  integrity_last_evaluated_at?: string | null;
+  integrity_last_state?: "clean" | "uncertain" | "suspicious" | "severe";
 }
 
 export interface Order {
@@ -128,6 +156,7 @@ export interface Order {
   reserved_account_minor: number;
   created_at: string;
   fill_after: string;
+  baseline_version_at_entry?: string;
 }
 
 export interface Fill {
@@ -227,6 +256,9 @@ export interface ProviderView {
   active: boolean;
   endpoint: string;
   stream_endpoint?: string;
+  http_source?: "saved_override" | "environment_default";
+  stream_source?: "saved_override" | "environment_default";
+  stream_fallback_active?: boolean;
   custom_endpoint?: boolean;
   api_key_configured?: boolean;
   model?: string;
@@ -299,6 +331,56 @@ export interface ReadinessGate {
   detail: string;
 }
 
+export interface ChallengerSkillStatus {
+  skill: "entry" | "manipulation" | "sizing" | "exit";
+  label: string;
+  state: "collecting" | "collecting_proof" | "candidate_testing" | "qualified" | "active" | "suspended";
+  latest_candidate: {
+    version: string;
+    created_at: string;
+    skill: string;
+    outcomes_seen: number;
+    sample_count: number;
+    training_count: number;
+    validation_count: number;
+    embargoed_count: number;
+    qualified: boolean;
+    metrics: Record<string, number | boolean | null>;
+    parameters: Record<string, unknown>;
+  } | null;
+  testing_version: string | null;
+  champion: ChallengerSkillStatus["latest_candidate"];
+  active_version: string | null;
+  common_forward_count: number;
+  tournament: Record<string, number | boolean | string | null>;
+  health: {
+    state: "inactive" | "collecting" | "healthy" | "degraded" | "unverifiable" | "suspended";
+    model_version: string | null;
+    observed_count: number;
+    usable_count: number;
+    minimum_samples: number;
+    availability_fraction: number;
+    estimated_uplift: number | null;
+    uplift_upper_bound: number | null;
+  };
+  gates: ReadinessGate[];
+}
+
+export interface ChallengerChampionEvent {
+  event_id: string;
+  occurred_at: string;
+  skill: ChallengerSkillStatus["skill"];
+  kind: "first_champion" | "promoted" | "defended" | "inconclusive";
+  candidate_version: string;
+  previous_champion_version: string | null;
+  champion_version: string;
+  common_observed_count: number;
+  common_usable_count: number;
+  availability_fraction: number;
+  mean_uplift: number | null;
+  uplift_lower_bound: number | null;
+}
+
 export interface LearningStatus {
   mode: LearningMode;
   state: "paused" | "collecting" | "challenger_testing" | "ready" | "active";
@@ -309,6 +391,8 @@ export interface LearningStatus {
   usable_outcome_count: number;
   pending_count: number;
   unavailable_outcome_count: number;
+  unavailable_outcome_reasons?: Record<string, number>;
+  clock_checkpoint_limit?: number;
   minimum_training_samples: number;
   retained_observation_limit: number;
   retained_model_limit: number;
@@ -368,6 +452,12 @@ export interface LearningStatus {
     suspended_at?: string;
   };
   activation_available: boolean;
+  consent_granted?: boolean;
+  active_skill_versions?: Partial<Record<"entry" | "manipulation" | "sizing" | "exit", string>>;
+  skills?: ChallengerSkillStatus[];
+  champion_journey?: ChallengerChampionEvent[];
+  challenger_common_forward_minimum?: number;
+  challenger_minimum_availability?: number;
   qualification_gates?: ReadinessGate[];
   qualification_passed?: number;
   qualification_total?: number;
@@ -481,6 +571,9 @@ export interface CoachReview {
   created_at: string;
   outcomes_seen: number;
   risk_mode: RiskMode;
+  baseline_version?: string;
+  feature_schema_version?: string;
+  dependency_versions?: Record<string, string>;
   model_name: string;
   candidate_count: number;
   latency_ms: number;
@@ -490,21 +583,34 @@ export interface CoachReview {
   failure_reason: string | null;
 }
 
+export interface CoachCondition {
+  feature_name: string;
+  operator: "<=" | ">=";
+  threshold: number;
+}
+
 export interface CoachHypothesis {
   hypothesis_id: string;
   created_at: string;
   updated_at: string;
   cutoff_at: string;
-  kind: "entry_veto" | "earlier_review";
+  kind: "entry_veto" | "manipulation_veto" | "sizing_multiplier" | "earlier_review";
+  skill?: "entry" | "manipulation" | "sizing" | "exit";
   state: "testing" | "promising" | "inconclusive" | "not_supported";
   title: string;
   rationale: string;
   risk_mode: RiskMode;
+  baseline_version?: string;
+  feature_schema_version?: string;
+  dependency_versions?: Record<string, string>;
   model_name: string;
   feature_name: string | null;
   operator: "<=" | ">=" | null;
   threshold: number | null;
+  conditions?: CoachCondition[];
   hold_seconds: number | null;
+  baseline_hold_seconds?: number | null;
+  size_multiplier?: number | null;
   discovery_observed_count: number;
   discovery_usable_count: number;
   discovery_availability_fraction: number;
@@ -520,12 +626,27 @@ export interface CoachHypothesis {
   minimum_forward_samples: number;
   minimum_availability_fraction: number;
   last_evaluated_at: string | null;
+  resolved_at?: string | null;
+  resolution_reason?: string | null;
+  contribution_state?: "research_only" | "ready" | "waiting_for_champion" | "handed_off" | "stale";
+  contributed_artifact_version?: string | null;
   influence_applied: false;
   context_active: boolean;
 }
 
+export interface CoachResearchLane {
+  skill: "entry" | "manipulation" | "sizing" | "exit";
+  label: string;
+  state: CoachHypothesis["state"] | "observing";
+  current_title: string | null;
+  best_title: string | null;
+  studies: number;
+  supported_studies: number;
+}
+
 export interface CoachStatus {
   mode: "off" | "shadow";
+  research_enabled?: boolean;
   state: "off" | "waiting" | "reviewing" | "testing" | "promising" | "inconclusive" | "not_supported";
   influence: "none";
   worker_running: boolean;
@@ -538,6 +659,16 @@ export interface CoachStatus {
   outcomes_until_review: number;
   minimum_forward_samples: number;
   minimum_forward_seasons: number;
+  minimum_samples_per_season?: number;
+  contribution_enabled?: boolean;
+  contribution_ready?: boolean;
+  contribution_candidate?: {
+    hypothesis_id: string;
+    title: string;
+    skill: "entry" | "manipulation" | "sizing" | "exit";
+    state: "ready" | "waiting_for_champion";
+  } | null;
+  research_lanes?: CoachResearchLane[];
   qualification_gates?: ReadinessGate[];
   qualification_passed?: number;
   qualification_total?: number;
@@ -659,6 +790,12 @@ export interface PaperSeason {
   comparison_key?: string;
   terminal_reason: string | null;
   result_quality?: "complete" | "unresolved";
+  accounting_status?: "current" | "complete" | "complete_with_writeoffs" | "incomplete_unknown" | "empty" | "legacy";
+  terminal_policy_version?: string;
+  boundary_type?: "open" | "automatic" | "finish_safely" | "end_now" | "reset" | "other" | "legacy";
+  meaningful_activity?: boolean;
+  write_off_count?: number;
+  write_off_entry_minor?: number;
   comparable?: boolean;
   unresolved_inventory?: Array<{
     position_id: string;
@@ -676,6 +813,8 @@ export interface PaperSeason {
     retirement_reason: string;
     retired_at: string;
     was_executed: false;
+    terminal_disposition?: "write_off" | "unknown";
+    terminal_evidence?: Record<string, unknown>;
   }>;
 }
 
@@ -694,11 +833,23 @@ export interface Seasons {
   comparison_groups?: Array<{
     comparison_key: string;
     quote_currency: QuoteCurrency;
+    quote_decimals?: number;
+    starting_minor?: number;
+    terminal_policy_version?: string;
     profile_provenance: "exact" | "legacy_unknown";
     profile_fingerprint: string | null;
     risk_mode: RiskMode | null;
     drawdown_policy: DrawdownPolicy | null;
     effective_drawdown_bps: number | null;
+    baseline_version?: string | null;
+    integrity_policy_version?: string | null;
+    sizing_policy_version?: string | null;
+    first_season_number?: number;
+    last_season_number?: number;
+    has_current?: boolean;
+    completed_count?: number;
+    comparable_count?: number;
+    boundary_types?: string[];
     season_count: number;
   }>;
   summary: {
@@ -738,6 +889,9 @@ export interface SeasonOperation {
   completed_at: string | null;
   target_risk_mode?: RiskMode;
   target_profile_fingerprint?: string;
+  target_quote_currency?: QuoteCurrency;
+  target_starting_minor?: number;
+  target_season_fingerprint?: string;
   previous_running?: boolean;
   transition_strategy?: ProfileTransitionStrategy;
   manual_settlement_started_at?: string | null;

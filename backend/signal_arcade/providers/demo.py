@@ -12,6 +12,10 @@ from datetime import UTC, datetime
 from ..models import EventKind, MarketEvent
 from .anchor import b58encode
 
+DEMO_TICKS_PER_TOKEN = 120
+DEMO_TICK_INTERVAL_SECONDS = 0.35
+DEMO_TRENDING_PHASE_TICKS = 36
+
 
 class DemoFeed:
     """Clearly labelled synthetic stream for onboarding and offline verification."""
@@ -67,14 +71,17 @@ class DemoFeed:
                 },
             )
         )
-        for tick in range(75):
+        # Keep each synthetic market alive long enough for the current Baseline's integrity
+        # evidence to mature. Demo uses the same decision boundary as mainnet, so ending the
+        # stream earlier would leave onboarding tokens permanently observable but untradeable.
+        for tick in range(DEMO_TICKS_PER_TOKEN):
             if stop.is_set():
                 return
-            phase = tick / 74
+            phase = tick / (DEMO_TICKS_PER_TOKEN - 1)
             buy_probability = 0.62 + 0.16 * math.sin(phase * math.pi)
             is_buy = self.random.random() < buy_probability
             quote = self.random.randint(8_000_000, 90_000_000)
-            if tick > 55:
+            if tick >= DEMO_TICKS_PER_TOKEN - DEMO_TRENDING_PHASE_TICKS:
                 trending_up = token_index % 3 != 0
                 is_buy = self.random.random() < (0.92 if trending_up else 0.18)
                 quote = self.random.randint(600_000_000, 900_000_000)
@@ -114,7 +121,7 @@ class DemoFeed:
                     },
                 )
             )
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(DEMO_TICK_INTERVAL_SECONDS)
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=5)
 

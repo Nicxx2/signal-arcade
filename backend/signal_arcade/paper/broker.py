@@ -7,16 +7,22 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
+from pydantic import ValidationError
+
 from ..config import Settings
 from ..database import Database
+from ..intelligence.decision import DecisionEngine, assess_market_integrity
 from ..intelligence.features import TokenState
 from ..models import (
     RISK_LIMITS,
+    ChallengerEvaluationReceipt,
+    ChallengerSkill,
     Decision,
     DecisionAction,
     EventKind,
     FeatureSnapshot,
     FillReceipt,
+    MarketIntegrityState,
     OrderStatus,
     PaperOrder,
     PortfolioSnapshot,
@@ -26,8 +32,17 @@ from ..models import (
     RiskLimits,
     RiskMode,
     Side,
+    SizingAssessment,
 )
-from ..risk_profiles import SeasonProfile
+from ..risk_profiles import SeasonProfile, upgrade_season_profile_strategy
+from ..strategy import (
+    BASELINE_VERSION,
+    LEARNABLE_BASELINE_VERSIONS,
+    LEGACY_BASELINE_VERSION,
+    SIZING_POLICY_VERSION,
+    UNCERTAIN_INTEGRITY_SIZE_MULTIPLIER,
+    integrity_policy_for_baseline,
+)
 from .curve_math import quote_buy, quote_sell
 from .exit_policy import ROUTE_BLOCKERS, assess_exit
 
@@ -46,6 +61,25 @@ UNFILLABLE_BUY_FLAGS = {
     "mint_account_failed_safety_checks",
 }
 UNFILLABLE_SELL_FLAGS = ROUTE_BLOCKERS
+
+
+def _clamp_fraction(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _integrity_reference_size_multiplier(
+    baseline_version: str,
+    state: MarketIntegrityState,
+) -> float:
+    """Return the frozen reference-size bound for a Baseline generation and integrity state."""
+
+    if state == MarketIntegrityState.SUSPICIOUS:
+        return 0.60
+    if state == MarketIntegrityState.SEVERE:
+        return 0.50
+    if baseline_version == BASELINE_VERSION and state == MarketIntegrityState.UNCERTAIN:
+        return UNCERTAIN_INTEGRITY_SIZE_MULTIPLIER
+    return 1.0
 
 
 class PaperBroker:
@@ -77,7 +111,20 @@ class PaperBroker:
             else None
         )
         if self.season_profile is not None:
-            SeasonProfile.model_validate(self.season_profile)
+            parsed_profile = SeasonProfile.model_validate(self.season_profile)
+            if (
+                parsed_profile.locked_at is None
+                and parsed_profile.baseline_version != BASELINE_VERSION
+            ):
+                # An empty, unlocked season has no decisions to mix. Upgrade its provenance in
+                # place; a locked season remains frozen until its normal successor boundary.
+                upgraded = upgrade_season_profile_strategy(self.season_profile)
+                assert self.season_id is not None
+                database.update_current_season_profile(
+                    str(self.season_id),
+                    upgraded.model_dump(mode="json"),
+                )
+                self.season_profile = upgraded.model_dump(mode="json")
         self.positions = {item.mint: item for item in database.list_positions()}
         self.pending = {
             item.order_id: item for item in database.list_orders([OrderStatus.PENDING.value])
@@ -85,6 +132,12 @@ class PaperBroker:
         self.traded_mints = {
             fill.mint for fill in database.list_fills(100_000) if fill.side == Side.BUY
         }
+        self._fill_decisions = DecisionEngine(
+            default_fee_bps=settings.pump_fee_bps,
+            one_way_network_fee_lamports=(
+                settings.network_fee_lamports + settings.priority_fee_lamports
+            ),
+        )
         self._last_equity_recorded_at: datetime | None = None
 
     def initialize(
@@ -110,6 +163,32 @@ class PaperBroker:
         self.initialized = True
         self.season_id = season_id
         self.season_profile = dict(season_profile) if season_profile else None
+        self._last_equity_recorded_at = datetime.now(UTC)
+
+    def reconfigure_unstarted(
+        self,
+        quote_currency: QuoteCurrency,
+        starting_minor: int,
+        season_profile: dict[str, Any],
+    ) -> None:
+        """Edit a never-started virtual bankroll as one durable ledger transaction."""
+
+        if not self.initialized or not self.season_id:
+            raise ValueError("create a paper bankroll before editing it")
+        if self.season_profile is None or self.season_profile.get("locked_at") is not None:
+            raise ValueError("paper season is already active")
+        if self.positions or self.pending:
+            raise RuntimeError("unstarted paper season contains unexpected inventory")
+        self.database.reconfigure_unstarted_portfolio(
+            season_id=str(self.season_id),
+            quote_currency=quote_currency.value,
+            starting_minor=starting_minor,
+            season_profile=season_profile,
+        )
+        self.quote_currency = quote_currency
+        self.quote_decimals = 9 if quote_currency == QuoteCurrency.SOL else 6
+        self.starting_lamports = starting_minor
+        self.season_profile = dict(season_profile)
         self._last_equity_recorded_at = datetime.now(UTC)
 
     @property
@@ -196,7 +275,11 @@ class PaperBroker:
             reserved_account_minor=required,
             fill_after=decision.created_at + timedelta(milliseconds=self.settings.entry_latency_ms),
             risk_mode_at_entry=decision.risk_mode,
+            baseline_version_at_entry=decision.model_version.split("+", maxsplit=1)[0],
         )
+        # Persist the exact entry thesis before exposing a fillable pending order. The later
+        # orchestrator journal call is idempotent, and this closes the zero-latency clock race.
+        self.database.save_decision(decision)
         self.pending[order.order_id] = order
         self.database.save_order(order)
         return order, None
@@ -231,6 +314,187 @@ class PaperBroker:
             return limits.order_size_sol
         planned_lamports = max(1, min(grown_lamports, exposure_cap_lamports))
         return planned_lamports / LAMPORTS_PER_SOL
+
+    def plan_entry_size(
+        self,
+        decision: Decision,
+        *,
+        sol_usd_price: float | None = None,
+    ) -> SizingAssessment:
+        """Choose a quality-aware size inside cash, exposure, slot, and impact limits.
+
+        The existing fixed-size result remains the reference size. Only mature, clean evidence
+        may scale above it; uncertain evidence stays at that reference and suspicious evidence
+        is reduced. Account targets are based on realized bankroll, never temporary unrealized
+        marks, while hard caps use current executable portfolio equity and reservations.
+        """
+
+        limits = self.risk_limits(decision.risk_mode)
+        base_size_sol = self.planned_order_size_sol(
+            decision.risk_mode,
+            sol_usd_price=sol_usd_price,
+        )
+        integrity = decision.integrity_assessment
+        baseline_version = decision.model_version.split("+", maxsplit=1)[0]
+        quality = _clamp_fraction(
+            0.30 * decision.score.opportunity
+            + 0.25 * decision.score.confidence
+            + 0.20 * decision.score.execution
+            + 0.25 * (1 - decision.score.danger)
+        )
+        reasons: list[str] = []
+        desired_size_sol = base_size_sol
+
+        if integrity is None:
+            reasons.append("Uncertain integrity evidence keeps the reference paper size")
+        elif integrity.state == MarketIntegrityState.UNCERTAIN:
+            multiplier = _integrity_reference_size_multiplier(
+                baseline_version,
+                integrity.state,
+            )
+            desired_size_sol = max(0.000001, base_size_sol * multiplier)
+            if multiplier < 1.0:
+                reasons.append("Unresolved integrity evidence reduces the exploratory paper size")
+            else:
+                reasons.append("Uncertain integrity evidence keeps the reference paper size")
+        elif integrity.state == MarketIntegrityState.SUSPICIOUS:
+            desired_size_sol = max(
+                0.000001,
+                base_size_sol
+                * _integrity_reference_size_multiplier(baseline_version, integrity.state),
+            )
+            reasons.append("Corroborated integrity concerns reduce the reference paper size")
+        elif integrity.state == MarketIntegrityState.SEVERE:
+            desired_size_sol = max(
+                0.000001,
+                base_size_sol
+                * _integrity_reference_size_multiplier(baseline_version, integrity.state),
+            )
+            reasons.append("Severe integrity evidence cannot size up and remains entry-blocked")
+        else:
+            per_slot_fraction = limits.max_exposure_fraction / limits.max_open_positions
+            confidence_to_scale = _clamp_fraction((quality - 0.58) / 0.34)
+            target_fraction = per_slot_fraction * (0.25 + 0.75 * confidence_to_scale)
+            desired_size_sol = self._realized_account_target_sol(
+                target_fraction,
+                sol_usd_price,
+                fallback=base_size_sol,
+            )
+            desired_size_sol = max(base_size_sol, desired_size_sol)
+            reasons.append("Clean, mature evidence allows bounded sizing from realized bankroll")
+
+        selected_size_sol, maximum_size_sol, constraints = self._bounded_entry_size_sol(
+            decision,
+            desired_size_sol,
+            sol_usd_price,
+        )
+        realized_bankroll = max(
+            1,
+            self.starting_lamports + self.snapshot(decision.risk_mode).realized_pnl_lamports,
+        )
+        try:
+            selected_account_minor = self._account_minor_from_sol(
+                max(1, int(selected_size_sol * LAMPORTS_PER_SOL)),
+                sol_usd_price,
+                ROUND_CEILING,
+            )
+        except ValueError:
+            selected_account_minor = 0
+
+        return SizingAssessment(
+            policy_version=SIZING_POLICY_VERSION,
+            base_size_sol=base_size_sol,
+            desired_size_sol=max(0.000001, desired_size_sol),
+            selected_size_sol=max(0.000001, selected_size_sol),
+            maximum_size_sol=max(0.000001, maximum_size_sol),
+            account_allocation_fraction=_clamp_fraction(selected_account_minor / realized_bankroll),
+            constraints=constraints,
+            reasons=reasons,
+        )
+
+    def _realized_account_target_sol(
+        self,
+        target_fraction: float,
+        sol_usd_price: float | None,
+        *,
+        fallback: float,
+    ) -> float:
+        if not self.initialized or self.starting_lamports <= 0:
+            return fallback
+        portfolio = self.snapshot()
+        realized_bankroll = max(
+            1,
+            self.starting_lamports + portfolio.realized_pnl_lamports,
+        )
+        target_account_minor = max(1, int(realized_bankroll * target_fraction))
+        try:
+            return (
+                self._sol_lamports_from_account_minor(target_account_minor, sol_usd_price)
+                / LAMPORTS_PER_SOL
+            )
+        except ValueError:
+            return fallback
+
+    def _bounded_entry_size_sol(
+        self,
+        decision: Decision,
+        desired_size_sol: float,
+        sol_usd_price: float | None,
+    ) -> tuple[float, float, list[str]]:
+        limits = self.risk_limits(decision.risk_mode)
+        desired_lamports = max(1, int(desired_size_sol * LAMPORTS_PER_SOL))
+        portfolio = self.snapshot(decision.risk_mode)
+        capacity_positions = self._capacity_positions(portfolio)
+        pending_buys = [order for order in self.pending.values() if order.side == Side.BUY]
+        exposure = sum(position.entry_cost_lamports for position in capacity_positions)
+        exposure += sum(self._pending_reservation(order, sol_usd_price) for order in pending_buys)
+        reserved_cash = sum(
+            self._pending_reservation(order, sol_usd_price) for order in pending_buys
+        )
+        fee_lamports = self.settings.network_fee_lamports + self.settings.priority_fee_lamports
+
+        caps: dict[str, int] = {}
+        account_caps = {
+            "per_position_exposure_cap": int(
+                portfolio.equity_lamports * limits.max_exposure_fraction / limits.max_open_positions
+            ),
+            "remaining_portfolio_exposure": max(
+                0,
+                int(portfolio.equity_lamports * limits.max_exposure_fraction) - exposure,
+            ),
+            "available_cash": max(0, self.cash_lamports - reserved_cash),
+        }
+        for name, account_minor in account_caps.items():
+            try:
+                caps[name] = max(
+                    1,
+                    self._sol_lamports_from_account_minor(account_minor, sol_usd_price)
+                    - fee_lamports,
+                )
+            except ValueError:
+                caps[name] = desired_lamports
+
+        reserve_sol = max(0.0, decision.feature_snapshot.number("virtual_quote_reserve_sol"))
+        if reserve_sol > 0:
+            caps["price_impact_cap"] = max(
+                1,
+                int(reserve_sol * limits.max_price_impact * LAMPORTS_PER_SOL),
+            )
+
+        maximum_lamports = min(caps.values()) if caps else desired_lamports
+        selected_lamports = min(desired_lamports, maximum_lamports)
+        constraints = [
+            name
+            for name, cap in caps.items()
+            if cap <= desired_lamports and cap == selected_lamports
+        ]
+        if not constraints:
+            constraints.append("quality_target")
+        return (
+            max(1, selected_lamports) / LAMPORTS_PER_SOL,
+            max(1, maximum_lamports) / LAMPORTS_PER_SOL,
+            constraints,
+        )
 
     def can_fund_permitted_entry(
         self,
@@ -305,6 +569,9 @@ class PaperBroker:
             return "paper_portfolio_not_initialized", None, None
         if decision.action != DecisionAction.ENTER:
             return "decision_is_not_an_entry", None, None
+        provenance_blocker = self._entry_strategy_receipt_blocker(decision)
+        if provenance_blocker is not None:
+            return provenance_blocker, None, None
         if decision.mint in self.traded_mints:
             return "mint_already_traded_this_season", None, None
         if decision.mint in self.positions:
@@ -340,6 +607,62 @@ class PaperBroker:
         if required > max(0, self.cash_lamports - reserved_cash):
             return "unreserved_paper_cash_insufficient", None, None
         return None, request, required
+
+    @staticmethod
+    def _entry_strategy_receipt_blocker(decision: Decision) -> str | None:
+        """Fail closed when entry-policy provenance is unsupported or internally inconsistent."""
+
+        baseline_version = decision.model_version.split("+", maxsplit=1)[0]
+        if baseline_version == LEGACY_BASELINE_VERSION:
+            return None
+        if baseline_version not in LEARNABLE_BASELINE_VERSIONS:
+            return "unsupported_baseline_version"
+        expected_integrity_policy = integrity_policy_for_baseline(baseline_version)
+        sizing = decision.sizing_assessment
+        integrity = decision.integrity_assessment
+        if decision.planned_order_size_sol is None or sizing is None or integrity is None:
+            return "current_baseline_receipt_incomplete"
+        if (
+            sizing.policy_version != SIZING_POLICY_VERSION
+            or integrity.policy_version != expected_integrity_policy
+        ):
+            return "current_baseline_policy_version_mismatch"
+        expected_size_sol = sizing.selected_size_sol
+        sizing_payload = decision.challenger_assessments.get(ChallengerSkill.SIZING.value)
+        if sizing_payload is not None:
+            try:
+                challenger_sizing = ChallengerEvaluationReceipt.model_validate(sizing_payload)
+            except ValidationError:
+                return "challenger_sizing_receipt_invalid"
+            if challenger_sizing.skill != ChallengerSkill.SIZING:
+                return "challenger_sizing_receipt_invalid"
+            applied = challenger_sizing.parameters.get("applied") is True
+            if applied:
+                raw_multiplier = challenger_sizing.parameters.get("selected_multiplier")
+                raw_baseline_size = challenger_sizing.parameters.get("baseline_size_sol")
+                if (
+                    not isinstance(raw_multiplier, (int, float))
+                    or isinstance(raw_multiplier, bool)
+                    or float(raw_multiplier) not in {0.5, 1.5, 2.0}
+                    or not isinstance(raw_baseline_size, (int, float))
+                    or isinstance(raw_baseline_size, bool)
+                    or abs(float(raw_baseline_size) - sizing.selected_size_sol) > 1e-9
+                    or not challenger_sizing.in_distribution
+                    or not challenger_sizing.baseline_actionable
+                    or challenger_sizing.proposed_action != f"{float(raw_multiplier):g}"
+                    or challenger_sizing.artifact_version
+                    not in decision.model_version.split("+")[1:]
+                ):
+                    return "challenger_sizing_receipt_invalid"
+                multiplier = float(raw_multiplier)
+                if multiplier > 1.0 and integrity.state != MarketIntegrityState.CLEAN:
+                    return "challenger_sizing_integrity_guard_failed"
+                expected_size_sol *= multiplier
+        planned_lamports = int(decision.planned_order_size_sol * LAMPORTS_PER_SOL)
+        selected_lamports = int(expected_size_sol * LAMPORTS_PER_SOL)
+        if abs(planned_lamports - selected_lamports) > 1:
+            return "current_baseline_size_receipt_mismatch"
+        return None
 
     def on_market_state(
         self,
@@ -415,7 +738,12 @@ class PaperBroker:
             if any(flag in unfillable for flag in features.hard_flags):
                 continue
             if order.side == Side.BUY:
-                blocker = self._pending_buy_fill_blocker(order, mode, sol_usd_price)
+                blocker = self._pending_buy_fill_blocker(
+                    order,
+                    mode,
+                    sol_usd_price,
+                    features,
+                )
                 if blocker:
                     self._fail_order(order, f"fill_rejected:{blocker}", now)
                     continue
@@ -544,6 +872,7 @@ class PaperBroker:
         now: datetime,
         *,
         reason: str,
+        dispositions: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Describe inventory without pretending its last indication was an executable sale."""
 
@@ -567,6 +896,14 @@ class PaperBroker:
                 "retirement_reason": reason,
                 "retired_at": now.isoformat(),
                 "was_executed": False,
+                "terminal_disposition": str(
+                    (dispositions or {})
+                    .get(position.mint, {})
+                    .get("terminal_disposition", "unknown")
+                ),
+                "terminal_evidence": dict(
+                    (dispositions or {}).get(position.mint, {}).get("terminal_evidence") or {}
+                ),
             }
             for position in portfolio.positions
         ]
@@ -726,6 +1063,7 @@ class PaperBroker:
             opened_at=receipt.filled_at,
             entry_fill_id=receipt.fill_id,
             risk_mode_at_entry=order.risk_mode_at_entry,
+            baseline_version_at_entry=order.baseline_version_at_entry,
             venue=state.venue,
             curve_address=state.curve_address,
             pool_address=state.pool_address,
@@ -864,12 +1202,18 @@ class PaperBroker:
         if position is None or self.has_pending_for(state.mint, Side.SELL):
             return
         limits = self._position_exit_limits(position, mode)
+        integrity_exit_reason = self._persistent_integrity_exit_reason(
+            position,
+            features,
+            now,
+        )
         assessment = assess_exit(
             position=position,
             features=features,
             now=now,
             limits=limits,
             soft_hold_seconds=soft_hold_seconds,
+            persistent_integrity_reason=integrity_exit_reason,
         )
         position.exit_assessment = assessment
         self.database.save_position(position)
@@ -964,6 +1308,7 @@ class PaperBroker:
         order: PaperOrder,
         mode: RiskMode,
         sol_usd_price: float | None,
+        features: FeatureSnapshot,
     ) -> str | None:
         """Recheck limits at fill time in case mode or portfolio state changed."""
         limits = self.risk_limits(mode)
@@ -990,6 +1335,113 @@ class PaperBroker:
             return "portfolio_exposure_limit_reached"
         if required > self.cash_lamports:
             return "paper_cash_insufficient"
+        if order.baseline_version_at_entry in LEARNABLE_BASELINE_VERSIONS:
+            decision = self.database.get_decision(order.decision_id) if order.decision_id else None
+            if decision is None:
+                return "entry_thesis_unavailable_at_fill"
+            provenance_blocker = self._entry_strategy_receipt_blocker(decision)
+            if provenance_blocker is not None:
+                return provenance_blocker
+            assert decision.planned_order_size_sol is not None
+            if (
+                abs(
+                    order.requested_sol_lamports
+                    - int(decision.planned_order_size_sol * LAMPORTS_PER_SOL)
+                )
+                > 1
+            ):
+                return "pending_order_size_differs_from_entry_receipt"
+            refreshed = self._fill_decisions.evaluate(
+                features,
+                order.risk_mode_at_entry or mode,
+                planned_order_size_sol=order.requested_sol_lamports / LAMPORTS_PER_SOL,
+                policy_limits=self.risk_limits(order.risk_mode_at_entry or mode),
+                baseline_version=order.baseline_version_at_entry,
+            )
+            if refreshed.action != DecisionAction.ENTER:
+                return refreshed.blockers[0] if refreshed.blockers else "entry_thesis_deteriorated"
+            original_base = (
+                decision.sizing_assessment.base_size_sol
+                if decision.sizing_assessment is not None
+                else decision.planned_order_size_sol
+            )
+            refreshed_integrity = refreshed.integrity_assessment
+            if original_base is not None and (
+                refreshed_integrity is None
+                or refreshed_integrity.state != MarketIntegrityState.CLEAN
+            ):
+                integrity_multiplier = (
+                    _integrity_reference_size_multiplier(
+                        order.baseline_version_at_entry,
+                        refreshed_integrity.state,
+                    )
+                    if refreshed_integrity is not None
+                    else 1.0
+                )
+                supported_lamports = int(original_base * integrity_multiplier * LAMPORTS_PER_SOL)
+                if order.requested_sol_lamports > supported_lamports + 1:
+                    return "entry_size_no_longer_supported_by_integrity"
+        elif order.baseline_version_at_entry != LEGACY_BASELINE_VERSION:
+            return "unsupported_baseline_version"
+        return None
+
+    def _persistent_integrity_exit_reason(
+        self,
+        position: Position,
+        features: FeatureSnapshot,
+        now: datetime,
+    ) -> str | None:
+        """Require repeated, time-separated integrity evidence before an adaptive exit."""
+
+        if position.baseline_version_at_entry not in LEARNABLE_BASELINE_VERSIONS:
+            return None
+        assessment = assess_market_integrity(
+            features,
+            policy_version=integrity_policy_for_baseline(position.baseline_version_at_entry),
+        )
+        state = assessment.state
+        trade_sample = features.values.get("trade_count_5m")
+        evidence_at = trade_sample.as_of if trade_sample is not None else features.computed_at
+        if state == MarketIntegrityState.CLEAN:
+            position.integrity_warning_count = 0
+            position.integrity_warning_since = None
+            position.integrity_last_warning_at = None
+        elif state in {MarketIntegrityState.SUSPICIOUS, MarketIntegrityState.SEVERE}:
+            warning_gap = (
+                (evidence_at - position.integrity_last_warning_at).total_seconds()
+                if position.integrity_last_warning_at is not None
+                else None
+            )
+            if position.integrity_warning_since is None or (
+                warning_gap is not None and warning_gap > 60
+            ):
+                position.integrity_warning_since = evidence_at
+                position.integrity_warning_count = 1
+                position.integrity_last_warning_at = evidence_at
+            elif warning_gap is None or warning_gap >= 5:
+                position.integrity_warning_count += 1
+                position.integrity_last_warning_at = evidence_at
+        # Uncertain evidence neither proves recovery nor advances an exit countdown.
+        position.integrity_last_state = state
+        position.integrity_last_evaluated_at = now
+
+        warning_age = (
+            (now - position.integrity_warning_since).total_seconds()
+            if position.integrity_warning_since is not None
+            else 0.0
+        )
+        if (
+            state == MarketIntegrityState.SEVERE
+            and position.integrity_warning_count >= 2
+            and warning_age >= 10
+        ):
+            return "persistent_severe_market_integrity"
+        if (
+            state == MarketIntegrityState.SUSPICIOUS
+            and position.integrity_warning_count >= 3
+            and warning_age >= 20
+        ):
+            return "persistent_suspicious_market_integrity"
         return None
 
     def expire_stuck_orders(self, now: datetime) -> list[PaperOrder]:
@@ -1158,6 +1610,9 @@ class PaperBroker:
             "break_even": sum(value == 0 for value in closed_pnl),
             "ending_drawdown_fraction": portfolio.drawdown_fraction,
             "open_positions": len(portfolio.positions),
+            # A durable position is itself evidence of a filled entry. Keeping that invariant in
+            # the summary also makes recovery resilient to a partially imported legacy fill log.
+            "meaningful_activity": bool(buys or portfolio.positions or closed_pnl),
         }
 
     def reset(self) -> None:
@@ -1185,11 +1640,14 @@ class PaperBroker:
         now: datetime,
         *,
         next_profile: dict[str, Any] | None = None,
+        next_quote_currency: QuoteCurrency | None = None,
+        next_starting_minor: int | None = None,
         terminal_reason: str = "auto_drawdown",
         next_running: bool = True,
         comparable: bool = True,
+        terminal_dispositions: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[str, str]:
-        """Atomically archive this paper season and fund an identical new one."""
+        """Atomically archive this paper season and fund one exact successor."""
 
         if not self.initialized or not self.season_id:
             raise RuntimeError("automatic rollover requires an initialized paper season")
@@ -1197,32 +1655,47 @@ class PaperBroker:
             raise RuntimeError("automatic rollover cannot discard pending paper orders")
         previous_season_id = str(self.season_id)
         next_season_id = "season-" + uuid.uuid4().hex
-        resolved_profile = (
-            dict(next_profile)
-            if next_profile is not None
-            else dict(self.season_profile)
-            if self.season_profile
-            else None
+        resolved_currency = next_quote_currency or self.quote_currency
+        resolved_starting_minor = (
+            self.starting_lamports if next_starting_minor is None else next_starting_minor
         )
+        if resolved_starting_minor <= 0:
+            raise ValueError("starting bankroll must be positive")
+        resolved_profile = dict(next_profile) if next_profile is not None else None
+        if resolved_profile is None and self.season_profile:
+            resolved_profile = upgrade_season_profile_strategy(
+                self.season_profile,
+                locked_at=now if next_running else None,
+            ).model_dump(mode="json")
         if resolved_profile is not None:
             resolved_profile["locked_at"] = now.isoformat() if next_running else None
         summary = self.season_summary()
-        unresolved = self.unresolved_position_records(now, reason=terminal_reason)
+        unresolved = self.unresolved_position_records(
+            now,
+            reason=terminal_reason,
+            dispositions=terminal_dispositions,
+        )
         self.database.rollover_paper_state(
             season_summary=summary,
             next_season_id=next_season_id,
-            starting_minor=self.starting_lamports,
-            quote_currency=self.quote_currency.value,
+            starting_minor=resolved_starting_minor,
+            quote_currency=resolved_currency.value,
             rolled_over_at=now,
             next_season_profile=resolved_profile,
             terminal_reason=terminal_reason,
             next_trading_enabled=next_running,
             unresolved_positions=unresolved,
-            comparable=comparable and not unresolved,
+            # The database distinguishes confirmed write-offs from genuinely unknown
+            # inventory.  A confirmed write-off is a real paper outcome and may remain
+            # comparable; only unknown inventory makes the boundary incomplete.
+            comparable=comparable,
         )
         self.positions.clear()
         self.pending.clear()
         self.traded_mints.clear()
+        self.quote_currency = resolved_currency
+        self.quote_decimals = 9 if resolved_currency == QuoteCurrency.SOL else 6
+        self.starting_lamports = resolved_starting_minor
         self.season_id = next_season_id
         self.season_profile = resolved_profile
         self._last_equity_recorded_at = now

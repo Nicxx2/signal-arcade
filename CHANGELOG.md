@@ -4,7 +4,86 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
-## Unreleased
+## 1.9.1 - 2026-09-01
+
+- Add Baseline v1.4 uncertainty handling: a new entry waits until integrity evidence reaches its
+  minimum time, trade and coverage sample; an extreme isolated warning must clear or gain
+  corroboration; and moderate unresolved evidence receives only 70% of the cautious reference
+  size. Mature clean evidence may still scale inside every hard cap, while locked v1.3 seasons,
+  pending fills, positions and Challenger cohorts retain their exact previous behavior.
+- Add Baseline v1.3 / integrity gates v2: extreme wallet-volume concentration combined with
+  overwhelming one-trade participation is now an independent concentrated-dispersion category.
+  Alone it prevents a size-up; only separate corroboration can reduce or veto an entry. Locked
+  v1.2 seasons, pending fills, positions and Challenger cohorts retain their exact prior policy.
+- Correct Challenger skill presentation so an unqualified contender with no Champion is shown as
+  collecting proof, while a genuinely suspended non-null Champion remains explicitly suspended.
+- Replace the static auto-season delay badge with server-authoritative live states for remaining
+  verified time, paused progress, due rollover, position management, settlement and data waits.
+- Skip the sparse-event batching delay whenever feed work is already queued, reducing recovery
+  latency during public-RPC bursts without reordering events, weakening evidence gates or changing
+  the protected critical-event backpressure path.
+
+## 1.9.0 - 2026-08-31
+
+- Split the statistical Challenger into independently versioned Entry, Manipulation, Sizing and
+  Exit skills with immutable candidates, saved champions and restart-safe common-forward
+  tournaments; a weaker new candidate no longer replaces the best proved artifact.
+- Add one explicit activation consent, bounded per-skill composition, exact decision audit
+  receipts and rolling health suspension. Later skills can join only after incremental forward
+  proof beside the active ensemble, and no skill can create an entry or bypass permanent safety.
+- Sample due outcomes fairly from fresh cached route state without extra RPC traffic, retain exact
+  unavailable-route reasons, and add fee/impact-aware 0.5–2× sizing trials plus conservative
+  earlier-review proof without fabricating fills or returns.
+- Show Contender, best-proved Champion, influence and shared-forward progress independently for all
+  four Challenger skills, plus a bounded, restart-safe Champion journey of honest promotions,
+  defences and inconclusive battles. Existing Champions are preserved without fabricated history.
+- Close a Challenger battle as inconclusive when prolonged route unavailability prevents the 70%
+  coverage gate from recovering, retain the saved Champion, and store its journey in a rollback-
+  readable sidecar rather than extending the strict skill-state payload.
+- Add Baseline v1.2 with coverage-aware, multi-category market-integrity conclusions; preserve the
+  exact v1.1 path for already-locked legacy seasons and start a new learning/configuration cohort.
+- Add deterministic realized-bankroll sizing receipts: only mature clean evidence can size above
+  the personality reference, within per-position/total exposure, cash, reservation and impact caps.
+- Keep an active Sizing recommendation at the Baseline amount when its exact larger multiplier no
+  longer fits every hard cap, and validate its immutable receipt again at submission and fill.
+- Route each newly resolved outcome to its exact retraining cohort, exclude still-pending horizons
+  from availability-health denominators, carry a promoted active champion forward safely, and make
+  dependent skills re-prove beside that new version.
+- Remove downstream authority when a new upstream skill joins, preserve its Champion and journey,
+  and require fresh proof for the exact new ensemble before it can influence again.
+- Protect in-flight tournament artifacts during bounded retention and restore only the exact saved
+  active dependency chain after restart; incomplete or inconsistent state fails back to Baseline.
+- Revalidate the exact entry thesis at fill time without ever increasing a pending order, and
+  require persistent time-separated manipulation evidence before an adaptive exit.
+- Replace separate profile controls with one responsive next-season editor for currency, exact
+  virtual bankroll, personality, drawdown policy and safe or bounded immediate transition.
+- Persist the complete target through restart and apply an unstarted edit atomically without
+  archiving an empty season or altering retained learning.
+- Version season-boundary accounting as complete, confirmed write-off, provider-unknown, empty or
+  legacy; require two distinct, fresh position-specific route probes before recording a zero-value
+  write-off, then count that terminal disposition as a loss without inventing a sell fill.
+- Compare Results only within the same currency, starting bankroll, exact profile and terminal
+  accounting policy, while keeping mixed, manual, empty and legacy history visible without
+  unsupported aggregate claims.
+- Add a Helius Economy preset that uses paced keyed HTTP for safety lookups and the configured
+  default/public WebSocket for the high-volume stream, with explicit route-source telemetry.
+- Keep long position evidence and values readable on narrow screens without hiding paper P/L or
+  changing execution, strategy, Challenger, or AI Coach behavior.
+- Expand the optional AI Coach into four bounded Entry, Manipulation, Sizing and Exit research
+  lanes, selected only from deterministic allowlists while market work is quiet.
+- Persist exact post-proposal Coach evidence and per-context lifetime outcome clocks so restart,
+  pruning and rolling history cannot replay proof or reset a study; close unsupported work as
+  rejected or inconclusive after bounded evidence or time.
+- Keep the Coach research-only and independently pausable. A supported idea needs explicit user
+  permission, an existing matching Challenger Champion and a fresh common-forward tournament;
+  it can never trade, create the first Champion or replace one directly.
+- Revalidate every contributed Coach policy against the deterministic allowlist at the Challenger
+  boundary so malformed or incompatible persisted research fails closed before a tournament.
+- Show Coach lane activity, exact proof milestones, an honest research notebook and the guarded
+  road to contribution in the Learning tab, with responsive layouts and durable milestone alerts.
+- Replace the native season-comparison select with an accessible responsive picker, distinguish
+  otherwise identical bankroll/profile rows by strategy generation, accounting boundary, finish
+  type and season range, and avoid repeating the current exact group as a second choice.
 
 ## 1.8.1 - 2026-08-30
 

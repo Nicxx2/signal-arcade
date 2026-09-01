@@ -18,15 +18,16 @@ from . import __version__
 from .ai_lab import AiDecisionLab, decision_evidence_payload
 from .coach import AiCoach
 from .config import Settings
-from .database import Database
+from .database import TERMINAL_POLICY_VERSION, Database
 from .intelligence.decision import DecisionEngine, deterministic_explanation
 from .intelligence.features import FeatureEngine, TokenState
-from .intelligence.learning import LearningEngine
+from .intelligence.learning import FEATURE_SCHEMA_VERSION, LearningEngine
 from .models import (
     AiDecisionMode,
     Decision,
     DecisionAction,
     EventKind,
+    FeatureSnapshot,
     FillReceipt,
     LearningMode,
     MarketEvent,
@@ -56,6 +57,13 @@ from .risk_profiles import (
     SeasonProfile,
     build_season_profile,
     season_profile_catalog,
+)
+from .strategy import (
+    LEGACY_BASELINE_VERSION,
+    LEGACY_INTEGRITY_POLICY_VERSION,
+    LEGACY_SIZING_POLICY_VERSION,
+    SIZING_POLICY_VERSION,
+    strategy_fingerprint_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +96,8 @@ _CANDIDATE_PRIORITY_FRACTION = 0.75
 _UPGRADE_AI_SETTLE_SECONDS = 32.0
 _UPGRADE_STORAGE_SETTLE_SECONDS = 30.0
 PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS = 90
+_TERMINAL_PROBE_MIN_CONFIRMATIONS = 2
+_TERMINAL_PROBE_MAX_AGE_SECONDS = 180.0
 _UI_TOKEN_VALUE_NAMES = frozenset(
     {"trade_count_1m", "buy_ratio_5m", "curve_progress", "identity_source"}
 )
@@ -118,6 +128,23 @@ def _stored_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _season_target_fingerprint(
+    profile_fingerprint: str,
+    quote_currency: QuoteCurrency,
+    starting_minor: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "profile_fingerprint": profile_fingerprint,
+            "quote_currency": quote_currency.value,
+            "starting_minor": starting_minor,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def decision_explanation_payload(decision: Decision) -> dict[str, Any]:
@@ -301,10 +328,30 @@ class Orchestrator:
             # global preference must never mutate the policy that already owns open positions.
             self.database.set_setting("risk_mode", self.risk_mode.value)
         self.demo_mode = bool(self.database.get_setting("demo_mode", settings.demo_mode))
+        if (
+            self.broker.season_profile is not None
+            and self.broker.season_profile.get("locked_at") is None
+            and self.broker.season_id is not None
+        ):
+            # No decision owns an unlocked profile yet, so refresh the complete current
+            # strategy/configuration identity in place rather than carrying stale metadata into
+            # its first lesson. Locked profiles remain immutable.
+            unlocked = SeasonProfile.model_validate(self.broker.season_profile)
+            refreshed = build_season_profile(
+                unlocked.risk_mode,
+                drawdown_policy=unlocked.drawdown_policy,
+                learning_fingerprint=self._configuration_fingerprint_for_mode(unlocked.risk_mode),
+            )
+            self.database.update_current_season_profile(
+                str(self.broker.season_id),
+                refreshed.model_dump(mode="json"),
+            )
+            self.broker.season_profile = refreshed.model_dump(mode="json")
         self.learning = LearningEngine(
             self.database,
             settings,
             configuration_fingerprint=self._configuration_fingerprint,
+            baseline_version=lambda: self._active_strategy_versions()["baseline_version"],
         )
         self.bus = EventBus()
         self.stop_event = asyncio.Event()
@@ -395,6 +442,7 @@ class Orchestrator:
         self.enriched_at: defaultdict[str, datetime | None] = defaultdict(lambda: None)
         self._route_retry_at: dict[str, datetime] = {}
         self._route_retry_delay_seconds: dict[str, float] = {}
+        self._position_route_probes: dict[str, dict[str, Any]] = {}
         self._candidate_verification_attempt_at: dict[str, datetime] = {}
         self._candidate_verification_retry_at: dict[str, datetime] = {}
         self.last_maintenance_at: datetime | None = None
@@ -443,16 +491,26 @@ class Orchestrator:
         self._ui_leaderboard_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._ui_seasons_refresh_lock = asyncio.Lock()
         self._ui_seasons_cache: tuple[float, dict[str, Any]] | None = None
+        self.coach_contribution_enabled = bool(
+            self.database.get_setting("coach_contribution_enabled", False)
+        )
+        self.coach_research_enabled = bool(
+            self.database.get_setting("coach_research_enabled", True)
+        )
         self.coach = AiCoach(
             self.database,
             self.http,
             enabled=lambda: (
-                not self._maintenance_requested and self.ai_lab.mode != AiDecisionMode.OFF
+                not self._maintenance_requested
+                and self.ai_lab.mode != AiDecisionMode.OFF
+                and self.coach_research_enabled
             ),
             context=lambda: (self.risk_mode, self._configuration_fingerprint()),
-            outcomes_seen=lambda: self.learning.outcomes_seen,
+            outcomes_seen=self._coach_context_outcomes_seen,
             model_provenance=self.ai_lab.selected_model_provenance,
             can_run=self._coach_can_run,
+            provenance=self._coach_provenance,
+            contribution_enabled=lambda: self.coach_contribution_enabled,
         )
         if self.demo_mode and self.learning.mode == LearningMode.ACTIVE:
             self.learning.set_mode(LearningMode.SHADOW)
@@ -978,6 +1036,13 @@ class Orchestrator:
             metadata={"dropped_total": self.events_dropped},
         )
 
+    def _event_batch_wait_seconds(self) -> float:
+        """Wait for a sparse batch, but never add delay behind an existing backlog."""
+
+        if self.settings.event_batch_wait_ms <= 0 or not self.event_queue.empty():
+            return 0.0
+        return self.settings.event_batch_wait_ms / 1_000
+
     async def _event_worker_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -987,8 +1052,13 @@ class Orchestrator:
                 continue
             batch = [first]
             self._event_batches_in_flight += 1
-            if self.settings.event_batch_wait_ms:
-                await asyncio.sleep(self.settings.event_batch_wait_ms / 1_000)
+            # A short wait improves database batching when traffic is sparse. Once another event
+            # is already queued, waiting adds pure lag and can amplify a public-stream burst.
+            # Skipping only that artificial delay preserves priority order, every event, and all
+            # held-position/outcome backpressure semantics while allowing the worker to catch up.
+            batch_wait_seconds = self._event_batch_wait_seconds()
+            if batch_wait_seconds:
+                await asyncio.sleep(batch_wait_seconds)
             while len(batch) < self.settings.event_batch_size:
                 try:
                     batch.append(self.event_queue.get_nowait())
@@ -1197,11 +1267,11 @@ class Orchestrator:
                     self.risk_mode,
                     sol_usd_price=sol_usd_price,
                 )
-                baseline_decision = self.decisions.evaluate(
+                baseline_decision = await asyncio.to_thread(
+                    self._evaluate_baseline_with_size,
                     snapshot,
-                    self.risk_mode,
-                    planned_order_size_sol=planned_size,
-                    policy_limits=self.broker.risk_limits(self.risk_mode),
+                    planned_size,
+                    sol_usd_price,
                 )
                 baseline_decision = baseline_decision.model_copy(
                     update={
@@ -1299,10 +1369,116 @@ class Orchestrator:
         return (decision.created_at - previous.created_at).total_seconds() >= 300
 
     def _configuration_fingerprint(self) -> str:
-        return self._configuration_fingerprint_for_mode(self.risk_mode)
+        return self._configuration_fingerprint_for_mode(
+            self.risk_mode,
+            strategy_versions=self._active_strategy_versions(),
+        )
 
-    def _configuration_fingerprint_for_mode(self, mode: RiskMode) -> str:
-        payload = {
+    def _evaluate_baseline_with_size(
+        self,
+        snapshot: FeatureSnapshot,
+        reference_size_sol: float,
+        sol_usd_price: float | None,
+    ) -> Decision:
+        """Evaluate once at reference size, then choose the largest bounded valid size."""
+
+        strategy = self._active_strategy_versions()
+        limits = self.broker.risk_limits(self.risk_mode)
+
+        def evaluate(size_sol: float) -> Decision:
+            return self.decisions.evaluate(
+                snapshot,
+                self.risk_mode,
+                planned_order_size_sol=size_sol,
+                policy_limits=limits,
+                baseline_version=strategy["baseline_version"],
+            )
+
+        reference = evaluate(reference_size_sol)
+        if strategy["sizing_policy_version"] != SIZING_POLICY_VERSION:
+            return reference
+
+        sizing = self.broker.plan_entry_size(reference, sol_usd_price=sol_usd_price)
+        selected = sizing.selected_size_sol
+        candidate = evaluate(selected)
+        cost_aware_trimmed = False
+
+        size_sensitive = {
+            "estimated_price_impact_above_limit",
+            "heuristic_net_edge_below_minimum",
+        }
+        new_blockers = set(candidate.blockers) - set(reference.blockers)
+        if (
+            selected > reference_size_sol
+            and reference.action == DecisionAction.ENTER
+            and candidate.action != DecisionAction.ENTER
+            and new_blockers
+            and new_blockers <= size_sensitive
+        ):
+            low = reference_size_sol
+            high = selected
+            candidate = reference
+            # Six deterministic steps are sub-percent precision across the bounded range and
+            # avoid an open-ended optimization loop on the live event path.
+            for _ in range(6):
+                midpoint = (low + high) / 2
+                tested = evaluate(midpoint)
+                if tested.action == DecisionAction.ENTER:
+                    low = midpoint
+                    candidate = tested
+                else:
+                    high = midpoint
+            selected = low
+            cost_aware_trimmed = selected < sizing.selected_size_sol
+
+        original_selected = sizing.selected_size_sol
+        sizing_constraints = list(sizing.constraints)
+        if cost_aware_trimmed and "cost_aware_edge_cap" not in sizing_constraints:
+            sizing_constraints.append("cost_aware_edge_cap")
+        sizing = sizing.model_copy(
+            update={
+                "selected_size_sol": selected,
+                "account_allocation_fraction": max(
+                    0.0,
+                    min(
+                        1.0,
+                        sizing.account_allocation_fraction
+                        * selected
+                        / max(original_selected, 0.000001),
+                    ),
+                ),
+                "constraints": sizing_constraints,
+            }
+        )
+        return candidate.model_copy(
+            update={
+                "planned_order_size_sol": selected,
+                "sizing_assessment": sizing,
+            }
+        )
+
+    def _active_strategy_versions(self) -> dict[str, str]:
+        if self.broker.season_profile is None:
+            return {
+                "baseline_version": LEGACY_BASELINE_VERSION,
+                "integrity_policy_version": LEGACY_INTEGRITY_POLICY_VERSION,
+                "sizing_policy_version": LEGACY_SIZING_POLICY_VERSION,
+            }
+        profile = SeasonProfile.model_validate(self.broker.season_profile)
+        return {
+            "baseline_version": profile.baseline_version,
+            "integrity_policy_version": profile.integrity_policy_version,
+            "sizing_policy_version": profile.sizing_policy_version,
+        }
+
+    def _configuration_fingerprint_for_mode(
+        self,
+        mode: RiskMode,
+        *,
+        strategy_versions: dict[str, str] | None = None,
+    ) -> str:
+        resolved_strategy = strategy_versions or strategy_fingerprint_payload()
+        payload: dict[str, Any] = {
             # Frozen evidence semantics are part of provenance. A schema change starts a new
             # forward cohort while retaining every older observation and model for audit.
             "learning_evidence_schema": "stream-integrity-v4",
@@ -1320,6 +1496,15 @@ class Orchestrator:
             "decision_cooldown_seconds": self.settings.decision_cooldown_seconds,
             "provider_plans": self.provider_configuration.model_dump(mode="json"),
         }
+        legacy_strategy = {
+            "baseline_version": LEGACY_BASELINE_VERSION,
+            "integrity_policy_version": LEGACY_INTEGRITY_POLICY_VERSION,
+            "sizing_policy_version": LEGACY_SIZING_POLICY_VERSION,
+        }
+        if resolved_strategy != legacy_strategy:
+            # Omitting this key for the exact legacy tuple reproduces the pre-v1.2 hash, so an
+            # already-running v1.1 season continues its existing Challenger cohort unchanged.
+            payload["strategy"] = resolved_strategy
         encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         return hashlib.sha256(encoded).hexdigest()[:16]
 
@@ -1901,6 +2086,127 @@ class Orchestrator:
             batches.append((batch_targets, batch_addresses, batch_minimum_slot or 0))
         return batches
 
+    def _record_position_route_probe(
+        self,
+        mint: str,
+        *,
+        available: bool,
+        observed_at: datetime,
+        slot: int,
+        market_status: str,
+        blockers: list[str],
+    ) -> None:
+        """Keep restart-conservative proof for terminal inventory classification."""
+
+        previous = self._position_route_probes.get(mint)
+        outcome = "available" if available else "unavailable"
+        same_outcome = bool(previous is not None and previous.get("outcome") == outcome)
+        previous_count = int(previous.get("consecutive") or 0) if previous else 0
+        previous_first = previous.get("first_observed_at") if previous else None
+        previous_observed_at = _stored_datetime(previous.get("observed_at")) if previous else None
+        previous_first_at = _stored_datetime(previous_first) if previous_first else None
+        duplicate_or_reordered = bool(
+            same_outcome
+            and previous_observed_at is not None
+            and observed_at <= previous_observed_at
+        )
+        continues_fresh_sequence = bool(
+            same_outcome
+            and previous_observed_at is not None
+            and previous_first_at is not None
+            and observed_at > previous_observed_at
+            and (observed_at - previous_observed_at).total_seconds()
+            <= _TERMINAL_PROBE_MAX_AGE_SECONDS
+            and (observed_at - previous_first_at).total_seconds() <= _TERMINAL_PROBE_MAX_AGE_SECONDS
+        )
+        recorded_at = (
+            previous_observed_at
+            if duplicate_or_reordered and previous_observed_at is not None
+            else observed_at
+        )
+        self._position_route_probes[mint] = {
+            "outcome": outcome,
+            "consecutive": (
+                previous_count
+                if duplicate_or_reordered
+                else previous_count + 1
+                if continues_fresh_sequence
+                else 1
+            ),
+            "first_observed_at": (
+                previous_first
+                if (continues_fresh_sequence or duplicate_or_reordered) and previous_first
+                else recorded_at.isoformat()
+            ),
+            "observed_at": recorded_at.isoformat(),
+            "slot": max(int(previous.get("slot") or 0) if previous else 0, 0, slot),
+            "market_status": market_status,
+            "blockers": list(blockers[:12]),
+        }
+
+    def _terminal_position_dispositions(
+        self,
+        portfolio: PortfolioSnapshot,
+        now: datetime,
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        """Classify only independently confirmed untradeability as a write-off."""
+
+        dispositions: dict[str, dict[str, Any]] = {}
+        waiting_for_probe: list[str] = []
+        globally_healthy = self._rollover_market_data_healthy(now)
+        for position in portfolio.positions:
+            probe = self._position_route_probes.get(position.mint)
+            probe_at = _stored_datetime(probe.get("observed_at")) if probe else None
+            probe_first_at = _stored_datetime(probe.get("first_observed_at")) if probe else None
+            probe_age = max(0.0, (now - probe_at).total_seconds()) if probe_at is not None else None
+            probe_sequence_age = (
+                max(0.0, (now - probe_first_at).total_seconds())
+                if probe_first_at is not None
+                else None
+            )
+            confirmed_unavailable = bool(
+                globally_healthy
+                and position.market_status.value != "active"
+                and probe is not None
+                and probe.get("outcome") == "unavailable"
+                and int(probe.get("consecutive") or 0) >= _TERMINAL_PROBE_MIN_CONFIRMATIONS
+                and probe_age is not None
+                and probe_at is not None
+                and probe_at <= now
+                and probe_age <= _TERMINAL_PROBE_MAX_AGE_SECONDS
+                and probe_sequence_age is not None
+                and probe_first_at is not None
+                and probe_first_at <= now
+                and probe_sequence_age <= _TERMINAL_PROBE_MAX_AGE_SECONDS
+            )
+            if confirmed_unavailable:
+                dispositions[position.mint] = {
+                    "terminal_disposition": "write_off",
+                    "terminal_evidence": {
+                        "policy": "two-fresh-route-probes",
+                        "probe": dict(probe or {}),
+                        "global_market_healthy": True,
+                    },
+                }
+                continue
+
+            reason = (
+                "executable_exit_not_settled"
+                if position.market_status.value == "active"
+                else "route_evidence_pending"
+            )
+            dispositions[position.mint] = {
+                "terminal_disposition": "unknown",
+                "terminal_evidence": {
+                    "reason": reason,
+                    "probe": dict(probe or {}),
+                    "global_market_healthy": globally_healthy,
+                },
+            }
+            if reason == "route_evidence_pending":
+                waiting_for_probe.append(position.mint)
+        return dispositions, waiting_for_probe
+
     async def _position_watchdog_tick(self, now: datetime) -> list[FillReceipt]:
         targets, _addresses, _minimum_slot = self._position_watchdog_targets()
         batches = self._position_watchdog_batches(targets)
@@ -2052,6 +2358,24 @@ class Orchestrator:
                     now=now,
                     sol_usd_price=sol_usd_price,
                 )
+        observed_positions = {
+            position.mint: position
+            for position in self.broker.snapshot(self.risk_mode, persist_peak=False).positions
+        }
+        for target in targets:
+            mint = str(target["mint"])
+            position = observed_positions.get(mint)
+            if position is None:
+                self._position_route_probes.pop(mint, None)
+                continue
+            self._record_position_route_probe(
+                mint,
+                available=position.market_status.value == "active",
+                observed_at=now,
+                slot=slot,
+                market_status=position.market_status.value,
+                blockers=list(position.mark_blockers),
+            )
         return receipts
 
     def _enrichment_candidates(self, limit: int = 20) -> list[TokenState]:
@@ -2175,7 +2499,16 @@ class Orchestrator:
             # The clock worker can fill an exit without a new provider event. That recovery must
             # invalidate the previous dormant observation window before the rollover tick runs.
             self._set_auto_new_season_clock(None, None, None)
-        learning_updates = self.learning.expire_checkpoints(now)
+        learning_updates = self.learning.sample_due_checkpoints(
+            self.features.tokens,
+            now,
+            live=not self.demo_mode,
+        )
+        learning_updates += self.learning.expire_checkpoints(
+            now,
+            states=self.features.tokens,
+        )
+        self._coach_contribution_tick()
         ai_updates = self.ai_lab.expire_outcomes(now)
         return receipts, expired, learning_updates, ai_updates
 
@@ -2213,6 +2546,7 @@ class Orchestrator:
         )
         manual_transition = strategy == ProfileTransitionStrategy.END_NOW
         cancelled_manual_exits = 0
+        terminal_dispositions: dict[str, dict[str, Any]] = {}
         if manual_transition:
             deadline = self._manual_profile_settlement_deadline(operation, now)
             remaining_seconds = max(0, int((deadline - now).total_seconds()))
@@ -2226,7 +2560,7 @@ class Orchestrator:
                         detail=(
                             "Trying real paper exits for executable holdings. "
                             f"The bounded window has up to {remaining_seconds}s remaining; "
-                            "untradeable inventory will be recorded as unresolved."
+                            "remaining inventory will be classified from fresh route evidence."
                         ),
                         values={
                             "manual_settlement_deadline": deadline.isoformat(),
@@ -2246,6 +2580,13 @@ class Orchestrator:
                 "manual_profile_change_settlement_expired",
             )
             portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
+            if portfolio.positions:
+                # End-now is a genuinely bounded escape hatch. Use proof already obtained by the
+                # watchdog, but never extend the deadline or invent a zero while waiting for it.
+                # Anything unconfirmed is retained as provider-unknown and excluded from claims.
+                terminal_dispositions, _waiting_for_probe = self._terminal_position_dispositions(
+                    portfolio, now
+                )
         else:
             if self.broker.pending:
                 await self._update_profile_transition_progress(
@@ -2312,8 +2653,8 @@ class Orchestrator:
                         operation_id,
                         stage="waiting_for_dormant_recovery",
                         detail=(
-                            "Waiting for dormant holdings to revive before retiring unresolved "
-                            "paper inventory."
+                            "Waiting for dormant holdings to revive before classifying the "
+                            "remaining paper inventory."
                         ),
                         values={
                             "dormant_eligible_since": eligible_since.isoformat(),
@@ -2321,6 +2662,20 @@ class Orchestrator:
                             "dormant_last_observed_at": now.isoformat(),
                         },
                         checkpoint_seconds=AUTO_NEW_SEASON_CLOCK_CHECKPOINT_SECONDS,
+                    )
+                    return None
+                terminal_dispositions, waiting_for_probe = self._terminal_position_dispositions(
+                    portfolio, now
+                )
+                if waiting_for_probe:
+                    await self._update_profile_transition_progress(
+                        operation_id,
+                        stage="waiting_for_terminal_evidence",
+                        detail=(
+                            "The recovery window finished. Confirming each remaining route before "
+                            "recording terminal write-offs."
+                        ),
+                        values={"terminal_evidence_pending": len(waiting_for_probe)},
                     )
                     return None
 
@@ -2338,6 +2693,25 @@ class Orchestrator:
             RiskLimits.model_validate(validated_target.risk_limits)
             if validated_target.profile_fingerprint != operation.get("target_profile_fingerprint"):
                 raise ValueError("saved target fingerprint does not match the operation")
+            target_currency = QuoteCurrency(
+                str(operation.get("target_quote_currency") or self.broker.quote_currency.value)
+            )
+            target_starting_minor = int(
+                operation.get("target_starting_minor") or self.broker.starting_lamports
+            )
+            if target_starting_minor <= 0:
+                raise ValueError("saved target bankroll is invalid")
+            saved_season_fingerprint = operation.get("target_season_fingerprint")
+            if (
+                saved_season_fingerprint is not None
+                and _season_target_fingerprint(
+                    validated_target.profile_fingerprint,
+                    target_currency,
+                    target_starting_minor,
+                )
+                != saved_season_fingerprint
+            ):
+                raise ValueError("saved season target fingerprint does not match the operation")
         except (TypeError, ValueError):
             await self._update_season_operation(
                 operation_id,
@@ -2353,11 +2727,14 @@ class Orchestrator:
             self.broker.rollover,
             now,
             next_profile=target_payload,
+            next_quote_currency=target_currency,
+            next_starting_minor=target_starting_minor,
             terminal_reason=(
                 "profile_change_manual" if manual_transition else "profile_change_safe"
             ),
             next_running=previous_running,
             comparable=not manual_transition,
+            terminal_dispositions=terminal_dispositions,
         )
         target_mode = RiskMode(str(target_payload["risk_mode"]))
         self.risk_mode = target_mode
@@ -2368,6 +2745,7 @@ class Orchestrator:
         self.last_recorded_decision.clear()
         self._route_retry_at.clear()
         self._route_retry_delay_seconds.clear()
+        self._position_route_probes.clear()
         self._ui_leaderboard_cache.clear()
         self._ui_seasons_cache = None
         await self._update_season_operation(
@@ -2382,7 +2760,14 @@ class Orchestrator:
                 "previous_season_id": previous_season_id,
                 "next_season_id": next_season_id,
                 "completed_profile_fingerprint": target_payload["profile_fingerprint"],
-                "unresolved_positions": len(portfolio.positions),
+                "unresolved_positions": sum(
+                    item.get("terminal_disposition") == "unknown"
+                    for item in terminal_dispositions.values()
+                ),
+                "written_off_positions": sum(
+                    item.get("terminal_disposition") == "write_off"
+                    for item in terminal_dispositions.values()
+                ),
                 "cancelled_manual_exits": cancelled_manual_exits,
             },
         )
@@ -2847,10 +3232,20 @@ class Orchestrator:
         if not self._rollover_pipeline_idle():
             return None
 
+        terminal_dispositions: dict[str, dict[str, Any]] = {}
+        if portfolio.positions:
+            terminal_dispositions, waiting_for_probe = self._terminal_position_dispositions(
+                portfolio,
+                now,
+            )
+            if waiting_for_probe:
+                # A completed grace period is not permission to invent a zero. Keep the clock
+                # due while the exact-account watchdog obtains independent route evidence.
+                return None
+
         terminal_reason = (
             "bankroll_exhausted" if self._drawdown_halt_disabled() else "auto_drawdown"
         )
-        next_profile: dict[str, Any] | None = None
         if self.broker.season_profile is None:
             # A pre-profile season has no exact policy to inherit. Freeze the current
             # personality's canonical defaults at this new boundary instead of allowing the
@@ -2859,10 +3254,22 @@ class Orchestrator:
                 self.risk_mode,
                 learning_fingerprint=self._configuration_fingerprint_for_mode(self.risk_mode),
             ).model_dump(mode="json")
+        else:
+            # Every legitimate successor receives the current strategy versions and learning
+            # identity. The archived source profile remains immutable, including a v1.1 season.
+            current_profile = SeasonProfile.model_validate(self.broker.season_profile)
+            next_profile = build_season_profile(
+                current_profile.risk_mode,
+                drawdown_policy=current_profile.drawdown_policy,
+                learning_fingerprint=self._configuration_fingerprint_for_mode(
+                    current_profile.risk_mode
+                ),
+            ).model_dump(mode="json")
         previous_season_id, next_season_id = self.broker.rollover(
             now,
             next_profile=next_profile,
             terminal_reason=terminal_reason,
+            terminal_dispositions=terminal_dispositions,
         )
         self._auto_new_season_eligible_since = None
         self._auto_new_season_paused_since = None
@@ -2874,6 +3281,7 @@ class Orchestrator:
         self.last_recorded_decision.clear()
         self._route_retry_at.clear()
         self._route_retry_delay_seconds.clear()
+        self._position_route_probes.clear()
         self._ui_leaderboard_cache.clear()
         self._ui_seasons_cache = None
         self.invalidate_snapshot_cache()
@@ -2934,22 +3342,46 @@ class Orchestrator:
         drawdown_policy: DrawdownPolicy,
         *,
         transition_strategy: ProfileTransitionStrategy = (ProfileTransitionStrategy.FINISH_SAFELY),
+        target_quote_currency: QuoteCurrency | None = None,
+        target_starting_minor: int | None = None,
     ) -> dict[str, Any]:
-        """Apply an unlocked profile or begin one durable exits-only transition."""
+        """Apply an unlocked target or begin one durable exits-only season transition."""
 
         target = build_season_profile(
             mode,
             drawdown_policy=drawdown_policy,
             learning_fingerprint=self._configuration_fingerprint_for_mode(mode),
         ).model_dump(mode="json")
+        resolved_currency = target_quote_currency or self.broker.quote_currency
+        resolved_starting_minor = (
+            self.broker.starting_lamports
+            if target_starting_minor is None
+            else target_starting_minor
+        )
+        if self.broker.initialized and resolved_starting_minor <= 0:
+            raise ValueError("starting bankroll must be positive")
+        target_season_fingerprint = _season_target_fingerprint(
+            str(target["profile_fingerprint"]),
+            resolved_currency,
+            resolved_starting_minor,
+        )
 
         current_operation = self._season_operation
         if current_operation and current_operation.get("state") == "running":
-            if (
+            operation_target_matches = bool(
                 current_operation.get("kind") == "profile_transition"
-                and current_operation.get("target_profile_fingerprint")
-                == target["profile_fingerprint"]
-            ):
+                and (
+                    current_operation.get("target_season_fingerprint") == target_season_fingerprint
+                    or (
+                        current_operation.get("target_season_fingerprint") is None
+                        and current_operation.get("target_profile_fingerprint")
+                        == target["profile_fingerprint"]
+                        and resolved_currency == self.broker.quote_currency
+                        and resolved_starting_minor == self.broker.starting_lamports
+                    )
+                )
+            )
+            if operation_target_matches:
                 current_strategy = (
                     ProfileTransitionStrategy.END_NOW
                     if current_operation.get("transition_strategy")
@@ -2971,6 +3403,8 @@ class Orchestrator:
                                 self.broker.season_profile is not None
                                 and self.broker.season_profile.get("profile_fingerprint")
                                 == target["profile_fingerprint"]
+                                and self.broker.quote_currency == resolved_currency
+                                and self.broker.starting_lamports == resolved_starting_minor
                             ):
                                 return {
                                     "kind": "profile_preference",
@@ -2992,7 +3426,8 @@ class Orchestrator:
                             stage="settling_manual_exits",
                             detail=(
                                 "Ending this season now: executable exits have a bounded "
-                                "settlement window; anything else will be recorded as unresolved."
+                                "settlement window; remaining inventory will be classified from "
+                                "fresh route evidence."
                             ),
                             values={
                                 "transition_strategy": transition_strategy.value,
@@ -3011,7 +3446,11 @@ class Orchestrator:
 
         profile = self.broker.season_profile
         locked = bool(profile is None or profile.get("locked_at") is not None)
-        if not self.broker.initialized or not locked:
+        if not self.broker.initialized:
+            if target_quote_currency is not None or target_starting_minor is not None:
+                raise ValueError(
+                    "create a paper bankroll before changing its currency or starting amount"
+                )
             self.set_season_profile(target)
             return {
                 "kind": "profile_preference",
@@ -3019,14 +3458,37 @@ class Orchestrator:
                 "mode": mode.value,
                 "transition_required": False,
             }
-        if (
+        current_target_matches = bool(
             profile is not None
             and profile.get("profile_fingerprint") == target["profile_fingerprint"]
-        ):
+            and self.broker.quote_currency == resolved_currency
+            and self.broker.starting_lamports == resolved_starting_minor
+        )
+        if current_target_matches:
             return {
                 "kind": "profile_preference",
                 "state": "completed",
                 "mode": mode.value,
+                "transition_required": False,
+            }
+        if not locked:
+            await asyncio.to_thread(
+                self.broker.reconfigure_unstarted,
+                resolved_currency,
+                resolved_starting_minor,
+                target,
+            )
+            self.risk_mode = mode
+            self.learning.set_risk_mode(mode)
+            self._ui_leaderboard_cache.clear()
+            self._ui_seasons_cache = None
+            self.invalidate_snapshot_cache()
+            return {
+                "kind": "season_preference",
+                "state": "completed",
+                "mode": mode.value,
+                "quote_currency": resolved_currency.value,
+                "starting_minor": resolved_starting_minor,
                 "transition_required": False,
             }
 
@@ -3050,6 +3512,9 @@ class Orchestrator:
                         "target_risk_mode": mode.value,
                         "target_profile": target,
                         "target_profile_fingerprint": target["profile_fingerprint"],
+                        "target_quote_currency": resolved_currency.value,
+                        "target_starting_minor": resolved_starting_minor,
+                        "target_season_fingerprint": target_season_fingerprint,
                         "previous_running": previous_running,
                         "transition_strategy": transition_strategy.value,
                         "manual_settlement_started_at": (
@@ -3157,6 +3622,25 @@ class Orchestrator:
             raise ValueError("switch to Solana Mainnet before enabling qualified AI Guarded mode")
         self.ai_lab.set_mode(mode)
 
+    def set_coach_contribution_enabled(self, enabled: bool) -> None:
+        if enabled and self.ai_lab.mode == AiDecisionMode.OFF:
+            raise ValueError("enable Local AI Shadow before allowing Coach contributions")
+        if enabled and self.learning.mode == LearningMode.OFF:
+            self.learning.set_mode(LearningMode.SHADOW)
+        self.coach_contribution_enabled = bool(enabled)
+        self.database.set_setting(
+            "coach_contribution_enabled",
+            self.coach_contribution_enabled,
+        )
+
+    def set_coach_research_enabled(self, enabled: bool) -> None:
+        if enabled and self.ai_lab.mode == AiDecisionMode.OFF:
+            raise ValueError("enable Local AI Shadow before starting Coach research")
+        if enabled and self.learning.mode == LearningMode.OFF:
+            self.learning.set_mode(LearningMode.SHADOW)
+        self.coach_research_enabled = bool(enabled)
+        self.database.set_setting("coach_research_enabled", self.coach_research_enabled)
+
     def _select_ollama_model(self, model: str) -> None:
         self.provider_secrets.update({"ollama_model": model})
         self.http.ollama_model = model
@@ -3248,11 +3732,18 @@ class Orchestrator:
             now_datetime = datetime.now(UTC)
             now = now_datetime.isoformat()
             current = self.database.current_paper_season()
+            target_currency = operation.get("target_quote_currency")
+            target_starting_minor = operation.get("target_starting_minor")
             committed = bool(
                 current
                 and current.get("season_id") != operation.get("source_season_id")
                 and current.get("profile_fingerprint")
                 == operation.get("target_profile_fingerprint")
+                and (target_currency is None or current.get("quote_currency") == target_currency)
+                and (
+                    target_starting_minor is None
+                    or int(current.get("starting_minor") or 0) == int(target_starting_minor)
+                )
             )
             if committed:
                 operation.update(
@@ -3895,6 +4386,45 @@ class Orchestrator:
             return False, "protecting_market_throughput"
         return True, None
 
+    def _coach_provenance(self) -> dict[str, Any]:
+        strategy = self._active_strategy_versions()
+        return {
+            "baseline_version": strategy["baseline_version"],
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "dependency_versions": dict(self.learning.active_skill_versions),
+            "baseline_hold_seconds": self.learning.recommended_hold_seconds(self.risk_mode),
+        }
+
+    def _coach_context_outcomes_seen(self) -> int:
+        provenance = self._coach_provenance()
+        return self.learning.context_outcomes_seen(
+            self.risk_mode,
+            self._configuration_fingerprint(),
+            str(provenance["baseline_version"]),
+            str(provenance["feature_schema_version"]),
+            dict(provenance["dependency_versions"]),
+        )
+
+    def _coach_contribution_tick(self) -> None:
+        # Research pause and contribution permission are independent. A proved, already-saved
+        # idea may still enter its deterministic tournament while research is paused, but Local
+        # AI Off and maintenance remain hard stops for any new AI-originated handoff.
+        if self._maintenance_requested or self.ai_lab.mode == AiDecisionMode.OFF:
+            return
+        hypothesis = self.coach.ready_contribution()
+        if hypothesis is None:
+            return
+        artifact_version, result = self.learning.seed_coach_candidate(hypothesis)
+        state = {
+            "handed_off": "handed_off",
+            "waiting_for_champion": "waiting_for_champion",
+        }.get(result, "stale")
+        self.coach.mark_contribution(
+            hypothesis.hypothesis_id,
+            state,
+            artifact_version,
+        )
+
     def event_pipeline_status(self) -> dict[str, Any]:
         depth = self.event_queue.qsize()
         capacity = self.settings.event_queue_max
@@ -4219,6 +4749,9 @@ class Orchestrator:
                             ),
                             "ending_drawdown_fraction": portfolio.drawdown_fraction,
                             "open_positions": len(portfolio.positions),
+                            "meaningful_activity": bool(
+                                summary["closed_trades"] or portfolio.positions
+                            ),
                         }
                     )
                 closed = int(season["closed_trades"])
@@ -4241,10 +4774,16 @@ class Orchestrator:
                     and isinstance(profile, dict)
                     and isinstance(fingerprint, str)
                 )
+                starting_minor = int(season["starting_minor"])
+                terminal_policy = str(season.get("terminal_policy_version") or "legacy-v1")
                 season["comparison_key"] = (
-                    f"{season['quote_currency']}:profile:{fingerprint}"
+                    f"{season['quote_currency']}:bankroll:{starting_minor}:"
+                    f"profile:{fingerprint}:terminal:{terminal_policy}"
                     if exact_profile
-                    else f"{season['quote_currency']}:legacy"
+                    else (
+                        f"{season['quote_currency']}:bankroll:{starting_minor}:"
+                        f"legacy:terminal:{terminal_policy}"
+                    )
                 )
                 seasons.append(season)
 
@@ -4269,6 +4808,9 @@ class Orchestrator:
                     {
                         "comparison_key": comparison_key,
                         "quote_currency": item["quote_currency"],
+                        "quote_decimals": item["quote_decimals"],
+                        "starting_minor": item["starting_minor"],
+                        "terminal_policy_version": item.get("terminal_policy_version"),
                         "profile_provenance": item["profile_provenance"],
                         "profile_fingerprint": (
                             fingerprint if isinstance(fingerprint, str) else None
@@ -4284,10 +4826,47 @@ class Orchestrator:
                             if isinstance(profile, dict)
                             else None
                         ),
+                        "baseline_version": (
+                            profile.get("baseline_version") if isinstance(profile, dict) else None
+                        ),
+                        "integrity_policy_version": (
+                            profile.get("integrity_policy_version")
+                            if isinstance(profile, dict)
+                            else None
+                        ),
+                        "sizing_policy_version": (
+                            profile.get("sizing_policy_version")
+                            if isinstance(profile, dict)
+                            else None
+                        ),
+                        "first_season_number": int(item["season_number"]),
+                        "last_season_number": int(item["season_number"]),
+                        "has_current": False,
+                        "completed_count": 0,
+                        "comparable_count": 0,
+                        "boundary_types": [],
                         "season_count": 0,
                     },
                 )
                 comparison["season_count"] += 1
+                comparison["first_season_number"] = min(
+                    int(comparison["first_season_number"]),
+                    int(item["season_number"]),
+                )
+                comparison["last_season_number"] = max(
+                    int(comparison["last_season_number"]),
+                    int(item["season_number"]),
+                )
+                comparison["has_current"] = bool(
+                    comparison["has_current"] or item["status"] == "current"
+                )
+                comparison["completed_count"] += int(item["status"] == "completed")
+                comparison["comparable_count"] += int(
+                    item["status"] == "completed" and item.get("comparable", True)
+                )
+                boundary_type = str(item.get("boundary_type") or "legacy")
+                if boundary_type not in comparison["boundary_types"]:
+                    comparison["boundary_types"].append(boundary_type)
                 if not isinstance(profile, dict) or not isinstance(fingerprint, str):
                     continue
                 entry = profile_counts.setdefault(
@@ -4326,6 +4905,7 @@ class Orchestrator:
             comparison_summaries.sort(
                 key=lambda item: (
                     str(item["quote_currency"]),
+                    int(item["starting_minor"]),
                     item["profile_provenance"] != "exact",
                     str(item["risk_mode"] or ""),
                     item["effective_drawdown_bps"] is None,
@@ -4335,6 +4915,7 @@ class Orchestrator:
             comparison_claims_available = (
                 len(comparison_summaries) == 1
                 and comparison_summaries[0]["profile_provenance"] == "exact"
+                and comparison_summaries[0]["terminal_policy_version"] == TERMINAL_POLICY_VERSION
             )
             result = {
                 "generated_at": generated_at.isoformat(),
@@ -4617,6 +5198,17 @@ class Orchestrator:
                     "active": not self.demo_mode,
                     "endpoint": endpoint_label(self._provider_value("solana_http")),
                     "stream_endpoint": endpoint_label(self._provider_value("solana_ws")),
+                    "http_source": (
+                        "saved_override"
+                        if "solana_http" in self.provider_secrets.values
+                        else "environment_default"
+                    ),
+                    "stream_source": (
+                        "saved_override"
+                        if "solana_ws" in self.provider_secrets.values
+                        else "environment_default"
+                    ),
+                    "stream_fallback_active": self.solana.using_fallback,
                     "custom_endpoint": any(
                         key in self.provider_secrets.values for key in ("solana_http", "solana_ws")
                     ),

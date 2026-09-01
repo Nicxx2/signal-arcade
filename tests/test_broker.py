@@ -8,17 +8,30 @@ from signal_arcade.database import Database
 from signal_arcade.intelligence.features import TokenState
 from signal_arcade.models import (
     RISK_LIMITS,
+    ChallengerEvaluationReceipt,
+    ChallengerSkill,
     DataValue,
     Decision,
     DecisionAction,
     DecisionScore,
     EventKind,
     FeatureSnapshot,
+    IntegrityAssessment,
+    MarketIntegrityState,
     Position,
     QuoteCurrency,
     RiskMode,
+    SizingAssessment,
 )
 from signal_arcade.paper.broker import EQUITY_PEAK_BASIS, PaperBroker
+from signal_arcade.strategy import (
+    BASELINE_VERSION,
+    INTEGRITY_POLICY_VERSION,
+    PREVIOUS_BASELINE_VERSION,
+    PREVIOUS_INTEGRITY_POLICY_VERSION,
+    RECENT_BASELINE_VERSION,
+    SIZING_POLICY_VERSION,
+)
 
 
 def make_features(now: datetime, mint: str = "mint") -> FeatureSnapshot:
@@ -40,6 +53,37 @@ def make_features(now: datetime, mint: str = "mint") -> FeatureSnapshot:
         },
         data_confidence=1,
     )
+
+
+def make_integrity_features(
+    now: datetime,
+    *,
+    severe: bool,
+    mint: str = "mint",
+) -> FeatureSnapshot:
+    snapshot = make_features(now, mint)
+    values = {
+        "age_seconds": 45,
+        "trade_count_5m": 30,
+        "round_trip_wallet_ratio": 0.9 if severe else 0.0,
+        "round_trip_volume_ratio": 0.95 if severe else 0.0,
+        "net_quote_flow_ratio": 0.02 if severe else 0.8,
+        "side_alternation_ratio": 0.96 if severe else 0.2,
+        "quantized_amount_repeat_ratio": 0.9 if severe else 0.1,
+        "slot_concentration_hhi": 0.75 if severe else 0.08,
+        "price_direction_consistency": 0.99 if severe else 0.55,
+        "multi_trade_signature_ratio": 0.7 if severe else 0.0,
+    }
+    for name, value in values.items():
+        snapshot.values[name] = DataValue(
+            value=value,
+            unit="fraction",
+            as_of=now,
+            sources=["test"],
+            freshness_seconds=0,
+            quality=1,
+        )
+    return snapshot
 
 
 def make_decision(
@@ -67,6 +111,29 @@ def make_decision(
         blockers=[],
         feature_snapshot=features,
     )
+
+
+def make_current_decision(now: datetime, mint: str) -> Decision:
+    decision = make_decision(now, mint)
+    decision.model_version = BASELINE_VERSION
+    decision.planned_order_size_sol = 0.025
+    decision.integrity_assessment = IntegrityAssessment(
+        policy_version=INTEGRITY_POLICY_VERSION,
+        state=MarketIntegrityState.CLEAN,
+        score=0,
+        coverage=1,
+        sample_count=30,
+        category_count=0,
+        evidence=["clean sample"],
+    )
+    decision.sizing_assessment = SizingAssessment(
+        policy_version=SIZING_POLICY_VERSION,
+        base_size_sol=0.025,
+        desired_size_sol=0.025,
+        selected_size_sol=0.025,
+        account_allocation_fraction=0.0025,
+    )
+    return decision
 
 
 def make_broker(database: Database, settings) -> PaperBroker:  # type: ignore[no-untyped-def]
@@ -795,6 +862,471 @@ def test_usdc_entry_exposure_uses_usdc_minor_units(settings) -> None:  # type: i
     assert blocker is None
     assert order is not None
     assert 3_000_000 < order.reserved_account_minor < 5_000_000
+    database.close()
+
+
+def test_clean_evidence_can_size_usdc_above_reference_inside_hard_caps(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = PaperBroker(database, settings)
+    broker.initialize(QuoteCurrency.USDC, 1_000_000_000)  # 1,000 USDC
+    now = datetime.now(UTC)
+    decision = make_decision(now)
+    decision.feature_snapshot.values["virtual_quote_reserve_sol"] = DataValue(
+        value=30.0,
+        unit="SOL",
+        as_of=now,
+        sources=["test"],
+        freshness_seconds=0,
+        quality=1,
+    )
+    decision.integrity_assessment = IntegrityAssessment(
+        policy_version=INTEGRITY_POLICY_VERSION,
+        state=MarketIntegrityState.CLEAN,
+        score=0,
+        coverage=1,
+        sample_count=30,
+        category_count=0,
+        evidence=["clean sample"],
+    )
+
+    sizing = broker.plan_entry_size(decision, sol_usd_price=150.0)
+
+    assert sizing.policy_version == SIZING_POLICY_VERSION
+    assert sizing.selected_size_sol > sizing.base_size_sol
+    assert sizing.selected_size_sol <= 0.20  # Balanced per-position cap is 3% = 30 USDC.
+    assert 0.19 < sizing.maximum_size_sol <= 0.20
+    assert sizing.selected_size_sol <= sizing.maximum_size_sol
+    assert sizing.account_allocation_fraction <= 0.03
+    assert sizing.constraints
+
+    suspicious = decision.model_copy(deep=True)
+    assert suspicious.integrity_assessment is not None
+    suspicious.integrity_assessment.state = MarketIntegrityState.SUSPICIOUS
+    suspicious.integrity_assessment.score = 0.7
+    reduced = broker.plan_entry_size(suspicious, sol_usd_price=150.0)
+    assert reduced.selected_size_sol < reduced.base_size_sol
+    assert reduced.account_allocation_fraction < sizing.account_allocation_fraction
+
+    concentrated = decision.model_copy(deep=True)
+    assert concentrated.integrity_assessment is not None
+    concentrated.integrity_assessment.state = MarketIntegrityState.UNCERTAIN
+    concentrated.integrity_assessment.score = 0.8
+    concentrated.integrity_assessment.category_count = 1
+    concentrated.integrity_assessment.categories = ["concentrated_dispersion"]
+    concentrated.model_version = BASELINE_VERSION
+    reduced_uncertain = broker.plan_entry_size(concentrated, sol_usd_price=150.0)
+    assert reduced_uncertain.selected_size_sol == pytest.approx(
+        reduced_uncertain.base_size_sol * 0.70
+    )
+    assert reduced_uncertain.account_allocation_fraction < sizing.account_allocation_fraction
+
+    # A locked v1.3 season retains its reference-size treatment for the same uncertainty.
+    recent_concentrated = concentrated.model_copy(deep=True)
+    recent_concentrated.model_version = RECENT_BASELINE_VERSION
+    recent_reference = broker.plan_entry_size(recent_concentrated, sol_usd_price=150.0)
+    assert recent_reference.selected_size_sol == pytest.approx(recent_reference.base_size_sol)
+    database.close()
+
+
+def test_current_baseline_pending_buy_revalidates_the_entry_thesis_before_fill(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    decision = make_current_decision(now, "fill-thesis")
+    database.save_decision(decision)
+    order = broker.submit_decision(decision)
+    assert order is not None
+
+    state = TokenState(
+        mint="fill-thesis",
+        symbol="TEST",
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+    receipts = broker.on_market_state(
+        state=state,
+        features=make_features(now, "fill-thesis"),
+        event_kind=EventKind.TRADE,
+        source_event_id="deteriorated-fill-state",
+        now=now + timedelta(milliseconds=1),
+        mode=RiskMode.BALANCED,
+    )
+
+    assert receipts == []
+    assert order.order_id not in broker.pending
+    persisted = next(item for item in database.list_orders() if item.order_id == order.order_id)
+    assert persisted.failure_reason is not None
+    assert persisted.failure_reason.startswith("fill_rejected:")
+    assert "fill-thesis" not in broker.positions
+    database.close()
+
+
+def test_locked_previous_baseline_receipt_remains_fill_compatible(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    decision = make_current_decision(now, "previous-baseline-fill")
+    decision.model_version = PREVIOUS_BASELINE_VERSION
+    assert decision.integrity_assessment is not None
+    decision.integrity_assessment.policy_version = PREVIOUS_INTEGRITY_POLICY_VERSION
+
+    order, blocker = broker.submit_decision_with_reason(decision)
+    assert blocker is None
+    assert order is not None
+    assert order.baseline_version_at_entry == PREVIOUS_BASELINE_VERSION
+
+    evaluated_with: dict[str, object] = {}
+
+    def evaluate(*args: object, **kwargs: object) -> Decision:
+        evaluated_with.update(kwargs)
+        return decision
+
+    monkeypatch.setattr(broker._fill_decisions, "evaluate", evaluate)
+    assert (
+        broker._pending_buy_fill_blocker(
+            order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, decision.mint),
+        )
+        is None
+    )
+    assert evaluated_with["baseline_version"] == PREVIOUS_BASELINE_VERSION
+    database.close()
+
+
+def test_fill_rejects_reference_size_when_integrity_now_supports_only_reduced_size(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    decision = make_current_decision(now, "integrity-size-fill")
+    order = broker.submit_decision(decision)
+    assert order is not None
+
+    refreshed = decision.model_copy(deep=True)
+    refreshed.integrity_assessment = IntegrityAssessment(
+        policy_version=INTEGRITY_POLICY_VERSION,
+        state=MarketIntegrityState.SUSPICIOUS,
+        score=0.7,
+        coverage=1,
+        sample_count=30,
+        category_count=2,
+        categories=["wallet_loops", "trade_structure"],
+        evidence=["corroborated suspicious evidence"],
+    )
+    monkeypatch.setattr(broker._fill_decisions, "evaluate", lambda *args, **kwargs: refreshed)
+
+    assert (
+        broker._pending_buy_fill_blocker(
+            order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, "integrity-size-fill"),
+        )
+        == "entry_size_no_longer_supported_by_integrity"
+    )
+
+    reduced_decision = make_current_decision(now, "integrity-reduced-fill")
+    assert reduced_decision.sizing_assessment is not None
+    reduced_decision.planned_order_size_sol = 0.015
+    reduced_decision.sizing_assessment.desired_size_sol = 0.015
+    reduced_decision.sizing_assessment.selected_size_sol = 0.015
+    reduced_decision.integrity_assessment = refreshed.integrity_assessment.model_copy(deep=True)
+    reduced_order = broker.submit_decision(reduced_decision)
+    assert reduced_order is not None
+    refreshed_reduced = reduced_decision.model_copy(deep=True)
+    monkeypatch.setattr(
+        broker._fill_decisions,
+        "evaluate",
+        lambda *args, **kwargs: refreshed_reduced,
+    )
+    assert (
+        broker._pending_buy_fill_blocker(
+            reduced_order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, "integrity-reduced-fill"),
+        )
+        is None
+    )
+    database.close()
+
+
+def test_current_uncertain_size_is_rechecked_at_fill_without_rewriting_v13(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    uncertainty = IntegrityAssessment(
+        policy_version=INTEGRITY_POLICY_VERSION,
+        state=MarketIntegrityState.UNCERTAIN,
+        score=0.70,
+        coverage=1,
+        sample_count=30,
+        category_count=1,
+        categories=["low_net_flow"],
+        evidence=["isolated moderate warning"],
+    )
+
+    reference = make_current_decision(now, "uncertain-reference-fill")
+    reference_order = broker.submit_decision(reference)
+    assert reference_order is not None
+    refreshed_reference = reference.model_copy(deep=True)
+    refreshed_reference.integrity_assessment = uncertainty.model_copy(deep=True)
+    monkeypatch.setattr(
+        broker._fill_decisions,
+        "evaluate",
+        lambda *args, **kwargs: refreshed_reference,
+    )
+    assert (
+        broker._pending_buy_fill_blocker(
+            reference_order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, reference.mint),
+        )
+        == "entry_size_no_longer_supported_by_integrity"
+    )
+
+    reduced = make_current_decision(now, "uncertain-reduced-fill")
+    assert reduced.sizing_assessment is not None
+    reduced.planned_order_size_sol = 0.0175
+    reduced.sizing_assessment.desired_size_sol = 0.0175
+    reduced.sizing_assessment.selected_size_sol = 0.0175
+    reduced.integrity_assessment = uncertainty.model_copy(deep=True)
+    reduced_order = broker.submit_decision(reduced)
+    assert reduced_order is not None
+    monkeypatch.setattr(broker._fill_decisions, "evaluate", lambda *args, **kwargs: reduced)
+    assert (
+        broker._pending_buy_fill_blocker(
+            reduced_order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, reduced.mint),
+        )
+        is None
+    )
+
+    recent = make_current_decision(now, "v13-uncertain-reference-fill")
+    recent.model_version = RECENT_BASELINE_VERSION
+    recent.integrity_assessment = uncertainty.model_copy(deep=True)
+    recent_order = broker.submit_decision(recent)
+    assert recent_order is not None
+    monkeypatch.setattr(broker._fill_decisions, "evaluate", lambda *args, **kwargs: recent)
+    assert (
+        broker._pending_buy_fill_blocker(
+            recent_order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, recent.mint),
+        )
+        is None
+    )
+    database.close()
+
+
+def test_entry_submission_fails_closed_for_unknown_or_incomplete_strategy_receipts(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+
+    unknown = make_decision(now, "future-baseline")
+    unknown.model_version = "baseline-v99"
+    order, blocker = broker.submit_decision_with_reason(unknown)
+    assert order is None
+    assert blocker == "unsupported_baseline_version"
+
+    incomplete = make_decision(now, "incomplete-baseline")
+    incomplete.model_version = BASELINE_VERSION
+    order, blocker = broker.submit_decision_with_reason(incomplete)
+    assert order is None
+    assert blocker == "current_baseline_receipt_incomplete"
+
+    mismatched = make_current_decision(now, "mismatched-size")
+    assert mismatched.sizing_assessment is not None
+    mismatched.sizing_assessment.selected_size_sol = 0.02
+    order, blocker = broker.submit_decision_with_reason(mismatched)
+    assert order is None
+    assert blocker == "current_baseline_size_receipt_mismatch"
+    database.close()
+
+
+def test_challenger_sizing_receipt_survives_submission_and_fill_revalidation(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+
+    decision = make_current_decision(now, "challenger-sized")
+    sizing_version = "challenger-skill-v1-sizing-fill-test"
+    decision.model_version = f"{BASELINE_VERSION}+entry-test+{sizing_version}"
+    decision.planned_order_size_sol = 0.05
+    decision.challenger_assessments["sizing"] = ChallengerEvaluationReceipt(
+        artifact_version=sizing_version,
+        skill=ChallengerSkill.SIZING,
+        evaluated_at=now,
+        prediction=2.0,
+        in_distribution=True,
+        proposed_action="2",
+        baseline_actionable=True,
+        parameters={
+            "applied": True,
+            "selected_multiplier": 2.0,
+            "baseline_size_sol": 0.025,
+        },
+    ).model_dump(mode="json")
+
+    order, blocker = broker.submit_decision_with_reason(decision)
+    assert blocker is None
+    assert order is not None
+    assert order.baseline_version_at_entry == BASELINE_VERSION
+    monkeypatch.setattr(broker._fill_decisions, "evaluate", lambda *args, **kwargs: decision)
+    assert (
+        broker._pending_buy_fill_blocker(
+            order,
+            RiskMode.BALANCED,
+            None,
+            make_features(now, decision.mint),
+        )
+        is None
+    )
+
+    missing_receipt = make_current_decision(now, "challenger-size-missing")
+    missing_receipt.model_version = f"{BASELINE_VERSION}+sizing-missing"
+    missing_receipt.planned_order_size_sol = 0.05
+    rejected, blocker = broker.submit_decision_with_reason(missing_receipt)
+    assert rejected is None
+    assert blocker == "current_baseline_size_receipt_mismatch"
+
+    suspicious = make_current_decision(now, "challenger-size-suspicious")
+    suspicious.model_version = f"{BASELINE_VERSION}+{sizing_version}"
+    suspicious.planned_order_size_sol = 0.05
+    assert suspicious.integrity_assessment is not None
+    suspicious.integrity_assessment.state = MarketIntegrityState.SUSPICIOUS
+    suspicious.challenger_assessments["sizing"] = decision.challenger_assessments["sizing"]
+    rejected, blocker = broker.submit_decision_with_reason(suspicious)
+    assert rejected is None
+    assert blocker == "challenger_sizing_integrity_guard_failed"
+
+    reduced = make_current_decision(now, "challenger-size-reduced")
+    reduced.model_version = f"{BASELINE_VERSION}+sizing-reduced"
+    reduced.planned_order_size_sol = 0.0125
+    assert reduced.integrity_assessment is not None
+    reduced.integrity_assessment.state = MarketIntegrityState.SUSPICIOUS
+    reduced.challenger_assessments["sizing"] = ChallengerEvaluationReceipt(
+        artifact_version="sizing-reduced",
+        skill=ChallengerSkill.SIZING,
+        evaluated_at=now,
+        prediction=0.5,
+        in_distribution=True,
+        proposed_action="0.5",
+        baseline_actionable=True,
+        parameters={
+            "applied": True,
+            "selected_multiplier": 0.5,
+            "baseline_size_sol": 0.025,
+        },
+    ).model_dump(mode="json")
+    reduced_order, blocker = broker.submit_decision_with_reason(reduced)
+    assert blocker is None
+    assert reduced_order is not None
+    database.close()
+
+
+def test_integrity_exit_requires_persistence_and_clean_evidence_resets_it(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    position = Position(
+        position_id="integrity-position",
+        mint="mint",
+        symbol="TEST",
+        token_units=1,
+        entry_cost_lamports=100,
+        book_value_lamports=100,
+        opened_at=now - timedelta(seconds=30),
+        entry_fill_id="integrity-fill",
+        baseline_version_at_entry=BASELINE_VERSION,
+    )
+    broker.positions[position.mint] = position
+    database.save_position(position)
+
+    severe = make_integrity_features(now, severe=True)
+    assert broker._persistent_integrity_exit_reason(position, severe, now) is None
+    uncertain = severe.model_copy(deep=True)
+    uncertain.values["trade_count_5m"].value = 10
+    assert (
+        broker._persistent_integrity_exit_reason(
+            position,
+            uncertain,
+            now + timedelta(seconds=5),
+        )
+        is None
+    )
+    assert (
+        broker._persistent_integrity_exit_reason(
+            position,
+            make_integrity_features(now + timedelta(seconds=70), severe=True),
+            now + timedelta(seconds=70),
+        )
+        is None
+    )
+    assert position.integrity_warning_count == 1
+
+    clean = make_integrity_features(now + timedelta(seconds=75), severe=False)
+    assert (
+        broker._persistent_integrity_exit_reason(
+            position,
+            clean,
+            now + timedelta(seconds=75),
+        )
+        is None
+    )
+    assert position.integrity_warning_count == 0
+
+    assert (
+        broker._persistent_integrity_exit_reason(
+            position,
+            make_integrity_features(now + timedelta(seconds=80), severe=True),
+            now + timedelta(seconds=80),
+        )
+        is None
+    )
+    assert (
+        broker._persistent_integrity_exit_reason(
+            position,
+            make_integrity_features(now + timedelta(seconds=85), severe=True),
+            now + timedelta(seconds=85),
+        )
+        is None
+    )
+    assert (
+        broker._persistent_integrity_exit_reason(
+            position,
+            make_integrity_features(now + timedelta(seconds=90), severe=True),
+            now + timedelta(seconds=90),
+        )
+        == "persistent_severe_market_integrity"
+    )
     database.close()
 
 

@@ -1,8 +1,8 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 
 import App from "./App";
-import type { Decision, Fill, Position, Snapshot } from "./types";
+import type { ChallengerSkillStatus, Decision, Fill, Position, SeasonAutomation, Snapshot } from "./types";
 
 const arenaLayoutKey = "signal-arcade-arena-layout-v1";
 const learningUiKey = "signal-arcade-learning-ui-v1";
@@ -71,6 +71,25 @@ const decision: Decision = {
   season_id: "season-test",
   configuration_fingerprint: "config-test",
   planned_order_size_sol: 0.025,
+  integrity_assessment: {
+    policy_version: "integrity-gates-v2",
+    state: "clean",
+    score: 0,
+    coverage: 0.94,
+    sample_count: 30,
+    category_count: 0,
+    categories: [],
+    evidence: ["No corroborated manipulation pattern is present in the usable sample"],
+  },
+  sizing_assessment: {
+    policy_version: "quality-size-v1",
+    base_size_sol: 0.025,
+    desired_size_sol: 0.08,
+    selected_size_sol: 0.06,
+    account_allocation_fraction: 0.018,
+    constraints: ["price_impact_cap"],
+    reasons: ["Clean, mature evidence allows bounded sizing from realized bankroll"],
+  },
   learning_assessment: null,
 };
 
@@ -320,6 +339,60 @@ function qualifiedLearningModel(version: string): NonNullable<Snapshot["learning
   };
 }
 
+function challengerSkillStatus(
+  skill: ChallengerSkillStatus["skill"],
+  state: ChallengerSkillStatus["state"],
+): ChallengerSkillStatus {
+  const version = `challenger-skill-v1-${skill}`;
+  const active = state === "active";
+  return {
+    skill,
+    label: `${skill.charAt(0).toUpperCase()}${skill.slice(1)} skill`,
+    state,
+    latest_candidate: {
+      version,
+      created_at: new Date().toISOString(),
+      skill,
+      outcomes_seen: 120,
+      sample_count: 100,
+      training_count: 70,
+      validation_count: 30,
+      embargoed_count: 4,
+      qualified: true,
+      metrics: {},
+      parameters: {},
+    },
+    testing_version: state === "candidate_testing" ? version : null,
+    champion: state === "collecting" ? null : {
+      version,
+      created_at: new Date().toISOString(),
+      skill,
+      outcomes_seen: 120,
+      sample_count: 100,
+      training_count: 70,
+      validation_count: 30,
+      embargoed_count: 4,
+      qualified: true,
+      metrics: {},
+      parameters: {},
+    },
+    active_version: active ? version : null,
+    common_forward_count: active ? 30 : 0,
+    tournament: active ? { result: "joined" } : {},
+    health: {
+      state: active ? "healthy" : "inactive",
+      model_version: active ? version : null,
+      observed_count: active ? 30 : 0,
+      usable_count: active ? 30 : 0,
+      minimum_samples: 30,
+      availability_fraction: active ? 1 : 0,
+      estimated_uplift: active ? 0.02 : null,
+      uplift_upper_bound: active ? 0.04 : null,
+    },
+    gates: [{ id: "coverage", label: "Coverage", current: 1, target: 0.7, comparison: ">=", state: "passed", unit: "fraction", detail: "Forward route coverage" }],
+  };
+}
+
 afterEach(() => {
   cleanup();
   window.sessionStorage.clear();
@@ -429,6 +502,7 @@ test("shows and safely toggles the guarded automatic season policy", async () =>
 
   render(<App />);
   expect(await screen.findByText(/3 dormant holdings/)).toBeInTheDocument();
+  expect(screen.getByLabelText("Automatic season status: 18h left")).toBeInTheDocument();
   const toggle = screen.getByRole("switch", { name: "Disable automatic new seasons" });
   expect(toggle).toHaveAttribute("aria-checked", "true");
   fireEvent.click(toggle);
@@ -437,6 +511,53 @@ test("shows and safely toggles the guarded automatic season policy", async () =>
     "/api/v1/season-automation",
     expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: false }) }),
   ));
+});
+
+test.each([
+  {
+    name: "a live minute countdown",
+    update: { state: "countdown", remaining_seconds: 3_900, verified_seconds: 120 },
+    label: "Automatic season status: 1h 5m left",
+  },
+  {
+    name: "verified time preserved during a data pause",
+    update: { state: "paused", remaining_seconds: 1_380, verified_seconds: 2_220 },
+    label: "Automatic season status: 37m / 1h saved",
+  },
+  {
+    name: "a due rollover waiting for its safe boundary",
+    update: { state: "due", remaining_seconds: 0, verified_seconds: 3_600 },
+    label: "Automatic season status: Due now",
+  },
+  {
+    name: "a countdown whose remaining telemetry is temporarily unavailable",
+    update: { state: "countdown", remaining_seconds: null, verified_seconds: 120 },
+    label: "Automatic season status: Counting",
+  },
+  {
+    name: "a data pause whose verified telemetry is temporarily unavailable",
+    update: { state: "paused", remaining_seconds: null, verified_seconds: null },
+    label: "Automatic season status: Paused",
+  },
+  {
+    name: "ordinary monitoring before a countdown starts",
+    update: { state: "monitoring", remaining_seconds: null, verified_seconds: 0 },
+    label: "Automatic season status: 1h rule",
+  },
+] as const)("shows $name in the automatic-season status chip", async ({ update, label }) => {
+  const automation: SeasonAutomation = {
+    ...snapshot.season_automation,
+    enabled: true,
+    grace_seconds: 3_600,
+    detail: "Server-authoritative automatic season state.",
+    ...update,
+  };
+  const current = { ...snapshot, season_automation: automation } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => current }));
+
+  render(<App />);
+
+  expect(await screen.findByLabelText(label)).toHaveAttribute("title", automation.detail);
 });
 
 test("saves a bounded automatic season delay before enabling it", async () => {
@@ -619,8 +740,10 @@ test("keeps detailed learning evidence tidy until requested", async () => {
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   const evidenceToggle = screen.getByRole("button", { name: "Show learning evidence" });
   const proofToggle = screen.getByRole("button", { name: "Show road to influence" });
+  const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
   expect(evidenceToggle).toHaveAttribute("aria-expanded", "false");
   expect(proofToggle).toHaveAttribute("aria-expanded", "false");
+  expect(journeyToggle).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("Forward test")).not.toBeInTheDocument();
   expect(screen.queryByText("Learning can become selective; it cannot become reckless")).not.toBeInTheDocument();
 
@@ -645,12 +768,13 @@ test("organizes the Learning Lab by player and remembers its per-device layout",
   const evidenceToggle = screen.getByRole("button", { name: "Show learning evidence" });
   expect(evidenceToggle).toHaveAttribute("aria-expanded", "false");
   fireEvent.click(evidenceToggle);
+  fireEvent.click(screen.getByRole("button", { name: "Show champion journey" }));
   expect(screen.getByText("Forward test")).toBeInTheDocument();
   await waitFor(() => expect(JSON.parse(window.localStorage.getItem(learningUiKey) ?? "null")).toMatchObject({
     version: 2,
     initialized: true,
     activeView: "challenger",
-    expandedSections: ["learning_evidence"],
+    expandedSections: ["champion_journey", "learning_evidence"],
   }));
   first.unmount();
 
@@ -659,6 +783,7 @@ test("organizes the Learning Lab by player and remembers its per-device layout",
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   expect(screen.getByRole("tab", { name: "Challenger" })).toHaveAttribute("aria-selected", "true");
   expect(screen.getByRole("button", { name: "Hide learning evidence" })).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("button", { name: "Hide champion journey" })).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByText("Forward test")).toBeInTheDocument();
 });
 
@@ -900,6 +1025,130 @@ test("does not describe an already active Challenger as waiting to be enabled", 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   expect(screen.getByText("Qualified Challenger active")).toBeInTheDocument();
   expect(screen.queryByText("Qualified Challenger ready")).not.toBeInTheDocument();
+});
+
+test("shows each Challenger skill and the exact bounded active ensemble", async () => {
+  const entrySkill = challengerSkillStatus("entry", "active");
+  const manipulationSkill = challengerSkillStatus("manipulation", "active");
+  const exitSkill = challengerSkillStatus("exit", "candidate_testing");
+  exitSkill.testing_version = "challenger-skill-v2-exit";
+  exitSkill.latest_candidate = {
+    ...exitSkill.latest_candidate!,
+    version: exitSkill.testing_version,
+  };
+  exitSkill.common_forward_count = 18;
+  const skills: ChallengerSkillStatus[] = [
+    entrySkill,
+    manipulationSkill,
+    challengerSkillStatus("sizing", "qualified"),
+    exitSkill,
+  ];
+  const championEvent = {
+    event_id: "champion-event-sizing-promoted",
+    occurred_at: new Date().toISOString(),
+    skill: "sizing" as const,
+    kind: "promoted" as const,
+    candidate_version: "challenger-skill-v2-sizing",
+    previous_champion_version: "challenger-skill-v1-sizing",
+    champion_version: "challenger-skill-v2-sizing",
+    common_observed_count: 32,
+    common_usable_count: 30,
+    availability_fraction: 0.9375,
+    mean_uplift: 0.03,
+    uplift_lower_bound: 0.012,
+  };
+  const skillSnapshot = {
+    ...snapshot,
+    demo_mode: false,
+    learning: {
+      ...snapshot.learning,
+      mode: "active" as const,
+      state: "active" as const,
+      collecting_from_current_source: true,
+      consent_granted: true,
+      active_skill_versions: {
+        entry: entrySkill.active_version!,
+        manipulation: manipulationSkill.active_version!,
+      },
+      skills,
+      champion_journey: [championEvent],
+      challenger_common_forward_minimum: 30,
+    },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => skillSnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  expect(screen.getByText(/2 bounded skills active/)).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Entry skill");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Manipulation skill");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Sizing skill");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Exit skill");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Contender");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Best proved");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("18 / 30 shared outcomes");
+  const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
+  expect(journeyToggle).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByText("A Champion means safer forward proof, never guaranteed profit.")).not.toBeInTheDocument();
+  fireEvent.click(journeyToggle);
+  expect(screen.getAllByText("New Champion earned").length).toBeGreaterThanOrEqual(1);
+  expect(screen.getByText(/30 shared outcomes · \+1\.2% conservative edge/)).toBeInTheDocument();
+  expect(screen.getByText(/never guaranteed profit/)).toBeInTheDocument();
+});
+
+test("does not invent Champion history for a pre-existing saved Champion", async () => {
+  const legacyChampion = challengerSkillStatus("entry", "qualified");
+  const legacySnapshot = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      skills: [legacyChampion],
+      champion_journey: [],
+    },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => legacySnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  expect(screen.getByText("Waiting for first Champion")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Show champion journey" }));
+  expect(screen.getByText(/Existing Champions remain valid/)).toBeInTheDocument();
+  expect(screen.getByText(/does not invent past battles/)).toBeInTheDocument();
+});
+
+test("explains low executable coverage while a Challenger battle is still open", async () => {
+  const skill = challengerSkillStatus("entry", "candidate_testing");
+  skill.testing_version = "challenger-skill-v2-entry";
+  skill.latest_candidate = { ...skill.latest_candidate!, version: skill.testing_version };
+  skill.common_forward_count = 45;
+  skill.tournament = {
+    result: "collecting",
+    common_observed_count: 75,
+    common_usable_count: 45,
+    availability_fraction: 0.60,
+  };
+  const lowCoverageSnapshot = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      skills: [skill],
+      challenger_common_forward_minimum: 30,
+      challenger_minimum_availability: 0.70,
+    },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => lowCoverageSnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent(
+    "60.0% coverage · needs 70.0%",
+  );
 });
 
 test("acknowledges only milestones that were actually visible", async () => {
@@ -1471,7 +1720,8 @@ test("keeps trades as the default Results view and separates legacy currencies",
   expect(screen.getByText("Legacy policy unknown")).toBeInTheDocument();
   expect(screen.queryByText("Best completed")).not.toBeInTheDocument();
 
-  fireEvent.change(screen.getByLabelText("Season comparison"), { target: { value: "all" } });
+  fireEvent.click(screen.getByRole("button", { name: "Season comparison" }));
+  fireEvent.click(within(screen.getByRole("dialog", { name: "Choose season comparison" })).getByRole("radio", { name: /^All seasons/ }));
   expect(screen.getByText("Ended 1.200 SOL")).toBeInTheDocument();
   expect(screen.getByText("Mixed comparison history")).toBeInTheDocument();
   expect(screen.queryByText("Best completed")).not.toBeInTheDocument();
@@ -1499,7 +1749,9 @@ test("filters every season view by exact profile and marks all-profile history a
     win_rate: status === "current" ? null : 0.6, net_return_fraction: net / 1_000_000_000,
     duration_seconds: 3_600, risk_mode: profile.risk_mode,
     profile_fingerprint: profile.profile_fingerprint, profile, profile_provenance: "exact" as const,
-    profile_locked_at: profile.locked_at, terminal_reason: status === "current" ? null : "manual_reset",
+    profile_locked_at: profile.locked_at, terminal_reason: status === "current" ? null : "auto_drawdown",
+    terminal_policy_version: "executable-boundary-v2", accounting_status: status === "current" ? "current" as const : "complete" as const,
+    boundary_type: status === "current" ? "open" : "automatic", meaningful_activity: true, comparable: true,
   });
   const seasons = [
     makeSeason(1, balancedDefault, "completed", -100_000_000),
@@ -1538,32 +1790,284 @@ test("filters every season view by exact profile and marks all-profile history a
 
   fireEvent.click(screen.getByRole("button", { name: "Results" }));
   fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
-  const selector = await screen.findByLabelText("Season comparison");
+  const comparisonTrigger = await screen.findByRole("button", { name: "Season comparison" });
+  const chooseComparison = (name: RegExp) => {
+    fireEvent.click(comparisonTrigger);
+    const dialog = screen.getByRole("dialog", { name: "Choose season comparison" });
+    fireEvent.click(within(dialog).getByRole("radio", { name }));
+  };
   expect(screen.getByText("Season 1")).toBeInTheDocument();
   expect(screen.getByText("Season 4")).toBeInTheDocument();
   expect(screen.queryByText("Season 2")).not.toBeInTheDocument();
   expect(screen.queryByText("Season 5")).not.toBeInTheDocument();
-  expect(Array.from(selector.querySelectorAll("optgroup"), (group) => group.label)).toEqual([
-    "SOL seasons",
-    "USDC seasons",
-  ]);
-
-  fireEvent.change(selector, { target: { value: "all" } });
-  expect(screen.getByText("All seasons · mixed history")).toBeInTheDocument();
+  fireEvent.click(comparisonTrigger);
+  const picker = screen.getByRole("dialog", { name: "Choose season comparison" });
+  expect(within(picker).getByRole("region", { name: "SOL seasons" })).toBeInTheDocument();
+  expect(within(picker).getByRole("region", { name: "USDC seasons" })).toBeInTheDocument();
+  fireEvent.click(within(picker).getByRole("radio", { name: /^All seasons/ }));
+  expect(screen.getByText("All seasons · mixed settings")).toBeInTheDocument();
   expect(screen.getByText("Season 2")).toBeInTheDocument();
   expect(screen.getByText("Season 3")).toBeInTheDocument();
   expect(screen.getByText("Season 5")).toBeInTheDocument();
   expect(screen.getByText("Mixed comparison history")).toBeInTheDocument();
 
-  fireEvent.change(selector, { target: { value: `SOL:profile:${balancedOff.profile_fingerprint}` } });
-  expect(screen.getByText("Balanced · DD off")).toBeInTheDocument();
+  chooseComparison(/^All SOL seasons/);
+  expect(screen.getByText("All SOL · mixed settings")).toBeInTheDocument();
+  expect(screen.getByText("Groups").closest("article")).toHaveTextContent("3");
+  expect(screen.queryByText("Season 5")).not.toBeInTheDocument();
+
+  chooseComparison(/^1 SOL · Balanced · DD off/);
+  expect(screen.getByText("SOL 1 · Balanced · DD off")).toBeInTheDocument();
   expect(screen.getByText("Season 2")).toBeInTheDocument();
   expect(screen.queryByText("Season 1")).not.toBeInTheDocument();
 
-  fireEvent.change(selector, { target: { value: `USDC:profile:${balancedDefault.profile_fingerprint}` } });
-  expect(screen.getByText("USDC · Balanced · Default DD 15%")).toBeInTheDocument();
+  chooseComparison(/^1000 USDC · Balanced · Default DD 15%/);
+  expect(screen.getByText("USDC 1000 · Balanced · Default DD 15%")).toBeInTheDocument();
   expect(screen.getByText("Season 5")).toBeInTheDocument();
   expect(screen.queryByText("Season 4")).not.toBeInTheDocument();
+});
+
+test("distinguishes matching season settings by strategy and accounting generation on mobile", async () => {
+  const now = new Date().toISOString();
+  const customDrawdown = { kind: "custom" as const, custom_threshold_bps: 2_000 };
+  const oldProfile = {
+    ...snapshot.season_profile!,
+    profile_fingerprint: "balanced-custom-old",
+    drawdown_policy: customDrawdown,
+    effective_drawdown_bps: 2_000,
+  };
+  const currentProfile = {
+    ...oldProfile,
+    profile_fingerprint: "balanced-custom-current",
+    baseline_version: "baseline-v1.3",
+  };
+  const makeSeason = (
+    seasonNumber: number,
+    profile: typeof oldProfile,
+    terminalPolicy: string,
+    boundaryType: "legacy" | "reset" | "open",
+    status: "completed" | "current",
+  ) => ({
+    season_id: `generation-season-${seasonNumber}`,
+    season_number: seasonNumber,
+    started_at: now,
+    ended_at: status === "current" ? null : now,
+    quote_currency: "USDC" as const,
+    quote_decimals: 6,
+    starting_minor: 200_000_000,
+    ending_equity_minor: 200_000_000,
+    last_known_ending_equity_minor: 200_000_000,
+    peak_equity_minor: 200_000_000,
+    realized_pnl_minor: 0,
+    net_pnl_minor: 0,
+    total_fees_minor: 0,
+    closed_trades: status === "current" ? 0 : 1,
+    wins: 0,
+    losses: status === "current" ? 0 : 1,
+    break_even: 0,
+    ending_drawdown_fraction: 0,
+    open_positions: 0,
+    status,
+    win_rate: status === "current" ? null : 0,
+    net_return_fraction: 0,
+    duration_seconds: 3_600,
+    risk_mode: "balanced" as const,
+    profile_fingerprint: profile.profile_fingerprint,
+    profile,
+    profile_provenance: "exact" as const,
+    profile_locked_at: profile.locked_at,
+    terminal_reason: status === "current" ? null : "manual_reset",
+    terminal_policy_version: terminalPolicy,
+    accounting_status: status === "current" ? "current" as const : "complete" as const,
+    boundary_type: boundaryType,
+    meaningful_activity: true,
+    comparable: terminalPolicy === "executable-boundary-v2",
+  });
+  const seasons = [
+    makeSeason(12, oldProfile, "legacy-v1", "legacy", "completed"),
+    makeSeason(13, oldProfile, "legacy-v1", "legacy", "completed"),
+    makeSeason(14, oldProfile, "executable-boundary-v2", "reset", "completed"),
+    makeSeason(15, currentProfile, "executable-boundary-v2", "open", "current"),
+  ];
+  const oldLegacyKey = "USDC:bankroll:200000000:profile:balanced-custom-old:terminal:legacy-v1";
+  const oldModernKey = "USDC:bankroll:200000000:profile:balanced-custom-old:terminal:executable-boundary-v2";
+  const currentKey = "USDC:bankroll:200000000:profile:balanced-custom-current:terminal:executable-boundary-v2";
+  const group = (
+    comparisonKey: string,
+    terminalPolicy: string,
+    first: number,
+    last: number,
+    seasonCount: number,
+    boundaryTypes: string[],
+    hasCurrent: boolean,
+    profileFingerprint: string,
+    baselineVersion: string | null,
+  ) => ({
+    comparison_key: comparisonKey,
+    quote_currency: "USDC" as const,
+    quote_decimals: 6,
+    starting_minor: 200_000_000,
+    terminal_policy_version: terminalPolicy,
+    profile_provenance: "exact" as const,
+    profile_fingerprint: profileFingerprint,
+    risk_mode: "balanced" as const,
+    drawdown_policy: customDrawdown,
+    effective_drawdown_bps: 2_000,
+    baseline_version: baselineVersion,
+    integrity_policy_version: baselineVersion ? "integrity-gates-v2" : null,
+    sizing_policy_version: baselineVersion ? "quality-size-v1" : null,
+    first_season_number: first,
+    last_season_number: last,
+    has_current: hasCurrent,
+    completed_count: hasCurrent ? 0 : seasonCount,
+    comparable_count: terminalPolicy === "executable-boundary-v2" && !hasCurrent ? seasonCount : 0,
+    boundary_types: boundaryTypes,
+    season_count: seasonCount,
+  });
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      return { ok: true, json: async () => ({ sort: "profit", summary: { closed_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null, total_fees_minor: 0 }, rows: [] }) };
+    }
+    if (input === "/api/v1/seasons") {
+      return { ok: true, json: async () => ({
+        generated_at: now,
+        current_profile_fingerprint: currentProfile.profile_fingerprint,
+        current_comparison_key: currentKey,
+        profiles: [],
+        comparison_groups: [
+          group(oldLegacyKey, "legacy-v1", 12, 13, 2, ["legacy"], false, oldProfile.profile_fingerprint, null),
+          group(oldModernKey, "executable-boundary-v2", 14, 14, 1, ["reset"], false, oldProfile.profile_fingerprint, null),
+          {
+            comparison_key: currentKey,
+            quote_currency: "USDC",
+            quote_decimals: 6,
+            starting_minor: 200_000_000,
+            terminal_policy_version: "executable-boundary-v2",
+            profile_provenance: "exact",
+            profile_fingerprint: currentProfile.profile_fingerprint,
+            risk_mode: "balanced",
+            drawdown_policy: customDrawdown,
+            effective_drawdown_bps: 2_000,
+            season_count: 1,
+          },
+        ],
+        seasons,
+        summary: { season_count: 4, completed_seasons: 3, comparable_seasons: 1, comparison_group_count: 3, comparison_claims_available: false, profitable_seasons: 0, losing_seasons: 1, average_win_rate: 0, best_return_fraction: 0 },
+      }) };
+    }
+    return { ok: true, json: async () => snapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
+
+  const trigger = await screen.findByRole("button", { name: "Season comparison" });
+  fireEvent.click(trigger);
+  const picker = screen.getByRole("dialog", { name: "Choose season comparison" });
+  expect(within(picker).getAllByRole("radio")).toHaveLength(5);
+  expect(within(picker).getByRole("radio", { name: /Current comparison.*Baseline v1\.3.*Current.*S15/ })).toBeInTheDocument();
+  expect(within(picker).getByRole("radio", { name: /Legacy strategy.*Legacy accounting.*Legacy boundary.*S12–S13/ })).toBeInTheDocument();
+  expect(within(picker).getByRole("radio", { name: /Legacy strategy.*Modern accounting.*Manual reset.*S14/ })).toBeInTheDocument();
+  expect(within(picker).getAllByRole("radio", { name: /^200 USDC · Balanced · Custom DD 20%/ })).toHaveLength(2);
+
+  fireEvent.click(within(picker).getByRole("radio", { name: /Legacy accounting.*S12–S13/ }));
+  expect(screen.getByText("Season 12")).toBeInTheDocument();
+  expect(screen.getByText("Season 13")).toBeInTheDocument();
+  expect(screen.queryByText("Season 14")).not.toBeInTheDocument();
+
+  fireEvent.click(trigger);
+  expect(screen.getByRole("dialog", { name: "Choose season comparison" })).toBeInTheDocument();
+  expect(document.body.style.overflow).toBe("hidden");
+  fireEvent.keyDown(document, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "Choose season comparison" })).not.toBeInTheDocument();
+  expect(document.body.style.overflow).toBe("");
+  expect(document.activeElement).toBe(trigger);
+});
+
+test("defaults completed-only season history to the honest all-seasons selection", async () => {
+  const now = new Date().toISOString();
+  const profile = snapshot.season_profile!;
+  const comparisonKey = `SOL:bankroll:1000000000:profile:${profile.profile_fingerprint}:terminal:executable-boundary-v2`;
+  const completedSeason = {
+    season_id: "completed-only-season",
+    season_number: 7,
+    started_at: now,
+    ended_at: now,
+    quote_currency: "SOL" as const,
+    quote_decimals: 9,
+    starting_minor: 1_000_000_000,
+    ending_equity_minor: 950_000_000,
+    last_known_ending_equity_minor: 950_000_000,
+    peak_equity_minor: 1_000_000_000,
+    realized_pnl_minor: -50_000_000,
+    net_pnl_minor: -50_000_000,
+    total_fees_minor: 1_000_000,
+    closed_trades: 1,
+    wins: 0,
+    losses: 1,
+    break_even: 0,
+    ending_drawdown_fraction: 0.05,
+    open_positions: 0,
+    status: "completed" as const,
+    win_rate: 0,
+    net_return_fraction: -0.05,
+    duration_seconds: 3_600,
+    risk_mode: profile.risk_mode,
+    profile_fingerprint: profile.profile_fingerprint,
+    profile,
+    profile_provenance: "exact" as const,
+    profile_locked_at: profile.locked_at,
+    terminal_reason: "manual_reset",
+    terminal_policy_version: "executable-boundary-v2",
+    accounting_status: "complete" as const,
+    boundary_type: "reset",
+    meaningful_activity: true,
+    comparable: true,
+  };
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      return { ok: true, json: async () => ({ sort: "profit", summary: { closed_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null, total_fees_minor: 0 }, rows: [] }) };
+    }
+    if (input === "/api/v1/seasons") {
+      return { ok: true, json: async () => ({
+        generated_at: now,
+        current_profile_fingerprint: null,
+        current_comparison_key: null,
+        profiles: [],
+        comparison_groups: [{
+          comparison_key: comparisonKey,
+          quote_currency: "SOL",
+          quote_decimals: 9,
+          starting_minor: 1_000_000_000,
+          terminal_policy_version: "executable-boundary-v2",
+          profile_provenance: "exact",
+          profile_fingerprint: profile.profile_fingerprint,
+          risk_mode: profile.risk_mode,
+          drawdown_policy: profile.drawdown_policy,
+          effective_drawdown_bps: profile.effective_drawdown_bps,
+          season_count: 1,
+        }],
+        seasons: [completedSeason],
+        summary: { season_count: 1, completed_seasons: 1, comparable_seasons: 1, comparison_group_count: 1, comparison_claims_available: true, profitable_seasons: 0, losing_seasons: 1, average_win_rate: 0, best_return_fraction: -0.05 },
+      }) };
+    }
+    return { ok: true, json: async () => snapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
+
+  const trigger = await screen.findByRole("button", { name: "Season comparison" });
+  expect(trigger).toHaveTextContent("All seasons");
+  expect(screen.getByText("Season 7")).toBeInTheDocument();
+  fireEvent.click(trigger);
+  const picker = screen.getByRole("dialog", { name: "Choose season comparison" });
+  expect(within(picker).queryByRole("region", { name: "Current" })).not.toBeInTheDocument();
+  expect(within(picker).getByRole("radio", { name: /^All seasons/ })).toHaveAttribute("aria-checked", "true");
 });
 
 test("scales season history past 100 scorecards without hiding or deleting older seasons", async () => {
@@ -1999,6 +2503,101 @@ test("builds both Solana endpoints from one guided provider key", async () => {
   });
 });
 
+test("uses keyed Helius HTTP while restoring the default stream in economy mode", async () => {
+  const managedSnapshot: Snapshot = {
+    ...snapshot,
+    provider_settings: {
+      ...snapshot.provider_settings,
+      presets: {
+        solana: [
+          { id: "public", label: "Public RPC", requests_per_minute: 120, monthly_limit: null, paid_mode: false },
+          { id: "helius_economy", label: "Helius Economy (keyed HTTP + public stream)", requests_per_minute: 600, monthly_limit: 500_000, paid_mode: false },
+        ],
+        jupiter: [],
+      },
+    },
+  };
+  const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => Promise.resolve({
+    ok: true,
+    json: async () => path.includes("/provider-settings") && init?.method === "PUT"
+      ? { provider_settings: managedSnapshot.provider_settings, source_restarted: true, paper_engine_stopped: true }
+      : managedSnapshot,
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show data providers" }));
+  fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+  fireEvent.change(screen.getByLabelText("RPC service"), { target: { value: "helius_economy" } });
+  expect(screen.getByText(/keyed Helius for paced safety lookups/i)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Helius API key"), { target: { value: "economy-key" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save providers" }));
+
+  await waitFor(() => {
+    const request = fetchMock.mock.calls.find(([path, init]) => String(path).includes("/provider-settings") && init?.method === "PUT");
+    expect(request).toBeDefined();
+    const body = JSON.parse(String(request?.[1]?.body)) as { secrets: { solana_http?: string; solana_ws?: string; clear: string[] } };
+    expect(body.secrets.solana_http).toBe("https://mainnet.helius-rpc.com/?api-key=economy-key");
+    expect(body.secrets.solana_ws).toBeUndefined();
+    expect(body.secrets.clear).toContain("solana_ws");
+    expect(body.secrets.clear).not.toContain("solana_http");
+  });
+});
+
+test("can move a saved full Helius route to economy without asking for the key again", async () => {
+  const heliusPolicy = { label: "Helius Free (500k HTTP reserve)", requests_per_minute: 600, monthly_limit: 500_000, reserve_fraction: 0.1, paid_mode: false };
+  const managedSnapshot: Snapshot = {
+    ...snapshot,
+    provider_settings: {
+      ...snapshot.provider_settings,
+      providers: {
+        ...snapshot.provider_settings.providers,
+        solana: {
+          ...snapshot.provider_settings.providers.solana,
+          endpoint: "https://mainnet.helius-rpc.com",
+          stream_endpoint: "wss://mainnet.helius-rpc.com",
+          custom_endpoint: true,
+          policy: heliusPolicy,
+        },
+      },
+      presets: {
+        solana: [
+          { id: "helius_free", label: heliusPolicy.label, requests_per_minute: 600, monthly_limit: 500_000, paid_mode: false },
+          { id: "helius_economy", label: "Helius Economy (keyed HTTP + public stream)", requests_per_minute: 600, monthly_limit: 500_000, paid_mode: false },
+        ],
+        jupiter: [],
+      },
+    },
+  };
+  const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => Promise.resolve({
+    ok: true,
+    json: async () => path.includes("/provider-settings") && init?.method === "PUT"
+      ? { provider_settings: managedSnapshot.provider_settings, source_restarted: true, paper_engine_stopped: true }
+      : managedSnapshot,
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show data providers" }));
+  fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+  fireEvent.change(screen.getByLabelText("RPC service"), { target: { value: "helius_economy" } });
+  expect(screen.getByLabelText("Helius API key")).not.toBeRequired();
+  fireEvent.click(screen.getByRole("button", { name: "Save providers" }));
+
+  await waitFor(() => {
+    const request = fetchMock.mock.calls.find(([path, init]) => String(path).includes("/provider-settings") && init?.method === "PUT");
+    const body = JSON.parse(String(request?.[1]?.body)) as { secrets: { solana_http?: string; solana_ws?: string; clear: string[] } };
+    expect(body.secrets.solana_http).toBeUndefined();
+    expect(body.secrets.solana_ws).toBeUndefined();
+    expect(body.secrets.clear).toContain("solana_ws");
+    expect(body.secrets.clear).not.toContain("solana_http");
+  });
+});
+
 test("keeps explicit Solana endpoints behind the custom RPC option", async () => {
   const managedSnapshot: Snapshot = {
     ...snapshot,
@@ -2090,17 +2689,103 @@ test("confirms a locked drawdown-only profile change before starting a new seaso
   render(<App />);
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
-  fireEvent.click(screen.getByText("Advanced drawdown setting"));
-  fireEvent.click(screen.getByRole("radio", { name: /Off/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
-  expect(screen.getByRole("dialog", { name: /Balanced · DD off/ })).toBeInTheDocument();
-  expect(screen.getByRole("radio", { name: /Finish safely/ })).toBeChecked();
+  fireEvent.click(screen.getByRole("button", { name: "Edit next season" }));
+  const editor = within(screen.getByRole("dialog", { name: "Edit the next paper season" }));
+  fireEvent.click(editor.getByRole("radio", { name: /OffStructural safety/ }));
+  expect(editor.getByRole("radio", { name: /Finish safely/ })).toBeChecked();
   expect(screen.getByRole("dialog").parentElement).toHaveClass("profile-confirm-backdrop");
-  fireEvent.click(screen.getByRole("button", { name: "Change profile safely" }));
+  fireEvent.click(editor.getByRole("button", { name: "Apply after safe finish" }));
 
   await act(async () => undefined);
   expect(fetchMock).toHaveBeenCalledWith("/api/v1/risk", expect.objectContaining({
-    body: JSON.stringify({ mode: "balanced", drawdown_policy: { kind: "disabled", custom_threshold_bps: null }, transition_strategy: "finish_safely" }),
+    body: JSON.stringify({ mode: "balanced", drawdown_policy: { kind: "disabled", custom_threshold_bps: null }, transition_strategy: "finish_safely", quote_currency: "SOL", starting_amount: "10" }),
+  }));
+});
+
+test("keeps the active risk profile concise and moves every change into one editor", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  const profileCard = screen.getByText("Current season profile").closest("article");
+  expect(profileCard).not.toBeNull();
+  const card = within(profileCard!);
+  expect(card.getByRole("heading", { name: "Balanced" })).toBeInTheDocument();
+  expect(card.getByLabelText("Current season settings")).toHaveTextContent("10 SOL");
+  expect(card.getByLabelText("Current season settings")).toHaveTextContent("4 positions");
+  expect(card.getByLabelText("Current season settings")).toHaveTextContent("12.0%");
+  expect(card.getByLabelText("Current season settings")).toHaveTextContent("15% · Default");
+  expect(card.queryByRole("radiogroup", { name: "Season risk personality" })).not.toBeInTheDocument();
+  expect(screen.queryByText("Advanced drawdown setting")).not.toBeInTheDocument();
+
+  fireEvent.click(card.getByRole("button", { name: "Edit next season" }));
+  const editor = within(screen.getByRole("dialog", { name: "Edit the next paper season" }));
+  expect(editor.getByRole("group", { name: "Risk personality" })).toBeInTheDocument();
+  expect(editor.getByRole("group", { name: "Portfolio drawdown halt" })).toBeInTheDocument();
+});
+
+test("keeps a legacy profile honest when exact limits are unavailable", async () => {
+  const legacySnapshot = {
+    ...snapshot,
+    season_profile: null,
+    season_profile_provenance: "legacy_unknown" as const,
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => legacySnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  const profileCard = screen.getByText("Current season profile").closest("article");
+  const card = within(profileCard!);
+  expect(card.getByLabelText("Current season settings")).toHaveTextContent("Unavailable");
+  expect(card.getByLabelText("Current season settings")).toHaveTextContent("Legacy / unknown");
+  expect(card.getByText(/Locked for this season/)).toBeInTheDocument();
+  fireEvent.click(card.getByRole("button", { name: "Edit next season" }));
+  expect(screen.getByRole("group", { name: "How should this season finish?" })).toBeInTheDocument();
+});
+
+test("blocks profile edits while an existing profile transition owns the boundary", async () => {
+  const transitioningSnapshot = {
+    ...snapshot,
+    season_operation: {
+      operation_id: "profile-transition-one",
+      kind: "profile_transition" as const,
+      state: "running" as const,
+      stage: "waiting_for_positions",
+      detail: "Finishing the current season safely.",
+      started_at: new Date(Date.now() - 5_000).toISOString(),
+      updated_at: new Date().toISOString(),
+      completed_at: null,
+    },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => transitioningSnapshot }));
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "Edit next season" })).toBeDisabled();
+  expect(screen.queryByRole("dialog", { name: "Edit the next paper season" })).not.toBeInTheDocument();
+});
+
+test("edits currency amount personality and drawdown as one exact next-season plan", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit next season" }));
+  const editor = within(screen.getByRole("dialog", { name: "Edit the next paper season" }));
+  fireEvent.click(editor.getByRole("radio", { name: /USDCDollar-denominated/ }));
+  fireEvent.change(editor.getByLabelText("Next season starting amount"), {
+    target: { value: "200" },
+  });
+  fireEvent.click(editor.getByRole("radio", { name: /Aggressive6 positions/ }));
+  fireEvent.click(editor.getByRole("radio", { name: /CustomA separate season/ }));
+  fireEvent.change(editor.getByLabelText("Next season custom drawdown percentage"), {
+    target: { value: "18.5" },
+  });
+  fireEvent.click(editor.getByRole("button", { name: "Apply after safe finish" }));
+
+  await act(async () => undefined);
+  expect(fetchMock).toHaveBeenCalledWith("/api/v1/risk", expect.objectContaining({
+    body: JSON.stringify({ mode: "aggressive", drawdown_policy: { kind: "custom", custom_threshold_bps: 1850 }, transition_strategy: "finish_safely", quote_currency: "USDC", starting_amount: "200" }),
   }));
 });
 
@@ -2110,17 +2795,17 @@ test("can end a locked season now without implying fabricated exits", async () =
   render(<App />);
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
-  fireEvent.click(screen.getByText("Advanced drawdown setting"));
-  fireEvent.click(screen.getByRole("radio", { name: /Off/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
-  fireEvent.click(screen.getByRole("radio", { name: /End season now/ }));
-  expect(screen.getByText(/never as a made-up fill, win or loss/i)).toBeInTheDocument();
-  expect(screen.getByText(/excluded from strategy comparisons/i)).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "End season & change profile" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit next season" }));
+  const editor = within(screen.getByRole("dialog", { name: "Edit the next paper season" }));
+  fireEvent.click(editor.getByRole("radio", { name: /OffStructural safety/ }));
+  fireEvent.click(editor.getByRole("radio", { name: /End season now/ }));
+  expect(editor.getByText(/never as a made-up fill, win or loss/i)).toBeInTheDocument();
+  expect(editor.getByText(/excluded from strategy comparisons/i)).toBeInTheDocument();
+  fireEvent.click(editor.getByRole("button", { name: "End season & apply" }));
 
   await act(async () => undefined);
   expect(fetchMock).toHaveBeenCalledWith("/api/v1/risk", expect.objectContaining({
-    body: JSON.stringify({ mode: "balanced", drawdown_policy: { kind: "disabled", custom_threshold_bps: null }, transition_strategy: "end_now" }),
+    body: JSON.stringify({ mode: "balanced", drawdown_policy: { kind: "disabled", custom_threshold_bps: null }, transition_strategy: "end_now", quote_currency: "SOL", starting_amount: "10" }),
   }));
 });
 
@@ -2128,9 +2813,7 @@ test("cancels the centered profile dialog with Escape", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
   render(<App />);
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
-  fireEvent.click(screen.getByText("Advanced drawdown setting"));
-  fireEvent.click(screen.getByRole("radio", { name: /Off/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit next season" }));
   expect(screen.getByRole("dialog")).toBeInTheDocument();
   fireEvent.keyDown(document, { key: "Escape" });
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -2142,14 +2825,14 @@ test("canonicalizes a custom drawdown equal to the personality default", async (
   render(<App />);
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
-  fireEvent.click(screen.getByText("Advanced drawdown setting"));
-  fireEvent.click(screen.getByRole("radio", { name: /Custom/ }));
-  fireEvent.change(screen.getByLabelText("Custom drawdown percentage"), {
+  fireEvent.click(screen.getByRole("button", { name: "Edit next season" }));
+  const editor = within(screen.getByRole("dialog", { name: "Edit the next paper season" }));
+  fireEvent.click(editor.getByRole("radio", { name: /CustomA separate season/ }));
+  fireEvent.change(editor.getByLabelText("Next season custom drawdown percentage"), {
     target: { value: "15" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Apply to a new season" }));
 
-  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(editor.getByRole("button", { name: "No changes" })).toBeDisabled();
   expect(fetchMock.mock.calls.some(([path]) => path === "/api/v1/risk")).toBe(false);
 });
 
@@ -2701,6 +3384,9 @@ test("opens explanation feedback immediately while local AI is working", async (
     });
   });
   expect(await screen.findByText("AAA is being watched while evidence develops.")).toBeInTheDocument();
+  expect(screen.getByText("Paper sizing receipt")).toBeInTheDocument();
+  expect(screen.getByText("Baseline market integrity")).toBeInTheDocument();
+  expect(screen.getByText("1.8%")).toBeInTheDocument();
   expect(screen.getByRole("textbox", { name: "AAA mint address" })).toHaveValue("mint-aaa");
   expect(screen.getAllByRole("link", { name: "Open AAA on GMGN" }).some((link) => link.getAttribute("href") === "https://gmgn.ai/sol/token/mint-aaa")).toBe(true);
 });
@@ -2734,8 +3420,10 @@ test("closing a slow explanation cancels it and prevents a late drawer", async (
 test("shows a forward-only AI coach experiment without implying trading influence", async () => {
   const coached = {
     ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
     coach: {
       ...snapshot.coach,
+      research_enabled: true,
       state: "testing" as const,
       outcomes_seen: 240,
       outcomes_until_review: 0,
@@ -2745,6 +3433,7 @@ test("shows a forward-only AI coach experiment without implying trading influenc
         updated_at: new Date().toISOString(),
         cutoff_at: new Date().toISOString(),
         kind: "entry_veto" as const,
+        skill: "entry" as const,
         state: "testing" as const,
         title: "Avoid weak one-minute momentum",
         rationale: "A bounded Shadow test of an observed weakness.",
@@ -2769,19 +3458,145 @@ test("shows a forward-only AI coach experiment without implying trading influenc
         minimum_forward_samples: 60,
         minimum_availability_fraction: 0.7,
         last_evaluated_at: new Date().toISOString(),
+        contribution_state: "research_only" as const,
         influence_applied: false as const,
         context_active: true,
       }],
+      research_lanes: [
+        { skill: "entry" as const, label: "Entry", state: "testing" as const, current_title: "Avoid weak one-minute momentum", best_title: null, studies: 1, supported_studies: 0 },
+        { skill: "manipulation" as const, label: "Manipulation", state: "observing" as const, current_title: null, best_title: null, studies: 0, supported_studies: 0 },
+        { skill: "sizing" as const, label: "Sizing", state: "observing" as const, current_title: null, best_title: null, studies: 0, supported_studies: 0 },
+        { skill: "exit" as const, label: "Exit", state: "observing" as const, current_title: null, best_title: null, studies: 0, supported_studies: 0 },
+      ],
     },
   } satisfies Snapshot;
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => coached }));
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => coached });
+  vi.stubGlobal("fetch", fetchMock);
   render(<App />);
 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
   const coachCard = screen.getByText("Slow, allowlisted experiments for the fast engine · Shadow-only").closest("article");
-  expect(coachCard).toHaveTextContent("InfluenceNone");
+  expect(coachCard).toHaveTextContent("InfluenceResearch only");
   expect(coachCard).toHaveTextContent("24 / 60 usable");
+  expect(screen.getByRole("region", { name: "AI Coach research lanes" })).toHaveTextContent("Manipulation");
+  expect(screen.getByRole("button", { name: "Show research notebook" })).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByRole("progressbar", { name: "Coach forward-test progress" })).toHaveAttribute("aria-valuenow", "24");
+  fireEvent.click(screen.getByRole("button", { name: "Pause research" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/v1/ai-lab/coach-research",
+    expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: false }) }),
+  ));
+});
+
+test("announces a proved Coach idea and requires explicit tournament permission", async () => {
+  const now = new Date().toISOString();
+  const ready = {
+    ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
+    coach: {
+      ...snapshot.coach,
+      mode: "shadow" as const,
+      research_enabled: true,
+      state: "promising" as const,
+      contribution_enabled: false,
+      contribution_ready: true,
+      recent_hypotheses: [{
+        hypothesis_id: "coach-ready-entry",
+        created_at: now,
+        updated_at: now,
+        cutoff_at: now,
+        kind: "entry_veto" as const,
+        skill: "entry" as const,
+        state: "promising" as const,
+        title: "Preserve cash during weak momentum",
+        rationale: "Supported by independent forward evidence.",
+        risk_mode: "balanced" as const,
+        model_name: "qwen3.5:4b",
+        feature_name: "momentum",
+        operator: "<=" as const,
+        threshold: 0,
+        conditions: [{ feature_name: "momentum", operator: "<=" as const, threshold: 0 }],
+        hold_seconds: null,
+        discovery_observed_count: 100,
+        discovery_usable_count: 90,
+        discovery_availability_fraction: 0.9,
+        discovery_mean_uplift: 0.05,
+        discovery_uplift_lower_bound: 0.02,
+        forward_observed_count: 80,
+        forward_usable_count: 70,
+        forward_availability_fraction: 0.875,
+        forward_season_count: 2,
+        forward_mean_uplift: 0.04,
+        forward_uplift_lower_bound: 0.015,
+        forward_uplift_upper_bound: 0.065,
+        minimum_forward_samples: 60,
+        minimum_availability_fraction: 0.7,
+        last_evaluated_at: now,
+        contribution_state: "ready" as const,
+        influence_applied: false as const,
+        context_active: true,
+      }],
+    },
+  } satisfies Snapshot;
+  window.localStorage.setItem(learningUiKey, JSON.stringify({
+    version: 2,
+    initialized: true,
+    activeView: "coach",
+    expandedSections: [],
+    seenMilestoneIds: [],
+  }));
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ready });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show road to contribution" }));
+  expect(screen.getByLabelText("Coach contribution path")).toHaveTextContent("Champion battle");
+  const allow = screen.getByRole("button", { name: "Allow contribution" });
+  expect(allow).toBeEnabled();
+  fireEvent.click(allow);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/v1/ai-lab/coach-contribution",
+    expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: true }) }),
+  ));
+});
+
+test("shows paused Coach research and keeps contribution revocation available", async () => {
+  const paused = {
+    ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
+    coach: {
+      ...snapshot.coach,
+      mode: "off" as const,
+      state: "off" as const,
+      research_enabled: false,
+      contribution_enabled: true,
+    },
+  } satisfies Snapshot;
+  window.localStorage.setItem(learningUiKey, JSON.stringify({
+    version: 2,
+    initialized: true,
+    activeView: "coach",
+    expandedSections: ["coach_contribution"],
+    seenMilestoneIds: [],
+  }));
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => paused });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByText("Paused · Shadow")).toBeInTheDocument();
+  expect(screen.getByText("Research can resume without losing evidence")).toBeInTheDocument();
+  const revoke = screen.getByRole("button", { name: "Turn contribution off" });
+  expect(revoke).toBeEnabled();
+  fireEvent.click(revoke);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/v1/ai-lab/coach-contribution",
+    expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: false }) }),
+  ));
 });

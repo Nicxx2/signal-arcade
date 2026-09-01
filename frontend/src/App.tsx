@@ -41,6 +41,7 @@ import type {
   Decision,
   DecisionAction,
   DrawdownPolicy,
+  ChallengerChampionEvent,
   EquityPoint,
   FeatureSnapshot,
   Fill,
@@ -54,9 +55,11 @@ import type {
   ProviderPolicy,
   ProviderPreset,
   ProviderSettingsUpdate,
+  ProviderView,
   QuoteCurrency,
   ReadinessGate,
   RiskMode,
+  SeasonAutomation,
   SeasonProfile,
   SeasonOperation,
   Seasons as SeasonsData,
@@ -75,13 +78,69 @@ const ARENA_POSITION_GROUP_KEYS = ["active", "exit_blocked", "dormant"] as const
 const DECISIONS_LAYOUT_KEY = "signal-arcade-decisions-layout-v1";
 const DECISION_GROUP_KEYS = ["best", "passed", "earlier"] as const;
 const LEARNING_UI_KEY = "signal-arcade-learning-ui-v1";
-const LEARNING_SECTION_KEYS = ["challenger_proof", "learning_evidence"] as const;
+const LEARNING_SECTION_KEYS = ["champion_journey", "challenger_proof", "learning_evidence", "coach_notebook", "coach_contribution", "coach_safety"] as const;
 const LEARNING_VIEW_KEYS = ["overview", "baseline", "challenger", "coach", "reviews", "safety"] as const;
 const MAX_SEASON_HISTORY_POINTS = 240;
 
 type LearningSectionKey = typeof LEARNING_SECTION_KEYS[number];
 type LearningViewKey = typeof LEARNING_VIEW_KEYS[number];
 type SeasonComparisonGroup = NonNullable<SeasonsData["comparison_groups"]>[number];
+type SeasonComparisonPickerOption = {
+  value: string;
+  label: string;
+  detail: string;
+};
+type SeasonComparisonPickerSection = {
+  label: string;
+  options: SeasonComparisonPickerOption[];
+};
+
+function finiteNonNegativeSeconds(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : null;
+}
+
+function compactAutoSeasonTime(seconds: number): string {
+  const roundedMinutes = Math.max(1, Math.ceil(seconds / 60));
+  if (roundedMinutes < 60) return `${roundedMinutes}m`;
+  const hours = Math.floor(roundedMinutes / 60);
+  const minutes = roundedMinutes % 60;
+  return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+function autoSeasonStatusChip(
+  automation: SeasonAutomation,
+  configuredHours: number,
+): { label: string; ariaLabel: string } {
+  const remaining = finiteNonNegativeSeconds(automation.remaining_seconds);
+  const verified = finiteNonNegativeSeconds(automation.verified_seconds);
+  const grace = finiteNonNegativeSeconds(automation.grace_seconds) ?? configuredHours * 3_600;
+  if (automation.state === "countdown") {
+    const label = remaining === null ? "Counting" : `${compactAutoSeasonTime(remaining)} left`;
+    return { label, ariaLabel: `Automatic season status: ${label}` };
+  }
+  if (automation.state === "paused") {
+    const progress = verified === null
+      ? "Paused"
+      : `${compactAutoSeasonTime(verified)} / ${compactAutoSeasonTime(grace)} saved`;
+    return { label: progress, ariaLabel: `Automatic season status: ${progress}` };
+  }
+  const label = automation.state === "due"
+    ? "Due now"
+    : automation.state === "confirming"
+      ? "Checking"
+      : automation.state === "managing_positions"
+        ? "Managing"
+        : automation.state === "pending_orders"
+          ? "Settling"
+          : automation.state === "engine_stopped"
+            ? "Engine off"
+            : automation.state === "maintenance"
+              ? "Paused"
+              : automation.state === "waiting_for_data"
+                ? "Waiting"
+                : `${configuredHours}h rule`;
+  return { label, ariaLabel: `Automatic season status: ${label}` };
+}
 
 function loadDismissedMaintenanceNotice(): string | null {
   try {
@@ -230,10 +289,64 @@ function learningMilestones(snapshot: Snapshot): LearningMilestone[] {
       tone: "warning",
     });
   }
+  (learning.skills ?? []).forEach((skill) => {
+    const championVersion = skill.champion?.version;
+    if (championVersion && !skill.active_version && skill.state !== "suspended") {
+      const championEvent = (learning.champion_journey ?? []).find((event) => (
+        event.skill === skill.skill && event.champion_version === championVersion
+      ));
+      milestones.push({
+        id: `challenger-skill-qualified-${skill.skill}-${championVersion}`,
+        title: championEvent?.kind === "promoted"
+          ? `${skill.label} crowned a new Champion`
+          : `${skill.label} skill qualified`,
+        detail: championEvent?.kind === "promoted"
+          ? "A contender beat the saved Champion on shared forward outcomes. Influence remains separately gated."
+          : learning.consent_granted
+            ? "Its independent proof passed. Fresh combined evidence decides when it may join."
+            : "Its independent proof passed. It remains Shadow until you enable the Challenger once.",
+        tone: "good",
+      });
+    }
+    if (skill.active_version) {
+      milestones.push({
+        id: `challenger-skill-active-${skill.skill}-${skill.active_version}`,
+        title: `${skill.label} joined the team`,
+        detail: "Fresh combined proof passed; this bounded skill is now active with the Baseline fallback.",
+        tone: "good",
+      });
+    }
+    if (skill.state === "suspended" && championVersion) {
+      milestones.push({
+        id: `challenger-skill-suspended-${skill.skill}-${championVersion}`,
+        title: `${skill.label} returned to Shadow`,
+        detail: "Later unseen evidence failed its health guard. Other safe components remain isolated.",
+        tone: "warning",
+      });
+    }
+  });
   snapshot.coach.recent_hypotheses
     .filter((hypothesis) => hypothesis.context_active)
     .slice(0, 3)
     .forEach((hypothesis) => {
+      if (hypothesis.contribution_state === "handed_off") {
+        milestones.push({
+          id: `coach-contribution-handed-off-${hypothesis.hypothesis_id}`,
+          title: "Coach idea entered a Challenger battle",
+          detail: "The proved idea is now a contender only. The saved Champion stays in control until fresh common outcomes prove an advantage.",
+          tone: "good",
+        });
+        return;
+      }
+      if (hypothesis.state === "promising" && hypothesis.contribution_state === "ready") {
+        milestones.push({
+          id: `coach-contribution-ready-${hypothesis.hypothesis_id}`,
+          title: "Coach idea is ready to challenge",
+          detail: "Independent Coach proof passed. You may allow this idea into a normal Challenger tournament; it still cannot trade directly.",
+          tone: "good",
+        });
+        return;
+      }
       const copy = hypothesis.state === "testing"
         ? "A new allowlisted coaching idea has begun collecting independent forward evidence."
         : hypothesis.state === "promising"
@@ -592,14 +705,20 @@ export default function App() {
     };
   }, [refresh]);
 
-  const setRisk = async (mode: RiskMode, drawdownPolicy: DrawdownPolicy = { kind: "default", custom_threshold_bps: null }, transitionStrategy: ProfileTransitionStrategy = "finish_safely") => {
+  const setRisk = async (
+    mode: RiskMode,
+    drawdownPolicy: DrawdownPolicy = { kind: "default", custom_threshold_bps: null },
+    transitionStrategy: ProfileTransitionStrategy = "finish_safely",
+    quoteCurrency?: QuoteCurrency,
+    startingAmount?: string,
+  ) => {
     setBusy(true);
     try {
-      await api.setRisk(mode, drawdownPolicy, transitionStrategy);
+      await api.setRisk(mode, drawdownPolicy, transitionStrategy, quoteCurrency, startingAmount);
       resolveIssue("risk");
       await refresh();
     } catch (cause) {
-      reportIssue("risk", "Risk mode was not changed", cause);
+      reportIssue("risk", "Next-season settings were not changed", cause);
     } finally {
       setBusy(false);
     }
@@ -668,6 +787,32 @@ export default function App() {
       await refresh();
     } catch (cause) {
       reportIssue("ai", "AI Decision Lab mode was not changed", cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setCoachContribution = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      await api.setCoachContribution(enabled);
+      resolveIssue("ai");
+      await refresh();
+    } catch (cause) {
+      reportIssue("ai", "AI Coach contribution permission was not changed", cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setCoachResearch = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      await api.setCoachResearch(enabled);
+      resolveIssue("ai");
+      await refresh();
+    } catch (cause) {
+      reportIssue("ai", "AI Coach research mode was not changed", cause);
     } finally {
       setBusy(false);
     }
@@ -788,7 +933,7 @@ export default function App() {
         ) : tab === "leaderboard" ? (
           <LeaderboardView explain={explain} reportIssue={reportIssue} resolveIssue={resolveIssue} />
         ) : tab === "learning" ? (
-          <LearningLab snapshot={snapshot} setLearningMode={setLearningMode} setAiMode={setAiMode} busy={controlsBusy} activeView={learningUi.activeView} setActiveView={setLearningView} expandedSections={learningUi.expandedSections} toggleSection={toggleLearningSection} milestones={milestones} hasUnseenMilestones={unseenMilestones.length > 0} />
+          <LearningLab snapshot={snapshot} setLearningMode={setLearningMode} setAiMode={setAiMode} setCoachResearch={setCoachResearch} setCoachContribution={setCoachContribution} busy={controlsBusy} activeView={learningUi.activeView} setActiveView={setLearningView} expandedSections={learningUi.expandedSections} toggleSection={toggleLearningSection} milestones={milestones} hasUnseenMilestones={unseenMilestones.length > 0} />
         ) : tab === "replay" ? (
           <Replay snapshot={snapshot} />
         ) : (
@@ -870,7 +1015,7 @@ function MaintenanceOperationBanner({ operation }: { operation: MaintenanceOpera
 function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfolio, setEngineRunning, busy, explain, explainingId, onViewAllDecisions }: {
   snapshot: Snapshot;
   totalPnl: number;
-  setRisk: (mode: RiskMode, drawdownPolicy?: DrawdownPolicy, transitionStrategy?: ProfileTransitionStrategy) => Promise<void>;
+  setRisk: (mode: RiskMode, drawdownPolicy?: DrawdownPolicy, transitionStrategy?: ProfileTransitionStrategy, quoteCurrency?: QuoteCurrency, startingAmount?: string) => Promise<void>;
   setSeasonAutomation: (enabled: boolean, graceHours?: number) => Promise<void>;
   setupPortfolio: (currency: QuoteCurrency, amount: string, riskMode: RiskMode, drawdownPolicy: DrawdownPolicy) => Promise<string | null>;
   setEngineRunning: (running: boolean) => Promise<void>;
@@ -883,22 +1028,17 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
   const [arenaLayout, setArenaLayout] = useState(loadArenaLayout);
   const collapsedPositionGroups = arenaLayout.collapsedPositionGroups;
   const marketRadarCollapsed = arenaLayout.marketRadarCollapsed;
-  const [pendingProfile, setPendingProfile] = useState<{ mode: RiskMode; drawdownPolicy: DrawdownPolicy; transitionStrategy: ProfileTransitionStrategy } | null>(null);
+  const [pendingProfile, setPendingProfile] = useState<{
+    mode: RiskMode;
+    drawdownPolicy: DrawdownPolicy;
+    transitionStrategy: ProfileTransitionStrategy;
+    quoteCurrency: QuoteCurrency;
+    startingAmount: string;
+    customDrawdown: string;
+  } | null>(null);
   const profileDialogOpen = pendingProfile !== null;
   const profileDialogRef = useRef<HTMLElement>(null);
   const profileReturnFocusRef = useRef<HTMLElement | null>(null);
-  const snapshotDrawdownPolicy = snapshot.season_profile?.drawdown_policy;
-  const profileSyncKey = `${snapshot.season_profile?.profile_fingerprint ?? "uninitialized"}:${snapshotDrawdownPolicy?.kind ?? "default"}:${snapshotDrawdownPolicy?.custom_threshold_bps ?? ""}`;
-  const [drawdownKind, setDrawdownKind] = useState<DrawdownPolicy["kind"]>(snapshotDrawdownPolicy?.kind ?? "default");
-  const [customDrawdown, setCustomDrawdown] = useState(() => snapshotDrawdownPolicy?.custom_threshold_bps ? String(snapshotDrawdownPolicy.custom_threshold_bps / 100) : "");
-  const [drawdownError, setDrawdownError] = useState<string | null>(null);
-  const [loadedProfileSyncKey, setLoadedProfileSyncKey] = useState(profileSyncKey);
-  if (loadedProfileSyncKey !== profileSyncKey) {
-    setLoadedProfileSyncKey(profileSyncKey);
-    setDrawdownKind(snapshotDrawdownPolicy?.kind ?? "default");
-    setCustomDrawdown(snapshotDrawdownPolicy?.custom_threshold_bps ? String(snapshotDrawdownPolicy.custom_threshold_bps / 100) : "");
-    setDrawdownError(null);
-  }
   const updateArenaLayout = useCallback((update: (current: ArenaLayoutPreferences) => ArenaLayoutPreferences) => {
     setArenaLayout((current) => {
       const next = update(current);
@@ -962,49 +1102,71 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
   const latestDecisionFeed = latestDecisionsByMint(snapshot.decisions).slice(0, 8);
   const capacityPositionCount = portfolio.positions.filter((item) => item.market_status !== "dormant").length;
   const autoSeasonHours = Math.max(1, Math.round(snapshot.season_automation.grace_seconds / 3600));
+  const autoSeasonChip = autoSeasonStatusChip(snapshot.season_automation, autoSeasonHours);
   const profileTransition = snapshot.season_operation?.kind === "profile_transition"
     && snapshot.season_operation.state === "running";
-  const selectedProfile = snapshot.season_profile_catalog.find((profile) => profile.risk_mode === snapshot.risk_mode)
-    ?? snapshot.season_profile;
-  const profileLocked = snapshot.season_profile?.locked_at !== null;
-  const requestProfile = (mode: RiskMode, drawdownPolicy: DrawdownPolicy) => {
-    if (mode === snapshot.risk_mode || busy || profileTransition) return;
-    if (profileLocked) {
-      profileReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      setPendingProfile({ mode, drawdownPolicy, transitionStrategy: "finish_safely" });
-    }
-    else void setRisk(mode, drawdownPolicy);
-  };
-  const chooseRiskMode = (mode: RiskMode) => {
-    if (mode === snapshot.risk_mode || busy || profileTransition) return;
-    requestProfile(mode, { kind: "default", custom_threshold_bps: null });
-  };
-  const applyDrawdownPolicy = () => {
-    let policy: DrawdownPolicy = { kind: drawdownKind, custom_threshold_bps: null };
-    if (drawdownKind === "custom") {
-      const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(customDrawdown.trim());
-      const value = Number(customDrawdown);
-      if (!match || !Number.isFinite(value) || value < 1 || value > 99) {
-        setDrawdownError("Enter a percentage from 1% to 99%, using at most two decimals.");
-        return;
-      }
-      policy = { kind: "custom", custom_threshold_bps: Math.round(value * 100) };
-    }
-    policy = canonicalDrawdownPolicy(snapshot.risk_mode, policy, snapshot.season_profile_catalog);
-    setDrawdownError(null);
-    const current = snapshot.season_profile?.drawdown_policy;
-    if (current?.kind === policy.kind && current.custom_threshold_bps === policy.custom_threshold_bps) return;
-    if (profileLocked) {
-      profileReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      setPendingProfile({ mode: snapshot.risk_mode, drawdownPolicy: policy, transitionStrategy: "finish_safely" });
-    }
-    else void setRisk(snapshot.risk_mode, policy);
+  const profileLocked = snapshot.season_profile === null || snapshot.season_profile.locked_at !== null;
+  const positionCapacity = snapshot.season_profile?.risk_limits.max_open_positions ?? null;
+  const exposureCap = typeof snapshot.season_profile?.risk_limits.max_exposure_fraction === "number"
+    ? snapshot.season_profile.risk_limits.max_exposure_fraction
+    : null;
+  const openSeasonEditor = (
+    mode: RiskMode = snapshot.risk_mode,
+    drawdownPolicy: DrawdownPolicy = snapshot.season_profile?.drawdown_policy
+      ?? { kind: "default", custom_threshold_bps: null },
+  ) => {
+    if (busy || profileTransition) return;
+    profileReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setPendingProfile({
+      mode,
+      drawdownPolicy,
+      transitionStrategy: "finish_safely",
+      quoteCurrency: portfolio.quote_currency,
+      startingAmount: minorAmountInput(portfolio.starting_lamports, portfolio.quote_decimals),
+      customDrawdown: drawdownPolicy.custom_threshold_bps
+        ? String(drawdownPolicy.custom_threshold_bps / 100)
+        : "",
+    });
   };
   const positionGroups = [
     { key: "active", label: "Active", hint: "Fresh, verified sell route", positions: portfolio.positions.filter((item) => item.market_status === "active") },
     { key: "exit_blocked", label: "Exit blocked", hint: "Fresh indication; route not currently executable", positions: portfolio.positions.filter((item) => item.market_status === "exit_blocked") },
     { key: "dormant", label: "Dormant", hint: "Still monitored; does not use an active slot", positions: portfolio.positions.filter((item) => item.market_status === "dormant") },
   ].filter((group) => group.positions.length > 0);
+  const pendingAmount = pendingProfile
+    ? parseStartingAmount(pendingProfile.startingAmount, pendingProfile.quoteCurrency)
+    : null;
+  const pendingCustomMatch = pendingProfile?.drawdownPolicy.kind === "custom"
+    ? /^(\d+)(?:\.(\d{1,2}))?$/.exec(pendingProfile.customDrawdown.trim())
+    : null;
+  const pendingCustomValue = pendingProfile?.drawdownPolicy.kind === "custom"
+    ? Number(pendingProfile.customDrawdown)
+    : null;
+  const pendingDrawdownError = pendingProfile?.drawdownPolicy.kind === "custom"
+    && (!pendingCustomMatch || !Number.isFinite(pendingCustomValue) || pendingCustomValue! < 1 || pendingCustomValue! > 99)
+    ? "Enter a drawdown from 1% to 99%, using at most two decimals."
+    : null;
+  const pendingResolvedPolicy = pendingProfile
+    ? canonicalDrawdownPolicy(
+      pendingProfile.mode,
+      pendingProfile.drawdownPolicy.kind === "custom" && pendingDrawdownError === null
+        ? { kind: "custom", custom_threshold_bps: Math.round(pendingCustomValue! * 100) }
+        : pendingProfile.drawdownPolicy,
+      snapshot.season_profile_catalog,
+    )
+    : null;
+  const pendingPlanChanged = Boolean(
+    pendingProfile
+    && pendingAmount !== null
+    && pendingAmount.minor !== null
+    && (
+      pendingProfile.quoteCurrency !== portfolio.quote_currency
+      || pendingAmount.minor !== portfolio.starting_lamports
+      || pendingProfile.mode !== snapshot.risk_mode
+      || pendingResolvedPolicy?.kind !== snapshot.season_profile?.drawdown_policy.kind
+      || pendingResolvedPolicy?.custom_threshold_bps !== snapshot.season_profile?.drawdown_policy.custom_threshold_bps
+    )
+  );
   return (
     <>
       <section className="page-heading">
@@ -1032,39 +1194,26 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
         </article>
 
         <article className="card risk-card">
-          <div className="card-label"><ShieldCheck size={16} /> Risk personality</div>
-          <h2>{title(snapshot.risk_mode)}</h2>
-          <p>{riskCopy(snapshot.risk_mode)}</p>
-          <div className="risk-profile-options" role="radiogroup" aria-label="Season risk personality">
-            {RISK_MODES.map((mode) => <button
-              type="button"
-              role="radio"
-              aria-checked={snapshot.risk_mode === mode}
-              className={snapshot.risk_mode === mode ? "active" : ""}
-              disabled={busy || profileTransition}
-              onClick={() => chooseRiskMode(mode)}
-              key={mode}
-            ><strong>{riskModeLabel(mode)}</strong><small>{profileLimitSummary(snapshot.season_profile_catalog.find((profile) => profile.risk_mode === mode) ?? null)}</small></button>)}
+          <div className="risk-profile-heading">
+            <div>
+              <div className="card-label"><ShieldCheck size={16} /> Current season profile</div>
+              <h2>{riskModeLabel(snapshot.risk_mode)}</h2>
+              <p>{riskCopy(snapshot.risk_mode)}</p>
+            </div>
+            <button type="button" className="button subtle" disabled={busy || profileTransition} onClick={() => openSeasonEditor()}><Settings size={14} />Edit next season</button>
           </div>
-          <div className="current-profile-read"><span>Portfolio drawdown halt</span><strong>{drawdownProfileLabel(snapshot.season_profile)}</strong><small>{profileLocked ? "Locked for this season" : "Editable until the first season starts"}</small></div>
-          <details className="drawdown-settings">
-            <summary>Advanced drawdown setting <ChevronDown size={13} /></summary>
-            <fieldset disabled={busy || profileTransition}>
-              <legend>Portfolio drawdown halt</legend>
-              <label><input type="radio" name="drawdown-policy" value="default" checked={drawdownKind === "default"} onChange={() => { setDrawdownKind("default"); setDrawdownError(null); }} /> <span><strong>Personality default</strong><small>{selectedProfile?.effective_drawdown_bps ? `${selectedProfile.effective_drawdown_bps / 100}% for ${riskModeLabel(snapshot.risk_mode)}` : "Backend policy default"}</small></span></label>
-              <label><input type="radio" name="drawdown-policy" value="custom" checked={drawdownKind === "custom"} onChange={() => { setDrawdownKind("custom"); setDrawdownError(null); }} /> <span><strong>Custom</strong><small>A separate season experiment</small></span></label>
-              {drawdownKind === "custom" && <label className="drawdown-custom"><span>Halt at</span><input aria-label="Custom drawdown percentage" value={customDrawdown} inputMode="decimal" onChange={(event) => { setCustomDrawdown(event.target.value); setDrawdownError(null); }} /><b>%</b></label>}
-              <label><input type="radio" name="drawdown-policy" value="disabled" checked={drawdownKind === "disabled"} onChange={() => { setDrawdownKind("disabled"); setDrawdownError(null); }} /> <span><strong>Off</strong><small>Only the portfolio halt is disabled</small></span></label>
-            </fieldset>
-            <p>Stop loss, trailing protection, exposure, position, stale-data, mint and route safety remain active.</p>
-            {drawdownError && <small className="drawdown-error" role="alert">{drawdownError}</small>}
-            <button type="button" className="button subtle" disabled={busy || profileTransition} onClick={applyDrawdownPolicy}>Apply to {profileLocked ? "a new season" : "this unstarted season"}</button>
-          </details>
+          <div className="active-profile-summary" aria-label="Current season settings">
+            <div><span>Paper bankroll</span><strong>{minorAmountInput(portfolio.starting_lamports, portfolio.quote_decimals)} {portfolio.quote_currency}</strong></div>
+            <div><span>Position capacity</span><strong>{positionCapacity === null ? "Unavailable" : `${positionCapacity} position${positionCapacity === 1 ? "" : "s"}`}</strong></div>
+            <div><span>Total exposure cap</span><strong>{exposureCap === null ? "Unavailable" : percent(exposureCap)}</strong></div>
+            <div><span>Drawdown halt</span><strong>{drawdownProfileLabel(snapshot.season_profile)}</strong></div>
+          </div>
+          <p className="active-profile-lock">{profileLocked ? "Locked for this season. Changes begin at a clean season boundary." : "Editable until the first decision locks this season."}</p>
           <div className="guardrail"><ShieldCheck size={17} /><span>Structural safety and stale-data gates always remain active.</span></div>
           <div className={`auto-season-control ${snapshot.season_automation.enabled ? "enabled" : ""}`}>
             <RotateCcw size={16} />
             <div><strong>Auto new season <em>{snapshot.season_automation.enabled ? "On" : "Off"}</em></strong><small>{snapshot.season_automation.enabled ? snapshot.season_automation.detail : snapshot.season_profile?.drawdown_policy.kind === "disabled" ? `Wait ${autoSeasonHours}h after genuine bankroll exhaustion; recoverable holdings and unknown data always defer rollover.` : `Wait ${autoSeasonHours}h after a guarded pause with no active holdings; healthy data is always required.`}</small></div>
-            {!snapshot.season_automation.enabled ? <label className="auto-season-delay">Wait<select aria-label="Automatic season wait" value={autoSeasonHours} disabled={busy} onChange={(event) => void setSeasonAutomation(false, Number(event.target.value))}>{Array.from({ length: 24 }, (_, index) => index + 1).map((hours) => <option value={hours} key={hours}>{hours}h</option>)}</select></label> : <span className="auto-season-delay-chip">{autoSeasonHours}h</span>}
+            {!snapshot.season_automation.enabled ? <label className="auto-season-delay">Wait<select aria-label="Automatic season wait" value={autoSeasonHours} disabled={busy} onChange={(event) => void setSeasonAutomation(false, Number(event.target.value))}>{Array.from({ length: 24 }, (_, index) => index + 1).map((hours) => <option value={hours} key={hours}>{hours}h</option>)}</select></label> : <span className={`auto-season-delay-chip state-${snapshot.season_automation.state}`} aria-label={autoSeasonChip.ariaLabel} title={snapshot.season_automation.detail}>{autoSeasonChip.label}</span>}
             <button type="button" role="switch" aria-checked={snapshot.season_automation.enabled} aria-label={`${snapshot.season_automation.enabled ? "Disable" : "Enable"} automatic new seasons`} disabled={busy} onClick={() => void setSeasonAutomation(!snapshot.season_automation.enabled, snapshot.season_automation.enabled ? undefined : autoSeasonHours)}><span /></button>
           </div>
         </article>
@@ -1138,27 +1287,43 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
           tabIndex={-1}
           ref={profileDialogRef}
         >
-          <ShieldCheck size={23} />
-          <h2 id="profile-confirm-title">Change to {riskModeLabel(pendingProfile.mode)} · {drawdownPolicyTargetLabel(pendingProfile.mode, pendingProfile.drawdownPolicy, snapshot.season_profile_catalog)}?</h2>
-          <p id="profile-confirm-copy">Choose how the current season reaches a clean boundary. The next season always starts with this exact profile and no inventory crosses between profiles.</p>
-          <fieldset className="profile-transition-options">
-            <legend>Season ending</legend>
+          <Settings size={23} />
+          <h2 id="profile-confirm-title">Edit the next paper season</h2>
+          <p id="profile-confirm-copy">Choose the complete target once. Currency, virtual bankroll and risk policy change together at one clean boundary; current inventory never crosses into the new profile.</p>
+          <div className="season-plan-current"><span>Current</span><strong>{portfolio.quote_currency} {minorAmountInput(portfolio.starting_lamports, portfolio.quote_decimals)} · {riskModeLabel(snapshot.risk_mode)} · {shortDrawdownLabel(snapshot.season_profile)}</strong></div>
+          <div className="season-plan-editor">
+            <fieldset className="season-plan-currency"><legend>Account currency</legend>{(["SOL", "USDC"] as QuoteCurrency[]).map((currency) => <label className={pendingProfile.quoteCurrency === currency ? "selected" : ""} key={currency}><input type="radio" name="next-season-currency" checked={pendingProfile.quoteCurrency === currency} onChange={() => setPendingProfile((current) => current ? { ...current, quoteCurrency: currency } : current)} /><span><strong>{currency}</strong><small>{currency === "SOL" ? "Native Solana accounting" : "Dollar-denominated accounting"}</small></span></label>)}</fieldset>
+            <label className="season-plan-amount"><span>Virtual starting bankroll</span><div><input aria-label="Next season starting amount" inputMode="decimal" value={pendingProfile.startingAmount} onChange={(event) => setPendingProfile((current) => current ? { ...current, startingAmount: event.target.value } : current)} /><b>{pendingProfile.quoteCurrency}</b></div>{pendingAmount?.error && <small role="alert">{pendingAmount.error}</small>}</label>
+            <fieldset className="season-plan-risk"><legend>Risk personality</legend>{RISK_MODES.map((mode) => <label className={pendingProfile.mode === mode ? "selected" : ""} key={mode}><input type="radio" name="next-season-risk" checked={pendingProfile.mode === mode} onChange={() => setPendingProfile((current) => current ? { ...current, mode } : current)} /><span><strong>{riskModeLabel(mode)}</strong><small>{profileLimitSummary(snapshot.season_profile_catalog.find((profile) => profile.risk_mode === mode) ?? null)}</small></span></label>)}</fieldset>
+            <fieldset className="season-plan-drawdown"><legend>Portfolio drawdown halt</legend>
+              <label className={pendingProfile.drawdownPolicy.kind === "default" ? "selected" : ""}><input type="radio" name="next-season-drawdown" checked={pendingProfile.drawdownPolicy.kind === "default"} onChange={() => setPendingProfile((current) => current ? { ...current, drawdownPolicy: { kind: "default", custom_threshold_bps: null } } : current)} /><span><strong>Personality default</strong><small>{drawdownPolicyTargetLabel(pendingProfile.mode, { kind: "default", custom_threshold_bps: null }, snapshot.season_profile_catalog)}</small></span></label>
+              <label className={pendingProfile.drawdownPolicy.kind === "custom" ? "selected" : ""}><input type="radio" name="next-season-drawdown" checked={pendingProfile.drawdownPolicy.kind === "custom"} onChange={() => setPendingProfile((current) => current ? { ...current, drawdownPolicy: { kind: "custom", custom_threshold_bps: null } } : current)} /><span><strong>Custom</strong><small>A separate season experiment</small></span></label>
+              {pendingProfile.drawdownPolicy.kind === "custom" && <label className="season-plan-custom"><input aria-label="Next season custom drawdown percentage" inputMode="decimal" value={pendingProfile.customDrawdown} onChange={(event) => setPendingProfile((current) => current ? { ...current, customDrawdown: event.target.value } : current)} /><b>%</b></label>}
+              <label className={pendingProfile.drawdownPolicy.kind === "disabled" ? "selected" : ""}><input type="radio" name="next-season-drawdown" checked={pendingProfile.drawdownPolicy.kind === "disabled"} onChange={() => setPendingProfile((current) => current ? { ...current, drawdownPolicy: { kind: "disabled", custom_threshold_bps: null } } : current)} /><span><strong>Off</strong><small>Structural safety still stays active</small></span></label>
+              {pendingDrawdownError && <small className="season-plan-error" role="alert">{pendingDrawdownError}</small>}
+            </fieldset>
+          </div>
+          {profileLocked && <fieldset className="profile-transition-options">
+            <legend>How should this season finish?</legend>
             <label className={pendingProfile.transitionStrategy === "finish_safely" ? "selected" : ""}>
               <input type="radio" name="profile-transition-strategy" value="finish_safely" checked={pendingProfile.transitionStrategy === "finish_safely"} onChange={() => setPendingProfile((current) => current ? { ...current, transitionStrategy: "finish_safely" } : current)} />
-              <span><strong>Finish safely <em>Recommended</em></strong><small>Freeze entries and keep managing positions with their original policy. Dormant holdings receive the configured recovery window.</small></span>
+              <span><strong>Finish safely <em>Recommended</em></strong><small>Freeze entries and manage positions under their original policy. Confirmed terminal inventory becomes an honest write-off after its recovery window.</small></span>
             </label>
             <label className={`manual ${pendingProfile.transitionStrategy === "end_now" ? "selected" : ""}`}>
               <input type="radio" name="profile-transition-strategy" value="end_now" checked={pendingProfile.transitionStrategy === "end_now"} onChange={() => setPendingProfile((current) => current ? { ...current, transitionStrategy: "end_now" } : current)} />
-              <span><strong>End season now</strong><small>Try genuine exits for up to 90 seconds. Anything still untradeable is recorded as unresolved—never as a made-up fill, win or loss.</small></span>
+              <span><strong>End season now</strong><small>Try genuine exits for up to 90 seconds, then classify remaining inventory from fresh route evidence. No fill, win or loss is invented.</small></span>
             </label>
-          </fieldset>
-          <div className={`profile-transition-impact ${pendingProfile.transitionStrategy === "end_now" ? "warning" : ""}`}>
-            {pendingProfile.transitionStrategy === "end_now" ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
-            <span>{pendingProfile.transitionStrategy === "end_now"
-              ? `${portfolio.positions.filter((position) => position.market_status === "active").length} executable · ${portfolio.positions.filter((position) => position.market_status !== "active").length} currently unresolved · ${portfolio.pending_orders.filter((order) => order.side === "sell").length} exits already pending. This season stays visible but is excluded from strategy comparisons.`
-              : `${portfolio.positions.length} open position${portfolio.positions.length === 1 ? "" : "s"} will keep the old policy until safely resolved.`}</span>
+          </fieldset>}
+          <div className={`profile-transition-impact ${pendingProfile.transitionStrategy === "end_now" && profileLocked ? "warning" : ""}`}>
+            {pendingProfile.transitionStrategy === "end_now" && profileLocked ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
+            <span>{!profileLocked
+              ? "This season has never started, so the exact target will replace it atomically without creating an empty scorecard."
+              : pendingProfile.transitionStrategy === "end_now"
+                ? `${portfolio.positions.filter((position) => position.market_status === "active").length} executable · ${portfolio.positions.filter((position) => position.market_status !== "active").length} non-executable · ${portfolio.pending_orders.filter((order) => order.side === "sell").length} exits already pending.`
+                : `${portfolio.positions.length} open position${portfolio.positions.length === 1 ? "" : "s"} will keep the old policy until safely resolved.`}</span>
           </div>
-          <div className="profile-confirm-actions"><button type="button" className="button ghost" onClick={closeProfileDialog}>Cancel</button><button type="button" className={`button ${pendingProfile.transitionStrategy === "end_now" ? "warning" : ""}`} onClick={() => { const target = pendingProfile; closeProfileDialog(); void setRisk(target.mode, target.drawdownPolicy, target.transitionStrategy); }}>{pendingProfile.transitionStrategy === "end_now" ? "End season & change profile" : "Change profile safely"}</button></div>
+          {pendingProfile.transitionStrategy === "end_now" && profileLocked && <p className="profile-manual-accounting">Remaining inventory is retained as a confirmed write-off or provider-unknown record—never as a made-up fill, win or loss. This manual boundary stays visible in Results but is excluded from strategy comparisons.</p>}
+          <div className="profile-confirm-actions"><button type="button" className="button ghost" onClick={closeProfileDialog}>Cancel</button><button type="button" className={`button ${pendingProfile.transitionStrategy === "end_now" && profileLocked ? "warning" : ""}`} disabled={!pendingPlanChanged || pendingAmount === null || pendingAmount.error !== null || pendingDrawdownError !== null} onClick={() => { const target = pendingProfile; const policy = pendingResolvedPolicy; if (!policy || pendingAmount?.minor === null || pendingAmount?.error) return; closeProfileDialog(); void setRisk(target.mode, policy, target.transitionStrategy, target.quoteCurrency, target.startingAmount.trim()); }}>{!pendingPlanChanged ? "No changes" : pendingProfile.transitionStrategy === "end_now" && profileLocked ? "End season & apply" : profileLocked ? "Apply after safe finish" : "Apply settings"}</button></div>
         </section>
       </div>}
     </>
@@ -1468,10 +1633,39 @@ function ReadinessGates({ gates, emptyCopy }: { gates: ReadinessGate[]; emptyCop
   </div>;
 }
 
-function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
+const CHALLENGER_SKILL_LABELS: Record<ChallengerChampionEvent["skill"], string> = {
+  entry: "Entry selection",
+  manipulation: "Manipulation defence",
+  sizing: "Position sizing",
+  exit: "Exit timing",
+};
+
+function championEventTitle(event: ChallengerChampionEvent): string {
+  if (event.kind === "first_champion") return "First Champion qualified";
+  if (event.kind === "promoted") return "New Champion earned";
+  if (event.kind === "defended") return "Champion defended";
+  return "No safe winner yet";
+}
+
+function championEventDetail(event: ChallengerChampionEvent): string {
+  if (event.kind === "first_champion") {
+    return `${CHALLENGER_SKILL_LABELS[event.skill]} established its first best-proved policy.`;
+  }
+  if (event.kind === "promoted") {
+    return `${compact(event.common_usable_count)} shared outcomes${event.uplift_lower_bound === null ? "" : ` · ${percentSigned(event.uplift_lower_bound)} conservative edge`}.`;
+  }
+  if (event.kind === "defended") {
+    return `${compact(event.common_usable_count)} shared outcomes · the contender did not beat the saved Champion safely.`;
+  }
+  return `${compact(event.common_usable_count)} shared outcomes · neither policy proved a safe advantage.`;
+}
+
+function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
   snapshot: Snapshot;
   setLearningMode: (mode: LearningMode) => Promise<void>;
   setAiMode: (mode: AiDecisionMode) => Promise<void>;
+  setCoachResearch: (enabled: boolean) => Promise<void>;
+  setCoachContribution: (enabled: boolean) => Promise<void>;
   busy: boolean;
   activeView: LearningViewKey;
   setActiveView: (view: LearningViewKey) => void;
@@ -1506,7 +1700,7 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
     collecting: "Collecting independent forward outcomes before fitting anything.",
     challenger_testing: "A challenger exists, but it has not beaten the baseline safely yet.",
     ready: "A challenger passed forward checks and can be enabled when you choose.",
-    active: "Qualified entry and hold challengers may act only inside their separate safety gates.",
+    active: "Qualified Challenger skills act only inside their separate safety gates.",
   }[learning.state];
   const stateCopy = liveHealth.state === "suspended"
     ? "A previously active learner showed confident harm on later unseen outcomes, so the baseline automatically took control."
@@ -1520,6 +1714,12 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
   const challengerPassed = learning.qualification_passed
     ?? challengerGates.filter((gate) => gate.state === "passed").length;
   const challengerTotal = learning.qualification_total ?? challengerGates.length;
+  const skillStatuses = learning.skills ?? [];
+  const championJourney = learning.champion_journey ?? [];
+  const latestChampionEvent = championJourney[0] ?? null;
+  const commonForwardMinimum = learning.challenger_common_forward_minimum ?? 30;
+  const minimumTournamentAvailability = learning.challenger_minimum_availability ?? 0.70;
+  const activeSkillCount = Math.max(1, Object.keys(learning.active_skill_versions ?? {}).length);
   const baselineState = learning.mode === "active" ? "Core + bounded learner" : "In control";
   const challengerState = liveHealth.state === "suspended"
     ? "Suspended safely"
@@ -1528,7 +1728,9 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
       : learning.mode === "active"
         ? "Active"
         : title(learning.state);
-  const coachState = snapshot.coach.mode === "off" ? "Off" : title(snapshot.coach.state);
+  const coachState = snapshot.coach.mode === "off"
+    ? snapshot.ai_lab.mode === "off" ? "Off" : "Paused"
+    : title(snapshot.coach.state);
   const views: Array<{ key: LearningViewKey; label: string; summary: string }> = [
     { key: "overview", label: "Overview", summary: "Team status and milestones" },
     { key: "baseline", label: "Baseline", summary: baselineState },
@@ -1619,7 +1821,7 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
       </div>
 
       <section className="card learning-progress-card">
-        <div><span className={`learning-state state-${learning.state}`} /> <strong>{title(learning.state)}</strong><small>{learning.mode === "active" ? `Active model · ${learning.active_model?.version ?? "none"} · ${duration(holdReview)} hold review` : `Baseline remains in control · ${duration(holdReview)} hold review`}</small></div>
+        <div><span className={`learning-state state-${learning.state}`} /> <strong>{title(learning.state)}</strong><small>{learning.mode === "active" ? `${activeSkillCount} bounded skill${activeSkillCount === 1 ? "" : "s"} active · ${duration(holdReview)} hold review` : `Baseline remains in control · ${duration(holdReview)} hold review`}</small></div>
         <div className="learning-progress-copy"><strong>{latest ? `${learning.usable_outcome_count} usable` : `${learning.usable_outcome_count} / ${learning.minimum_training_samples}`}</strong><small>{latest ? `Minimum ${learning.minimum_training_samples} met · ${nextChallengerCopy}` : "usable five-minute outcomes before first training"}</small></div>
         <div className="learning-progress" role="progressbar" aria-label={progressLabel} aria-valuemin={0} aria-valuemax={progressMax} aria-valuenow={progressNow}><span style={{ width: `${progress * 100}%` }} /></div>
       </section>
@@ -1630,6 +1832,67 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
         <Stat label="Still unfolding" value={compact(learning.pending_count)} hint="Measured at 1, 5, 10, 15 and 20 minutes" />
         <Stat label="Unknown outcomes" value={compact(learning.unavailable_outcome_count)} hint="No fake P/L; unavailable exits reduce horizon utility" />
       </section>
+
+      {skillStatuses.length > 0 && <section className="challenger-skill-grid" aria-label="Challenger skills">
+        {skillStatuses.map((skill) => {
+          const passed = skill.gates.filter((gate) => gate.state === "passed").length;
+          const candidate = skill.latest_candidate;
+          const latestSkillEvent = championJourney.find((event) => event.skill === skill.skill);
+          const contenderState = skill.testing_version
+            ? "Testing"
+            : !candidate
+              ? "Collecting"
+              : candidate.version === skill.champion?.version
+                ? "Champion"
+                : candidate.qualified
+                  ? "Qualified"
+                  : "Building proof";
+          const tournamentAvailability = typeof skill.tournament.availability_fraction === "number"
+            ? skill.tournament.availability_fraction
+            : null;
+          const battleProgress = skill.testing_version
+            ? skill.common_forward_count >= commonForwardMinimum
+              && tournamentAvailability !== null
+              && tournamentAvailability < minimumTournamentAvailability
+              ? `${percent(tournamentAvailability)} coverage · needs ${percent(minimumTournamentAvailability)}`
+              : `${skill.common_forward_count} / ${commonForwardMinimum} shared outcomes`
+            : latestSkillEvent
+              ? championEventTitle(latestSkillEvent)
+              : candidate
+                ? `${compact(candidate.sample_count)} outcomes`
+                : "Independent proof";
+          return <article className={`card challenger-skill-card skill-${skill.state}`} key={skill.skill}>
+            <header><div><span>{skill.skill}</span><strong>{skill.label}</strong></div><b>{title(skill.state)}</b></header>
+            <p>{skill.skill === "entry" ? "Selects among entries the Baseline already approved." : skill.skill === "manipulation" ? "Learns recurring adversarial flow patterns and may only veto." : skill.skill === "sizing" ? "Tests bounded 0.5x–2x sizes under the same executable route." : "May move the normal review earlier; hard exits never move."}</p>
+            <div className="challenger-skill-facts">
+              <span><small>Contender</small><strong>{contenderState}</strong></span>
+              <span><small>Best proved</small><strong>{skill.champion ? "Champion" : "None yet"}</strong></span>
+              <span><small>Influence</small><strong>{skill.active_version ? "Active" : skill.state === "suspended" ? "Suspended" : "Shadow"}</strong></span>
+            </div>
+            <footer><span>{passed} / {skill.gates.length} skill gates</span><span>{battleProgress}</span></footer>
+          </article>;
+        })}
+      </section>}
+
+      <LearningDisclosure
+        id="champion-journey-details"
+        title="Champion journey"
+        subtitle="Recent honest promotions and defences for this personality"
+        summary={latestChampionEvent ? championEventTitle(latestChampionEvent) : "Waiting for first Champion"}
+        open={expandedSections.has("champion_journey")}
+        onToggle={() => toggleSection("champion_journey")}
+      >
+        {championJourney.length > 0
+          ? <ol className="champion-journey-list" aria-label="Recent Challenger Champion milestones">
+            {championJourney.slice(0, 8).map((event) => <li key={event.event_id}>
+              <span className={`champion-journey-icon event-${event.kind}`} aria-hidden="true">{event.kind === "promoted" || event.kind === "first_champion" ? <Trophy size={14} /> : <ShieldCheck size={14} />}</span>
+              <span><small>{CHALLENGER_SKILL_LABELS[event.skill]}</small><strong>{championEventTitle(event)}</strong><em>{championEventDetail(event)}</em></span>
+              <time dateTime={event.occurred_at}>{shortDate(event.occurred_at)}</time>
+            </li>)}
+          </ol>
+          : <EmptyState icon={<History size={22} />} title="No recorded Champion battles yet" copy="Existing Champions remain valid. Honest journey history begins with the next completed challenge; Signal Arcade does not invent past battles." />}
+        <p className="champion-journey-note"><ShieldCheck size={13} />Season profit stays in Results. A Champion means safer forward proof, never guaranteed profit.</p>
+      </LearningDisclosure>
 
       <LearningDisclosure
         id="challenger-readiness-details"
@@ -1678,9 +1941,9 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
     </>}
 
     {activeView === "coach" && <>
-      <div className="learning-view-heading"><div><span>AI Coach</span><h2>Slow, asynchronous experiments that can never delay a trade</h2></div><strong>{snapshot.coach.mode === "off" ? "Off" : `${coachState} · Shadow`}</strong></div>
-      <div className="local-ai-boundary"><Bot size={17} /><div><strong>One shared local AI mode</strong><small>Off or Shadow controls both the Coach and saved decision reviews. Coach experiments remain zero-influence in this version.</small></div></div>
-      <CoachRoom snapshot={snapshot} />
+      <div className="learning-view-heading"><div><span>AI Coach</span><h2>Slow, asynchronous experiments that can never delay a trade</h2></div><strong>{snapshot.ai_lab.mode === "off" ? "Off" : `${coachState} · Shadow`}</strong></div>
+      <div className="local-ai-boundary"><Bot size={17} /><div><strong>Research director, never a hidden trader</strong><small>The Coach studies saved outcomes. With your permission, a supported idea may enter a normal Challenger tournament; it can never bypass proof or act directly.</small></div></div>
+      <CoachRoom snapshot={snapshot} setCoachResearch={setCoachResearch} setCoachContribution={setCoachContribution} busy={busy} expandedSections={expandedSections} toggleSection={toggleSection} />
     </>}
 
     {activeView === "reviews" && <>
@@ -1697,15 +1960,24 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, busy, activeView, s
   </>;
 }
 
-function CoachRoom({ snapshot }: { snapshot: Snapshot }) {
+function CoachRoom({ snapshot, setCoachResearch, setCoachContribution, busy, expandedSections, toggleSection }: {
+  snapshot: Snapshot;
+  setCoachResearch: (enabled: boolean) => Promise<void>;
+  setCoachContribution: (enabled: boolean) => Promise<void>;
+  busy: boolean;
+  expandedSections: Set<LearningSectionKey>;
+  toggleSection: (section: LearningSectionKey) => void;
+}) {
   const coach = snapshot.coach;
   const current = coach.recent_hypotheses.find((item) => item.context_active);
-  const active = coach.mode === "shadow" && (current?.state === "testing" || current?.state === "promising");
+  const active = coach.mode === "shadow" && current?.state === "testing";
   const progress = current
     ? Math.min(1, current.forward_usable_count / current.minimum_forward_samples)
     : 0;
   const stateCopy: Record<typeof coach.state, string> = {
-    off: "Enable AI Shadow when you want the local coach to review completed evidence.",
+    off: snapshot.ai_lab.mode === "off"
+      ? "Enable AI Shadow when you want the local coach to review completed evidence."
+      : "Coach research is paused. Saved Shadow reviews and completed studies remain available.",
     waiting: coach.paused_reason === "protecting_open_positions"
       ? "The coach is waiting while the engine manages open positions."
       : coach.paused_reason === "protecting_market_throughput"
@@ -1715,35 +1987,50 @@ function CoachRoom({ snapshot }: { snapshot: Snapshot }) {
           : "Waiting for enough new measured outcomes to review another idea.",
     reviewing: "The local model is comparing bounded experiments in the background.",
     testing: "A coaching idea is collecting only outcomes created after it was proposed.",
-    promising: "This idea has survived its forward Shadow test across multiple seasons.",
-    inconclusive: "Too many forward exits were unavailable to trust this experiment yet.",
+    promising: "This idea survived independent forward proof. It still cannot trade directly.",
+    inconclusive: "The bounded study ended without enough reliable evidence to support it.",
     not_supported: "New forward evidence did not support this coaching idea.",
   };
   const latestReview = coach.recent_reviews[0];
   const coachGates = coach.qualification_gates ?? [];
   const coachPassed = coach.qualification_passed ?? coachGates.filter((gate) => gate.state === "passed").length;
   const coachTotal = coach.qualification_total ?? coachGates.length;
+  const lanes = coach.research_lanes ?? [];
+  const currentSkill = current?.skill
+    ?? (current?.kind === "earlier_review" ? "exit" : current?.kind === "sizing_multiplier" ? "sizing" : current?.kind === "manipulation_veto" ? "manipulation" : "entry");
+  const contributionEnabled = coach.contribution_enabled ?? false;
+  const contributionReady = coach.contribution_ready ?? current?.contribution_state === "ready";
+  const contributionCandidate = coach.contribution_candidate;
+  const researchEnabled = coach.research_enabled ?? coach.mode === "shadow";
+  const notebook = coach.recent_hypotheses.filter((item) => item.context_active);
   return <article className="card coach-card">
     <div className="coach-heading">
       <SectionHeader title="AI Coach" subtitle="Slow, allowlisted experiments for the fast engine · Shadow-only" />
-      <span className={`coach-state state-${coach.state}`}>{title(coach.state)}</span>
+      <div className="coach-heading-actions"><span className={`coach-state state-${coach.state}`}>{title(coach.state)}</span><button className="button subtle" disabled={busy || snapshot.ai_lab.mode === "off"} onClick={() => void setCoachResearch(!researchEnabled)}>{researchEnabled ? "Pause research" : "Start research"}</button></div>
     </div>
     <div className="coach-summary">
-      <div><span>Coach mode</span><strong>{coach.mode === "shadow" ? "Watching" : "Off"}</strong><small>{coach.mode === "off" ? "No local model work" : coach.worker_running ? "Background worker healthy" : "No AI coach calls"}</small></div>
-      <div><span>Influence</span><strong>None</strong><small>Cannot change entries, exits, sizing or safety</small></div>
+      <div><span>Coach mode</span><strong>{coach.mode === "shadow" ? "Watching" : snapshot.ai_lab.mode === "off" ? "Off" : "Paused"}</strong><small>{snapshot.ai_lab.mode === "off" ? "No local model work" : coach.mode === "off" ? "Research can resume without losing evidence" : coach.worker_running ? "Background worker healthy" : "No AI coach calls"}</small></div>
+      <div><span>Influence</span><strong>Research only</strong><small>{contributionEnabled ? "Proved ideas may challenge · never act directly" : "Cannot change entries, exits, sizing or safety"}</small></div>
       <div><span>Next review</span><strong>{active ? "Forward test active" : coach.outcomes_until_review === 0 ? "When the engine is quiet" : `${coach.outcomes_until_review} outcomes`}</strong><small>{coach.outcomes_seen.toLocaleString()} fee-inclusive outcomes seen</small></div>
     </div>
     <p className="coach-state-copy"><Bot size={15} />{stateCopy[coach.state]}</p>
+    {lanes.length > 0 && <section className="coach-lane-grid" aria-label="AI Coach research lanes">
+      {lanes.map((lane) => <article key={lane.skill} className={`coach-lane lane-${lane.state}`}>
+        <span>{lane.label}</span><strong>{title(lane.state)}</strong>
+        <small>{lane.current_title || "Watching measured outcomes"}</small>
+        <em>{lane.supported_studies} supported · {lane.studies} studied</em>
+      </article>)}
+    </section>}
     {current ? <div className="coach-experiment">
       <div className="coach-experiment-head">
-        <div><span>{current.kind === "entry_veto" ? "Entry protection experiment" : "Exit timing experiment"}</span><strong>{current.title}</strong><small>{current.rationale}</small></div>
+        <div><span>{CHALLENGER_SKILL_LABELS[currentSkill]} research</span><strong>{current.title}</strong><small>{current.rationale}</small></div>
         <span className={`coach-experiment-state state-${current.state}`}>{title(current.state)}</span>
       </div>
       <div className="coach-proof-grid">
         <div><span>Historical screen</span><strong>{current.discovery_uplift_lower_bound === null ? "Unknown" : `${percentSigned(current.discovery_uplift_lower_bound)} floor`}</strong><small>{current.discovery_usable_count} usable · could only propose</small></div>
         <div><span>New forward evidence</span><strong>{current.forward_mean_uplift === null ? "Collecting" : percentSigned(current.forward_mean_uplift)}</strong><small>{current.forward_usable_count} / {current.minimum_forward_samples} usable</small></div>
         <div><span>Outcome coverage</span><strong>{percent(current.forward_availability_fraction)}</strong><small>Needs {percent(current.minimum_availability_fraction)}</small></div>
-        <div><span>Independent seasons</span><strong>{current.forward_season_count} / {coach.minimum_forward_seasons}</strong><small>No historical double counting</small></div>
+        <div><span>Independent seasons</span><strong>{current.forward_season_count} / {coach.minimum_forward_seasons}</strong><small>{coach.minimum_samples_per_season ?? 10}+ usable outcomes in each</small></div>
       </div>
       <div className="coach-progress" role="progressbar" aria-label="Coach forward-test progress" aria-valuemin={0} aria-valuemax={current.minimum_forward_samples} aria-valuenow={current.forward_usable_count}><span style={{ width: `${progress * 100}%` }} /></div>
     </div> : <div className="coach-empty">
@@ -1751,9 +2038,28 @@ function CoachRoom({ snapshot }: { snapshot: Snapshot }) {
       <div><strong>{latestReview?.selected_candidate_id === "none" ? "No experiment cleared screening yet" : "The coach is observing"}</strong><small>{latestReview?.summary || "It will review compact, normalized outcomes without placing work on the live decision path."}</small></div>
     </div>}
     {coach.last_error && <p className="coach-safe-error"><ShieldCheck size={14} />Optional coaching is waiting after a local-model issue; the engine was unaffected.</p>}
-    <ReadinessGates gates={coachGates} emptyCopy="No Coach experiment is selected yet, so its forward Shadow proof has not started." />
-    {coachTotal > 0 && <p className="coach-proof-note"><ShieldCheck size={13} />{coachPassed} / {coachTotal} Shadow proof gates passed. Even a Promising result has no influence in this version.</p>}
-    <div className="coach-guardrails">{coach.guardrails.slice(0, 4).map((item) => <span key={item}><ShieldCheck size={13} />{item}</span>)}</div>
+
+    <LearningDisclosure id="coach-notebook" title="Research notebook" subtitle="Honest supported, rejected and inconclusive studies" summary={notebook.length ? `${notebook.length} recent ${notebook.length === 1 ? "study" : "studies"}` : "Waiting for first study"} open={expandedSections.has("coach_notebook")} onToggle={() => toggleSection("coach_notebook")}>
+      {notebook.length > 0 ? <ol className="coach-notebook-list">
+        {notebook.slice(0, 8).map((item) => <li key={item.hypothesis_id}>
+          <span className={`state-${item.state}`}><BrainCircuit size={14} /></span>
+          <div><small>{CHALLENGER_SKILL_LABELS[item.skill ?? (item.kind === "earlier_review" ? "exit" : "entry")]}</small><strong>{item.title}</strong><em>{title(item.state)} · {item.forward_usable_count} usable forward outcomes</em></div>
+          <time dateTime={item.updated_at}>{shortDate(item.updated_at)}</time>
+        </li>)}
+      </ol> : <EmptyState icon={<BrainCircuit size={22} />} title="The notebook is empty" copy="The Coach will record the first bounded study only after enough fee-inclusive evidence clears screening." />}
+    </LearningDisclosure>
+
+    <LearningDisclosure id="coach-contribution" title="Road to contribution" subtitle="Coach proof first, then a completely new Challenger battle" summary={current?.contribution_state === "handed_off" ? "Contender handed off" : contributionEnabled ? "Permission on" : contributionReady ? "Permission available" : `${coachPassed} / ${coachTotal || 6} Coach gates`} open={expandedSections.has("coach_contribution")} onToggle={() => toggleSection("coach_contribution")}>
+      <div className="coach-contribution-path" aria-label="Coach contribution path"><span>Allowlisted idea</span><ChevronRight size={14} /><span>Coach forward proof</span><ChevronRight size={14} /><span>Challenger contender</span><ChevronRight size={14} /><span>Champion battle</span></div>
+      {contributionCandidate && <p className="coach-contribution-candidate"><BrainCircuit size={14} /><span><strong>{CHALLENGER_SKILL_LABELS[contributionCandidate.skill]} idea ready</strong><small>{contributionCandidate.title}{contributionCandidate.state === "waiting_for_champion" ? " · waiting for that skill's first statistical Champion" : ""}</small></span></p>}
+      <ReadinessGates gates={coachGates} emptyCopy="No Coach experiment is selected yet, so its independent forward proof has not started." />
+      <div className="coach-contribution-control"><div><strong>Allow proved Coach ideas to challenge</strong><small>Permission only hands a supported policy to the existing statistical tournament. It never enables direct AI trading.</small></div><button className={`button ${contributionEnabled ? "ghost" : "learning-primary"}`} disabled={busy || (!contributionEnabled && (snapshot.ai_lab.mode === "off" || !contributionReady))} onClick={() => void setCoachContribution(!contributionEnabled)}>{contributionEnabled ? "Turn contribution off" : "Allow contribution"}</button></div>
+      {coachTotal > 0 && <p className="coach-proof-note"><ShieldCheck size={13} />{coachPassed} / {coachTotal} Coach proof gates passed. Challenger tournament evidence begins only after handoff.</p>}
+    </LearningDisclosure>
+
+    <LearningDisclosure id="coach-safety" title="Permanent Coach boundaries" subtitle="Performance, authority and data-quality limits" summary={`${coach.guardrails.length} always active`} open={expandedSections.has("coach_safety")} onToggle={() => toggleSection("coach_safety")}>
+      <div className="coach-guardrails">{coach.guardrails.map((item) => <span key={item}><ShieldCheck size={13} />{item}</span>)}</div>
+    </LearningDisclosure>
   </article>;
 }
 
@@ -1940,7 +2246,7 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
 
   return <>
     <section className="page-heading leaderboard-heading">
-      <div><span className="eyebrow"><Trophy size={14} /> Results board</span><h1>{view === "trades" ? "Wins, losses, and the evidence behind them." : "Is the strategy improving each season?"}</h1><p>{view === "trades" ? "Review this season's net-of-fee paper trades, then open the exact saved entry and exit evidence." : "Compare like-for-like currencies and profiles while keeping every season scorecard available."}</p></div>
+      <div><span className="eyebrow"><Trophy size={14} /> Results board</span><h1>{view === "trades" ? "Wins, losses, and the evidence behind them." : "Is the strategy improving each season?"}</h1><p>{view === "trades" ? "Review this season's net-of-fee paper trades, then open the exact saved entry and exit evidence." : "Compare like-for-like bankrolls, profiles, and accounting rules while keeping every season scorecard available."}</p></div>
       <div className="results-controls">
         <div className="results-view-tabs" aria-label="Results view">
           <button className={view === "trades" ? "active" : ""} aria-pressed={view === "trades"} onClick={() => setView("trades")}>Trades</button>
@@ -1994,7 +2300,55 @@ function SeasonsView({ reportIssue, resolveIssue }: {
   const [chartRange, setChartRange] = useState<10 | 25 | "all">(10);
   const [historyLimit, setHistoryLimit] = useState<number | "all">(20);
   const [profileFilter, setProfileFilter] = useState<string>("current");
+  const [comparisonPickerOpen, setComparisonPickerOpen] = useState(false);
   const consecutiveFailures = useRef(0);
+  const comparisonPickerTriggerRef = useRef<HTMLButtonElement>(null);
+  const comparisonPickerDialogRef = useRef<HTMLElement>(null);
+
+  const closeComparisonPicker = useCallback(() => setComparisonPickerOpen(false), []);
+  useEffect(() => {
+    if (!comparisonPickerOpen) return;
+    const dialog = comparisonPickerDialogRef.current;
+    const trigger = comparisonPickerTriggerRef.current;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusFrame = window.requestAnimationFrame(() => {
+      const selected = dialog?.querySelector<HTMLElement>('[aria-checked="true"]');
+      (selected ?? dialog)?.focus();
+    });
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeComparisonPicker();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )];
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", handleKey);
+      document.body.style.overflow = previousOverflow;
+      trigger?.focus();
+    };
+  }, [closeComparisonPicker, comparisonPickerOpen]);
 
   useEffect(() => {
     let active = true;
@@ -2041,30 +2395,104 @@ function SeasonsView({ reportIssue, resolveIssue }: {
 
   // Keep the Results view readable during a rolling backend/frontend update: an older
   // cached response is valid legacy history, not a reason to blank the entire tab.
+  const derivedComparisonGroups = deriveSeasonComparisonGroups(data.seasons);
   const comparisonGroups = data.comparison_groups?.length
-    ? data.comparison_groups
-    : deriveSeasonComparisonGroups(data.seasons);
+    ? data.comparison_groups.map((group) => ({
+      ...derivedComparisonGroups.find(
+        (derived) => derived.comparison_key === group.comparison_key,
+      ),
+      ...group,
+    }))
+    : derivedComparisonGroups;
   const currentSeason = data.seasons.find((season) => season.status === "current") ?? null;
   const currentComparisonKey = data.current_comparison_key
     ?? (currentSeason ? seasonComparisonKey(currentSeason) : null);
-  const resolvedProfileFilter = profileFilter === "current"
-    ? currentComparisonKey ?? "all"
+  const currentComparisonGroup = comparisonGroups.find(
+    (group) => group.comparison_key === currentComparisonKey,
+  ) ?? null;
+  const comparisonPickerSections: SeasonComparisonPickerSection[] = [];
+  if (currentComparisonKey) {
+    comparisonPickerSections.push({
+      label: "Current",
+      options: [{
+        value: "current",
+        label: "Current comparison",
+        detail: currentComparisonGroup
+          ? `${seasonComparisonGroupLabel(currentComparisonGroup)} · ${seasonComparisonGroupContext(currentComparisonGroup)}`
+          : "The exact settings used by the running paper season",
+      }],
+    });
+  }
+  for (const currency of ["SOL", "USDC"] as QuoteCurrency[]) {
+    const variants = comparisonGroups.filter((group) => group.quote_currency === currency);
+    if (!variants.length) continue;
+    const seasonCount = variants.reduce((sum, group) => sum + group.season_count, 0);
+    const exactOptions = variants
+      .filter((group) => group.comparison_key !== currentComparisonKey)
+      .map((group) => ({
+        value: group.comparison_key,
+        label: seasonComparisonGroupLabel(group, false),
+        detail: seasonComparisonGroupContext(group),
+      }));
+    comparisonPickerSections.push({
+      label: `${currency} seasons`,
+      options: [{
+        value: `currency:${currency}`,
+        label: `All ${currency} seasons`,
+        detail: `${seasonCount} retained season${seasonCount === 1 ? "" : "s"} across ${variants.length} comparison group${variants.length === 1 ? "" : "s"}`,
+      }, ...exactOptions],
+    });
+  }
+  comparisonPickerSections.push({
+    label: "Complete history",
+    options: [{
+      value: "all",
+      label: "All seasons",
+      detail: `${data.seasons.length} retained season${data.seasons.length === 1 ? "" : "s"} across every currency and policy`,
+    }],
+  });
+  const comparisonPickerOptions = comparisonPickerSections.flatMap((section) => section.options);
+  const requestedPickerFilter = profileFilter === currentComparisonKey
+    ? "current"
     : profileFilter;
+  const normalizedProfileFilter = comparisonPickerOptions.some(
+    (option) => option.value === requestedPickerFilter,
+  )
+    ? requestedPickerFilter
+    : currentComparisonKey ? "current" : "all";
+  const selectedPickerOption = comparisonPickerOptions.find(
+    (option) => option.value === normalizedProfileFilter,
+  ) ?? comparisonPickerOptions[0];
+  const resolvedProfileFilter = normalizedProfileFilter === "current"
+    ? currentComparisonKey ?? "all"
+    : normalizedProfileFilter;
+  const filteredCurrency = resolvedProfileFilter.startsWith("currency:")
+    ? resolvedProfileFilter.slice("currency:".length) as QuoteCurrency
+    : null;
   const filteredSeasons = resolvedProfileFilter === "all"
     ? data.seasons
-    : data.seasons.filter((season) => seasonComparisonKey(season) === resolvedProfileFilter);
+    : filteredCurrency
+      ? data.seasons.filter((season) => season.quote_currency === filteredCurrency)
+      : data.seasons.filter((season) => seasonComparisonKey(season) === resolvedProfileFilter);
   const orderedSeasons = [...filteredSeasons].sort((left, right) => left.season_number - right.season_number);
   const completed = orderedSeasons.filter((season) => season.status === "completed");
   const comparableCompleted = completed.filter((season) => season.comparable !== false);
   const excludedCompletedCount = completed.length - comparableCompleted.length;
-  const selectedComparison = resolvedProfileFilter === "all"
-    ? comparisonGroups.length === 1 ? comparisonGroups[0] ?? null : null
+  const selectedGroups = filteredCurrency
+    ? comparisonGroups.filter((group) => group.quote_currency === filteredCurrency)
+    : comparisonGroups;
+  const selectedComparison = resolvedProfileFilter === "all" || filteredCurrency
+    ? selectedGroups.length === 1 ? selectedGroups[0] ?? null : null
     : comparisonGroups.find((group) => group.comparison_key === resolvedProfileFilter) ?? null;
-  const mixedHistory = resolvedProfileFilter === "all" && comparisonGroups.length > 1;
-  const legacyHistory = !mixedHistory && selectedComparison?.profile_provenance !== "exact";
+  const mixedHistory = (resolvedProfileFilter === "all" || filteredCurrency !== null)
+    && selectedGroups.length > 1;
+  const legacyHistory = !mixedHistory && (
+    selectedComparison?.profile_provenance !== "exact"
+    || selectedComparison?.terminal_policy_version !== "executable-boundary-v2"
+  );
   const comparisonClaimsHidden = mixedHistory || legacyHistory;
   const trend = mixedHistory
-    ? { title: "Mixed comparison history", copy: "Choose one currency and exact profile for a like-for-like performance trend.", tone: "neutral" as const }
+    ? { title: "Mixed comparison history", copy: "Choose one exact bankroll, profile and boundary policy for a like-for-like performance trend.", tone: "neutral" as const }
     : legacyHistory
       ? { title: "Legacy policy unknown", copy: "These scorecards remain available, but their exact policy cannot support an improvement claim.", tone: "neutral" as const }
     : seasonTrend(comparableCompleted);
@@ -2073,7 +2501,10 @@ function SeasonsView({ reportIssue, resolveIssue }: {
     if (best === null || best.net_return_fraction === null || season.net_return_fraction > best.net_return_fraction) return season;
     return best;
   }, null);
-  const chartEligibleSeasons = orderedSeasons.filter((season) => season.status === "current" || season.comparable !== false);
+  const chartEligibleSeasons = orderedSeasons.filter((season) => (
+    season.status === "current"
+    || (season.status === "completed" && season.accounting_status !== "empty" && season.meaningful_activity !== false)
+  ));
   const chartSeasons = chartRange === "all" ? chartEligibleSeasons : chartEligibleSeasons.slice(-chartRange);
   const newestSeasons = [...orderedSeasons].reverse();
   const visibleHistory = historyLimit === "all" ? newestSeasons : newestSeasons.slice(0, historyLimit);
@@ -2085,33 +2516,25 @@ function SeasonsView({ reportIssue, resolveIssue }: {
     : null;
   return <>
     <section className="season-profile-filter card">
-      <div><span>Compare seasons</span><strong>{mixedHistory ? "All seasons · mixed history" : seasonComparisonGroupLabel(selectedComparison)}</strong><small>{mixedHistory ? "These seasons used different currencies or policies; aggregate improvement claims are intentionally hidden." : legacyHistory ? "Currency matches, but the historical policy is unknown; comparison claims stay hidden." : "Every statistic, chart and scorecard below uses the same currency and exact profile."}</small></div>
-      <label><span>Season comparison</span><select value={profileFilter} onChange={(event) => { setProfileFilter(event.target.value); setHistoryLimit(20); }}>
-        {currentComparisonKey && <option value="current">Current comparison</option>}
-        {(["SOL", "USDC"] as QuoteCurrency[]).map((currency) => {
-          const variants = comparisonGroups.filter((group) => group.quote_currency === currency);
-          return variants.length ? <optgroup label={`${currency} seasons`} key={currency}>
-            {variants.map((group) => <option value={group.comparison_key} key={group.comparison_key}>{seasonComparisonGroupLabel(group, false)} · {group.season_count}</option>)}
-          </optgroup> : null;
-        })}
-        <option value="all">All seasons</option>
-      </select></label>
+      <div><span>Compare seasons</span><strong>{mixedHistory ? `${filteredCurrency ? `All ${filteredCurrency}` : "All seasons"} · mixed settings` : seasonComparisonGroupLabel(selectedComparison)}</strong><small>{mixedHistory ? "These scorecards remain visible, but bankroll, policy or boundary differences hide aggregate improvement claims." : legacyHistory ? "This retained history predates exact boundary accounting; comparison claims stay hidden." : "Every comparison statistic uses the same currency, starting bankroll, exact profile and terminal policy."}</small></div>
+      <div className="season-comparison-control"><span id="season-comparison-control-label">Season comparison</span><button ref={comparisonPickerTriggerRef} type="button" className="season-comparison-trigger" aria-labelledby="season-comparison-control-label" aria-haspopup="dialog" aria-expanded={comparisonPickerOpen} onClick={() => setComparisonPickerOpen(true)}><span><strong>{selectedPickerOption?.label ?? "Choose comparison"}</strong><small>{selectedPickerOption?.detail ?? "Select retained season history"}</small></span><ChevronDown size={15} /></button></div>
+      {comparisonPickerOpen && <div className="season-comparison-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeComparisonPicker(); }}><section ref={comparisonPickerDialogRef} className="season-comparison-dialog" role="dialog" aria-modal="true" aria-labelledby="season-comparison-title" aria-describedby="season-comparison-copy" tabIndex={-1}><header><div><strong id="season-comparison-title">Choose season comparison</strong><small id="season-comparison-copy">Exact strategy and accounting generations remain separate.</small></div><button type="button" aria-label="Close season comparison" onClick={closeComparisonPicker}><X size={16} /></button></header><div className="season-comparison-options">{comparisonPickerSections.map((section) => <section key={section.label} aria-label={section.label}><h3>{section.label}</h3><div role="radiogroup" aria-label={section.label}>{section.options.map((option) => <button type="button" role="radio" aria-checked={normalizedProfileFilter === option.value} className={normalizedProfileFilter === option.value ? "selected" : ""} key={option.value} onClick={() => { setProfileFilter(option.value); setHistoryLimit(20); closeComparisonPicker(); }}><span><strong>{option.label}</strong><small>{option.detail}</small></span>{normalizedProfileFilter === option.value && <Check size={16} />}</button>)}</div></section>)}</div></section></div>}
     </section>
     {!orderedSeasons.length && <div className="leaderboard-table"><EmptyState icon={<History size={22} />} title="No seasons for this comparison" copy="This retained currency and profile combination has not produced a paper season yet." /></div>}
     {!!orderedSeasons.length && <>
     <section className="stats-grid leaderboard-stats season-stats">
       <Stat label="Seasons" value={String(orderedSeasons.length)} hint="Filtered set" />
       <Stat label="Completed" value={String(completed.length)} />
-      <Stat label={mixedHistory ? "Groups" : "Profitable"} value={mixedHistory ? String(comparisonGroups.length) : String(profitableCount)} hint={mixedHistory ? "Mixed history" : legacyHistory ? "Raw scorecards" : "Comparable seasons"} tone={!comparisonClaimsHidden && profitableCount ? "good" : undefined} />
+      <Stat label={mixedHistory ? "Groups" : "Profitable"} value={mixedHistory ? String(selectedGroups.length) : String(profitableCount)} hint={mixedHistory ? "Mixed history" : legacyHistory ? "Raw scorecards" : "Comparable seasons"} tone={!comparisonClaimsHidden && profitableCount ? "good" : undefined} />
       <Stat label="Average win rate" value={comparisonClaimsHidden || averageWinRate === null ? "—" : percent(averageWinRate)} hint={mixedHistory ? "Select one comparison" : legacyHistory ? "Exact policy unknown" : "Comparable seasons"} />
     </section>
-    {excludedCompletedCount > 0 && <div className="season-comparison-note"><ShieldCheck size={15} /><span>{excludedCompletedCount} manually ended or unresolved season{excludedCompletedCount === 1 ? " is" : "s are"} retained below but excluded from best-season and performance comparisons.</span></div>}
+    {excludedCompletedCount > 0 && <div className="season-comparison-note"><ShieldCheck size={15} /><span>{excludedCompletedCount} manual, empty, legacy, or provider-unknown season{excludedCompletedCount === 1 ? " is" : "s are"} retained below but excluded from best-season and performance comparisons.</span></div>}
     <section className="season-overview-grid">
       <article className="card season-chart-card">
         <div className="season-card-heading">
           <div><span>Win rate by season</span><strong>Performance progression</strong></div>
           <div className="season-chart-actions">
-            <small>{chartRange === "all" ? `All ${chartEligibleSeasons.length} comparable seasons` : `Latest ${Math.min(chartRange, chartEligibleSeasons.length)} of ${chartEligibleSeasons.length}`}</small>
+            <small>{chartRange === "all" ? `All ${chartEligibleSeasons.length} recorded seasons` : `Latest ${Math.min(chartRange, chartEligibleSeasons.length)} of ${chartEligibleSeasons.length}`}</small>
             {chartEligibleSeasons.length > 10 && <div className="season-range-tabs" role="group" aria-label="Season chart range">
               <button type="button" className={chartRange === 10 ? "active" : ""} aria-pressed={chartRange === 10} onClick={() => setChartRange(10)}>Latest 10</button>
               <button type="button" className={chartRange === 25 ? "active" : ""} aria-pressed={chartRange === 25} onClick={() => setChartRange(25)}>Latest 25</button>
@@ -2184,7 +2607,7 @@ function SeasonWinChart({ seasons, all, total }: { seasons: PaperSeason[]; all: 
     <div className={`season-chart-bars ${seasons.length > 12 ? "compact" : ""}`} ref={barsRef}>
       {seasons.map((season) => {
         const rate = season.win_rate;
-        return <div className={`season-chart-column ${season.status}`} key={season.season_id}>
+        return <div className={`season-chart-column ${season.status} ${seasonChartBoundaryClass(season)}`} key={season.season_id}>
           <div className="season-chart-value">{rate === null ? "—" : percent(rate)}</div>
           <div className="season-chart-track"><span style={{ height: rate === null ? "0" : `${Math.max(0, Math.min(100, rate * 100))}%` }} /></div>
           <strong>S{season.season_number}</strong>
@@ -2244,7 +2667,11 @@ function SeasonHistoryChart({ seasons }: { seasons: PaperSeason[] }) {
     const season = seasons[index]!;
     const previousIndex = sampledIndexes[sampleIndex - 1];
     const breakBefore = previousIndex !== undefined
-      && missingPrefix[index]! - missingPrefix[previousIndex + 1]! > 0;
+      && (
+        missingPrefix[index]! - missingPrefix[previousIndex + 1]! > 0
+        || season.comparable === false
+        || seasons[previousIndex]?.comparable === false
+      );
     return {
       season,
       index,
@@ -2279,7 +2706,7 @@ function SeasonHistoryChart({ seasons }: { seasons: PaperSeason[] }) {
       })}
       {path && <path className="season-line-path" d={path.trim()} />}
       {sampledPoints.map((point) => <circle
-        className={`season-line-point ${point.season.status} ${(point.season.net_return_fraction ?? 0) >= 0 ? "positive" : "negative"}`}
+        className={`season-line-point ${point.season.status} ${seasonChartBoundaryClass(point.season)} ${(point.season.net_return_fraction ?? 0) >= 0 ? "positive" : "negative"}`}
         cx={point.x}
         cy={point.y}
         r={point.season.status === "current" ? 4.5 : 3}
@@ -2295,25 +2722,39 @@ function SeasonHistoryChart({ seasons }: { seasons: PaperSeason[] }) {
 function SeasonRow({ season }: { season: PaperSeason }) {
   const ending = season.ending_equity_minor;
   const winRate = season.win_rate;
-  const unresolved = season.result_quality === "unresolved" || (season.unresolved_inventory?.length ?? 0) > 0;
+  const boundaryInventory = season.unresolved_inventory ?? [];
+  const unknownCount = boundaryInventory.filter((item) => item.terminal_disposition !== "write_off").length;
+  const writeOffCount = season.write_off_count
+    ?? boundaryInventory.filter((item) => item.terminal_disposition === "write_off").length;
+  const unresolved = season.accounting_status === "incomplete_unknown"
+    || season.result_quality === "unresolved"
+    || unknownCount > 0;
+  const empty = season.accounting_status === "empty";
   return <div className={`season-row ${season.status} ${season.comparable === false ? "not-comparable" : ""}`} role="row">
-    <span className="season-identity" data-label="Season"><strong>Season {season.season_number}</strong><small>{season.status === "current" ? "Live scorecard" : `Finished ${shortDate(season.ended_at!)}`}</small><em>{season.status}</em>{unresolved && <em className="unresolved">unresolved</em>}{season.comparable === false && !unresolved && <em className="not-compared">not compared</em>}<b>{season.profile ? `${riskModeLabel(season.profile.risk_mode)} · ${shortDrawdownLabel(season.profile)}` : "Legacy / unknown"}</b>{season.terminal_reason && <small>Ended: {terminalReasonLabel(season.terminal_reason)}</small>}</span>
+    <span className="season-identity" data-label="Season"><strong>Season {season.season_number}</strong><small>{season.status === "current" ? "Live scorecard" : `Finished ${shortDate(season.ended_at!)}`}</small><em>{season.status}</em>{writeOffCount > 0 && <em className="write-off">{writeOffCount} write-off{writeOffCount === 1 ? "" : "s"}</em>}{unresolved && <em className="unresolved">provider unknown</em>}{empty && <em className="not-compared">empty</em>}{season.comparable === false && !unresolved && !empty && <em className="not-compared">not compared</em>}<b>{season.profile ? `${riskModeLabel(season.profile.risk_mode)} · ${shortDrawdownLabel(season.profile)}` : "Legacy / unknown"}</b>{season.terminal_reason && <small>Ended: {terminalReasonLabel(season.terminal_reason)}</small>}</span>
     <span data-label="Bankroll"><strong>{money(season.starting_minor, season.quote_currency, season.quote_decimals)}</strong><small>{ending === null ? "No equity mark" : `${season.status === "current" ? "Now" : unresolved ? "Executable end" : "Ended"} ${money(ending, season.quote_currency, season.quote_decimals)}`}</small></span>
     <span data-label="Net result" className={season.net_pnl_minor >= 0 ? "positive" : "negative"}><strong>{signedMoney(season.net_pnl_minor, season.quote_currency, season.quote_decimals)}</strong><small>{season.comparable === false ? "Excluded from comparisons" : season.net_return_fraction === null ? "—" : percentSigned(season.net_return_fraction)}</small></span>
     <span data-label="Win rate"><strong>{winRate === null ? "—" : percent(winRate)}</strong><small>{season.wins}W · {season.losses}L{season.break_even ? ` · ${season.break_even} even` : ""}</small></span>
     <span data-label="Trades"><strong>{season.closed_trades.toLocaleString()}</strong><small>{money(season.total_fees_minor, season.quote_currency, season.quote_decimals)} fees</small></span>
     <span data-label="Drawdown"><strong>{percent(season.ending_drawdown_fraction)}</strong><small>{season.open_positions ? `${season.open_positions} ${unresolved ? "unresolved at boundary" : `open at ${season.status === "current" ? "present" : "finish"}`}` : "No open positions"}</small></span>
     <span data-label="Duration"><strong>{longDuration(season.duration_seconds)}</strong><small>Started {shortDate(season.started_at)}</small></span>
-    {!!season.unresolved_inventory?.length && <details className="season-unresolved-detail">
-      <summary>Review unresolved inventory · {season.unresolved_inventory.length}</summary>
-      <div>{season.unresolved_inventory.map((position) => <span key={position.position_id}>
+    {!!boundaryInventory.length && <details className="season-unresolved-detail">
+      <summary>Review boundary inventory · {boundaryInventory.length}</summary>
+      <div>{boundaryInventory.map((position) => <span key={position.position_id}>
         <strong title={position.mint}>{tokenDisplayLabel(position.symbol, position.mint)}</strong>
-        <small>{position.token_units.toLocaleString()} raw token units · {humanize(position.market_status)}</small>
+        <small>{position.token_units.toLocaleString()} raw token units · {humanize(position.market_status)} · {position.terminal_disposition === "write_off" ? "confirmed write-off" : "provider unknown"}</small>
         <small>Last-known indication {money(position.last_known_mark_minor, position.quote_currency, position.quote_decimals)} · not an executed sale</small>
         <small>{position.mark_blockers.length ? position.mark_blockers.map(humanize).join(" · ") : "No executable route at the season boundary"}</small>
       </span>)}</div>
     </details>}
   </div>;
+}
+
+function seasonChartBoundaryClass(season: PaperSeason) {
+  if (season.accounting_status === "incomplete_unknown") return "boundary-unknown";
+  if (season.boundary_type === "end_now") return "boundary-manual";
+  if (season.accounting_status === "complete_with_writeoffs") return "boundary-write-off";
+  return "";
 }
 
 function seasonTrend(completed: PaperSeason[]): { title: string; copy: string; tone: "neutral" | "good" | "bad" } {
@@ -2364,11 +2805,25 @@ function DecisionEvidence({ decision }: { decision: Decision }) {
     ["One-way price movement", values.price_direction_consistency, "percent"],
     ["Multi-trade signatures", values.multi_trade_signature_ratio, "percent"],
   ] as const;
+  const integrity = decision.integrity_assessment;
+  const sizing = decision.sizing_assessment;
   return <section className="explain-evidence">
     <div className="explain-score-grid"><ScoreBar label="Opportunity" value={decision.score.opportunity} tone="good" /><ScoreBar label="Danger" value={decision.score.danger} tone="bad" /><ScoreBar label="Execution" value={decision.score.execution} tone="blue" /><ScoreBar label="Evidence confidence" value={decision.score.confidence} tone="purple" /></div>
     <h3>What the engine actually saw</h3>
     <div className="evidence-grid">{evidence.map(([label, item, format]) => <div key={label}><span>{label}</span><strong>{formatEvidence(item?.value, format)}</strong><small>{item ? `${Math.round(item.quality * 100)}% source quality · ${duration(item.freshness_seconds)} old` : "Not recorded"}</small></div>)}<div><span>Estimated entry impact</span><strong>{estimatedImpact === null ? "Unknown" : percent(estimatedImpact)}</strong><small>Planned paper size ÷ observed reserve depth</small></div></div>
-    <h3>Market integrity evidence · shadow learning</h3>
+    {sizing && <><h3>Paper sizing receipt</h3><div className="evidence-grid">
+      <div><span>Reference size</span><strong>{sizing.base_size_sol.toFixed(4)} SOL</strong><small>The personality's cautious starting point</small></div>
+      <div><span>Selected size</span><strong>{sizing.selected_size_sol.toFixed(4)} SOL</strong><small>{sizing.reasons.map(humanize).join(" · ")}</small></div>
+      <div><span>Realized-bankroll allocation</span><strong>{percent(sizing.account_allocation_fraction)}</strong><small>Unrealized gains cannot increase this target</small></div>
+      <div><span>Binding limit</span><strong>{sizing.constraints.map(humanize).join(" · ")}</strong><small>{humanize(sizing.policy_version)}</small></div>
+    </div></>}
+    {integrity && <><h3>Baseline market integrity</h3><div className="evidence-grid">
+      <div><span>Conclusion</span><strong>{humanize(integrity.state)}</strong><small>{integrity.evidence[0] ?? "No conclusion recorded"}</small></div>
+      <div><span>Usable coverage</span><strong>{percent(integrity.coverage)}</strong><small>{integrity.sample_count} trades in the frozen sample</small></div>
+      <div><span>Corroborating categories</span><strong>{integrity.category_count}</strong><small>{integrity.categories.length ? integrity.categories.map(humanize).join(" · ") : "No corroborated pattern"}</small></div>
+      <div><span>Integrity policy</span><strong>{humanize(integrity.policy_version)}</strong><small>Missing or short evidence remains uncertain</small></div>
+    </div></>}
+    <h3>{integrity ? "Evidence behind the integrity conclusion" : "Market integrity evidence · shadow learning"}</h3>
     <div className="evidence-grid">{integrityEvidence.map(([label, item, format]) => <div key={label}><span>{label}</span><strong>{formatEvidence(item?.value, format)}</strong><small>{item?.missing_reason ? humanize(item.missing_reason) : item ? `${Math.round(item.quality * 100)}% evidence coverage` : "Not recorded in this decision"}</small></div>)}</div>
     <div className="explain-gates"><div><strong>Positive evidence</strong>{decision.reasons.map((reason) => <span key={reason}><Check size={13} />{reason}</span>)}</div><div><strong>{decision.blockers.length ? "Gates that stopped entry" : "Safety gates"}</strong>{decision.blockers.length ? decision.blockers.map((blocker) => <span key={blocker}><AlertTriangle size={13} />{humanize(blocker)}</span>) : <span><ShieldCheck size={13} />All configured entry gates passed at this checkpoint.</span>}</div></div>
   </section>;
@@ -2836,9 +3291,15 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
     if (guidedSolana && solanaApiKey?.trim()) {
       const endpoints = guidedSolanaEndpoints(guidedSolana, solanaApiKey);
       secrets.solana_http = endpoints.http;
-      secrets.solana_ws = endpoints.ws;
       effectiveClear.delete("solana_http");
-      effectiveClear.delete("solana_ws");
+      if (endpoints.ws) {
+        secrets.solana_ws = endpoints.ws;
+        effectiveClear.delete("solana_ws");
+      }
+    }
+    if (guidedSolana?.streamMode === "default") {
+      delete secrets.solana_ws;
+      effectiveClear.add("solana_ws");
     }
     secrets.clear = [...effectiveClear] as ProviderSettingsUpdate["secrets"]["clear"];
     const body: ProviderSettingsUpdate = { configuration, secrets };
@@ -2877,9 +3338,17 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
       <div className="provider-list">
         {Object.entries(settings.providers).map(([name, provider]) => {
           const quota = snapshot.quotas[name];
+          const solanaStreamHealthy = name === "solana"
+            && provider.active
+            && snapshot.provider_health.connected === true;
+          const activity = name === "solana" && provider.active
+            ? solanaStreamHealthy
+              ? provider.stream_fallback_active ? "Stream connected · fallback" : "Stream connected"
+              : snapshot.provider_health.next_retry_at ? "Stream retrying" : "Stream connecting"
+            : providerActivity(name, provider.active);
           return <div className="provider-row" key={name}>
-            <div><strong>{title(name)}</strong><small>{providerRole(name)} · {provider.policy.label} · {provider.endpoint}</small></div>
-            <div><span className={provider.active ? "provider-active" : "provider-idle"}>{providerActivity(name, provider.active)}</span><small>{quota ? providerQuotaCopy(quota) : "No external calls"}</small></div>
+            <div><strong>{title(name)}</strong><small>{providerRole(name)} · {provider.policy.label} · {provider.endpoint}</small>{name === "solana" && <small className="provider-route-read">HTTP safety: {provider.endpoint} ({providerRouteSourceLabel(provider.http_source)}) · Live stream: {provider.stream_endpoint ?? "unavailable"} ({providerRouteSourceLabel(provider.stream_source)})</small>}</div>
+            <div><span className={solanaStreamHealthy || (name !== "solana" && provider.active) ? "provider-active" : provider.active ? "provider-retrying" : "provider-idle"}>{activity}</span><small>{quota ? providerQuotaCopy(quota) : "No external calls"}</small></div>
           </div>;
         })}
       </div>
@@ -2892,10 +3361,10 @@ function ProviderManager({ snapshot, refresh, busy, setBusy, reportIssue, resolv
           value={secretValues.solana_api_key ?? ""}
           placeholder={guidedSolanaConfigured ? "Saved securely · blank keeps it" : `Paste your ${guidedSolana.name} key`}
           required={!guidedSolanaConfigured}
-          onChange={(value) => updateSecret("solana_api_key", value, ["solana_http", "solana_ws"])}
+          onChange={(value) => updateSecret("solana_api_key", value, guidedSolana.streamMode === "default" ? ["solana_http"] : ["solana_http", "solana_ws"])}
         />}
         {solanaPresetId === "public" && <p className="provider-connection-guide">No key required. Saving restores the configured environment endpoint or the bundled public Solana endpoint.</p>}
-        {guidedSolana && <p className="provider-connection-guide">Signal Arcade creates the secure HTTP and WebSocket URLs automatically. The key remains write-only.</p>}
+        {guidedSolana && <p className="provider-connection-guide">{guidedSolana.streamMode === "default" ? "Economy mode keeps keyed Helius for paced safety lookups and restores the environment/public WebSocket for the high-volume live stream." : "Signal Arcade creates the secure HTTP and WebSocket URLs automatically."} The key remains write-only.</p>}
         {solanaPresetId === "custom" && <>
           <SecretInput label="HTTP RPC URL" value={secretValues.solana_http ?? ""} placeholder={`${settings.providers.solana.endpoint} · blank keeps saved value`} onChange={(value) => updateSecret("solana_http", value, ["solana_http", "solana_ws"])} />
           <SecretInput label="WebSocket URL" value={secretValues.solana_ws ?? ""} placeholder={`${settings.providers.solana.stream_endpoint ?? "Saved stream"} · blank keeps saved value`} onChange={(value) => updateSecret("solana_ws", value, ["solana_http", "solana_ws"])} />
@@ -2960,9 +3429,10 @@ function matchingPreset(policy: ProviderPolicy, presets: ProviderPreset[] | unde
 interface GuidedSolanaProvider {
   name: string;
   httpHost: string;
-  wsHost: string;
+  wsHost?: string;
+  streamMode: "provider" | "default";
   httpTemplate: (encodedKey: string) => string;
-  wsTemplate: (encodedKey: string) => string;
+  wsTemplate?: (encodedKey: string) => string;
 }
 
 const GUIDED_SOLANA_PROVIDERS: Record<string, GuidedSolanaProvider> = {
@@ -2970,13 +3440,21 @@ const GUIDED_SOLANA_PROVIDERS: Record<string, GuidedSolanaProvider> = {
     name: "Helius",
     httpHost: "https://mainnet.helius-rpc.com",
     wsHost: "wss://mainnet.helius-rpc.com",
+    streamMode: "provider",
     httpTemplate: (key) => `https://mainnet.helius-rpc.com/?api-key=${key}`,
     wsTemplate: (key) => `wss://mainnet.helius-rpc.com/?api-key=${key}`,
+  },
+  helius_economy: {
+    name: "Helius",
+    httpHost: "https://mainnet.helius-rpc.com",
+    streamMode: "default",
+    httpTemplate: (key) => `https://mainnet.helius-rpc.com/?api-key=${key}`,
   },
   alchemy_free: {
     name: "Alchemy",
     httpHost: "https://solana-mainnet.g.alchemy.com",
     wsHost: "wss://solana-mainnet.g.alchemy.com",
+    streamMode: "provider",
     httpTemplate: (key) => `https://solana-mainnet.g.alchemy.com/v2/${key}`,
     wsTemplate: (key) => `wss://solana-mainnet.g.alchemy.com/v2/${key}`,
   },
@@ -2984,6 +3462,7 @@ const GUIDED_SOLANA_PROVIDERS: Record<string, GuidedSolanaProvider> = {
     name: "SolanaTracker RPC",
     httpHost: "https://rpc-mainnet.solanatracker.io",
     wsHost: "wss://rpc-mainnet.solanatracker.io",
+    streamMode: "provider",
     httpTemplate: (key) => `https://rpc-mainnet.solanatracker.io?api_key=${key}`,
     wsTemplate: (key) => `wss://rpc-mainnet.solanatracker.io?api_key=${key}`,
   },
@@ -2994,12 +3473,19 @@ function guidedSolanaProvider(presetId: string): GuidedSolanaProvider | null {
 }
 
 function solanaProviderMatches(provider: Snapshot["provider_settings"]["providers"]["solana"], guided: GuidedSolanaProvider): boolean {
-  return provider.endpoint === guided.httpHost && provider.stream_endpoint === guided.wsHost;
+  return provider.endpoint === guided.httpHost && (
+    guided.streamMode === "default"
+      ? true
+      : provider.stream_endpoint === guided.wsHost
+  );
 }
 
-function guidedSolanaEndpoints(guided: GuidedSolanaProvider, apiKey: string): { http: string; ws: string } {
+function guidedSolanaEndpoints(guided: GuidedSolanaProvider, apiKey: string): { http: string; ws?: string } {
   const encodedKey = encodeURIComponent(apiKey.trim());
-  return { http: guided.httpTemplate(encodedKey), ws: guided.wsTemplate(encodedKey) };
+  return {
+    http: guided.httpTemplate(encodedKey),
+    ws: guided.wsTemplate?.(encodedKey),
+  };
 }
 
 function providerRole(name: string): string {
@@ -3014,6 +3500,12 @@ function providerActivity(name: string, active: boolean): string {
   if (name === "jupiter") return "Idle in V1";
   if (name === "ollama") return active ? "On demand" : "Optional";
   return active ? "In use" : "Optional";
+}
+
+function providerRouteSourceLabel(source: ProviderView["http_source"]): string {
+  if (source === "saved_override") return "saved route";
+  if (source === "environment_default") return "default route";
+  return "route source unknown";
 }
 
 function providerQuotaCopy(quota: Snapshot["quotas"][string]): string {
@@ -3239,6 +3731,27 @@ function EmptyState({ icon, title: heading, copy }: { icon: React.ReactNode; tit
 function NavButton({ active, onClick, icon, label, attention = false }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string; attention?: boolean }) { return <button className={active ? "active" : ""} aria-label={label} aria-current={active ? "page" : undefined} aria-describedby={attention ? "learning-milestone-notice" : undefined} title={attention ? "New learning milestone" : undefined} onClick={onClick}>{icon}<span>{label}</span>{attention && <span className="nav-attention-dot" aria-hidden="true" />}{attention && <span className="sr-only" id="learning-milestone-notice">New learning milestone</span>}</button>; }
 function LoadingState() { return <div className="loading-state"><span className="loader" /><strong>Starting the arcade…</strong><p>Checking the ledger and connecting to the selected market source.</p></div>; }
 
+function minorAmountInput(value: number, decimals: number): string {
+  const fixed = (value / 10 ** decimals).toFixed(decimals);
+  const [whole = "0", fraction = ""] = fixed.split(".");
+  const trimmed = fraction.replace(/0+$/, "");
+  return trimmed ? `${whole}.${trimmed}` : whole;
+}
+function parseStartingAmount(value: string, currency: QuoteCurrency): { minor: number | null; error: string | null } {
+  const decimals = currency === "SOL" ? 9 : 6;
+  const match = new RegExp(`^(\\d+)(?:\\.(\\d{1,${decimals}}))?$`).exec(value.trim());
+  const amount = Number(value);
+  if (!match || !Number.isFinite(amount) || amount <= 0) {
+    return { minor: null, error: `Enter a positive ${currency} amount with at most ${decimals} decimals.` };
+  }
+  if (amount > 1_000_000_000 || (currency === "SOL" && amount > 1_000_000)) {
+    return { minor: null, error: currency === "SOL" ? "SOL bankroll must not exceed 1,000,000." : "USDC bankroll must not exceed 1,000,000,000." };
+  }
+  const minor = Math.round(amount * 10 ** decimals);
+  return Number.isSafeInteger(minor) && minor > 0
+    ? { minor, error: null }
+    : { minor: null, error: "That bankroll cannot be represented exactly." };
+}
 function money(value: number, currency: QuoteCurrency, decimals: number) { const scale = 10 ** decimals; const amount = value / scale; return currency === "USDC" ? `${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC` : `${amount.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 5 })} SOL`; }
 function signedMoney(value: number, currency: QuoteCurrency, decimals: number) { return `${value >= 0 ? "+" : "−"}${money(Math.abs(value), currency, decimals)}`; }
 function percent(value: number) { return `${(value * 100).toFixed(value < 0.01 ? 2 : 1)}%`; }
@@ -3332,9 +3845,9 @@ function riskCopy(mode: RiskMode) { return mode === "safe" ? "Waits for stronger
 function riskModeLabel(mode: RiskMode) { return mode === "safe" ? "Safer" : title(mode); }
 function drawdownProfileLabel(profile: SeasonProfile | null) {
   if (!profile) return "Legacy / unknown";
-  if (profile.drawdown_policy.kind === "disabled") return "Off · custom season profile";
+  if (profile.drawdown_policy.kind === "disabled") return "Off";
   const value = profile.effective_drawdown_bps === null ? "Unknown" : `${profile.effective_drawdown_bps / 100}%`;
-  return profile.drawdown_policy.kind === "default" ? `${value} · personality default` : `${value} · custom season profile`;
+  return profile.drawdown_policy.kind === "default" ? `${value} · Default` : `${value} · Custom`;
 }
 function drawdownPolicyTargetLabel(mode: RiskMode, policy: DrawdownPolicy, catalog: SeasonProfile[]) {
   if (policy.kind === "disabled") return "DD off";
@@ -3356,7 +3869,8 @@ function profileLimitSummary(profile: SeasonProfile | null) {
   const drawdown = profile.effective_drawdown_bps;
   return `${positions} position${positions === 1 ? "" : "s"} · ${typeof exposure === "number" ? percent(exposure) : "—"} exposure · ${drawdown === null ? "DD off" : `${drawdown / 100}% DD`}`;
 }
-function shortDrawdownLabel(profile: SeasonProfile) {
+function shortDrawdownLabel(profile: SeasonProfile | null) {
+  if (!profile) return "DD unavailable";
   if (profile.drawdown_policy.kind === "disabled") return "DD off";
   const value = profile.effective_drawdown_bps === null ? "DD unknown" : `DD ${profile.effective_drawdown_bps / 100}%`;
   return profile.drawdown_policy.kind === "default" ? `${value} default` : `${value} custom`;
@@ -3369,8 +3883,8 @@ function seasonComparisonKey(season: PaperSeason) {
     && season.profile !== null
     && typeof season.profile_fingerprint === "string";
   return exact
-    ? `${season.quote_currency}:profile:${season.profile_fingerprint}`
-    : `${season.quote_currency}:legacy`;
+    ? `${season.quote_currency}:bankroll:${season.starting_minor}:profile:${season.profile_fingerprint}:terminal:${season.terminal_policy_version ?? "legacy-v1"}`
+    : `${season.quote_currency}:bankroll:${season.starting_minor}:legacy:terminal:${season.terminal_policy_version ?? "legacy-v1"}`;
 }
 function deriveSeasonComparisonGroups(seasons: PaperSeason[]): SeasonComparisonGroup[] {
   const groups = new Map<string, SeasonComparisonGroup>();
@@ -3382,22 +3896,52 @@ function deriveSeasonComparisonGroups(seasons: PaperSeason[]): SeasonComparisonG
     const existing = groups.get(comparisonKey);
     if (existing) {
       existing.season_count += 1;
+      existing.first_season_number = Math.min(
+        existing.first_season_number ?? season.season_number,
+        season.season_number,
+      );
+      existing.last_season_number = Math.max(
+        existing.last_season_number ?? season.season_number,
+        season.season_number,
+      );
+      existing.has_current = Boolean(existing.has_current || season.status === "current");
+      existing.completed_count = (existing.completed_count ?? 0) + Number(season.status === "completed");
+      existing.comparable_count = (existing.comparable_count ?? 0)
+        + Number(season.status === "completed" && season.comparable !== false);
+      const boundary = season.boundary_type ?? "legacy";
+      existing.boundary_types = existing.boundary_types?.includes(boundary)
+        ? existing.boundary_types
+        : [...(existing.boundary_types ?? []), boundary];
       continue;
     }
     groups.set(comparisonKey, {
       comparison_key: comparisonKey,
       quote_currency: season.quote_currency,
+      quote_decimals: season.quote_decimals,
+      starting_minor: season.starting_minor,
+      terminal_policy_version: season.terminal_policy_version,
       profile_provenance: exact ? "exact" : "legacy_unknown",
       profile_fingerprint: exact ? season.profile_fingerprint : null,
       risk_mode: exact ? season.profile!.risk_mode : null,
       drawdown_policy: exact ? season.profile!.drawdown_policy : null,
       effective_drawdown_bps: exact ? season.profile!.effective_drawdown_bps : null,
+      baseline_version: exact ? season.profile!.baseline_version ?? null : null,
+      integrity_policy_version: exact ? season.profile!.integrity_policy_version ?? null : null,
+      sizing_policy_version: exact ? season.profile!.sizing_policy_version ?? null : null,
+      first_season_number: season.season_number,
+      last_season_number: season.season_number,
+      has_current: season.status === "current",
+      completed_count: Number(season.status === "completed"),
+      comparable_count: Number(season.status === "completed" && season.comparable !== false),
+      boundary_types: [season.boundary_type ?? "legacy"],
       season_count: 1,
     });
   }
   return [...groups.values()].sort((left, right) => {
     const currencyOrder = left.quote_currency.localeCompare(right.quote_currency);
     if (currencyOrder !== 0) return currencyOrder;
+    const bankrollOrder = (left.starting_minor ?? 0) - (right.starting_minor ?? 0);
+    if (bankrollOrder !== 0) return bankrollOrder;
     if (left.profile_provenance !== right.profile_provenance) {
       return left.profile_provenance === "exact" ? -1 : 1;
     }
@@ -3415,13 +3959,57 @@ function seasonComparisonGroupLabel(
     || group.risk_mode === null
     || group.drawdown_policy === null
   ) {
-    return `${includeCurrency ? `${group.quote_currency} · ` : ""}Legacy / unknown`;
+    const prefix = seasonComparisonBankrollLabel(group, includeCurrency);
+    return `${prefix} · Legacy / unknown`;
   }
   const drawdown = group.drawdown_policy.kind === "disabled"
     ? "DD off"
     : `${group.drawdown_policy.kind === "default" ? "Default DD" : "Custom DD"} ${(group.effective_drawdown_bps ?? 0) / 100}%`;
   const label = `${riskModeLabel(group.risk_mode)} · ${drawdown}`;
-  return includeCurrency ? `${group.quote_currency} · ${label}` : label;
+  return `${seasonComparisonBankrollLabel(group, includeCurrency)} · ${label}`;
+}
+function seasonComparisonBankrollLabel(
+  group: SeasonComparisonGroup,
+  includeCurrency: boolean,
+) {
+  const decimals = group.quote_decimals ?? (group.quote_currency === "SOL" ? 9 : 6);
+  const amount = group.starting_minor === undefined
+    ? "amount unknown"
+    : minorAmountInput(group.starting_minor, decimals);
+  return includeCurrency ? `${group.quote_currency} ${amount}` : `${amount} ${group.quote_currency}`;
+}
+function seasonComparisonGroupContext(group: SeasonComparisonGroup) {
+  const strategy = group.baseline_version
+    ? group.baseline_version.replace("baseline-", "Baseline ")
+    : "Legacy strategy";
+  const accounting = group.terminal_policy_version === "executable-boundary-v2"
+    ? "Modern accounting"
+    : "Legacy accounting";
+  const first = group.first_season_number;
+  const last = group.last_season_number;
+  const seasons = first === undefined || last === undefined
+    ? `${group.season_count} season${group.season_count === 1 ? "" : "s"}`
+    : first === last
+      ? `S${first}`
+      : `S${first}–S${last}`;
+  const boundaries = (group.boundary_types ?? [])
+    .filter((boundary) => boundary !== "open")
+    .map(seasonBoundaryLabel);
+  const boundary = group.has_current
+    ? "Current"
+    : boundaries.length
+      ? [...new Set(boundaries)].join(" / ")
+      : null;
+  return [strategy, accounting, boundary, seasons].filter(Boolean).join(" · ");
+}
+function seasonBoundaryLabel(boundary: string) {
+  if (boundary === "automatic") return "Automatic finish";
+  if (boundary === "finish_safely") return "Safe finish";
+  if (boundary === "end_now") return "Ended now";
+  if (boundary === "reset") return "Manual reset";
+  if (boundary === "legacy") return "Legacy boundary";
+  if (boundary === "other") return "Other boundary";
+  return humanize(boundary);
 }
 function terminalReasonLabel(reason: string) {
   if (reason === "profile_change") return "Profile change";

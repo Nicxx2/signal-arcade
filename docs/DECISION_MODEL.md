@@ -10,12 +10,20 @@ missing-data reason. Rolling features include trade velocity, buy/sell balance, 
 wallet-volume concentration, repeated amounts, same-slot coordination, creator sells, curve
 progress, momentum, drawdown, reserves, observed fees, and optional DEX context.
 
-Decision explanations also retain a separate market-integrity evidence layer derived only from
+Decision explanations retain a separate market-integrity evidence layer derived only from
 the already-received five-minute stream: one-trade wallet share, wallet round trips and their
 volume, net flow versus gross activity, side alternation, clustered sizing, slot concentration,
 price-direction consistency and multi-trade signatures. Coverage and missing reasons are saved
-with each value. These measures are inputs to forward challenger/Coach research only; V1's
-baseline score and permanent gates do not change because a heuristic looks suspicious.
+with each value. Baseline v1.4 classifies these measurements only after minimum time, trade and
+coverage requirements and will not enter before that integrity sample is mature. One isolated
+pattern remains uncertain; an extreme isolated warning must clear or gain corroboration before
+entry, while moderate uncertainty may use only a reduced exploratory amount. Suspicious or severe
+conclusions require corroboration across independent wallet-loop, concentrated-dispersion,
+net-flow, trade-structure and price-path categories. Concentrated dispersion itself requires both
+extreme wallet-volume concentration and overwhelming one-trade participation, so neither a lone
+whale nor an organic broad launch is condemned. Severe evidence blocks entry and suspicious
+evidence raises deterministic danger and reduces size. Locked v1.1/v1.2/v1.3 seasons retain their
+frozen behavior until a legitimate successor season begins.
 
 ## Scores
 
@@ -34,13 +42,16 @@ The weights and thresholds are explicit, hand-selected V1 hypotheses. They are l
 market and risk features, but they have not yet earned the label of validated alpha. The model
 must be judged on untouched forward paper data before any tuning or stronger performance claim.
 
-The local Learning Lab is a deliberately subordinate challenger. It records one eligible live
-lesson per mint, resolves fee-inclusive future outcomes, and validates chronological model
-versions. Shadow mode cannot affect decisions. After qualification, active mode may only reject a
-baseline ENTER with a non-positive conservative forecast; it cannot create a trade or weaken a
-gate. Qualification is isolated by risk/configuration and must prove the exact actionable-entry
-veto policy; unfamiliar feature combinations fall back to the baseline. See
-[LEARNING.md](LEARNING.md) for the exact lifecycle and caveats.
+The local Learning Lab is a deliberately subordinate Challenger with four independently versioned
+skills. Entry and Manipulation may only veto an actionable Baseline ENTER. Sizing may select a
+bounded 0.5×, 1×, 1.5× or 2× counterfactual size, with size-up allowed only when current
+deterministic integrity is Clean and every portfolio/execution cap still passes. Exit may only
+shorten the normal review. No skill can create a trade, weaken a gate, lengthen a hold or fabricate
+a fill. Each candidate validates chronologically and must then beat its saved champion on the same
+later common-forward outcomes before replacement; unfamiliar evidence falls back to the Baseline.
+One explicit consent activates the qualified Entry champion, while later skills join only after
+separate incremental proof beside the active ensemble. See [LEARNING.md](LEARNING.md) for the exact
+lifecycle and caveats.
 
 The optional Ollama AI Decision Lab is a second, independent experiment. Off is the default.
 Shadow reviews only actionable baseline ENTER candidates and has no control path. It keeps at most
@@ -55,9 +66,12 @@ input hash, season, and configuration fingerprint. Guarded remains locked until 
 forward evidence gate qualifies that exact model; if qualified, it can only turn ENTER into PASS.
 It cannot add score, create a trade, increase size, manage an exit, or bypass a permanent gate.
 
-The Safe/Balanced/Aggressive slider changes order size, evidence thresholds, acceptable danger
-and impact, portfolio exposure, drawdown stop, and exit widths. It never disables structural
-safety gates.
+The Safe/Balanced/Aggressive slider changes the reference size, evidence thresholds, acceptable
+danger and impact, portfolio exposure, drawdown stop, and exit widths. Baseline v1.4 may size a
+mature clean entry above that reference from realized bankroll only. It remains bounded by the
+mode's per-position and total exposure, available cash, pending reservations and observed reserve
+depth; moderate uncertain evidence is reduced to 70% of the reference and cannot size up. It never
+disables structural safety gates.
 
 ## Permanent abstention gates
 

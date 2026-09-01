@@ -111,6 +111,8 @@ class RiskRequest(BaseModel):
     mode: RiskMode
     drawdown_policy: DrawdownPolicy = Field(default_factory=DrawdownPolicy)
     transition_strategy: ProfileTransitionStrategy = ProfileTransitionStrategy.FINISH_SAFELY
+    quote_currency: QuoteCurrency | None = None
+    starting_amount: Decimal | None = Field(default=None, gt=0, le=1_000_000_000)
 
 
 class AutoNewSeasonRequest(BaseModel):
@@ -128,6 +130,18 @@ class AiDecisionModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: AiDecisionMode
+
+
+class CoachContributionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class CoachResearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
 
 
 class AiModelRequest(BaseModel):
@@ -153,6 +167,19 @@ class PortfolioSetupRequest(BaseModel):
     starting_amount: Decimal = Field(gt=0, le=1_000_000_000)
     risk_mode: RiskMode | None = None
     drawdown_policy: DrawdownPolicy = Field(default_factory=DrawdownPolicy)
+
+
+def _portfolio_starting_minor(quote_currency: QuoteCurrency, starting_amount: Decimal) -> int:
+    decimals = 9 if quote_currency == QuoteCurrency.SOL else 6
+    scaled = starting_amount * (Decimal(10) ** decimals)
+    if scaled != scaled.to_integral_value():
+        raise HTTPException(
+            status_code=422,
+            detail=f"{quote_currency.value} supports at most {decimals} decimals",
+        )
+    if quote_currency == QuoteCurrency.SOL and starting_amount > 1_000_000:
+        raise HTTPException(status_code=422, detail="SOL bankroll is unreasonably large")
+    return int(scaled)
 
 
 class StorageSettingsRequest(BaseModel):
@@ -341,11 +368,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.put("/api/v1/risk", dependencies=[Depends(normal_operation)])
     async def set_risk(body: RiskRequest) -> dict[str, Any]:
+        if (body.quote_currency is None) != (body.starting_amount is None):
+            raise HTTPException(
+                status_code=422,
+                detail="quote currency and starting amount must be changed together",
+            )
+        target_minor = (
+            _portfolio_starting_minor(body.quote_currency, body.starting_amount)
+            if body.quote_currency is not None and body.starting_amount is not None
+            else None
+        )
         try:
             result = await orchestrator.request_season_profile(
                 body.mode,
                 body.drawdown_policy,
                 transition_strategy=body.transition_strategy,
+                target_quote_currency=body.quote_currency,
+                target_starting_minor=target_minor,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -390,6 +429,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
         return orchestrator.ai_lab.status()
+
+    @app.put(
+        "/api/v1/ai-lab/coach-contribution",
+        dependencies=[Depends(normal_operation)],
+    )
+    async def set_coach_contribution(body: CoachContributionRequest) -> dict[str, Any]:
+        try:
+            orchestrator.set_coach_contribution_enabled(body.enabled)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        orchestrator.invalidate_snapshot_cache()
+        return orchestrator.coach.status()
+
+    @app.put(
+        "/api/v1/ai-lab/coach-research",
+        dependencies=[Depends(normal_operation)],
+    )
+    async def set_coach_research(body: CoachResearchRequest) -> dict[str, Any]:
+        try:
+            orchestrator.set_coach_research_enabled(body.enabled)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        orchestrator.invalidate_snapshot_cache()
+        return orchestrator.coach.status()
 
     @app.put("/api/v1/ai-lab/model", dependencies=[Depends(normal_operation)])
     async def select_ai_model(body: AiModelRequest) -> dict[str, Any]:
@@ -457,19 +520,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/portfolio/setup", dependencies=[Depends(normal_operation)])
     async def setup_portfolio(body: PortfolioSetupRequest) -> dict[str, Any]:
-        decimals = 9 if body.quote_currency == QuoteCurrency.SOL else 6
-        scaled = body.starting_amount * (Decimal(10) ** decimals)
-        if scaled != scaled.to_integral_value():
-            raise HTTPException(
-                status_code=422,
-                detail=f"{body.quote_currency.value} supports at most {decimals} decimals",
-            )
-        if body.quote_currency == QuoteCurrency.SOL and body.starting_amount > 1_000_000:
-            raise HTTPException(status_code=422, detail="SOL bankroll is unreasonably large")
+        starting_minor = _portfolio_starting_minor(
+            body.quote_currency,
+            body.starting_amount,
+        )
         try:
             await orchestrator.setup_portfolio(
                 body.quote_currency,
-                int(scaled),
+                starting_minor,
                 risk_mode=body.risk_mode,
                 drawdown_policy=body.drawdown_policy,
             )
@@ -479,7 +537,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "initialized": True,
             "quote_currency": body.quote_currency.value,
-            "starting_minor": int(scaled),
+            "starting_minor": starting_minor,
             "running": False,
         }
 

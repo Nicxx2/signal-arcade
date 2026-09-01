@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from signal_arcade.database import SCHEMA_VERSION, Database
-from signal_arcade.models import EventKind, MarketEvent
+from signal_arcade.database import SCHEMA_VERSION, TERMINAL_POLICY_VERSION, Database
+from signal_arcade.models import (
+    ChallengerChampionEvent,
+    ChallengerSkill,
+    ChallengerSkillArtifact,
+    ChallengerSkillState,
+    EventKind,
+    MarketEvent,
+    RiskMode,
+)
 
 
 def test_events_are_deduplicated(tmp_path: Path) -> None:
@@ -126,6 +135,193 @@ def test_recent_event_startup_query_uses_global_time_index_and_upgrades_v3(
     upgraded.close()
 
 
+def test_v10_migration_preserves_completed_history_and_upgrades_only_current_boundary(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v9-season-history.sqlite3"
+    database = Database(path)
+    database.initialize_portfolio("season-legacy", 1_000_000_000, "SOL")
+    database.reset_paper_state(
+        {
+            "ending_equity_minor": 900_000_000,
+            "last_known_ending_equity_minor": 900_000_000,
+            "peak_equity_minor": 1_000_000_000,
+            "realized_pnl_minor": -100_000_000,
+            "net_pnl_minor": -100_000_000,
+            "total_fees_minor": 1_000_000,
+            "closed_trades": 1,
+            "wins": 0,
+            "losses": 1,
+            "break_even": 0,
+            "ending_drawdown_fraction": 0.1,
+            "open_positions": 0,
+            "meaningful_activity": True,
+        }
+    )
+    database.initialize_portfolio("season-current", 500_000_000, "USDC")
+    database.close()
+
+    legacy = sqlite3.connect(path)
+    for column in (
+        "accounting_status",
+        "terminal_policy_version",
+        "boundary_type",
+        "meaningful_activity",
+        "write_off_count",
+        "write_off_entry_minor",
+    ):
+        legacy.execute(f"ALTER TABLE paper_seasons DROP COLUMN {column}")
+    legacy.execute("PRAGMA user_version=9")
+    legacy.commit()
+    legacy.close()
+
+    upgraded = Database(path)
+    seasons = upgraded.list_paper_seasons()
+    assert seasons[0]["status"] == "completed"
+    assert seasons[0]["accounting_status"] == "legacy"
+    assert seasons[0]["terminal_policy_version"] == "legacy-v1"
+    assert seasons[0]["net_pnl_minor"] == -100_000_000
+    assert seasons[0]["comparable"] is False
+    assert seasons[1]["status"] == "current"
+    assert seasons[1]["accounting_status"] == "current"
+    assert seasons[1]["terminal_policy_version"] == TERMINAL_POLICY_VERSION
+    assert seasons[1]["boundary_type"] == "open"
+    assert upgraded.ledger_balance("cash") == 500_000_000
+    upgraded.close()
+
+
+def test_v11_adds_multiskill_challenger_without_rewriting_legacy_learning(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v10-challenger.sqlite3"
+    database = Database(path)
+    legacy_payload = '{"version":"legacy-proof"}'
+    database._conn.execute(  # noqa: SLF001 - seed an immutable legacy artifact
+        "INSERT INTO learning_models VALUES(?,?,?,?)",
+        ("legacy-proof", datetime.now(UTC).isoformat(), 0, legacy_payload),
+    )
+    database._conn.execute("PRAGMA user_version=10")  # noqa: SLF001
+    database._conn.commit()  # noqa: SLF001
+    database.close()
+
+    upgraded = Database(path)
+    artifact = ChallengerSkillArtifact(
+        version="challenger-entry-v1",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="config-v1",
+        baseline_version="baseline-v1.2",
+        feature_schema_version="features-v1",
+        qualified=True,
+    )
+    state = ChallengerSkillState(
+        cohort_key="balanced:config-v1:baseline-v1.2:features-v1",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="config-v1",
+        baseline_version="baseline-v1.2",
+        feature_schema_version="features-v1",
+        latest_candidate_version=artifact.version,
+        champion_version=artifact.version,
+        champion_journey=[
+            ChallengerChampionEvent(
+                event_id="champion-event-first",
+                skill=ChallengerSkill.ENTRY,
+                kind="first_champion",
+                candidate_version=artifact.version,
+                champion_version=artifact.version,
+            )
+        ],
+    )
+    upgraded.save_challenger_artifact(artifact)
+    upgraded.save_challenger_artifact(artifact)
+    with pytest.raises(ValueError, match="different data"):
+        upgraded.save_challenger_artifact(artifact.model_copy(update={"qualified": False}))
+    testing_artifact = artifact.model_copy(
+        update={"version": "challenger-entry-testing", "created_at": datetime.now(UTC)}
+    )
+    latest_artifact = artifact.model_copy(
+        update={"version": "challenger-entry-latest", "created_at": datetime.now(UTC)}
+    )
+    upgraded.save_challenger_artifact(testing_artifact)
+    upgraded.save_challenger_artifact(latest_artifact)
+    state.testing_version = testing_artifact.version
+    state.latest_candidate_version = latest_artifact.version
+    upgraded.save_challenger_skill_state(state)
+
+    assert {item.version for item in upgraded.list_challenger_artifacts()} == {
+        artifact.version,
+        testing_artifact.version,
+        latest_artifact.version,
+    }
+    assert upgraded.list_challenger_skill_states() == [state]
+    raw_state = json.loads(
+        upgraded._conn.execute(  # noqa: SLF001 - verify rollback-readable storage contract
+            "SELECT record_json FROM challenger_skill_states"
+        ).fetchone()[0]
+    )
+    assert "champion_journey" not in raw_state
+    assert (
+        upgraded._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM settings WHERE key LIKE 'challenger_champion_journey_v1:%'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        upgraded._conn.execute(  # noqa: SLF001
+            "SELECT record_json FROM learning_models WHERE version='legacy-proof'"
+        ).fetchone()[0]
+        == legacy_payload
+    )
+    assert upgraded.storage_stats(force=True)["challenger_skill_artifacts"] == 3
+    assert upgraded.prune_challenger_artifacts(1) == []
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION  # noqa: SLF001
+    upgraded.close()
+
+
+def test_embedded_champion_journey_is_migrated_to_rollback_safe_sidecar(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "embedded-champion-journey.sqlite3")
+    event = ChallengerChampionEvent(
+        event_id="embedded-event",
+        skill=ChallengerSkill.ENTRY,
+        kind="first_champion",
+        candidate_version="embedded-champion",
+        champion_version="embedded-champion",
+    )
+    state = ChallengerSkillState(
+        cohort_key="balanced:embedded",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="embedded",
+        baseline_version="baseline-v1.2",
+        feature_schema_version="features-v2",
+        champion_version="embedded-champion",
+        champion_journey=[event],
+    )
+    database._conn.execute(  # noqa: SLF001 - seed the short-lived embedded format
+        "INSERT INTO challenger_skill_states VALUES(?,?,?,?)",
+        (
+            state.cohort_key,
+            state.skill.value,
+            state.updated_at.isoformat(),
+            state.model_dump_json(),
+        ),
+    )
+    database._conn.commit()  # noqa: SLF001
+
+    assert database.list_challenger_skill_states() == [state]
+    normalized = json.loads(
+        database._conn.execute(  # noqa: SLF001
+            "SELECT record_json FROM challenger_skill_states"
+        ).fetchone()[0]
+    )
+    assert "champion_journey" not in normalized
+    assert database.list_challenger_skill_states()[0].champion_journey == [event]
+    database.close()
+
+
 def test_ledger_rejects_unbalanced_transactions(tmp_path: Path) -> None:
     database = Database(tmp_path / "test.sqlite3")
     with pytest.raises(ValueError, match="not balanced"):
@@ -191,6 +387,7 @@ def test_reset_archives_the_season_before_starting_the_next_one(tmp_path: Path) 
             "break_even": 0,
             "ending_drawdown_fraction": 0.066,
             "open_positions": 0,
+            "meaningful_activity": True,
         }
     )
     archived = database.list_paper_seasons()[0]
@@ -198,6 +395,8 @@ def test_reset_archives_the_season_before_starting_the_next_one(tmp_path: Path) 
     assert archived["ended_at"] is not None
     assert archived["net_pnl_minor"] == 120_000_000
     assert archived["wins"] == 3
+    assert archived["accounting_status"] == "complete"
+    assert archived["comparable"] is True
     assert database.ledger_balance("cash") == 0
 
     database.initialize_portfolio("season-two", 500_000_000, "SOL")
@@ -248,6 +447,42 @@ def test_reset_cannot_retire_inventory_without_matching_audit_records(tmp_path: 
     assert database.get_setting("season_id") == "season-audit"
     assert database.ledger_balance("cash") == 1_000_000_000
     assert database.list_paper_seasons()[0]["status"] == "current"
+    database.close()
+
+
+def test_reset_rejects_a_writeoff_without_confirmed_route_evidence(tmp_path: Path) -> None:
+    database = Database(tmp_path / "writeoff-proof.sqlite3")
+    database.initialize_portfolio("season-proof", 1_000_000_000, "SOL")
+    summary = {
+        "ending_equity_minor": 900_000_000,
+        "last_known_ending_equity_minor": 950_000_000,
+        "peak_equity_minor": 1_000_000_000,
+        "realized_pnl_minor": 0,
+        "net_pnl_minor": -100_000_000,
+        "total_fees_minor": 0,
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "break_even": 0,
+        "ending_drawdown_fraction": 0.1,
+        "open_positions": 1,
+        "meaningful_activity": True,
+    }
+    unsupported = {
+        "position_id": "unsupported-position",
+        "mint": "unsupported-mint",
+        "symbol": "NOPE",
+        "was_executed": False,
+        "terminal_disposition": "write_off",
+        "terminal_evidence": {},
+    }
+
+    with pytest.raises(ValueError, match="requires confirmed route evidence"):
+        database.reset_paper_state(summary, unresolved_positions=[unsupported])
+
+    assert database.get_setting("portfolio_initialized") is True
+    assert database.list_paper_seasons()[0]["status"] == "current"
+    assert database.ledger_balance("cash") == 1_000_000_000
     database.close()
 
 
@@ -322,6 +557,7 @@ def test_storage_maintenance_never_prunes_season_scorecards(tmp_path: Path) -> N
             "break_even": 0,
             "ending_drawdown_fraction": 0.066,
             "open_positions": 0,
+            "meaningful_activity": True,
         }
     )
     database.initialize_portfolio("season-two", 1_000_000_000, "SOL")

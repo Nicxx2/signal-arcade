@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.8.1
+# 🧠 Signal Arcade v1.9.1
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach can observe the same saved outcomes without slowing or controlling the
 trading path. No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.8.1-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.9.1-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -20,8 +20,8 @@ trading path. No wallet keys, live orders, paid provider or cloud AI are require
 
 ## 📸 See it in action
 
-These screenshots come from the running v1.8.0 app. They show genuine paper results—including
-losing seasons, legacy history and evidence that is still collecting—instead of a staged
+These captures come from the running v1.9.1 app. They show genuine paper results—including wins,
+losses, excluded legacy history and evidence that is still collecting—instead of a staged
 guaranteed-profit demo.
 
 ### The Arena
@@ -29,46 +29,52 @@ guaranteed-profit demo.
 Paper equity, the season-locked risk profile, drawdown policy, unattended continuity, positions
 and recent decisions stay together without hiding the assumptions behind the score.
 
-![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/01-arena-overview.png)
+![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/01-arena-overview.png)
 
 ### Season progress
 
-Compare win rate, drawdown, fees and net return across every retained paper season. V1.8 seasons
-freeze their exact profile and currency for like-for-like filters; preserved pre-profile seasons
-remain clearly labelled as legacy history without unsupported comparison claims.
+Compare win rate, drawdown, fees and net return across every retained paper season. Modern seasons
+freeze their currency, starting bankroll, exact profile and accounting-boundary policy for
+like-for-like filters; older history remains clearly labelled without unsupported claims.
 
-![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/03-season-progress.png)
+![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/03-season-progress.png)
 
 ### Learning Lab and AI Coach Room
 
-The deterministic baseline remains in control until a statistical challenger earns qualification
-on later unseen outcomes. The local AI coach proposes only bounded, allowlisted experiments and
-collects forward evidence separately from historical screening.
+The deterministic baseline remains in control until the statistical Challenger earns qualification
+on later unseen outcomes. Its Entry, Manipulation, Sizing and Exit skills qualify independently,
+then compete with their saved champions on common forward evidence. The local AI Coach remains a
+separate, shadow-only researcher. With explicit permission, one supported Coach idea may enter the
+matching Challenger skill as a normal contender; it never replaces a Champion or trades directly.
 
-![Signal Arcade Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/04-learning-lab.png)
+![Signal Arcade Challenger Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/04-learning-lab.png)
 
 <details>
 <summary><strong>📷 More screenshots</strong></summary>
 
 ### Decision board
 
-![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/02-decision-board.png)
+![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/02-decision-board.png)
 
 ### Replay receipts and modeled friction
 
-![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/08-replay-receipts.png)
+![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/08-replay-receipts.png)
+
+### AI Coach Room
+
+![Signal Arcade AI Coach Room](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/09-ai-coach-room.png)
 
 ### Provider budgets and pacing
 
-![Signal Arcade data providers](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/05-data-providers.png)
+![Signal Arcade data providers](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/05-data-providers.png)
 
 ### Optional local AI models
 
-![Signal Arcade local AI models](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/06-local-ai.png)
+![Signal Arcade local AI models](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/06-local-ai.png)
 
 ### Mobile layout
 
-<img src="https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.8.0/07-mobile-arena.png" alt="Signal Arcade mobile Arena" width="430">
+<img src="https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/07-mobile-arena.png" alt="Signal Arcade mobile Arena" width="430">
 
 </details>
 
@@ -76,29 +82,40 @@ collects forward evidence separately from historical screening.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.8 |
+| Player | What it does | Influence in v1.9 |
 |---|---|---|
-| **Fast Baseline** | Scores fresh point-in-time evidence with deterministic rules | Runs the paper portfolio |
-| **Statistical Challenger** | Learns chronologically from fee-inclusive forward outcomes | Shadow until it passes every proof gate; monitored after activation |
-| **Local AI Coach** | Selects from deterministic, allowlisted experiments when the engine is quiet | Shadow only; cannot change a trade |
+| **Fast Baseline** | Scores fresh evidence, corroborates integrity patterns and sizes inside hard limits | Runs the paper portfolio |
+| **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | One explicit consent activates a qualified Entry champion; later skills can join only after independent forward proof and remain monitored |
+| **Local AI Coach** | Rotates through bounded Entry, Manipulation, Sizing and Exit studies when the engine is quiet | Research only; a proved idea needs explicit permission and a fresh Challenger tournament before it could ever influence |
 
+- 🛡️ **Corroborated integrity** — Baseline v1.4 combines wallet loops, net flow, coordinated trade
+  structure, price-path evidence and concentrated one-trade activity without calling any one
+  pattern a scam. It waits for a usable integrity sample and holds an extreme unresolved warning
+  while continuing to learn from the same on-chain stream—no paid provider or extra holder crawl
+  is required.
 - 🎮 **Comparable paper seasons** — Every new season locks one Safer, Balanced or Aggressive
-  profile and a typed drawdown policy. Profile changes can finish safely or use a bounded end-now
-  path that records unresolved inventory honestly and excludes manual endings from performance
-  claims.
+  profile, a typed drawdown policy, currency and exact virtual bankroll. One next-season editor can
+  change them together. Profile changes can finish safely or use a bounded end-now path; manual
+  endings remain visible but never become strategy-performance claims.
 - 🧠 **Explainable decisions and fills** — Opportunity, danger, confidence, execution, fees,
   impact and latency remain attached to the exact point-in-time evidence used.
-- 📚 **Learning must earn trust** — Challengers train and validate chronologically with outcome
-  embargoes, forward proof, minimum evidence and automatic rollback when later results deteriorate.
-- 🔎 **Manipulation-aware observations** — Wallet churn, rapid round trips, gross-versus-net flow,
-  trade regularity and evidence coverage inform shadow learning without becoming an unsupported
-  scam label or silently changing the baseline.
+- 📚 **Learning must earn trust** — Each Challenger skill trains and validates chronologically with
+  outcome embargoes, then a frozen candidate must beat the saved champion on the same later
+  outcomes. Qualified influence is bounded, versioned, auditable and suspended if health degrades.
+- 🔎 **Manipulation-aware decisions** — Wallet loops, gross-versus-net flow, trade structure and
+  price paths require mature, independently corroborated evidence. A new entry waits for minimum
+  integrity coverage, and an extreme isolated warning must resolve before the Baseline acts;
+  raw point-in-time measurements remain available to the Challenger and Coach.
+- 📐 **Auditable adaptive paper sizing** — Clean mature evidence may use more of realized bankroll,
+  while moderate uncertainty receives a smaller exploratory amount, suspicious evidence stays
+  bounded, and cash, exposure, reservations and price impact remain hard limits.
 - 🛡️ **Permanent safety boundaries** — A drawdown override changes only the portfolio halt. Stop,
   exposure, stale-data, mint, route and executable-exit protections remain active.
 - 🔄 **Built for unattended runs** — Auto season rollover uses 1–24 hours of verified healthy,
   dormant evidence; brief source interruptions pause the clock instead of becoming proof.
 - 🔌 **Keyless and local by default** — Public Solana RPC and DEX Screener work without accounts;
-  guided or custom providers and the private Ollama companion are optional.
+  guided or custom providers and the private Ollama companion are optional. Helius Economy can
+  reserve the key for paced HTTP safety lookups while retaining the default live stream.
 - 📱 **Responsive and resilient** — Desktop and mobile views use live updates with automatic
   polling fallback, while persistent data and model volumes survive container updates.
 
@@ -120,7 +137,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.8.1
+    image: nicxx2/signal-arcade:1.9.1
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -262,9 +279,21 @@ evidence may extend a winner past its normal review point, but it cannot remove 
 
 - Outcomes are measured after the decision at 1, 5, 10, 15 and 20 minutes.
 - Fees, impact and exit availability are included; missing exits never become fake zero P/L.
+- Entry, Manipulation, Sizing and Exit are independent versioned skills; one weak skill cannot earn
+  another skill's permission.
 - Training and validation remain chronological with embargoes to reduce look-ahead leakage.
-- Small or lucky cohorts cannot activate a challenger.
-- Active learners continue monitoring later unseen outcomes and roll back on deterioration.
+- A candidate and current champion are frozen before a common-forward tournament; small, lucky or
+  survivor-only cohorts cannot replace the champion.
+- The Learning Lab keeps a compact, restart-safe Champion journey for completed battles only;
+  historical Champions remain valid without invented promotions or profit claims.
+- One explicit activation grants consent to the qualified Entry champion. Later qualified skills
+  auto-join only after proving value beside the active upstream ensemble.
+- Active skills continue monitoring later unseen outcomes. A degraded or unverifiable skill and
+  every dependent downstream skill are suspended without weakening the Baseline.
+- Unfinished forward horizons remain pending rather than counting as unavailable, and every
+  retraining trigger stays inside the exact personality/configuration cohort that produced it.
+- A proved Sizing multiplier applies only when that exact amount still fits all deterministic cash,
+  exposure, reservation and route-impact limits; otherwise the valid Baseline size is preserved.
 - Demo tokens can never train or activate the live-paper learner.
 - Learning history persists across paper seasons and remains separated by risk personality.
 - Default, custom and disabled drawdown experiments keep distinct season scorecards while sharing
@@ -289,9 +318,19 @@ without Ollama.
   fee-inclusive evidence across independent seasons.
 - **Live Critic** — remains a future stage and cannot be enabled in this release.
 
-The AI Coach Room runs only when trading work is quiet. Deterministic code creates a small
-allowlist of experiments; the model may select one or select none. Historical evidence can propose
-an idea, but only outcomes recorded after that proposal can support it.
+The AI Coach Room is a separate research workflow and can be paused without disabling saved Shadow
+decision reviews. It runs only when trading work is quiet. Deterministic code creates a small
+allowlist across Entry, Manipulation, Sizing and Exit; the model may select one candidate or none.
+Historical evidence can reject or propose an idea, but only exact-cohort outcomes recorded after
+that proposal can support it. The proof clock survives pruning and restart, while incompatible
+Baseline, feature-schema, personality, provider/fee or active-Challenger contexts never mix.
+
+A bounded study needs at least 60 usable forward outcomes, at least 70% executable coverage, two
+independent seasons with at least ten usable outcomes each, and a confidence-adjusted improvement
+above one percentage point. It closes honestly as rejected or inconclusive instead of collecting
+forever. A supported idea still has zero direct authority. If the user explicitly allows
+contribution, it waits for an existing statistical Champion in the matching skill, becomes only a
+new contender, and must win a fresh common-forward tournament before the Challenger can promote it.
 
 <details>
 <summary><strong>⚡ Optional GPU acceleration</strong></summary>
@@ -335,7 +374,9 @@ The baseline requires no API key:
 
 Under **Settings → Data providers**, users can select guided Helius, Alchemy or SolanaTracker RPC
 presets, or enter custom HTTP/WebSocket endpoints and explicit free/paid limits. Keys are
-write-only and never returned to the browser.
+write-only and never returned to the browser. **Helius Economy** uses keyed Helius HTTP for paced
+mint/route safety lookups but restores the configured environment/public WebSocket for the
+high-volume stream; the UI shows both routes and whether either is saved or default.
 
 Monthly tracked-call caps are paced across the month, routine calls retain a reserve, and provider
 `429 Retry-After` responses are honored. WebSocket bandwidth and provider-specific credits/CUs

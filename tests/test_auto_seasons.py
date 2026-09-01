@@ -24,7 +24,7 @@ from signal_arcade.orchestrator import (
     AUTO_NEW_SEASON_GRACE_SECONDS,
     Orchestrator,
 )
-from signal_arcade.risk_profiles import DrawdownPolicy, DrawdownPolicyKind
+from signal_arcade.risk_profiles import DrawdownPolicy, DrawdownPolicyKind, build_season_profile
 
 
 def season_summary(*, open_positions: int = 0) -> dict[str, int | float]:
@@ -41,7 +41,34 @@ def season_summary(*, open_positions: int = 0) -> dict[str, int | float]:
         "break_even": 0,
         "ending_drawdown_fraction": 0.5,
         "open_positions": open_positions,
+        "meaningful_activity": True,
     }
+
+
+def test_legacy_strategy_keeps_its_existing_learning_cohort_fingerprint(
+    tmp_path: Path,
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    legacy_fingerprint = orchestrator._configuration_fingerprint()  # noqa: SLF001
+    current_fingerprint = orchestrator._configuration_fingerprint_for_mode(  # noqa: SLF001
+        RiskMode.BALANCED
+    )
+    legacy_profile = build_season_profile(RiskMode.BALANCED).model_dump(mode="json")
+    legacy_profile.pop("baseline_version")
+    legacy_profile.pop("integrity_policy_version")
+    legacy_profile.pop("sizing_policy_version")
+    legacy_profile["learning_fingerprint"] = legacy_fingerprint
+
+    orchestrator.broker.initialize(
+        QuoteCurrency.SOL,
+        1_000_000_000,
+        legacy_profile,
+    )
+
+    assert current_fingerprint != legacy_fingerprint
+    assert orchestrator._configuration_fingerprint() == legacy_fingerprint  # noqa: SLF001
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
 
 
 def learning_observation(now: datetime) -> LearningObservation:
@@ -100,6 +127,22 @@ def dormant_position(now: datetime) -> Position:
         mark_is_stale=True,
         mark_is_executable=False,
     )
+
+
+def confirm_unavailable_route(
+    orchestrator: Orchestrator,
+    mint: str,
+    observed_at: datetime,
+) -> None:
+    for offset, slot in ((-1, 201), (0, 202)):
+        orchestrator._record_position_route_probe(  # noqa: SLF001 - terminal evidence fixture
+            mint,
+            available=False,
+            observed_at=observed_at + timedelta(seconds=offset),
+            slot=slot,
+            market_status="dormant",
+            blockers=["route_unavailable"],
+        )
 
 
 def drawdown_off_orchestrator(
@@ -382,9 +425,10 @@ def test_auto_season_waits_full_grace_then_rolls_dormant_season(tmp_path: Path) 
     )
     assert orchestrator._auto_new_season_tick(almost_due) is None  # noqa: SLF001
 
-    rollover = orchestrator._auto_new_season_tick(  # noqa: SLF001
-        almost_due + timedelta(seconds=2)
-    )
+    due_at = almost_due + timedelta(seconds=2)
+    assert orchestrator._auto_new_season_tick(due_at) is None  # noqa: SLF001
+    confirm_unavailable_route(orchestrator, position.mint, due_at)
+    rollover = orchestrator._auto_new_season_tick(due_at)  # noqa: SLF001
 
     assert rollover is not None
     assert rollover["previous_season_id"] != rollover["next_season_id"]
@@ -400,6 +444,11 @@ def test_auto_season_waits_full_grace_then_rolls_dormant_season(tmp_path: Path) 
         "current",
     ]
     seasons = orchestrator.database.list_paper_seasons()
+    assert seasons[0]["accounting_status"] == "complete_with_writeoffs"
+    assert seasons[0]["write_off_count"] == 1
+    assert seasons[0]["closed_trades"] == 1
+    assert seasons[0]["losses"] == 1
+    assert seasons[0]["comparable"] is True
     assert seasons[0]["profile"] is None
     assert seasons[0]["profile_provenance"] == "legacy_unknown"
     assert seasons[1]["profile_provenance"] == "exact"

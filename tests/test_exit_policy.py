@@ -188,3 +188,16 @@ def test_deteriorating_market_and_failed_mint_safety_exit_early() -> None:
         "signal_deterioration",
     )
     assert (unsafe.action, unsafe.reason) == ("exit", "mint_safety_exit")
+
+
+def test_stop_loss_keeps_priority_over_persistent_integrity_attribution() -> None:
+    now = datetime.now(UTC)
+    assessment = assess_exit(
+        position=position(now, age_seconds=45, mark=70, peak=100),
+        features=features(now, strong=False),
+        now=now,
+        limits=RISK_LIMITS[RiskMode.BALANCED],
+        persistent_integrity_reason="persistent_severe_market_integrity",
+    )
+
+    assert (assessment.action, assessment.reason) == ("exit", "stop_loss")

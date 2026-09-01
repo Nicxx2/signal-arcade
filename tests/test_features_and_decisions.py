@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Event
 
+import pytest
 from signal_arcade.intelligence.decision import DecisionEngine
 from signal_arcade.intelligence.features import FeatureEngine
 from signal_arcade.models import (
@@ -12,7 +13,16 @@ from signal_arcade.models import (
     DecisionScore,
     EventKind,
     MarketEvent,
+    MarketIntegrityState,
     RiskMode,
+)
+from signal_arcade.strategy import (
+    BASELINE_VERSION,
+    INTEGRITY_POLICY_VERSION,
+    LEGACY_BASELINE_VERSION,
+    PREVIOUS_BASELINE_VERSION,
+    PREVIOUS_INTEGRITY_POLICY_VERSION,
+    RECENT_BASELINE_VERSION,
 )
 
 
@@ -540,10 +550,14 @@ def test_decision_progresses_from_watch_to_evaluated() -> None:
         "Mint111111111111111111111111111111111111111", start + timedelta(seconds=25)
     )
     assert snapshot is not None
-    decision = DecisionEngine().evaluate(snapshot, RiskMode.AGGRESSIVE)
+    decision = DecisionEngine().evaluate(
+        snapshot,
+        RiskMode.AGGRESSIVE,
+        baseline_version=LEGACY_BASELINE_VERSION,
+    )
     assert decision.action in {DecisionAction.ENTER, DecisionAction.PASS}
     assert decision.score.confidence >= 0.55
-    assert decision.model_version == "baseline-v1.1"
+    assert decision.model_version == LEGACY_BASELINE_VERSION
 
     # Integrity evidence is deliberately observational in v1.7. Extreme values must not alter
     # the fast baseline until a separately qualified learner is explicitly activated.
@@ -559,11 +573,184 @@ def test_decision_progresses_from_watch_to_evaluated() -> None:
     ):
         extreme.values[name].value = 1.0
     extreme.values["net_quote_flow_ratio"].value = 0.0
-    extreme_decision = DecisionEngine().evaluate(extreme, RiskMode.AGGRESSIVE)
+    extreme_decision = DecisionEngine().evaluate(
+        extreme,
+        RiskMode.AGGRESSIVE,
+        baseline_version=LEGACY_BASELINE_VERSION,
+    )
     assert extreme_decision.action == decision.action
     assert extreme_decision.score == decision.score
     assert extreme_decision.reasons == decision.reasons
     assert extreme_decision.blockers == decision.blockers
+
+    # The current Baseline keeps that same short sample uncertain and waits for its integrity
+    # evidence to mature. Extreme-looking values are not mislabeled as manipulation, but neither
+    # are they treated as safe enough for an immediate entry.
+    short_sample = DecisionEngine().evaluate(extreme, RiskMode.AGGRESSIVE)
+    assert short_sample.model_version == BASELINE_VERSION
+    assert short_sample.integrity_assessment is not None
+    assert short_sample.integrity_assessment.state == MarketIntegrityState.UNCERTAIN
+    assert "market_integrity_severe" not in short_sample.blockers
+    assert "market_integrity_evidence_not_mature" in short_sample.blockers
+    assert short_sample.action == DecisionAction.PASS
+
+    # A season already locked to v1.3 keeps its original fast-entry behavior after upgrade.
+    recent_short_sample = DecisionEngine().evaluate(
+        extreme,
+        RiskMode.AGGRESSIVE,
+        baseline_version=RECENT_BASELINE_VERSION,
+    )
+    assert "market_integrity_evidence_not_mature" not in recent_short_sample.blockers
+
+    mature_extreme = extreme.model_copy(deep=True)
+    mature_extreme.values["trade_count_5m"].value = 30
+    mature_extreme.values["age_seconds"].value = 45
+    current_decision = DecisionEngine().evaluate(mature_extreme, RiskMode.AGGRESSIVE)
+    assert current_decision.integrity_assessment is not None
+    assert current_decision.integrity_assessment.state == MarketIntegrityState.SEVERE
+    assert current_decision.integrity_assessment.category_count >= 3
+    assert "market_integrity_severe" in current_decision.blockers
+    assert current_decision.action == DecisionAction.PASS
+
+    incomplete = mature_extreme.model_copy(deep=True)
+    for name in (
+        "round_trip_wallet_ratio",
+        "round_trip_volume_ratio",
+        "side_alternation_ratio",
+        "quantized_amount_repeat_ratio",
+        "slot_concentration_hhi",
+        "multi_trade_signature_ratio",
+    ):
+        incomplete.values[name].value = None
+        incomplete.values[name].quality = 0
+        incomplete.values[name].missing_reason = "test_missing"
+    incomplete_decision = DecisionEngine().evaluate(incomplete, RiskMode.AGGRESSIVE)
+    assert incomplete_decision.integrity_assessment is not None
+    assert incomplete_decision.integrity_assessment.coverage < 0.75
+    assert incomplete_decision.integrity_assessment.state == MarketIntegrityState.UNCERTAIN
+    assert "market_integrity_evidence_not_mature" in incomplete_decision.blockers
+
+    isolated = mature_extreme.model_copy(deep=True)
+    isolated.values["round_trip_wallet_ratio"].value = 0.0
+    isolated.values["round_trip_volume_ratio"].value = 0.0
+    isolated.values["net_quote_flow_ratio"].value = 0.8
+    isolated.values["side_alternation_ratio"].value = 0.2
+    isolated.values["quantized_amount_repeat_ratio"].value = 0.1
+    isolated.values["slot_concentration_hhi"].value = 0.08
+    isolated.values["price_direction_consistency"].value = 1.0
+    isolated_decision = DecisionEngine().evaluate(isolated, RiskMode.AGGRESSIVE)
+    assert isolated_decision.integrity_assessment is not None
+    assert isolated_decision.integrity_assessment.category_count == 1
+    assert isolated_decision.integrity_assessment.state == MarketIntegrityState.UNCERTAIN
+    assert "market_integrity_uncertain_high_risk" in isolated_decision.blockers
+    assert isolated_decision.action == DecisionAction.PASS
+
+    # The integrity boundary is a permanent Baseline safety rule, not a personality-specific
+    # preference. Aggressive may accept more ordinary danger, but it cannot bypass unresolved
+    # high-risk manipulation evidence; a recovered complete sample must also clear the earlier
+    # provider-coverage maturity blocker deterministically.
+    assert "market_integrity_evidence_not_mature" not in isolated_decision.blockers
+    for mode in (RiskMode.SAFE, RiskMode.BALANCED, RiskMode.AGGRESSIVE):
+        mode_decision = DecisionEngine().evaluate(isolated, mode)
+        assert "market_integrity_uncertain_high_risk" in mode_decision.blockers
+        assert mode_decision.action == DecisionAction.PASS
+
+    exact_maturity = isolated.model_copy(deep=True)
+    exact_maturity.values["trade_count_5m"].value = 24
+    exact_maturity.values["age_seconds"].value = 30
+    exact_maturity_decision = DecisionEngine().evaluate(exact_maturity, RiskMode.AGGRESSIVE)
+    assert "market_integrity_evidence_not_mature" not in exact_maturity_decision.blockers
+    for field, below in (("trade_count_5m", 23), ("age_seconds", 29.999)):
+        below_maturity = exact_maturity.model_copy(deep=True)
+        below_maturity.values[field].value = below
+        below_decision = DecisionEngine().evaluate(below_maturity, RiskMode.AGGRESSIVE)
+        assert "market_integrity_evidence_not_mature" in below_decision.blockers
+
+    recent_isolated = DecisionEngine().evaluate(
+        isolated,
+        RiskMode.AGGRESSIVE,
+        baseline_version=RECENT_BASELINE_VERSION,
+    )
+    assert recent_isolated.integrity_assessment is not None
+    assert recent_isolated.integrity_assessment.policy_version == INTEGRITY_POLICY_VERSION
+    assert "market_integrity_uncertain_high_risk" not in recent_isolated.blockers
+
+    moderate_isolated = isolated.model_copy(deep=True)
+    moderate_isolated.values["price_direction_consistency"].value = 0.93
+    moderate_decision = DecisionEngine().evaluate(moderate_isolated, RiskMode.AGGRESSIVE)
+    assert moderate_decision.integrity_assessment is not None
+    assert moderate_decision.integrity_assessment.state == MarketIntegrityState.UNCERTAIN
+    assert 0 < moderate_decision.integrity_assessment.score < 0.80
+    assert "market_integrity_uncertain_high_risk" not in moderate_decision.blockers
+
+    isolated.values["price_direction_consistency"].value = 0.55
+    clean_decision = DecisionEngine().evaluate(isolated, RiskMode.AGGRESSIVE)
+    assert clean_decision.integrity_assessment is not None
+    assert clean_decision.integrity_assessment.state == MarketIntegrityState.CLEAN
+
+    # V2 treats extreme value concentration plus one-trade wallet dispersion as one independent
+    # manipulation category. It prevents a size-up but cannot condemn the market by itself.
+    concentrated_dispersion = isolated.model_copy(deep=True)
+    concentrated_dispersion.values["wallet_volume_hhi"].value = 0.90
+    concentrated_dispersion.values["single_trade_wallet_ratio"].value = 0.95
+    dispersion_decision = DecisionEngine().evaluate(
+        concentrated_dispersion,
+        RiskMode.AGGRESSIVE,
+    )
+    assert dispersion_decision.integrity_assessment is not None
+    assert dispersion_decision.integrity_assessment.policy_version == INTEGRITY_POLICY_VERSION
+    assert dispersion_decision.integrity_assessment.categories == ["concentrated_dispersion"]
+    assert dispersion_decision.integrity_assessment.state == MarketIntegrityState.UNCERTAIN
+    assert "market_integrity_uncertain_high_risk" in dispersion_decision.blockers
+
+    # The exact v1.2 generation remains frozen for already-locked seasons after an upgrade.
+    previous_dispersion = DecisionEngine().evaluate(
+        concentrated_dispersion,
+        RiskMode.AGGRESSIVE,
+        baseline_version=PREVIOUS_BASELINE_VERSION,
+    )
+    assert previous_dispersion.integrity_assessment is not None
+    assert (
+        previous_dispersion.integrity_assessment.policy_version == PREVIOUS_INTEGRITY_POLICY_VERSION
+    )
+    assert previous_dispersion.integrity_assessment.state == MarketIntegrityState.CLEAN
+
+    # Either ingredient alone remains ordinary concentration/participation evidence. A second
+    # independent category is still required before deterministic danger and sizing are reduced.
+    lone_whale = concentrated_dispersion.model_copy(deep=True)
+    lone_whale.values["single_trade_wallet_ratio"].value = 0.50
+    lone_whale_decision = DecisionEngine().evaluate(lone_whale, RiskMode.AGGRESSIVE)
+    assert lone_whale_decision.integrity_assessment is not None
+    assert lone_whale_decision.integrity_assessment.state == MarketIntegrityState.CLEAN
+
+    dispersed_organic = concentrated_dispersion.model_copy(deep=True)
+    dispersed_organic.values["wallet_volume_hhi"].value = 0.10
+    dispersed_organic_decision = DecisionEngine().evaluate(
+        dispersed_organic,
+        RiskMode.AGGRESSIVE,
+    )
+    assert dispersed_organic_decision.integrity_assessment is not None
+    assert dispersed_organic_decision.integrity_assessment.state == MarketIntegrityState.CLEAN
+
+    corroborated_dispersion = concentrated_dispersion.model_copy(deep=True)
+    corroborated_dispersion.values["net_quote_flow_ratio"].value = 0.05
+    corroborated_decision = DecisionEngine().evaluate(
+        corroborated_dispersion,
+        RiskMode.AGGRESSIVE,
+    )
+    assert corroborated_decision.integrity_assessment is not None
+    assert set(corroborated_decision.integrity_assessment.categories) == {
+        "concentrated_dispersion",
+        "low_net_flow",
+    }
+    assert corroborated_decision.integrity_assessment.state == MarketIntegrityState.SUSPICIOUS
+
+    with pytest.raises(ValueError, match="unsupported baseline version"):
+        DecisionEngine().evaluate(
+            isolated,
+            RiskMode.AGGRESSIVE,
+            baseline_version="baseline-future-unknown",
+        )
 
 
 def test_stale_data_forces_abstention() -> None:

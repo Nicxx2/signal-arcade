@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from signal_arcade.config import Settings
 from signal_arcade.database import Database
+from signal_arcade.intelligence.decision import INTEGRITY_MIN_AGE_SECONDS
 from signal_arcade.intelligence.features import TokenState
 from signal_arcade.models import (
     DataValue,
@@ -27,7 +28,11 @@ from signal_arcade.models import (
 from signal_arcade.orchestrator import Orchestrator
 from signal_arcade.provider_settings import ProviderConfiguration, ProviderPolicy
 from signal_arcade.providers.anchor import b58encode
-from signal_arcade.providers.demo import DemoFeed
+from signal_arcade.providers.demo import (
+    DEMO_TICK_INTERVAL_SECONDS,
+    DEMO_TICKS_PER_TOKEN,
+    DemoFeed,
+)
 from signal_arcade.providers.http import SPL_TOKEN_PROGRAM
 from signal_arcade.providers.solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, SolanaLogProvider
 
@@ -331,6 +336,14 @@ def test_demo_sessions_do_not_reuse_persistent_event_ids() -> None:
     first = DemoFeed(seed=7)
     second = DemoFeed(seed=7)
     assert first.session_id != second.session_id
+
+
+def test_demo_token_lifetime_can_clear_the_current_integrity_maturity_gate() -> None:
+    observable_lifetime = (DEMO_TICKS_PER_TOKEN - 1) * DEMO_TICK_INTERVAL_SECONDS
+
+    # A fill near the maturity boundary still receives a useful synthetic management window;
+    # merely crossing the boundary would make the first position go dormant almost immediately.
+    assert observable_lifetime >= INTEGRITY_MIN_AGE_SECONDS + 10
 
 
 def test_pumpswap_pool_mapping_is_bounded_and_recent_entries_survive() -> None:
@@ -1513,6 +1526,35 @@ def test_candidate_scoring_cooldown_adapts_only_when_queue_pressure_is_extreme(
     for sequence in range(9):
         orchestrator.event_queue.put_nowait((2, sequence, event))
     assert orchestrator._candidate_decision_cooldown_seconds() == 30  # noqa: SLF001
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_event_batch_wait_is_skipped_when_a_backlog_already_exists(tmp_path: Path) -> None:
+    settings = Settings(
+        data_dir=tmp_path,
+        demo_mode=True,
+        event_batch_wait_ms=25,
+        _env_file=None,
+    )
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    event = MarketEvent(
+        event_id="already-queued",
+        source="test",
+        kind=EventKind.TRADE,
+        mint="queued-mint",
+        received_at=now,
+        payload={"is_buy": True},
+    )
+
+    assert orchestrator._event_batch_wait_seconds() == 0.025  # noqa: SLF001
+    orchestrator.event_queue.put_nowait((2, 1, event))
+    assert orchestrator._event_batch_wait_seconds() == 0.0  # noqa: SLF001
+    queued = orchestrator.event_queue.get_nowait()
+    assert queued[2] == event
+    orchestrator.event_queue.task_done()
 
     asyncio.run(orchestrator.http.close())
     orchestrator.database.close()

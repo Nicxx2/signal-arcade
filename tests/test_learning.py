@@ -6,21 +6,37 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from signal_arcade.database import Database
 from signal_arcade.intelligence.features import TokenState
-from signal_arcade.intelligence.learning import FEATURE_NAMES, LearningEngine
+from signal_arcade.intelligence.learning import (
+    FEATURE_NAMES,
+    FEATURE_SCHEMA_VERSION,
+    LearningEngine,
+    _challenger_cohort_key,
+    _predict_skill_artifact,
+)
 from signal_arcade.models import (
+    ChallengerSkill,
+    ChallengerSkillArtifact,
+    CoachCondition,
+    CoachExperimentKind,
+    CoachExperimentState,
+    CoachHypothesis,
     DataValue,
     Decision,
     DecisionAction,
     DecisionScore,
     FeatureSnapshot,
+    IntegrityAssessment,
     LearningCheckpoint,
     LearningMode,
     LearningModel,
     LearningObservation,
     LearningObservationStatus,
+    MarketIntegrityState,
     RiskMode,
+    SizingAssessment,
 )
 from signal_arcade.paper.curve_math import quote_buy, quote_sell
+from signal_arcade.strategy import BASELINE_VERSION, PREVIOUS_BASELINE_VERSION
 
 
 def make_decision(now: datetime, mint: str, opportunity: float = 0.8) -> Decision:
@@ -131,6 +147,64 @@ def qualified_model(version: str, prediction: float, outcomes_seen: int) -> Lear
     )
 
 
+def test_unqualified_skill_candidate_is_collecting_proof_not_suspended(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "candidate-status-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        configuration,
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    artifact = ChallengerSkillArtifact(
+        version="challenger-skill-v1-manipulation-unqualified",
+        skill=ChallengerSkill.MANIPULATION,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        outcomes_seen=80,
+        sample_count=80,
+        training_count=50,
+        validation_count=26,
+        embargoed_count=4,
+        qualified=False,
+        qualification_reasons=["manipulation_proof_gates_not_met"],
+    )
+
+    learner._register_skill_artifact(artifact, cohort_key)  # noqa: SLF001
+
+    state = learner.skill_states[(cohort_key, ChallengerSkill.MANIPULATION)]
+    assert state.champion_version is None
+    assert state.suspended_version is None
+    status = next(
+        item
+        for item in learner.status(demo_mode=False)["skills"]
+        if item["skill"] == ChallengerSkill.MANIPULATION.value
+    )
+    assert status["state"] == "collecting_proof"
+    assert status["health"]["state"] == "inactive"
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    restarted_status = next(
+        item
+        for item in restarted.skill_statuses()
+        if item["skill"] == ChallengerSkill.MANIPULATION.value
+    )
+    assert restarted_status["state"] == "collecting_proof"
+    assert restarted_status["health"]["state"] == "inactive"
+    database.close()
+
+
 def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     learner = LearningEngine(database, settings)
@@ -206,6 +280,1280 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
     database.close()
 
 
+def test_clock_sampler_uses_only_fresh_cached_route_evidence(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    state = make_state("clock-route")
+    assert learner.register(make_decision(now, state.mint), state, live=True)
+
+    state.last_reserve_at = now + timedelta(seconds=300)
+    state.last_event_at = state.last_reserve_at
+    state.last_event_id = "trade-at-checkpoint"
+    state.reserve_source = "solana:logs"
+    assert (
+        learner.sample_due_checkpoints(
+            {state.mint: state},
+            now + timedelta(seconds=300),
+            live=True,
+        )
+        == 2
+    )
+    checkpoint = learner.observations[state.mint].checkpoints["300"]
+    assert checkpoint.net_return is not None
+    assert checkpoint.route_event_id == "trade-at-checkpoint"
+    assert checkpoint.route_source == "solana:logs"
+    assert checkpoint.reserve_age_seconds == 0
+    database.close()
+
+
+def test_clock_sampler_never_prices_stale_routes_and_records_exact_reason(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    states: dict[str, TokenState] = {}
+    for mint in ("stale-a", "fresh-b"):
+        state = make_state(mint)
+        assert learner.register(make_decision(now, mint), state, live=True)
+        state.last_reserve_at = now if mint == "stale-a" else now + timedelta(seconds=300)
+        state.last_event_at = state.last_reserve_at
+        states[mint] = state
+
+    sampled = learner.sample_due_checkpoints(
+        states,
+        now + timedelta(seconds=300),
+        live=True,
+        max_observations=1,
+    )
+    assert sampled == 2
+    assert "300" not in learner.observations["stale-a"].checkpoints
+    # An old stale item cannot starve a fresh due route when work is bounded.
+    assert learner.observations["fresh-b"].checkpoints["300"].net_return is not None
+
+    assert (
+        learner.expire_checkpoints(
+            now + timedelta(seconds=391),
+            states=states,
+        )
+        >= 2
+    )
+    stale = learner.observations["stale-a"].checkpoints["300"]
+    assert stale.net_return is None
+    assert stale.missing_reason == "stale_cached_route"
+    assert learner.status(demo_mode=False)["unavailable_outcome_reasons"]["stale_cached_route"] == 1
+    database.close()
+
+
+def test_candidate_replaces_champion_only_on_common_forward_evidence(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "baseline-v1.2-tournament-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    champion = qualified_model("champion", 0.20, 80).model_copy(
+        update={
+            "created_at": now,
+            "configuration_fingerprint": configuration,
+        }
+    )
+    candidate = qualified_model("candidate", -0.20, 90).model_copy(
+        update={
+            "created_at": now + timedelta(seconds=1),
+            "configuration_fingerprint": configuration,
+        }
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001 - exercise tournament boundary directly
+        champion,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        candidate,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    state = next(iter(learner.skill_states.values()))
+    original_champion = state.champion_version
+    contender = state.testing_version
+    assert original_champion is not None
+    assert contender is not None
+    assert original_champion != contender
+    assert [event.kind for event in state.champion_journey] == ["first_champion"]
+    assert state.champion_journey[0].champion_version == original_champion
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    assert learner.active_skill_versions["entry"] == original_champion
+
+    for index in range(30):
+        observed_at = now + timedelta(minutes=10 + index)
+        mint = f"tournament-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        assert set(observation.challenger_evaluations) == {original_champion, contender}
+        observation.checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observed_at + timedelta(seconds=300),
+            net_return=-0.10,
+            exit_value_lamports=1,
+        )
+        database.save_learning_observation(observation)
+        learner._advance_entry_tournaments()  # noqa: SLF001
+        if index < 29:
+            assert state.champion_version == original_champion
+
+    assert state.champion_version == contender
+    assert state.testing_version is None
+    assert state.active_version == contender
+    assert learner.active_skill_versions["entry"] == contender
+    assert state.last_tournament["result"] == "promoted"
+    assert state.last_tournament["common_usable_count"] == 30
+    assert [event.kind for event in state.champion_journey] == ["first_champion", "promoted"]
+    promotion = state.champion_journey[-1]
+    assert promotion.previous_champion_version == original_champion
+    assert promotion.champion_version == contender
+    assert promotion.common_usable_count == 30
+    learner._advance_entry_tournaments()  # noqa: SLF001 - a settled battle is idempotent
+    assert [event.kind for event in state.champion_journey] == ["first_champion", "promoted"]
+    stale_state = state.model_copy(
+        update={
+            "cohort_key": "stale-configuration-cohort",
+            "configuration_fingerprint": "stale-configuration",
+            "champion_version": "missing-old-champion",
+            "testing_version": "missing-old-candidate",
+            "suspended_version": None,
+        }
+    )
+    learner.skill_states[(stale_state.cohort_key, ChallengerSkill.ENTRY)] = stale_state
+    learner._advance_entry_tournaments()  # noqa: SLF001
+    assert stale_state.testing_version == "missing-old-candidate"
+    assert stale_state.suspended_version is None
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    restarted_state = next(iter(restarted.skill_states.values()))
+    assert restarted_state.champion_version == contender
+    assert restarted.active_skill_versions["entry"] == contender
+    assert [event.kind for event in restarted_state.champion_journey] == [
+        "first_champion",
+        "promoted",
+    ]
+    assert [event["kind"] for event in restarted.status(demo_mode=False)["champion_journey"]] == [
+        "promoted",
+        "first_champion",
+    ]
+    assert restarted.status(demo_mode=False)["challenger_common_forward_minimum"] == 30
+    assert restarted.status(demo_mode=False)["challenger_minimum_availability"] == 0.70
+    database.close()
+
+
+def test_champion_journey_is_bounded_idempotent_and_cohort_isolated(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "champion-history-current"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    champion = qualified_model("journey-champion", 0.2, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001 - exercise durable event boundary
+        champion,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    state = next(iter(learner.skill_states.values()))
+    for index in range(14):
+        learner._append_champion_event(  # noqa: SLF001
+            state,
+            kind="defended",
+            candidate_version=f"contender-{index}",
+            previous_champion_version=state.champion_version,
+            champion_version=state.champion_version or "missing",
+            common_observed_count=30,
+            common_usable_count=30,
+            availability_fraction=1.0,
+            mean_uplift=-0.01,
+            uplift_lower_bound=-0.02,
+            occurred_at=now + timedelta(minutes=index + 1),
+        )
+    assert len(state.champion_journey) == 12
+    retained_ids = [event.event_id for event in state.champion_journey]
+    learner._append_champion_event(  # noqa: SLF001 - duplicate must remain a no-op
+        state,
+        kind="defended",
+        candidate_version="contender-13",
+        previous_champion_version=state.champion_version,
+        champion_version=state.champion_version or "missing",
+        common_observed_count=30,
+        common_usable_count=30,
+        availability_fraction=1.0,
+    )
+    assert [event.event_id for event in state.champion_journey] == retained_ids
+    database.save_challenger_skill_state(state)
+
+    learner.current_risk_mode = RiskMode.SAFE
+    assert learner.champion_journey() == []
+    learner.current_risk_mode = RiskMode.BALANCED
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    restarted_state = next(iter(restarted.skill_states.values()))
+    assert [event.event_id for event in restarted_state.champion_journey] == retained_ids
+    assert len(restarted.champion_journey()) == 12
+    database.close()
+
+
+def test_champion_journey_records_a_real_common_forward_defence(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "champion-defence-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    champion = qualified_model("defence-champion", 0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    candidate = qualified_model("defence-candidate", -0.20, 90).model_copy(
+        update={
+            "created_at": now + timedelta(seconds=1),
+            "configuration_fingerprint": configuration,
+        }
+    )
+    for model in (champion, candidate):
+        learner._publish_entry_artifact(  # noqa: SLF001 - exercise real battle result
+            model,
+            baseline_version=BASELINE_VERSION,
+            evidence_started_at=now - timedelta(hours=1),
+            evidence_ended_at=model.created_at,
+        )
+    state = next(iter(learner.skill_states.values()))
+    original_champion = state.champion_version
+    contender = state.testing_version
+    assert original_champion is not None
+    assert contender is not None
+
+    for index in range(30):
+        observed_at = now + timedelta(minutes=10 + index)
+        mint = f"defence-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        observation.checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observed_at + timedelta(seconds=300),
+            net_return=0.10,
+            exit_value_lamports=1,
+        )
+        database.save_learning_observation(observation)
+        learner._advance_entry_tournaments()  # noqa: SLF001
+
+    assert state.champion_version == original_champion
+    assert state.testing_version is None
+    assert state.last_tournament["result"] == "rejected"
+    defence = state.champion_journey[-1]
+    assert defence.kind == "defended"
+    assert defence.candidate_version == contender
+    assert defence.champion_version == original_champion
+    assert defence.common_usable_count == 30
+    database.close()
+
+
+def test_champion_journey_closes_a_max_length_tie_as_inconclusive(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "champion-inconclusive-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    champion = qualified_model("tie-champion", -0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    candidate = qualified_model("tie-candidate", 0.20, 90).model_copy(
+        update={
+            "created_at": now + timedelta(seconds=1),
+            "configuration_fingerprint": configuration,
+        }
+    )
+    for model in (champion, candidate):
+        learner._publish_entry_artifact(  # noqa: SLF001
+            model,
+            baseline_version=BASELINE_VERSION,
+            evidence_started_at=now - timedelta(hours=1),
+            evidence_ended_at=model.created_at,
+        )
+    state = next(iter(learner.skill_states.values()))
+    original_champion = state.champion_version
+
+    for index in range(120):
+        observed_at = now + timedelta(minutes=10 + index)
+        mint = f"inconclusive-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        outcome = -0.10 if index % 10 < 3 else 0.043
+        observation.checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observed_at + timedelta(seconds=300),
+            net_return=outcome,
+            exit_value_lamports=1,
+        )
+        database.save_learning_observation(observation)
+        learner._advance_entry_tournaments()  # noqa: SLF001
+
+    assert state.champion_version == original_champion
+    assert state.testing_version is None
+    tie = state.champion_journey[-1]
+    assert tie.kind == "inconclusive"
+    assert tie.common_usable_count == 120
+    assert tie.uplift_lower_bound is not None and tie.uplift_lower_bound <= 0
+    database.close()
+
+
+def test_champion_tournament_cannot_run_forever_on_poor_outcome_coverage(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "champion-low-coverage-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    champion = qualified_model("coverage-champion", -0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    candidate = qualified_model("coverage-candidate", 0.20, 90).model_copy(
+        update={
+            "created_at": now + timedelta(seconds=1),
+            "configuration_fingerprint": configuration,
+        }
+    )
+    for model in (champion, candidate):
+        learner._publish_entry_artifact(  # noqa: SLF001
+            model,
+            baseline_version=BASELINE_VERSION,
+            evidence_started_at=now - timedelta(hours=1),
+            evidence_ended_at=model.created_at,
+        )
+    state = next(iter(learner.skill_states.values()))
+    original_champion = state.champion_version
+
+    # 53 unavailable plus 119 usable outcomes leaves coverage just below 70% after 172
+    # resolved common-forward cases. The trial must stop safely instead of collecting forever.
+    for index in range(172):
+        observed_at = now + timedelta(minutes=10 + index)
+        mint = f"low-coverage-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        observation.checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observed_at + timedelta(seconds=300),
+            net_return=None if index < 53 else 0.043,
+            exit_value_lamports=None if index < 53 else 1,
+            missing_reason="route_unavailable" if index < 53 else None,
+        )
+        database.save_learning_observation(observation)
+        learner._advance_entry_tournaments()  # noqa: SLF001
+
+    assert state.champion_version == original_champion
+    assert state.testing_version is None
+    assert state.last_tournament["result"] == "inconclusive"
+    assert state.last_tournament["common_observed_count"] == 172
+    assert state.last_tournament["common_usable_count"] == 119
+    assert float(state.last_tournament["availability_fraction"]) < 0.70
+    assert state.champion_journey[-1].kind == "inconclusive"
+    database.close()
+
+
+def test_retraining_interval_counts_only_new_outcomes_in_the_exact_cohort(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "cohort-a"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    model = qualified_model("cohort-interval", 0.2, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner.models.append(model)
+
+    for cohort, count in (("cohort-b", 10), (configuration, 1)):
+        for index in range(count):
+            created_at = now + timedelta(
+                minutes=10 + index + (20 if cohort == configuration else 0)
+            )
+            mint = f"{cohort}-{index}"
+            decision = make_decision(created_at, mint).model_copy(
+                update={
+                    "model_version": BASELINE_VERSION,
+                    "configuration_fingerprint": cohort,
+                }
+            )
+            assert learner.register(decision, make_state(mint), live=True)
+            observation = learner.observations[mint]
+            observation.checkpoints["300"] = LearningCheckpoint(
+                horizon_seconds=300,
+                observed_at=created_at + timedelta(seconds=300),
+                net_return=0.05,
+                exit_value_lamports=1,
+            )
+
+    assert learner._new_outcomes_since_model(model) == 1  # noqa: SLF001
+    assert learner.status(demo_mode=False)["outcomes_until_next_training"] == 9
+    database.close()
+
+
+def test_primary_resolution_retrains_the_cohort_that_actually_changed(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    decision = make_decision(now, "delayed-cohort-a").model_copy(
+        update={
+            "model_version": BASELINE_VERSION,
+            "configuration_fingerprint": "cohort-a",
+        }
+    )
+    assert learner.register(decision, make_state(decision.mint), live=True)
+    calls: list[tuple[RiskMode | None, str | None]] = []
+    monkeypatch.setattr(
+        learner,
+        "_retrain_if_ready",
+        lambda *, target_mode=None, target_configuration=None: calls.append(
+            (target_mode, target_configuration)
+        ),
+    )
+
+    assert (
+        learner.observe_market(
+            make_state(decision.mint),
+            now + timedelta(seconds=300),
+            live=True,
+        )
+        == 2
+    )
+    assert calls == [(RiskMode.BALANCED, "cohort-a")]
+    database.close()
+
+
+def test_manipulation_skill_learns_an_independent_veto_policy(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    configuration = "baseline-v1.2-manipulation-config"
+    rows: list[tuple[LearningObservation, float]] = []
+    for index in range(80):
+        manipulated = index % 2 == 0
+        observed_at = now + timedelta(seconds=index)
+        mint = f"manipulation-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        for feature_name in (
+            "round_trip_wallet_ratio",
+            "round_trip_volume_ratio",
+            "side_alternation_ratio",
+            "quantized_amount_repeat_ratio",
+        ):
+            decision.feature_snapshot.values[feature_name] = data(
+                observed_at, 0.95 if manipulated else 0.05
+            )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        outcome = -0.40 if manipulated else 0.20
+        rows.append((learner.observations[mint], outcome))
+
+    learner._publish_manipulation_artifact(  # noqa: SLF001 - validate skill boundary
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        rows=rows,
+        training=rows[:60],
+        validation=rows[60:],
+        resolved_count=len(rows),
+        embargoed_count=0,
+    )
+    artifacts = [
+        artifact
+        for artifact in learner.skill_artifacts.values()
+        if artifact.skill.value == "manipulation"
+    ]
+    assert len(artifacts) == 1
+    specialist = artifacts[0]
+    assert specialist.qualified is True
+    assert specialist.metrics["policy_vetoes"] == 10
+    assert specialist.metrics["policy_winner_vetoes"] == 0
+    state = next(
+        state for state in learner.skill_states.values() if state.skill.value == "manipulation"
+    )
+    assert state.champion_version == specialist.version
+
+    future = make_decision(now + timedelta(minutes=30), "manipulation-future").model_copy(
+        update={
+            "model_version": BASELINE_VERSION,
+            "configuration_fingerprint": configuration,
+        }
+    )
+    for feature_name in (
+        "round_trip_wallet_ratio",
+        "round_trip_volume_ratio",
+        "side_alternation_ratio",
+        "quantized_amount_repeat_ratio",
+    ):
+        future.feature_snapshot.values[feature_name] = data(future.created_at, 0.95)
+    assert learner.register(
+        future,
+        make_state(future.mint),
+        live=True,
+        evaluation_actionable=True,
+    )
+    receipt = learner.observations[future.mint].challenger_evaluations[specialist.version]
+    assert receipt.skill.value == "manipulation"
+    assert receipt.proposed_action == "veto"
+    database.close()
+
+
+def test_sizing_skill_learns_only_from_bounded_executable_size_trials(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    configuration = "baseline-v1.2-sizing-config"
+    rows: list[tuple[LearningObservation, float]] = []
+    for index in range(80):
+        strong = index % 2 == 0
+        observed_at = now + timedelta(seconds=index)
+        mint = f"sizing-{index}"
+        decision = make_decision(
+            observed_at,
+            mint,
+            opportunity=0.95 if strong else 0.15,
+        ).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        baseline_cost = observation.size_trials["1"].entry_cost_lamports
+        assert baseline_cost is not None
+        for trial in observation.size_trials.values():
+            if not trial.eligible_at_entry or trial.entry_cost_lamports is None:
+                continue
+            normalized_profit = trial.multiplier * (0.10 if strong else -0.10)
+            exit_value = max(
+                0,
+                int(trial.entry_cost_lamports + baseline_cost * normalized_profit),
+            )
+            trial.checkpoints["300"] = LearningCheckpoint(
+                horizon_seconds=300,
+                observed_at=observed_at + timedelta(seconds=300),
+                net_return=(exit_value - trial.entry_cost_lamports) / trial.entry_cost_lamports,
+                exit_value_lamports=exit_value,
+            )
+        rows.append((observation, 0.10 if strong else -0.10))
+
+    learner._publish_sizing_artifact(  # noqa: SLF001 - validate sizing proof boundary
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        rows=rows,
+        training=rows[:60],
+        validation=rows[60:],
+        embargoed_count=0,
+    )
+    specialist = next(
+        artifact
+        for artifact in learner.skill_artifacts.values()
+        if artifact.skill.value == "sizing"
+    )
+    assert specialist.qualified is True
+    assert specialist.metrics["policy_changes"] == 20
+    assert specialist.metrics["harm_count"] == 0
+    state = next(state for state in learner.skill_states.values() if state.skill.value == "sizing")
+    assert state.champion_version == specialist.version
+
+    future = make_decision(
+        now + timedelta(minutes=30),
+        "sizing-future",
+        opportunity=0.95,
+    ).model_copy(
+        update={
+            "model_version": BASELINE_VERSION,
+            "configuration_fingerprint": configuration,
+        }
+    )
+    assert learner.register(
+        future,
+        make_state(future.mint),
+        live=True,
+        evaluation_actionable=True,
+    )
+    receipt = learner.observations[future.mint].challenger_evaluations[specialist.version]
+    assert receipt.skill.value == "sizing"
+    assert receipt.proposed_action == "2"
+    assert set(learner.observations[future.mint].size_trials) == {"0.5", "1", "1.5", "2"}
+    database.close()
+
+
+def test_exit_skill_can_only_qualify_an_earlier_bounded_review(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    configuration = "baseline-v1.2-exit-config"
+    for index in range(60):
+        observed_at = now + timedelta(minutes=index * 20)
+        mint = f"exit-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        for horizon, outcome in ((60, 0.20), (300, 0.10), (600, 0.0)):
+            observation.checkpoints[str(horizon)] = LearningCheckpoint(
+                horizon_seconds=horizon,
+                observed_at=observed_at + timedelta(seconds=horizon),
+                net_return=outcome,
+                exit_value_lamports=1,
+            )
+
+    learner._publish_exit_artifact(  # noqa: SLF001 - validate independent exit proof
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+    )
+    specialist = next(
+        artifact for artifact in learner.skill_artifacts.values() if artifact.skill.value == "exit"
+    )
+    assert specialist.qualified is True
+    assert specialist.parameters["selected_horizon_seconds"] == 60
+    assert specialist.parameters["baseline_horizon_seconds"] == 600
+    assert specialist.parameters["hard_max_hold_seconds"] == 1_800
+    state = next(state for state in learner.skill_states.values() if state.skill.value == "exit")
+    assert state.champion_version == specialist.version
+
+    future = make_decision(now + timedelta(days=2), "exit-future").model_copy(
+        update={
+            "model_version": BASELINE_VERSION,
+            "configuration_fingerprint": configuration,
+        }
+    )
+    assert learner.register(
+        future,
+        make_state(future.mint),
+        live=True,
+        evaluation_actionable=True,
+    )
+    receipt = learner.observations[future.mint].challenger_evaluations[specialist.version]
+    assert receipt.skill.value == "exit"
+    assert receipt.proposed_action == "60"
+    database.close()
+
+
+def test_one_consent_activates_entry_and_later_skill_joins_only_after_common_proof(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "baseline-v1.2-consent-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    entry_model = qualified_model("consent-entry", 0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        entry_model,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True,
+        "observed_count": 80,
+        "available_count": 80,
+        "availability_fraction": 1.0,
+        "minimum_fraction": 0.7,
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    assert learner.consent_granted is True
+    assert database.get_setting("challenger_consent_granted") is True
+    assert set(learner.active_skill_versions) == {"entry"}
+
+    cohort_key = next(
+        state.cohort_key
+        for state in learner.skill_states.values()
+        if state.skill == ChallengerSkill.ENTRY
+    )
+    manipulation = ChallengerSkillArtifact(
+        version="challenger-skill-v1-manipulation-consent",
+        skill=ChallengerSkill.MANIPULATION,
+        created_at=now + timedelta(seconds=1),
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version="challenger-features-v2",
+        outcomes_seen=80,
+        sample_count=80,
+        training_count=60,
+        validation_count=20,
+        feature_names=[
+            "danger",
+            "confidence",
+            "concentration",
+            "repetition",
+            "coordination",
+            "single_trade_wallet_ratio",
+            "round_trip_wallet_ratio",
+            "round_trip_volume_ratio",
+            "net_quote_flow_ratio",
+            "side_alternation_ratio",
+            "quantized_amount_repeat_ratio",
+            "slot_concentration_hhi",
+            "price_direction_consistency",
+        ],
+        parameters={
+            "means": [0.0] * 13,
+            "scales": [1.0] * 13,
+            "coefficients": [-0.20, *([0.0] * 13)],
+        },
+        metrics={"validation_rmse": 0.05},
+        qualified=True,
+    )
+    learner._register_skill_artifact(manipulation, cohort_key)  # noqa: SLF001
+    for index in range(30):
+        observed_at = now + timedelta(minutes=10 + index)
+        mint = f"join-proof-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        observation = learner.observations[mint]
+        observation.checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observed_at + timedelta(seconds=300),
+            net_return=-0.10,
+            exit_value_lamports=1,
+        )
+    learner._govern_skill_ensemble()  # noqa: SLF001
+    assert set(learner.active_skill_versions) == {"entry", "manipulation"}
+    assert database.get_setting("active_challenger_skills") == learner.active_skill_versions
+    status = learner.status(demo_mode=False)
+    assert status["consent_granted"] is True
+    assert set(status["active_skill_versions"]) == {"entry", "manipulation"}
+    skill_statuses = {item["skill"]: item for item in status["skills"]}
+    assert set(skill_statuses) == {"entry", "manipulation", "sizing", "exit"}
+    assert skill_statuses["entry"]["state"] == "active"
+    assert skill_statuses["manipulation"]["state"] == "active"
+    # The join proof is consumed at activation, so its durable counter resets for the next
+    # candidate instead of presenting old evidence as a future tournament.
+    assert skill_statuses["manipulation"]["common_forward_count"] == 0
+    assert skill_statuses["sizing"]["state"] == "collecting"
+    assert skill_statuses["exit"]["state"] == "collecting"
+
+    assessed = learner.assess(
+        make_decision(now + timedelta(days=1), "consent-assess").model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        ),
+        live=True,
+        baseline_actionable=True,
+    )
+    assert assessed.action == DecisionAction.PASS
+    assert "challenger_manipulation_veto" in assessed.blockers
+    assert set(assessed.challenger_assessments) == {"entry", "manipulation"}
+
+    learner.set_risk_mode(RiskMode.BALANCED)
+    assert learner.mode == LearningMode.ACTIVE
+    assert set(learner.active_skill_versions) == {"entry", "manipulation"}
+    learner.set_risk_mode(RiskMode.SAFE)
+    assert learner.mode == LearningMode.SHADOW
+    assert learner.active_skill_versions == {}
+    assert learner.consent_granted is True
+    database.close()
+
+
+def test_active_sizing_cannot_invent_entry_or_size_up_uncertain_integrity(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "baseline-v1.3-sizing-active-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    entry_model = qualified_model("sizing-entry", 0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        entry_model,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    cohort_key = next(iter(learner.skill_states.values())).cohort_key
+    sizing = ChallengerSkillArtifact(
+        version="challenger-skill-v1-sizing-active",
+        skill=ChallengerSkill.SIZING,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version="challenger-features-v2",
+        feature_names=[
+            "opportunity",
+            "danger",
+            "execution",
+            "confidence",
+            "reserve_depth",
+            "momentum",
+            "drawdown",
+            "single_trade_wallet_ratio",
+            "round_trip_wallet_ratio",
+            "round_trip_volume_ratio",
+            "net_quote_flow_ratio",
+            "side_alternation_ratio",
+            "quantized_amount_repeat_ratio",
+            "slot_concentration_hhi",
+            "price_direction_consistency",
+        ],
+        parameters={
+            "means": [0.0] * 15,
+            "scales": [1.0] * 15,
+            "coefficients": [2.0, *([0.0] * 15)],
+        },
+        qualified=True,
+    )
+    learner._register_skill_artifact(sizing, cohort_key)  # noqa: SLF001
+    learner._activate_skill(sizing)  # noqa: SLF001
+
+    baseline = make_decision(now, "sizing-active").model_copy(
+        update={
+            "model_version": BASELINE_VERSION,
+            "configuration_fingerprint": configuration,
+        }
+    )
+    uncertain = learner.assess(baseline, live=True, baseline_actionable=True)
+    assert uncertain.planned_order_size_sol == baseline.planned_order_size_sol
+    assert uncertain.challenger_assessments["sizing"]["proposed_action"] == (
+        "baseline_integrity_guard"
+    )
+
+    clean = baseline.model_copy(
+        update={
+            "integrity_assessment": IntegrityAssessment(
+                policy_version="test",
+                state=MarketIntegrityState.CLEAN,
+                score=0.0,
+                coverage=1.0,
+                sample_count=20,
+                category_count=4,
+            ),
+            "sizing_assessment": SizingAssessment(
+                policy_version="test",
+                base_size_sol=0.025,
+                desired_size_sol=0.025,
+                selected_size_sol=0.025,
+                maximum_size_sol=0.04,
+                account_allocation_fraction=0.01,
+            ),
+        }
+    )
+    capacity_guarded = learner.assess(clean, live=True, baseline_actionable=True)
+    assert capacity_guarded.planned_order_size_sol == clean.planned_order_size_sol
+    assert capacity_guarded.challenger_assessments["sizing"]["proposed_action"] == (
+        "baseline_capacity_guard"
+    )
+    assert capacity_guarded.challenger_assessments["sizing"]["parameters"]["applied"] is False
+
+    assert clean.sizing_assessment is not None
+    clean.sizing_assessment.maximum_size_sol = 0.05
+    sized = learner.assess(clean, live=True, baseline_actionable=True)
+    assert sized.planned_order_size_sol == pytest.approx(0.05)
+    passed = learner.assess(
+        clean.model_copy(update={"action": DecisionAction.PASS}),
+        live=True,
+        baseline_actionable=False,
+    )
+    assert passed.action == DecisionAction.PASS
+    assert passed.planned_order_size_sol == clean.planned_order_size_sol
+
+    entry_version = learner.active_skill_versions["entry"]
+    sizing_state = learner._current_skill_state(ChallengerSkill.SIZING)  # noqa: SLF001
+    assert sizing_state is not None
+    sizing_state.active_dependencies = {
+        "entry": entry_version,
+        "manipulation": "missing-manipulation-dependency",
+    }
+    database.save_challenger_skill_state(sizing_state)
+    runtime_guarded = learner.assess(clean, live=True, baseline_actionable=True)
+    assert "sizing" not in runtime_guarded.challenger_assessments
+    dependency_restart = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    assert dependency_restart.mode == LearningMode.ACTIVE
+    assert dependency_restart.active_skill_versions == {"entry": entry_version}
+
+    database.set_setting(
+        "active_challenger_skills",
+        {"entry": "missing-entry-artifact", "sizing": sizing.version},
+    )
+    database.set_setting("learning_mode", LearningMode.ACTIVE.value)
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    assert restarted.mode == LearningMode.SHADOW
+    assert restarted.active_skill_versions == {}
+    database.close()
+
+
+def test_locked_previous_baseline_keeps_its_exact_active_challenger_cohort(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "locked-baseline-v1.2-cohort"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+        baseline_version=lambda: PREVIOUS_BASELINE_VERSION,
+    )
+    now = datetime.now(UTC)
+    entry_model = qualified_model("previous-entry", 0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        entry_model,
+        baseline_version=PREVIOUS_BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    assert learner.active_skill_versions.keys() == {"entry"}
+
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+        baseline_version=lambda: PREVIOUS_BASELINE_VERSION,
+    )
+    assert restarted.mode == LearningMode.ACTIVE
+    assert restarted.active_skill_versions == learner.active_skill_versions
+    state = restarted._current_skill_state(ChallengerSkill.ENTRY)  # noqa: SLF001
+    assert state is not None
+    assert state.baseline_version == PREVIOUS_BASELINE_VERSION
+    database.close()
+
+
+def test_new_upstream_skill_deactivates_downstream_until_fresh_join_proof(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "baseline-v1.2-upstream-join-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    entry_model = qualified_model("upstream-entry", 0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        entry_model,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    cohort_key = next(iter(learner.skill_states.values())).cohort_key
+    exit_artifact = ChallengerSkillArtifact(
+        version="challenger-skill-v1-exit-active-before-sizing",
+        skill=ChallengerSkill.EXIT,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        parameters={
+            "selected_horizon_seconds": 300,
+            "baseline_horizon_seconds": 600,
+            "hard_max_hold_seconds": 1_800,
+        },
+        qualified=True,
+    )
+    learner._register_skill_artifact(exit_artifact, cohort_key)  # noqa: SLF001
+    learner._activate_skill(exit_artifact)  # noqa: SLF001
+    assert set(learner.active_skill_versions) == {"entry", "exit"}
+
+    sizing_artifact = ChallengerSkillArtifact(
+        version="challenger-skill-v1-sizing-joins-after-exit",
+        skill=ChallengerSkill.SIZING,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        feature_names=["opportunity"],
+        parameters={
+            "means": [0.0],
+            "scales": [1.0],
+            "coefficients": [1.0, 0.0],
+        },
+        qualified=True,
+    )
+    learner._register_skill_artifact(sizing_artifact, cohort_key)  # noqa: SLF001
+    learner._activate_skill(sizing_artifact)  # noqa: SLF001
+
+    assert set(learner.active_skill_versions) == {"entry", "sizing"}
+    exit_state = learner._current_skill_state(ChallengerSkill.EXIT)  # noqa: SLF001
+    assert exit_state is not None
+    assert exit_state.champion_version == exit_artifact.version
+    assert exit_state.active_version is None
+    assert exit_state.last_tournament["result"] == "dependency_activated"
+    assert exit_state.last_tournament["dependency"] == "sizing"
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    assert set(restarted.active_skill_versions) == {"entry", "sizing"}
+    database.close()
+
+
+def test_harmful_active_entry_skill_suspends_without_revoking_consent(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "baseline-v1.2-suspension-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    harmful = qualified_model("harmful-active-entry", -0.20, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        harmful,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    active_version = learner.active_skill_versions["entry"]
+    for index in range(30):
+        observed_at = now + timedelta(minutes=10 + index)
+        mint = f"active-harm-{index}"
+        decision = make_decision(observed_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+        learner.observations[mint].checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observed_at + timedelta(seconds=300),
+            net_return=0.10,
+            exit_value_lamports=1,
+        )
+    learner._govern_skill_ensemble()  # noqa: SLF001
+    assert learner.mode == LearningMode.SHADOW
+    assert learner.active_skill_versions == {}
+    assert learner.consent_granted is True
+    state = next(
+        state for state in learner.skill_states.values() if state.skill == ChallengerSkill.ENTRY
+    )
+    assert state.suspended_version == active_version
+    assert state.suspension_reason == "degraded"
+    suspended_status = next(
+        item for item in learner.skill_statuses() if item["skill"] == ChallengerSkill.ENTRY.value
+    )
+    assert suspended_status["state"] == "suspended"
+    assert suspended_status["health"]["state"] == "suspended"
+    restarted = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    assert restarted.mode == LearningMode.SHADOW
+    assert restarted.active_skill_versions == {}
+    assert restarted.consent_granted is True
+    restarted_status = next(
+        item for item in restarted.skill_statuses() if item["skill"] == ChallengerSkill.ENTRY.value
+    )
+    assert restarted_status["state"] == "suspended"
+    assert restarted_status["health"]["state"] == "suspended"
+    database.close()
+
+
+def test_pending_active_outcomes_do_not_count_as_unverifiable_health(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "baseline-v1.2-pending-health-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    entry_model = qualified_model("pending-health-entry", 0.2, 80).model_copy(
+        update={"created_at": now, "configuration_fingerprint": configuration}
+    )
+    learner._publish_entry_artifact(  # noqa: SLF001
+        entry_model,
+        baseline_version=BASELINE_VERSION,
+        evidence_started_at=now - timedelta(hours=1),
+        evidence_ended_at=now,
+    )
+    learner.entry_outcome_availability = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "qualified": True
+    }
+    learner.set_mode(LearningMode.ACTIVE)
+    active_version = learner.active_skill_versions["entry"]
+
+    for index in range(30):
+        created_at = now + timedelta(seconds=index)
+        mint = f"pending-health-{index}"
+        decision = make_decision(created_at, mint).model_copy(
+            update={
+                "model_version": BASELINE_VERSION,
+                "configuration_fingerprint": configuration,
+            }
+        )
+        assert learner.register(
+            decision,
+            make_state(mint),
+            live=True,
+            evaluation_actionable=True,
+        )
+
+    health = learner._skill_health(ChallengerSkill.ENTRY, active_version)  # noqa: SLF001
+    assert health["observed_count"] == 0
+    assert health["state"] == "collecting"
+
+    for observation in learner.observations.values():
+        observation.checkpoints["300"] = LearningCheckpoint(
+            horizon_seconds=300,
+            observed_at=observation.created_at + timedelta(seconds=390),
+            missing_reason="stale_cached_route",
+        )
+    health = learner._skill_health(ChallengerSkill.ENTRY, active_version)  # noqa: SLF001
+    assert health["observed_count"] == 30
+    assert health["availability_fraction"] == 0
+    assert health["state"] == "unverifiable"
+    database.close()
+
+
 def test_incomplete_integrity_evidence_never_becomes_zero_filled_learning(
     settings,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -243,6 +1591,35 @@ def test_missing_horizon_is_unknown_not_a_loss(settings) -> None:  # type: ignor
     assert status["usable_outcome_count"] == 0
     assert status["challenger_interval_outcomes"] == 10
     assert status["demo_excluded"] is True
+    database.close()
+
+
+def test_unquotable_primary_outcome_immediately_advances_health_governance(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    mint = "unquotable-primary"
+    assert learner.register(make_decision(now, mint), make_state(mint), live=True)
+    bad_route = make_state(mint)
+    monkeypatch.setattr(
+        "signal_arcade.intelligence.learning.quote_sell",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unquotable")),
+    )
+    calls = {"govern": 0}
+    monkeypatch.setattr(
+        learner,
+        "_govern_skill_ensemble",
+        lambda: calls.__setitem__("govern", calls["govern"] + 1),
+    )
+
+    assert learner.observe_market(bad_route, now + timedelta(seconds=300), live=True) == 2
+    checkpoint = learner.observations[mint].checkpoints["300"]
+    assert checkpoint.net_return is None
+    assert checkpoint.missing_reason == "executable_exit_quote_unavailable"
+    assert calls["govern"] == 1
     database.close()
 
 
@@ -775,3 +2152,236 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
     assessed_unsafe = learner.assess(unsafe, live=True)
     assert assessed_unsafe.action == DecisionAction.ABSTAIN
     database.close()
+
+
+def _supported_coach_hypothesis(now: datetime) -> CoachHypothesis:
+    return CoachHypothesis(
+        hypothesis_id="coach-supported-entry",
+        signature="coach-supported-signature",
+        coach_review_id="coach-review-supported",
+        created_at=now,
+        updated_at=now,
+        cutoff_at=now,
+        kind=CoachExperimentKind.ENTRY_VETO,
+        skill=ChallengerSkill.ENTRY,
+        state=CoachExperimentState.PROMISING,
+        title="Preserve cash during weak momentum",
+        rationale="Supported by independent forward evidence.",
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="coach-fp",
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        dependency_versions={},
+        model_name="qwen3.5:2b",
+        conditions=[
+            CoachCondition(feature_name="momentum", operator="<=", threshold=0),
+        ],
+        discovery_observed_count=80,
+        discovery_usable_count=80,
+        discovery_availability_fraction=1,
+        discovery_mean_uplift=0.08,
+        discovery_uplift_lower_bound=0.03,
+        forward_observed_count=80,
+        forward_usable_count=80,
+        forward_availability_fraction=1,
+        forward_season_count=2,
+        forward_mean_uplift=0.07,
+        forward_uplift_lower_bound=0.02,
+        forward_uplift_upper_bound=0.12,
+        resolved_at=now,
+        resolution_reason="forward_proof_supported",
+        contribution_state="ready",
+    )
+
+
+def _coach_test_champion(now: datetime) -> ChallengerSkillArtifact:
+    return ChallengerSkillArtifact(
+        version="challenger-skill-entry-existing-champion",
+        skill=ChallengerSkill.ENTRY,
+        created_at=now,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="coach-fp",
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        outcomes_seen=100,
+        sample_count=80,
+        training_count=50,
+        validation_count=30,
+        feature_names=list(FEATURE_NAMES),
+        parameters={
+            "means": [0.0] * len(FEATURE_NAMES),
+            "scales": [1.0] * len(FEATURE_NAMES),
+            "coefficients": [0.2, *([0.0] * len(FEATURE_NAMES))],
+        },
+        metrics={"validation_rmse": 0.05},
+        qualified=True,
+    )
+
+
+def test_supported_coach_policy_waits_for_an_existing_champion(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings, configuration_fingerprint=lambda: "coach-fp")
+
+    version, result = learner.seed_coach_candidate(_supported_coach_hypothesis(datetime.now(UTC)))
+
+    assert version is None
+    assert result == "waiting_for_champion"
+    assert learner.skill_artifacts == {}
+    database.close()
+
+
+def test_supported_coach_policy_enters_normal_tournament_without_activation(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings, configuration_fingerprint=lambda: "coach-fp")
+    now = datetime.now(UTC)
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        "coach-fp",
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    champion = _coach_test_champion(now)
+    learner._register_skill_artifact(champion, cohort_key)  # noqa: SLF001
+
+    version, result = learner.seed_coach_candidate(_supported_coach_hypothesis(now))
+
+    assert version is not None
+    assert result == "handed_off"
+    candidate = learner.skill_artifacts[version]
+    state = learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)]
+    assert state.champion_version == champion.version
+    assert state.testing_version == candidate.version
+    assert learner.active_skill_versions == {}
+    assert _predict_skill_artifact(candidate, {"momentum": -0.1}) == -1
+    assert _predict_skill_artifact(candidate, {"momentum": 0.1}) == 1
+    assert learner.seed_coach_candidate(_supported_coach_hypothesis(now)) == (
+        version,
+        "handed_off",
+    )
+    database.close()
+
+
+def test_coach_tournament_candidate_retires_when_ensemble_context_changes(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings, configuration_fingerprint=lambda: "coach-fp")
+    now = datetime.now(UTC)
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        "coach-fp",
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    champion = _coach_test_champion(now)
+    learner._register_skill_artifact(champion, cohort_key)  # noqa: SLF001
+    version, result = learner.seed_coach_candidate(_supported_coach_hypothesis(now))
+    assert version is not None and result == "handed_off"
+
+    learner.active_skill_versions = {ChallengerSkill.ENTRY.value: champion.version}
+    learner._advance_entry_tournaments()  # noqa: SLF001
+
+    state = learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)]
+    assert state.champion_version == champion.version
+    assert state.testing_version is None
+    assert version in state.rejected_versions
+    assert state.last_tournament["result"] == "context_stale"
+    database.close()
+
+
+def test_coach_handoff_rejects_policy_outside_deterministic_allowlist(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings, configuration_fingerprint=lambda: "coach-fp")
+    now = datetime.now(UTC)
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        "coach-fp",
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    champion = _coach_test_champion(now)
+    learner._register_skill_artifact(champion, cohort_key)  # noqa: SLF001
+    malformed = _supported_coach_hypothesis(now).model_copy(
+        update={
+            "conditions": [
+                CoachCondition(
+                    feature_name="opportunity",
+                    operator=">=",
+                    threshold=0.1,
+                )
+            ]
+        }
+    )
+
+    assert learner.seed_coach_candidate(malformed) == (None, "coach_context_stale")
+    state = learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)]
+    assert state.champion_version == champion.version
+    assert state.testing_version is None
+    database.close()
+
+
+def test_coach_context_outcome_clock_survives_restart_and_pruning(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings, configuration_fingerprint=lambda: "coach-fp")
+    now = datetime.now(UTC)
+    decision = make_decision(now, "coach-clock").model_copy(
+        update={
+            "model_version": BASELINE_VERSION,
+            "configuration_fingerprint": "coach-fp",
+        }
+    )
+    assert learner.register(decision, make_state("coach-clock"), live=True)
+    observation = learner.observations["coach-clock"]
+    observation.checkpoints["300"] = LearningCheckpoint(
+        horizon_seconds=300,
+        observed_at=now + timedelta(seconds=300),
+        net_return=0.05,
+        exit_value_lamports=observation.entry_cost_lamports + 1,
+    )
+    observation.status = LearningObservationStatus.COMPLETE
+    database.save_learning_observation(observation)
+    database.close()
+
+    restarted_database = Database(settings.database_path)
+    restarted = LearningEngine(
+        restarted_database,
+        settings,
+        configuration_fingerprint=lambda: "coach-fp",
+    )
+    assert (
+        restarted.context_outcomes_seen(
+            RiskMode.BALANCED,
+            "coach-fp",
+            BASELINE_VERSION,
+            FEATURE_SCHEMA_VERSION,
+            {},
+        )
+        == 1
+    )
+    context_key = next(iter(restarted.context_outcome_counts))
+    restarted.context_outcome_counts[context_key] = 9
+    restarted_database.set_setting(
+        "learning_context_outcomes_seen",
+        restarted.context_outcome_counts,
+    )
+    restarted_database.prune_learning_observations(0)
+    restarted_database.close()
+
+    pruned_database = Database(settings.database_path)
+    pruned = LearningEngine(
+        pruned_database,
+        settings,
+        configuration_fingerprint=lambda: "coach-fp",
+    )
+    assert (
+        pruned.context_outcomes_seen(
+            RiskMode.BALANCED,
+            "coach-fp",
+            BASELINE_VERSION,
+            FEATURE_SCHEMA_VERSION,
+            {},
+        )
+        == 9
+    )
+    pruned_database.close()

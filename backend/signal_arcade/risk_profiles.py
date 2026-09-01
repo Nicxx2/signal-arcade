@@ -9,6 +9,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .models import RISK_LIMITS, RiskMode
+from .strategy import (
+    BASELINE_VERSION,
+    INTEGRITY_POLICY_VERSION,
+    LEGACY_BASELINE_VERSION,
+    LEGACY_INTEGRITY_POLICY_VERSION,
+    LEGACY_SIZING_POLICY_VERSION,
+    SIZING_POLICY_VERSION,
+)
 
 SEASON_PROFILE_SCHEMA_VERSION = 1
 
@@ -45,6 +53,11 @@ class SeasonProfile(BaseModel):
     provenance: Literal["exact"] = "exact"
     risk_mode: RiskMode
     risk_policy_version: str = "risk-limits-v1"
+    # Missing values identify exact profiles created before strategy provenance existed. They
+    # deliberately remain on the frozen v1.1 path until a clean successor season starts.
+    baseline_version: str = LEGACY_BASELINE_VERSION
+    integrity_policy_version: str = LEGACY_INTEGRITY_POLICY_VERSION
+    sizing_policy_version: str = LEGACY_SIZING_POLICY_VERSION
     risk_limits: dict[str, int | float | str]
     drawdown_policy: DrawdownPolicy
     effective_drawdown_bps: int | None = Field(default=None, ge=100, le=9_900)
@@ -85,6 +98,9 @@ def build_season_profile(
     fingerprint_payload: dict[str, Any] = {
         "schema_version": SEASON_PROFILE_SCHEMA_VERSION,
         "risk_policy_version": "risk-limits-v1",
+        "baseline_version": BASELINE_VERSION,
+        "integrity_policy_version": INTEGRITY_POLICY_VERSION,
+        "sizing_policy_version": SIZING_POLICY_VERSION,
         "risk_mode": mode.value,
         "risk_limits": limits,
         "drawdown_policy": {
@@ -100,10 +116,32 @@ def build_season_profile(
     fingerprint = hashlib.sha256(encoded).hexdigest()
     return SeasonProfile(
         risk_mode=mode,
+        baseline_version=BASELINE_VERSION,
+        integrity_policy_version=INTEGRITY_POLICY_VERSION,
+        sizing_policy_version=SIZING_POLICY_VERSION,
         risk_limits=limits,
         drawdown_policy=policy,
         effective_drawdown_bps=effective_bps,
         profile_fingerprint=fingerprint,
+        learning_fingerprint=learning_fingerprint,
+        locked_at=locked_at,
+    )
+
+
+def upgrade_season_profile_strategy(
+    profile: dict[str, Any],
+    *,
+    locked_at: datetime | None = None,
+) -> SeasonProfile:
+    """Create the current strategy successor without mutating the stored source profile."""
+
+    parsed = SeasonProfile.model_validate(profile)
+    learning_fingerprint = (
+        parsed.learning_fingerprint if parsed.baseline_version == BASELINE_VERSION else None
+    )
+    return build_season_profile(
+        parsed.risk_mode,
+        drawdown_policy=parsed.drawdown_policy,
         learning_fingerprint=learning_fingerprint,
         locked_at=locked_at,
     )

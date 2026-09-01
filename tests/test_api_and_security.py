@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from signal_arcade import __version__
 from signal_arcade.api import create_app
 from signal_arcade.config import Settings
+from signal_arcade.strategy import BASELINE_VERSION, INTEGRITY_POLICY_VERSION
 from starlette.websockets import WebSocketDisconnect
 
 
@@ -168,6 +169,76 @@ def test_ai_lab_is_opt_in_curated_and_veto_gated(settings) -> None:  # type: ign
         )
 
 
+def test_coach_research_and_contribution_permissions_are_independent_and_persistent(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    with TestClient(create_app(settings)) as client:
+        assert (
+            client.put("/api/v1/ai-lab/coach-research", json={"enabled": True}).status_code == 409
+        )
+        assert (
+            client.put(
+                "/api/v1/ai-lab/coach-contribution",
+                json={"enabled": True},
+            ).status_code
+            == 409
+        )
+        assert client.put("/api/v1/ai-lab/mode", json={"mode": "shadow"}).status_code == 200
+        assert client.get("/api/v1/snapshot").json()["coach"]["research_enabled"] is True
+
+        paused = client.put("/api/v1/ai-lab/coach-research", json={"enabled": False})
+        assert paused.status_code == 200
+        assert paused.json()["research_enabled"] is False
+        assert paused.json()["mode"] == "off"
+        assert client.get("/api/v1/ai-lab").json()["mode"] == "shadow"
+
+        permission = client.put(
+            "/api/v1/ai-lab/coach-contribution",
+            json={"enabled": True},
+        )
+        assert permission.status_code == 200
+        assert permission.json()["contribution_enabled"] is True
+        assert (
+            client.put(
+                "/api/v1/ai-lab/coach-research",
+                json={"enabled": False, "unexpected": True},
+            ).status_code
+            == 422
+        )
+
+    with TestClient(create_app(settings)) as restarted:
+        coach = restarted.get("/api/v1/snapshot").json()["coach"]
+        assert coach["research_enabled"] is False
+        assert coach["contribution_enabled"] is True
+        resumed = restarted.put(
+            "/api/v1/ai-lab/coach-research",
+            json={"enabled": True},
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["research_enabled"] is True
+        assert resumed.json()["mode"] == "shadow"
+
+
+def test_coach_contribution_permission_can_be_revoked_while_local_ai_is_off(settings) -> None:  # type: ignore[no-untyped-def]
+    with TestClient(create_app(settings)) as client:
+        assert client.put("/api/v1/ai-lab/mode", json={"mode": "shadow"}).status_code == 200
+        enabled = client.put(
+            "/api/v1/ai-lab/coach-contribution",
+            json={"enabled": True},
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["contribution_enabled"] is True
+        assert client.put("/api/v1/ai-lab/mode", json={"mode": "off"}).status_code == 200
+
+        disabled = client.put(
+            "/api/v1/ai-lab/coach-contribution",
+            json={"enabled": False},
+        )
+
+        assert disabled.status_code == 200
+        assert disabled.json()["contribution_enabled"] is False
+
+
 def test_user_must_create_bankroll_before_explicit_start(settings) -> None:  # type: ignore[no-untyped-def]
     app = create_app(settings)
     with TestClient(app) as client:
@@ -251,13 +322,20 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         assert first_body["seasons"][0]["status"] == "current"
         assert first_body["seasons"][0]["net_return_fraction"] == 0
         assert first_body["current_profile_fingerprint"]
-        comparison_key = f"SOL:profile:{first_body['current_profile_fingerprint']}"
+        comparison_key = (
+            f"SOL:bankroll:1000000000:profile:"
+            f"{first_body['current_profile_fingerprint']}:"
+            "terminal:executable-boundary-v2"
+        )
         assert first_body["current_comparison_key"] == comparison_key
         assert first_body["seasons"][0]["comparison_key"] == comparison_key
         assert first_body["comparison_groups"] == [
             {
                 "comparison_key": comparison_key,
                 "quote_currency": "SOL",
+                "quote_decimals": 9,
+                "starting_minor": 1_000_000_000,
+                "terminal_policy_version": "executable-boundary-v2",
                 "profile_provenance": "exact",
                 "profile_fingerprint": first_body["current_profile_fingerprint"],
                 "risk_mode": "balanced",
@@ -266,6 +344,15 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
                     "custom_threshold_bps": None,
                 },
                 "effective_drawdown_bps": 1_500,
+                "baseline_version": BASELINE_VERSION,
+                "integrity_policy_version": INTEGRITY_POLICY_VERSION,
+                "sizing_policy_version": "quality-size-v1",
+                "first_season_number": 1,
+                "last_season_number": 1,
+                "has_current": True,
+                "completed_count": 0,
+                "comparable_count": 0,
+                "boundary_types": ["open"],
                 "season_count": 1,
             }
         ]
@@ -294,6 +381,13 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         assert archived["seasons"][0]["status"] == "completed"
         assert archived["seasons"][0]["ending_equity_minor"] == 1_000_000_000
         assert archived["seasons"][0]["terminal_reason"] == "manual_reset"
+        archived_group = archived["comparison_groups"][0]
+        assert archived_group["first_season_number"] == 1
+        assert archived_group["last_season_number"] == 1
+        assert archived_group["has_current"] is False
+        assert archived_group["completed_count"] == 1
+        assert archived_group["comparable_count"] == 0
+        assert archived_group["boundary_types"] == ["reset"]
 
         assert (
             client.post(
@@ -310,7 +404,9 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         ]
         assert seasons[1]["quote_currency"] == "USDC"
         assert mixed_currency["current_comparison_key"] == (
-            f"USDC:profile:{mixed_currency['current_profile_fingerprint']}"
+            f"USDC:bankroll:100000000:profile:"
+            f"{mixed_currency['current_profile_fingerprint']}:"
+            "terminal:executable-boundary-v2"
         )
         assert [group["quote_currency"] for group in mixed_currency["comparison_groups"]] == [
             "SOL",
@@ -384,6 +480,61 @@ def test_profile_transition_strategy_is_typed_and_persisted(settings) -> None:  
         assert requested.json()["manual_settlement_deadline"] is not None
 
 
+def test_next_season_request_validates_and_persists_exact_bankroll(settings) -> None:  # type: ignore[no-untyped-def]
+    app = create_app(settings)
+    with TestClient(app) as client:
+        uninitialized = client.put(
+            "/api/v1/risk",
+            json={
+                "mode": "safe",
+                "quote_currency": "USDC",
+                "starting_amount": "200",
+            },
+        )
+        assert uninitialized.status_code == 409
+        assert "create a paper bankroll" in uninitialized.json()["detail"]
+
+        assert (
+            client.post(
+                "/api/v1/portfolio/setup",
+                json={"quote_currency": "SOL", "starting_amount": "1"},
+            ).status_code
+            == 200
+        )
+
+        partial = client.put(
+            "/api/v1/risk",
+            json={"mode": "safe", "quote_currency": "USDC"},
+        )
+        assert partial.status_code == 422
+        too_precise = client.put(
+            "/api/v1/risk",
+            json={
+                "mode": "safe",
+                "quote_currency": "USDC",
+                "starting_amount": "1.0000001",
+            },
+        )
+        assert too_precise.status_code == 422
+
+        exact = client.put(
+            "/api/v1/risk",
+            json={
+                "mode": "aggressive",
+                "drawdown_policy": {"kind": "disabled"},
+                "quote_currency": "USDC",
+                "starting_amount": "200",
+            },
+        )
+        assert exact.status_code == 200
+        assert exact.json()["transition_required"] is False
+        snapshot = client.get("/api/v1/snapshot").json()
+        assert snapshot["portfolio"]["quote_currency"] == "USDC"
+        assert snapshot["portfolio"]["starting_lamports"] == 200_000_000
+        assert snapshot["season_profile"]["risk_mode"] == "aggressive"
+        assert snapshot["season_profile"]["drawdown_policy"]["kind"] == "disabled"
+
+
 def test_state_changes_and_websockets_reject_cross_origin_requests(settings) -> None:  # type: ignore[no-untyped-def]
     app = create_app(settings)
     with TestClient(app) as client:
@@ -439,6 +590,13 @@ def test_free_rpc_presets_reserve_capacity_for_byte_metered_streams(settings) ->
         provider_settings = client.get("/api/v1/provider-settings").json()
         presets = {item["id"]: item for item in provider_settings["presets"]["solana"]}
         assert presets["helius_free"]["monthly_limit"] == 500_000
+        assert presets["helius_economy"] == {
+            "id": "helius_economy",
+            "label": "Helius Economy (keyed HTTP + public stream)",
+            "requests_per_minute": 600,
+            "monthly_limit": 500_000,
+            "paid_mode": False,
+        }
         assert presets["alchemy_free"]["monthly_limit"] == 1_500_000
         assert presets["alchemy_free"]["requests_per_minute"] == 3_000
         assert "uncompressed bytes" in provider_settings["notes"]["streaming"]
@@ -468,6 +626,8 @@ def test_provider_secrets_are_write_only_and_endpoints_are_redacted(settings) ->
             "https://mainnet.helius-rpc.com"
         )
         assert provider_settings["providers"]["jupiter"]["api_key_configured"] is True
+        assert provider_settings["providers"]["solana"]["http_source"] == "saved_override"
+        assert provider_settings["providers"]["solana"]["stream_source"] == "saved_override"
 
     restarted = create_app(settings)
     with TestClient(restarted, base_url="http://127.0.0.1") as client:

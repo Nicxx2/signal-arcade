@@ -10,6 +10,8 @@ __pycache__/
 .mypy_cache/
 .audit-cache/
 .coverage
+.coverage.*
+coverage/
 htmlcov/
 .test-tmp/
 .pytest-*/
@@ -17,6 +19,7 @@ htmlcov/
 .tmp/
 .smoke-data/
 .browser-smoke-data/
+.capture-profile-*/
 pytest-cache-files-*/
 data/
 logs/
@@ -24,9 +27,12 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/coverage/
 dist/
 build/
 *.log
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/

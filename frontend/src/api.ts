@@ -1,4 +1,4 @@
-import type { AiDecisionMode, AiLabStatus, AiModelDownload, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
+import type { AiDecisionMode, AiLabStatus, AiModelDownload, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000): Promise<T> {
   const controller = new AbortController();
@@ -32,10 +32,22 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000):
 export const api = {
   health: () => request<HealthStatus>("/api/v1/health", undefined, 2_500),
   snapshot: () => request<Snapshot>("/api/v1/snapshot"),
-  setRisk: (mode: RiskMode, drawdown_policy: DrawdownPolicy = { kind: "default", custom_threshold_bps: null }, transition_strategy: ProfileTransitionStrategy = "finish_safely") =>
+  setRisk: (
+    mode: RiskMode,
+    drawdown_policy: DrawdownPolicy = { kind: "default", custom_threshold_bps: null },
+    transition_strategy: ProfileTransitionStrategy = "finish_safely",
+    quote_currency?: QuoteCurrency,
+    starting_amount?: string,
+  ) =>
     request<{ mode: RiskMode }>("/api/v1/risk", {
       method: "PUT",
-      body: JSON.stringify({ mode, drawdown_policy, transition_strategy }),
+      body: JSON.stringify({
+        mode,
+        drawdown_policy,
+        transition_strategy,
+        ...(quote_currency === undefined ? {} : { quote_currency }),
+        ...(starting_amount === undefined ? {} : { starting_amount }),
+      }),
     }),
   setSeasonAutomation: (enabled: boolean, grace_hours?: number) =>
     request<SeasonAutomation>("/api/v1/season-automation", {
@@ -52,6 +64,16 @@ export const api = {
     request<AiLabStatus>("/api/v1/ai-lab/mode", {
       method: "PUT",
       body: JSON.stringify({ mode }),
+    }),
+  setCoachContribution: (enabled: boolean) =>
+    request<CoachStatus>("/api/v1/ai-lab/coach-contribution", {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
+    }),
+  setCoachResearch: (enabled: boolean) =>
+    request<CoachStatus>("/api/v1/ai-lab/coach-research", {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
     }),
   selectAiModel: (model: string) =>
     request<AiLabStatus>("/api/v1/ai-lab/model", {

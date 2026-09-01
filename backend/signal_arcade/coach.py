@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import threading
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -15,9 +16,19 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .database import Database
-from .intelligence.learning import LEARNING_HORIZONS_SECONDS, PRIMARY_HORIZON_SECONDS
+from .intelligence.learning import (
+    COACH_ENTRY_RULES,
+    COACH_MANIPULATION_COMBINATIONS,
+    COACH_MANIPULATION_RULES,
+    FEATURE_SCHEMA_VERSION,
+    LEARNING_HORIZONS_SECONDS,
+    PRIMARY_HORIZON_SECONDS,
+    SIZING_MULTIPLIERS,
+)
 from .models import (
     RISK_LIMITS,
+    ChallengerSkill,
+    CoachCondition,
     CoachExperimentKind,
     CoachExperimentState,
     CoachHypothesis,
@@ -27,11 +38,12 @@ from .models import (
     RiskMode,
 )
 from .providers.http import HttpProviders
+from .strategy import LEARNABLE_BASELINE_VERSIONS
 
 logger = logging.getLogger(__name__)
 
-COACH_PROMPT_VERSION = "coach-shadow-v2"
-COACH_SCHEMA_VERSION = "coach-shadow-schema-v2"
+COACH_PROMPT_VERSION = "coach-research-v3"
+COACH_SCHEMA_VERSION = "coach-research-schema-v3"
 COACH_REVIEW_INTERVAL_OUTCOMES = 25
 COACH_FIRST_REVIEW_OUTCOMES = 80
 COACH_MINIMUM_DISCOVERY_SAMPLES = 20
@@ -43,9 +55,12 @@ COACH_MINIMUM_UPLIFT = 0.01
 COACH_MONITOR_SECONDS = 30
 COACH_RETRY_SECONDS = 300
 COACH_INFERENCE_TIMEOUT_SECONDS = 75
-COACH_OBSERVATION_WINDOW = 1_000
+COACH_OBSERVATION_WINDOW = 5_000
 COACH_MAX_CANDIDATES = 6
 COACH_Z_SCORE = 1.96
+COACH_MINIMUM_SAMPLES_PER_SEASON = 10
+COACH_MAXIMUM_FORWARD_OBSERVED = 180
+COACH_MAXIMUM_FORWARD_DAYS = 90
 
 _FEATURE_LABELS = {
     "buy_ratio": "low buy participation",
@@ -65,29 +80,6 @@ _FEATURE_LABELS = {
     "price_direction_consistency": "the price path is unusually one-way",
 }
 
-_ENTRY_RULES: tuple[tuple[str, str, float], ...] = (
-    ("momentum", "<=", -0.05),
-    ("momentum", "<=", 0.00),
-    ("buy_ratio", "<=", 0.50),
-    ("buy_ratio", "<=", 0.55),
-    ("concentration", ">=", 0.35),
-    ("concentration", ">=", 0.50),
-    ("drawdown", ">=", 0.18),
-    ("drawdown", ">=", 0.30),
-    ("danger", ">=", 0.20),
-    ("danger", ">=", 0.30),
-    ("execution", "<=", 0.85),
-    ("confidence", "<=", 0.72),
-    ("single_trade_wallet_ratio", ">=", 0.90),
-    ("round_trip_wallet_ratio", ">=", 0.35),
-    ("round_trip_volume_ratio", ">=", 0.50),
-    ("net_quote_flow_ratio", "<=", 0.20),
-    ("side_alternation_ratio", ">=", 0.75),
-    ("quantized_amount_repeat_ratio", ">=", 0.40),
-    ("slot_concentration_hhi", ">=", 0.30),
-    ("price_direction_consistency", ">=", 0.90),
-)
-
 
 class _CoachSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -101,11 +93,15 @@ class _Candidate:
     candidate_id: str
     signature: str
     kind: CoachExperimentKind
+    skill: ChallengerSkill
     title: str
     feature_name: str | None
     operator: str | None
     threshold: float | None
+    conditions: tuple[CoachCondition, ...]
     hold_seconds: int | None
+    baseline_hold_seconds: int | None
+    size_multiplier: float | None
     observed_count: int
     usable_count: int
     availability_fraction: float
@@ -117,6 +113,7 @@ class _Candidate:
         return {
             "candidate_id": self.candidate_id,
             "kind": self.kind.value,
+            "skill": self.skill.value,
             "experiment": self.title,
             "observed": self.observed_count,
             "usable": self.usable_count,
@@ -140,6 +137,8 @@ class AiCoach:
         outcomes_seen: Callable[[], int],
         model_provenance: Callable[[], tuple[str, str]],
         can_run: Callable[[], tuple[bool, str | None]],
+        provenance: Callable[[], dict[str, Any]] | None = None,
+        contribution_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.database = database
         self.http = http
@@ -148,14 +147,49 @@ class AiCoach:
         self.outcomes_seen = outcomes_seen
         self.model_provenance = model_provenance
         self.can_run = can_run
+        self.provenance = provenance
+        self.contribution_enabled = contribution_enabled or (lambda: False)
+        self._lock = threading.RLock()
         self.task: asyncio.Task[None] | None = None
         self.busy = False
         self.last_error: str | None = None
         self.paused_reason: str | None = None
         self.last_attempt_at: datetime | None = None
         self.next_attempt_at: datetime | None = None
+        self.context_outcomes_seen = 0
         self.reviews = database.list_coach_reviews(25)
         self.hypotheses = database.list_coach_hypotheses(100)
+
+    def _context_provenance(self) -> dict[str, Any]:
+        mode, fingerprint = self.context()
+        supplied = self.provenance() if self.provenance is not None else {}
+        dependencies = supplied.get("dependency_versions", {})
+        return {
+            "risk_mode": mode,
+            "configuration_fingerprint": fingerprint,
+            "baseline_version": str(supplied.get("baseline_version") or "baseline-v1.1"),
+            "feature_schema_version": str(
+                supplied.get("feature_schema_version") or "challenger-features-v1"
+            ),
+            "dependency_versions": (
+                {str(key): str(value) for key, value in dependencies.items()}
+                if isinstance(dependencies, dict)
+                else {}
+            ),
+            "baseline_hold_seconds": int(
+                supplied.get("baseline_hold_seconds") or RISK_LIMITS[mode].max_hold_seconds
+            ),
+        }
+
+    @staticmethod
+    def _matches_provenance(item: CoachHypothesis | CoachReview, context: dict[str, Any]) -> bool:
+        return bool(
+            item.risk_mode == context["risk_mode"]
+            and item.configuration_fingerprint == context["configuration_fingerprint"]
+            and item.baseline_version == context["baseline_version"]
+            and item.feature_schema_version == context["feature_schema_version"]
+            and item.dependency_versions == context["dependency_versions"]
+        )
 
     async def start(self) -> None:
         if self.task is None or self.task.done():
@@ -187,20 +221,28 @@ class AiCoach:
         if not self.enabled():
             self.paused_reason = "ai_shadow_off"
             return
-        await asyncio.to_thread(self._refresh_hypotheses, now)
-        mode, fingerprint = self.context()
-        active = self._active_hypothesis(mode, fingerprint)
+        observations = await asyncio.to_thread(
+            self.database.recent_learning_observations,
+            COACH_OBSERVATION_WINDOW,
+        )
+        await asyncio.to_thread(self._refresh_hypotheses, now, observations)
+        context = self._context_provenance()
+        mode = context["risk_mode"]
+        fingerprint = context["configuration_fingerprint"]
+        active = self._active_hypothesis(context)
         if active is not None:
             self.paused_reason = "forward_test_in_progress"
             return
-        seen = max(0, self.outcomes_seen())
+        exact_seen = _context_outcomes_seen(observations, context)
+        # The fallback keeps the standalone v2 constructor contract used by older integrations;
+        # production supplies exact provenance and therefore never uses a global cohort count.
+        seen = max(exact_seen, self.outcomes_seen())
+        self.context_outcomes_seen = seen
         last_seen = max(
             (
                 review.outcomes_seen
                 for review in self.reviews
-                if review.valid
-                and review.risk_mode == mode
-                and review.configuration_fingerprint == fingerprint
+                if review.valid and self._matches_provenance(review, context)
             ),
             default=0,
         )
@@ -227,16 +269,25 @@ class AiCoach:
         self.paused_reason = None
         self.last_attempt_at = now
         try:
-            observations = await asyncio.to_thread(
-                self.database.recent_learning_observations,
-                COACH_OBSERVATION_WINDOW,
-            )
             excluded = {
                 item.signature
                 for item in self.hypotheses
-                if item.risk_mode == mode and item.configuration_fingerprint == fingerprint
+                if self._matches_provenance(item, context)
             }
-            candidates = _build_candidates(observations, mode, fingerprint, excluded)
+            candidates = _build_candidates(
+                observations,
+                mode,
+                fingerprint,
+                excluded,
+                baseline_version=context["baseline_version"],
+                feature_schema_version=context["feature_schema_version"],
+                dependency_versions=context["dependency_versions"],
+                baseline_hold_seconds=context["baseline_hold_seconds"],
+            )
+            candidates = _fair_lane_candidates(
+                candidates,
+                [item for item in self.hypotheses if self._matches_provenance(item, context)],
+            )
             model_name, model_digest = self.model_provenance()
             if not candidates:
                 review = _review_without_candidate(
@@ -244,6 +295,9 @@ class AiCoach:
                     outcomes_seen=seen,
                     mode=mode,
                     fingerprint=fingerprint,
+                    baseline_version=context["baseline_version"],
+                    feature_schema_version=context["feature_schema_version"],
+                    dependency_versions=context["dependency_versions"],
                     model_name=model_name,
                     model_digest=model_digest,
                 )
@@ -274,8 +328,13 @@ class AiCoach:
                 # bound and the existing five-minute failure backoff.
                 timeout_seconds=COACH_INFERENCE_TIMEOUT_SECONDS,
             )
-            current_mode, current_fingerprint = self.context()
-            if current_mode != mode or current_fingerprint != fingerprint:
+            # A pause may arrive while a slow CPU inference is in flight. Discard that optional
+            # result instead of allowing a proposal to appear after the user paused research.
+            if not self.enabled():
+                self.paused_reason = "research_paused_during_review"
+                return
+            current_context = self._context_provenance()
+            if current_context != context:
                 self.last_error = "context_changed_during_review"
                 self.next_attempt_at = now + timedelta(seconds=COACH_RETRY_SECONDS)
                 return
@@ -285,6 +344,9 @@ class AiCoach:
                     outcomes_seen=seen,
                     mode=mode,
                     fingerprint=fingerprint,
+                    baseline_version=context["baseline_version"],
+                    feature_schema_version=context["feature_schema_version"],
+                    dependency_versions=context["dependency_versions"],
                     model_name=model_name,
                     model_digest=model_digest,
                     input_sha256=hashlib.sha256(serialized.encode()).hexdigest(),
@@ -316,6 +378,9 @@ class AiCoach:
                 outcomes_seen=seen,
                 risk_mode=mode,
                 configuration_fingerprint=fingerprint,
+                baseline_version=context["baseline_version"],
+                feature_schema_version=context["feature_schema_version"],
+                dependency_versions=context["dependency_versions"],
                 model_name=model_name,
                 model_digest=model_digest,
                 prompt_version=COACH_PROMPT_VERSION,
@@ -332,8 +397,8 @@ class AiCoach:
                 ),
                 failure_reason=None if valid else "invalid_structured_response",
             )
-            await asyncio.to_thread(self._save_review, review)
             if not valid:
+                await asyncio.to_thread(self._save_review, review)
                 self.last_error = review.failure_reason
                 self.next_attempt_at = now + timedelta(seconds=COACH_RETRY_SECONDS)
                 return
@@ -345,62 +410,104 @@ class AiCoach:
                     candidate,
                     selection.summary if selection is not None else "",
                 )
-                await asyncio.to_thread(self._save_hypothesis, hypothesis)
+                await asyncio.to_thread(self._save_selection, review, hypothesis)
+            else:
+                await asyncio.to_thread(self._save_review, review)
         finally:
             self.busy = False
 
     def _save_review(self, review: CoachReview) -> None:
         self.database.save_coach_review(review)
-        retained = [item for item in self.reviews if item.review_id != review.review_id]
-        self.reviews = [review, *retained][:25]
+        with self._lock:
+            retained = [item for item in self.reviews if item.review_id != review.review_id]
+            self.reviews = [review, *retained][:25]
         self.database.prune_coach_history()
 
     def _save_hypothesis(self, hypothesis: CoachHypothesis) -> None:
         self.database.save_coach_hypothesis(hypothesis)
-        self.hypotheses = [
-            hypothesis,
-            *[item for item in self.hypotheses if item.hypothesis_id != hypothesis.hypothesis_id],
-        ][:100]
+        with self._lock:
+            self.hypotheses = [
+                hypothesis,
+                *[
+                    item
+                    for item in self.hypotheses
+                    if item.hypothesis_id != hypothesis.hypothesis_id
+                ],
+            ][:100]
 
-    def _refresh_hypotheses(self, now: datetime) -> None:
+    def _save_selection(self, review: CoachReview, hypothesis: CoachHypothesis) -> None:
+        if not self.database.save_coach_selection(review, hypothesis):
+            return
+        with self._lock:
+            self.reviews = [
+                review,
+                *[item for item in self.reviews if item.review_id != review.review_id],
+            ][:25]
+            self.hypotheses = [
+                hypothesis,
+                *[
+                    item
+                    for item in self.hypotheses
+                    if item.hypothesis_id != hypothesis.hypothesis_id
+                ],
+            ][:100]
+        self.database.prune_coach_history()
+
+    def _refresh_hypotheses(
+        self,
+        now: datetime,
+        observations: Sequence[LearningObservation] | None = None,
+    ) -> None:
         if not self.hypotheses:
             return
-        observations = self.database.recent_learning_observations(COACH_OBSERVATION_WINDOW)
+        selected = (
+            list(observations)
+            if observations is not None
+            else self.database.recent_learning_observations(COACH_OBSERVATION_WINDOW)
+        )
         refreshed: list[CoachHypothesis] = []
         for hypothesis in self.hypotheses:
-            updated = _evaluate_hypothesis(hypothesis, observations, now)
+            updated = _evaluate_hypothesis(hypothesis, selected, now)
             if updated != hypothesis:
                 self.database.save_coach_hypothesis(updated)
             refreshed.append(updated)
-        self.hypotheses = refreshed
+        with self._lock:
+            self.hypotheses = refreshed
 
-    def _active_hypothesis(self, mode: RiskMode, fingerprint: str) -> CoachHypothesis | None:
+    def _current_hypothesis(self, context: dict[str, Any]) -> CoachHypothesis | None:
         return next(
-            (
-                item
-                for item in self.hypotheses
-                if item.risk_mode == mode
-                and item.configuration_fingerprint == fingerprint
-                and item.state
-                in {
-                    CoachExperimentState.TESTING,
-                    CoachExperimentState.PROMISING,
-                }
-            ),
+            (item for item in self.hypotheses if self._matches_provenance(item, context)),
             None,
         )
 
+    def _active_hypothesis(self, context: dict[str, Any]) -> CoachHypothesis | None:
+        current = self._current_hypothesis(context)
+        return (
+            current
+            if current is not None and current.state == CoachExperimentState.TESTING
+            else None
+        )
+
     def status(self) -> dict[str, Any]:
-        mode, fingerprint = self.context()
-        seen = max(0, self.outcomes_seen())
-        active = self._active_hypothesis(mode, fingerprint)
+        context = self._context_provenance()
+        seen = max(self.context_outcomes_seen, max(0, self.outcomes_seen()))
+        current = self._current_hypothesis(context)
+        active = self._active_hypothesis(context)
+        contribution_candidate = next(
+            (
+                item
+                for item in self.hypotheses
+                if self._matches_provenance(item, context)
+                and item.state == CoachExperimentState.PROMISING
+                and item.contribution_state in {"ready", "waiting_for_champion"}
+            ),
+            None,
+        )
         last_valid_seen = max(
             (
                 review.outcomes_seen
                 for review in self.reviews
-                if review.valid
-                and review.risk_mode == mode
-                and review.configuration_fingerprint == fingerprint
+                if review.valid and self._matches_provenance(review, context)
             ),
             default=0,
         )
@@ -414,20 +521,19 @@ class AiCoach:
             if not self.enabled()
             else "reviewing"
             if self.busy
-            else active.state.value
-            if active is not None
+            else current.state.value
+            if current is not None
             else "waiting"
         )
-        qualification_gates = _coach_qualification_gates(active)
+        qualification_gates = _coach_qualification_gates(current)
         recent_hypotheses = []
         for item in self.hypotheses[:6]:
             view = item.model_dump(mode="json")
-            view["context_active"] = bool(
-                item.risk_mode == mode and item.configuration_fingerprint == fingerprint
-            )
+            view["context_active"] = bool(self._matches_provenance(item, context))
             recent_hypotheses.append(view)
         return {
             "mode": "shadow" if self.enabled() else "off",
+            "research_enabled": self.enabled(),
             "state": state,
             "influence": "none",
             "worker_running": self.task is not None and not self.task.done(),
@@ -440,6 +546,20 @@ class AiCoach:
             "outcomes_until_review": max(0, next_at - seen) if active is None else 0,
             "minimum_forward_samples": COACH_MINIMUM_FORWARD_SAMPLES,
             "minimum_forward_seasons": COACH_MINIMUM_FORWARD_SEASONS,
+            "minimum_samples_per_season": COACH_MINIMUM_SAMPLES_PER_SEASON,
+            "contribution_enabled": bool(self.contribution_enabled()),
+            "contribution_ready": contribution_candidate is not None,
+            "contribution_candidate": (
+                {
+                    "hypothesis_id": contribution_candidate.hypothesis_id,
+                    "title": contribution_candidate.title,
+                    "skill": contribution_candidate.skill.value,
+                    "state": contribution_candidate.contribution_state,
+                }
+                if contribution_candidate is not None
+                else None
+            ),
+            "research_lanes": _research_lane_status(self.hypotheses, context),
             "qualification_gates": qualification_gates,
             "qualification_passed": sum(gate["state"] == "passed" for gate in qualification_gates),
             "qualification_total": len(qualification_gates),
@@ -454,6 +574,56 @@ class AiCoach:
                 "Experiments are isolated by risk mode and fee/provider configuration",
             ],
         }
+
+    def ready_contribution(self) -> CoachHypothesis | None:
+        """Return one supported current-context study without mutating trading state."""
+
+        if not self.contribution_enabled():
+            return None
+        context = self._context_provenance()
+        with self._lock:
+            candidates = [
+                item
+                for item in self.hypotheses
+                if self._matches_provenance(item, context)
+                and item.state == CoachExperimentState.PROMISING
+                and item.contribution_state in {"ready", "waiting_for_champion"}
+            ]
+            # Give every newly supported idea one handoff attempt before retrying a study whose
+            # skill has no Champion yet. This prevents one unavailable lane starving the others.
+            selected = next(
+                (item for item in candidates if item.contribution_state == "ready"),
+                candidates[0] if candidates else None,
+            )
+            return selected.model_copy(deep=True) if selected is not None else None
+
+    def mark_contribution(
+        self,
+        hypothesis_id: str,
+        state: str,
+        artifact_version: str | None = None,
+    ) -> None:
+        allowed = {"waiting_for_champion", "handed_off", "stale"}
+        if state not in allowed:
+            raise ValueError("unsupported Coach contribution state")
+        with self._lock:
+            hypothesis = next(
+                (item for item in self.hypotheses if item.hypothesis_id == hypothesis_id),
+                None,
+            )
+            if hypothesis is None:
+                return
+            updated = hypothesis.model_copy(
+                update={
+                    "updated_at": datetime.now(UTC),
+                    "contribution_state": state,
+                    "contributed_artifact_version": artifact_version,
+                }
+            )
+            self.hypotheses = [
+                updated if item.hypothesis_id == hypothesis_id else item for item in self.hypotheses
+            ]
+        self.database.save_coach_hypothesis(updated)
 
 
 def _coach_qualification_gates(
@@ -556,11 +726,21 @@ def _build_candidates(
     mode: RiskMode,
     fingerprint: str,
     excluded_signatures: set[str],
+    *,
+    baseline_version: str = "baseline-v1.1",
+    feature_schema_version: str = "challenger-features-v1",
+    dependency_versions: dict[str, str] | None = None,
+    baseline_hold_seconds: int | None = None,
 ) -> list[_Candidate]:
+    dependencies = dependency_versions or {}
     context_rows = [
         item
         for item in observations
-        if item.risk_mode == mode and item.configuration_fingerprint == fingerprint
+        if item.risk_mode == mode
+        and item.configuration_fingerprint == fingerprint
+        and item.baseline_version == baseline_version
+        and item.feature_schema_version == feature_schema_version
+        and item.active_skill_versions == dependencies
     ]
     actionable_entries = [
         item
@@ -568,15 +748,18 @@ def _build_candidates(
         if item.baseline_action == DecisionAction.ENTER and item.baseline_actionable
     ]
     candidates: list[_Candidate] = []
-    for feature, operator, threshold in _ENTRY_RULES:
+    for feature, operator, threshold in COACH_ENTRY_RULES:
+        entry_conditions = (
+            CoachCondition(feature_name=feature, operator=operator, threshold=threshold),
+        )
         signature = _signature(
             CoachExperimentKind.ENTRY_VETO,
             mode,
             fingerprint,
-            feature,
-            operator,
-            threshold,
-            None,
+            conditions=entry_conditions,
+            baseline_version=baseline_version,
+            feature_schema_version=feature_schema_version,
+            dependency_versions=dependencies,
         )
         if signature in excluded_signatures:
             continue
@@ -602,11 +785,15 @@ def _build_candidates(
                 candidate_id="candidate-" + signature[:16],
                 signature=signature,
                 kind=CoachExperimentKind.ENTRY_VETO,
+                skill=ChallengerSkill.ENTRY,
                 title=f"Test preserving cash when {label}",
                 feature_name=feature,
                 operator=operator,
                 threshold=threshold,
+                conditions=entry_conditions,
                 hold_seconds=None,
+                baseline_hold_seconds=None,
+                size_multiplier=None,
                 observed_count=observed,
                 usable_count=usable,
                 availability_fraction=availability,
@@ -616,7 +803,110 @@ def _build_candidates(
             )
         )
 
-    baseline_hold = RISK_LIMITS[mode].max_hold_seconds
+    manipulation_rules: list[tuple[CoachCondition, ...]] = [
+        (CoachCondition(feature_name=feature, operator=operator, threshold=threshold),)
+        for feature, operator, threshold in COACH_MANIPULATION_RULES
+    ]
+    manipulation_rules.extend(
+        tuple(
+            CoachCondition(feature_name=feature, operator=operator, threshold=threshold)
+            for feature, operator, threshold in pair
+        )
+        for pair in COACH_MANIPULATION_COMBINATIONS
+    )
+    for conditions in manipulation_rules:
+        signature = _signature(
+            CoachExperimentKind.MANIPULATION_VETO,
+            mode,
+            fingerprint,
+            conditions=conditions,
+            baseline_version=baseline_version,
+            feature_schema_version=feature_schema_version,
+            dependency_versions=dependencies,
+        )
+        if signature in excluded_signatures:
+            continue
+        matched = [item for item in actionable_entries if _conditions_match(item, conditions)]
+        stats = _entry_stats(matched)
+        if (
+            stats is None
+            or stats[1] < COACH_MINIMUM_DISCOVERY_SAMPLES
+            or stats[2] < COACH_MINIMUM_AVAILABILITY
+            or stats[4] <= 0
+        ):
+            continue
+        observed, usable, availability, mean, lower, upper = stats
+        labels = " and ".join(_FEATURE_LABELS[item.feature_name] for item in conditions)
+        candidates.append(
+            _Candidate(
+                candidate_id="candidate-" + signature[:16],
+                signature=signature,
+                kind=CoachExperimentKind.MANIPULATION_VETO,
+                skill=ChallengerSkill.MANIPULATION,
+                title=f"Test avoiding entries when {labels}",
+                feature_name=conditions[0].feature_name if len(conditions) == 1 else None,
+                operator=conditions[0].operator if len(conditions) == 1 else None,
+                threshold=conditions[0].threshold if len(conditions) == 1 else None,
+                conditions=conditions,
+                hold_seconds=None,
+                baseline_hold_seconds=None,
+                size_multiplier=None,
+                observed_count=observed,
+                usable_count=usable,
+                availability_fraction=availability,
+                mean_uplift=mean,
+                uplift_lower_bound=lower,
+                uplift_upper_bound=upper,
+            )
+        )
+
+    for multiplier in SIZING_MULTIPLIERS:
+        if multiplier == 1.0:
+            continue
+        signature = _signature(
+            CoachExperimentKind.SIZING_MULTIPLIER,
+            mode,
+            fingerprint,
+            size_multiplier=multiplier,
+            baseline_version=baseline_version,
+            feature_schema_version=feature_schema_version,
+            dependency_versions=dependencies,
+        )
+        if signature in excluded_signatures:
+            continue
+        stats = _sizing_stats(actionable_entries, multiplier)
+        if (
+            stats is None
+            or stats[1] < COACH_MINIMUM_DISCOVERY_SAMPLES
+            or stats[2] < COACH_MINIMUM_AVAILABILITY
+            or stats[4] <= 0
+        ):
+            continue
+        observed, usable, availability, mean, lower, upper = stats
+        candidates.append(
+            _Candidate(
+                candidate_id="candidate-" + signature[:16],
+                signature=signature,
+                kind=CoachExperimentKind.SIZING_MULTIPLIER,
+                skill=ChallengerSkill.SIZING,
+                title=f"Test a bounded {multiplier:g}x paper size",
+                feature_name=None,
+                operator=None,
+                threshold=None,
+                conditions=(),
+                hold_seconds=None,
+                baseline_hold_seconds=None,
+                size_multiplier=multiplier,
+                observed_count=observed,
+                usable_count=usable,
+                availability_fraction=availability,
+                mean_uplift=mean,
+                uplift_lower_bound=lower,
+                uplift_upper_bound=upper,
+            )
+        )
+
+    baseline_hold = baseline_hold_seconds or RISK_LIMITS[mode].max_hold_seconds
     for horizon in LEARNING_HORIZONS_SECONDS:
         if horizon >= baseline_hold:
             continue
@@ -624,10 +914,11 @@ def _build_candidates(
             CoachExperimentKind.EARLIER_REVIEW,
             mode,
             fingerprint,
-            None,
-            None,
-            None,
-            horizon,
+            hold_seconds=horizon,
+            baseline_hold_seconds=baseline_hold,
+            baseline_version=baseline_version,
+            feature_schema_version=feature_schema_version,
+            dependency_versions=dependencies,
         )
         if signature in excluded_signatures:
             continue
@@ -645,11 +936,15 @@ def _build_candidates(
                 candidate_id="candidate-" + signature[:16],
                 signature=signature,
                 kind=CoachExperimentKind.EARLIER_REVIEW,
+                skill=ChallengerSkill.EXIT,
                 title=f"Test reviewing normal holds at {horizon // 60}m",
                 feature_name=None,
                 operator=None,
                 threshold=None,
+                conditions=(),
                 hold_seconds=horizon,
+                baseline_hold_seconds=baseline_hold,
+                size_multiplier=None,
                 observed_count=observed,
                 usable_count=usable,
                 availability_fraction=availability,
@@ -662,7 +957,7 @@ def _build_candidates(
         key=lambda item: (item.uplift_lower_bound, item.mean_uplift, item.usable_count),
         reverse=True,
     )
-    return candidates[:COACH_MAX_CANDIDATES]
+    return candidates
 
 
 def _entry_stats(
@@ -696,6 +991,133 @@ def _hold_stats(
     return _stats(len(observed), values)
 
 
+def _coach_size_value(
+    observation: LearningObservation,
+    multiplier: float,
+) -> float | None:
+    trial = observation.size_trials.get(f"{multiplier:g}")
+    baseline = observation.size_trials.get("1")
+    if (
+        trial is None
+        or baseline is None
+        or not trial.eligible_at_entry
+        or trial.entry_cost_lamports is None
+        or baseline.entry_cost_lamports is None
+        or baseline.entry_cost_lamports <= 0
+    ):
+        return None
+    checkpoint = trial.checkpoints.get(str(PRIMARY_HORIZON_SECONDS))
+    if checkpoint is None or checkpoint.exit_value_lamports is None:
+        return None
+    return (checkpoint.exit_value_lamports - trial.entry_cost_lamports) / (
+        baseline.entry_cost_lamports
+    )
+
+
+def _sizing_stats(
+    observations: Sequence[LearningObservation],
+    multiplier: float,
+) -> tuple[int, int, float, float, float, float] | None:
+    primary = str(PRIMARY_HORIZON_SECONDS)
+    observed = [
+        item
+        for item in observations
+        if (selected_trial := item.size_trials.get(f"{multiplier:g}")) is not None
+        and (baseline_trial := item.size_trials.get("1")) is not None
+        and primary in selected_trial.checkpoints
+        and primary in baseline_trial.checkpoints
+    ]
+    values: list[float] = []
+    for item in observed:
+        selected_value = _coach_size_value(item, multiplier)
+        baseline_value = _coach_size_value(item, 1.0)
+        if selected_value is not None and baseline_value is not None:
+            values.append(selected_value - baseline_value)
+    return _stats(len(observed), values)
+
+
+def _fair_lane_candidates(
+    candidates: Sequence[_Candidate],
+    history: Sequence[CoachHypothesis],
+) -> list[_Candidate]:
+    """Rotate research lanes so one rich signal family cannot monopolize the Coach."""
+
+    order = [
+        ChallengerSkill.ENTRY,
+        ChallengerSkill.MANIPULATION,
+        ChallengerSkill.SIZING,
+        ChallengerSkill.EXIT,
+    ]
+    last_skill = history[0].skill if history else ChallengerSkill.EXIT
+    start = (order.index(last_skill) + 1) % len(order)
+    for offset in range(len(order)):
+        skill = order[(start + offset) % len(order)]
+        selected = [item for item in candidates if item.skill == skill]
+        if selected:
+            return selected[:COACH_MAX_CANDIDATES]
+    return []
+
+
+def _context_outcomes_seen(
+    observations: Sequence[LearningObservation],
+    context: dict[str, Any],
+) -> int:
+    primary = str(PRIMARY_HORIZON_SECONDS)
+    return sum(
+        primary in item.checkpoints
+        and item.checkpoints[primary].net_return is not None
+        and item.risk_mode == context["risk_mode"]
+        and item.configuration_fingerprint == context["configuration_fingerprint"]
+        and item.baseline_version == context["baseline_version"]
+        and item.feature_schema_version == context["feature_schema_version"]
+        and item.active_skill_versions == context["dependency_versions"]
+        for item in observations
+    )
+
+
+def _research_lane_status(
+    hypotheses: Sequence[CoachHypothesis],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    labels = {
+        ChallengerSkill.ENTRY: "Entry",
+        ChallengerSkill.MANIPULATION: "Manipulation",
+        ChallengerSkill.SIZING: "Sizing",
+        ChallengerSkill.EXIT: "Exit",
+    }
+    result = []
+    for skill, label in labels.items():
+        history = [
+            item
+            for item in hypotheses
+            if item.skill == skill
+            and item.risk_mode == context["risk_mode"]
+            and item.configuration_fingerprint == context["configuration_fingerprint"]
+            and item.baseline_version == context["baseline_version"]
+            and item.feature_schema_version == context["feature_schema_version"]
+            and item.dependency_versions == context["dependency_versions"]
+        ]
+        current = history[0] if history else None
+        supported = next(
+            (item for item in history if item.state == CoachExperimentState.PROMISING),
+            None,
+        )
+        result.append(
+            {
+                "skill": skill.value,
+                "label": label,
+                "state": current.state.value if current is not None else "observing",
+                "current_title": current.title if current is not None else None,
+                "best_title": supported.title if supported is not None else None,
+                "studies": len(history),
+                "supported_studies": sum(
+                    item.state == CoachExperimentState.PROMISING for item in history
+                ),
+            }
+        )
+    return result
+
+
 def _stats(
     observed: int,
     values: Sequence[float],
@@ -721,91 +1143,181 @@ def _evaluate_hypothesis(
     now: datetime,
 ) -> CoachHypothesis:
     if hypothesis.state in {
+        CoachExperimentState.PROMISING,
         CoachExperimentState.INCONCLUSIVE,
         CoachExperimentState.NOT_SUPPORTED,
     }:
-        # These are recorded terminal outcomes. The signature remains excluded from future
-        # proposals, and later ambient observations cannot silently revive an old experiment
-        # alongside the context's newer active test.
         return hypothesis
-    rows = [
-        item
-        for item in observations
-        if item.created_at > hypothesis.cutoff_at
-        and item.risk_mode == hypothesis.risk_mode
-        and item.configuration_fingerprint == hypothesis.configuration_fingerprint
-    ]
-    if hypothesis.kind == CoachExperimentKind.ENTRY_VETO:
-        rows = [
+
+    rows = sorted(
+        (
             item
-            for item in rows
-            if item.baseline_action == DecisionAction.ENTER
-            and item.baseline_actionable
-            and hypothesis.feature_name is not None
-            and hypothesis.operator is not None
-            and hypothesis.threshold is not None
-            and _condition_matches(
-                item,
-                hypothesis.feature_name,
-                hypothesis.operator,
-                hypothesis.threshold,
-            )
-        ]
-        stats = _entry_stats(rows)
-        observed_rows = [item for item in rows if str(PRIMARY_HORIZON_SECONDS) in item.checkpoints]
-    else:
-        rows = [
-            item
-            for item in rows
-            if item.baseline_action == DecisionAction.ENTER and item.baseline_actionable
-        ]
-        baseline = RISK_LIMITS[hypothesis.risk_mode].max_hold_seconds
-        selected = hypothesis.hold_seconds or baseline
-        stats = _hold_stats(rows, selected, baseline)
-        observed_rows = [
-            item
-            for item in rows
-            if str(selected) in item.checkpoints and str(baseline) in item.checkpoints
-        ]
-    if stats is None:
-        observed = len(observed_rows)
-        usable = 0
-        availability = 0.0
-        mean = lower = upper = None
-    else:
-        observed, usable, availability, mean, lower, upper = stats
-    seasons = {item.season_id for item in observed_rows if item.season_id}
+            for item in observations
+            if item.created_at > hypothesis.cutoff_at
+            and item.risk_mode == hypothesis.risk_mode
+            and item.configuration_fingerprint == hypothesis.configuration_fingerprint
+            and item.baseline_version == hypothesis.baseline_version
+            and item.feature_schema_version == hypothesis.feature_schema_version
+            and item.active_skill_versions == hypothesis.dependency_versions
+        ),
+        key=lambda item: item.created_at,
+    )
+    seen_ids = set(hypothesis.forward_observation_ids)
+    observation_ids = list(hypothesis.forward_observation_ids)
+    values = list(hypothesis.forward_values)
+    season_counts = dict(hypothesis.forward_season_counts)
+    for item in rows:
+        if item.observation_id in seen_ids:
+            continue
+        resolved, relevant, value = _hypothesis_observation_value(hypothesis, item)
+        if not relevant or not resolved:
+            continue
+        seen_ids.add(item.observation_id)
+        observation_ids.append(item.observation_id)
+        if value is not None:
+            values.append(value)
+            if item.season_id:
+                season_counts[item.season_id] = season_counts.get(item.season_id, 0) + 1
+        if len(observation_ids) >= COACH_MAXIMUM_FORWARD_OBSERVED:
+            break
+
+    observed = len(observation_ids)
+    usable = len(values)
+    availability = usable / observed if observed else 0.0
+    mean = lower = upper = None
+    if values:
+        mean, lower, upper = _mean_bounds(values)
+    meaningful_seasons = sum(
+        count >= COACH_MINIMUM_SAMPLES_PER_SEASON for count in season_counts.values()
+    )
     state = CoachExperimentState.TESTING
+    resolution_reason: str | None = None
     if (
-        observed >= hypothesis.minimum_forward_samples
-        and availability < hypothesis.minimum_availability_fraction
-    ):
-        state = CoachExperimentState.INCONCLUSIVE
-    elif (
         usable >= hypothesis.minimum_forward_samples
         and availability >= hypothesis.minimum_availability_fraction
-        and len(seasons) >= COACH_MINIMUM_FORWARD_SEASONS
+        and meaningful_seasons >= COACH_MINIMUM_FORWARD_SEASONS
         and lower is not None
         and lower > COACH_MINIMUM_UPLIFT
     ):
         state = CoachExperimentState.PROMISING
+        resolution_reason = "forward_proof_supported"
     elif usable >= COACH_REJECTION_SAMPLES and upper is not None and upper <= 0:
         state = CoachExperimentState.NOT_SUPPORTED
+        resolution_reason = "forward_evidence_not_supported"
+    elif observed >= COACH_MAXIMUM_FORWARD_OBSERVED:
+        state = CoachExperimentState.INCONCLUSIVE
+        resolution_reason = "maximum_forward_evidence_reached"
+    elif now - hypothesis.created_at >= timedelta(days=COACH_MAXIMUM_FORWARD_DAYS):
+        state = CoachExperimentState.INCONCLUSIVE
+        resolution_reason = "forward_study_expired"
+    terminal = state != CoachExperimentState.TESTING
+    contribution_state = hypothesis.contribution_state
+    if (
+        state == CoachExperimentState.PROMISING
+        and hypothesis.baseline_version in LEARNABLE_BASELINE_VERSIONS
+        and hypothesis.feature_schema_version == FEATURE_SCHEMA_VERSION
+        and contribution_state == "research_only"
+    ):
+        contribution_state = "ready"
     evidence = {
         "state": state,
         "forward_observed_count": observed,
         "forward_usable_count": usable,
         "forward_availability_fraction": availability,
-        "forward_season_count": len(seasons),
+        "forward_season_count": meaningful_seasons,
         "forward_mean_uplift": mean,
         "forward_uplift_lower_bound": lower,
         "forward_uplift_upper_bound": upper,
+        "forward_observation_ids": observation_ids,
+        "forward_values": values,
+        "forward_season_counts": season_counts,
+        "resolved_at": now if terminal else None,
+        "resolution_reason": resolution_reason,
+        "contribution_state": contribution_state,
     }
     # The monitor wakes often so it can notice new outcomes promptly. Do not turn those wakeups
     # into redundant SQLite writes when the evidence itself has not changed.
     if all(getattr(hypothesis, field) == value for field, value in evidence.items()):
         return hypothesis
     return hypothesis.model_copy(update={"updated_at": now, "last_evaluated_at": now, **evidence})
+
+
+def _hypothesis_observation_value(
+    hypothesis: CoachHypothesis,
+    observation: LearningObservation,
+) -> tuple[bool, bool, float | None]:
+    if observation.baseline_action != DecisionAction.ENTER or not observation.baseline_actionable:
+        return False, False, None
+    skill = _skill_for_kind(hypothesis.kind)
+    if skill in {ChallengerSkill.ENTRY, ChallengerSkill.MANIPULATION}:
+        conditions = tuple(hypothesis.conditions)
+        if not conditions and (
+            hypothesis.feature_name is None
+            or hypothesis.operator is None
+            or hypothesis.threshold is None
+        ):
+            return False, False, None
+        if conditions:
+            matches = _conditions_match(observation, conditions)
+        else:
+            matches = _condition_matches(
+                observation,
+                hypothesis.feature_name or "",
+                hypothesis.operator or "<=",
+                hypothesis.threshold or 0.0,
+            )
+        if not matches:
+            return False, False, None
+        checkpoint = observation.checkpoints.get(str(PRIMARY_HORIZON_SECONDS))
+        if checkpoint is None:
+            return False, True, None
+        return True, True, -checkpoint.net_return if checkpoint.net_return is not None else None
+    if skill == ChallengerSkill.SIZING:
+        multiplier = hypothesis.size_multiplier
+        if multiplier is None:
+            return False, False, None
+        trial = observation.size_trials.get(f"{multiplier:g}")
+        baseline_trial = observation.size_trials.get("1")
+        if trial is None or baseline_trial is None:
+            return True, True, None
+        primary = str(PRIMARY_HORIZON_SECONDS)
+        if primary not in trial.checkpoints or primary not in baseline_trial.checkpoints:
+            return False, True, None
+        selected_value = _coach_size_value(observation, multiplier)
+        baseline_value = _coach_size_value(observation, 1.0)
+        return (
+            True,
+            True,
+            selected_value - baseline_value
+            if selected_value is not None and baseline_value is not None
+            else None,
+        )
+    selected = hypothesis.hold_seconds
+    baseline_horizon = (
+        hypothesis.baseline_hold_seconds or RISK_LIMITS[hypothesis.risk_mode].max_hold_seconds
+    )
+    if selected is None:
+        return False, False, None
+    selected_checkpoint = observation.checkpoints.get(str(selected))
+    baseline_checkpoint = observation.checkpoints.get(str(baseline_horizon))
+    if selected_checkpoint is None or baseline_checkpoint is None:
+        return False, True, None
+    return (
+        True,
+        True,
+        selected_checkpoint.net_return - baseline_checkpoint.net_return
+        if selected_checkpoint.net_return is not None and baseline_checkpoint.net_return is not None
+        else None,
+    )
+
+
+def _skill_for_kind(kind: CoachExperimentKind) -> ChallengerSkill:
+    return {
+        CoachExperimentKind.ENTRY_VETO: ChallengerSkill.ENTRY,
+        CoachExperimentKind.MANIPULATION_VETO: ChallengerSkill.MANIPULATION,
+        CoachExperimentKind.SIZING_MULTIPLIER: ChallengerSkill.SIZING,
+        CoachExperimentKind.EARLIER_REVIEW: ChallengerSkill.EXIT,
+    }[kind]
 
 
 def _condition_matches(
@@ -820,23 +1332,45 @@ def _condition_matches(
     return value <= threshold if operator == "<=" else value >= threshold
 
 
+def _conditions_match(
+    observation: LearningObservation,
+    conditions: Sequence[CoachCondition],
+) -> bool:
+    return bool(conditions) and all(
+        _condition_matches(
+            observation,
+            condition.feature_name,
+            condition.operator,
+            condition.threshold,
+        )
+        for condition in conditions
+    )
+
+
 def _signature(
     kind: CoachExperimentKind,
     mode: RiskMode,
     fingerprint: str,
-    feature: str | None,
-    operator: str | None,
-    threshold: float | None,
-    hold_seconds: int | None,
+    *,
+    conditions: Sequence[CoachCondition] = (),
+    hold_seconds: int | None = None,
+    baseline_hold_seconds: int | None = None,
+    size_multiplier: float | None = None,
+    baseline_version: str = "baseline-v1.1",
+    feature_schema_version: str = "challenger-features-v1",
+    dependency_versions: dict[str, str] | None = None,
 ) -> str:
     payload = {
         "kind": kind.value,
         "risk_mode": mode.value,
         "configuration_fingerprint": fingerprint,
-        "feature": feature,
-        "operator": operator,
-        "threshold": threshold,
+        "conditions": [condition.model_dump(mode="json") for condition in conditions],
         "hold_seconds": hold_seconds,
+        "baseline_hold_seconds": baseline_hold_seconds,
+        "size_multiplier": size_multiplier,
+        "baseline_version": baseline_version,
+        "feature_schema_version": feature_schema_version,
+        "dependency_versions": dependency_versions or {},
         "schema": COACH_SCHEMA_VERSION,
     }
     return hashlib.sha256(
@@ -870,16 +1404,23 @@ def _hypothesis_from_candidate(
         updated_at=now,
         cutoff_at=review.cutoff_at,
         kind=candidate.kind,
+        skill=candidate.skill,
         title=candidate.title,
         rationale=_clean_text(summary, 240) or "Selected for a new forward-only Shadow test.",
         risk_mode=review.risk_mode,
         configuration_fingerprint=review.configuration_fingerprint,
+        baseline_version=review.baseline_version,
+        feature_schema_version=review.feature_schema_version,
+        dependency_versions=dict(review.dependency_versions),
         model_name=review.model_name,
         model_digest=review.model_digest,
         feature_name=candidate.feature_name,
         operator=candidate.operator,  # type: ignore[arg-type]
         threshold=candidate.threshold,
+        conditions=list(candidate.conditions),
         hold_seconds=candidate.hold_seconds,
+        baseline_hold_seconds=candidate.baseline_hold_seconds,
+        size_multiplier=candidate.size_multiplier,
         discovery_observed_count=candidate.observed_count,
         discovery_usable_count=candidate.usable_count,
         discovery_availability_fraction=candidate.availability_fraction,
@@ -897,6 +1438,9 @@ def _review_without_candidate(
     outcomes_seen: int,
     mode: RiskMode,
     fingerprint: str,
+    baseline_version: str,
+    feature_schema_version: str,
+    dependency_versions: dict[str, str],
     model_name: str,
     model_digest: str,
 ) -> CoachReview:
@@ -907,6 +1451,9 @@ def _review_without_candidate(
         outcomes_seen=outcomes_seen,
         risk_mode=mode,
         configuration_fingerprint=fingerprint,
+        baseline_version=baseline_version,
+        feature_schema_version=feature_schema_version,
+        dependency_versions=dependency_versions,
         model_name=model_name,
         model_digest=model_digest,
         prompt_version=COACH_PROMPT_VERSION,
@@ -926,6 +1473,9 @@ def _failed_review(
     outcomes_seen: int,
     mode: RiskMode,
     fingerprint: str,
+    baseline_version: str,
+    feature_schema_version: str,
+    dependency_versions: dict[str, str],
     model_name: str,
     model_digest: str,
     input_sha256: str,
@@ -939,6 +1489,9 @@ def _failed_review(
         outcomes_seen=outcomes_seen,
         risk_mode=mode,
         configuration_fingerprint=fingerprint,
+        baseline_version=baseline_version,
+        feature_schema_version=feature_schema_version,
+        dependency_versions=dependency_versions,
         model_name=model_name,
         model_digest=model_digest,
         prompt_version=COACH_PROMPT_VERSION,

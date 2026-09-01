@@ -15,6 +15,8 @@ from signal_arcade.coach import (
 )
 from signal_arcade.database import SCHEMA_VERSION, Database
 from signal_arcade.models import (
+    ChallengerSizeTrial,
+    ChallengerSkill,
     CoachExperimentKind,
     CoachExperimentState,
     CoachHypothesis,
@@ -79,6 +81,9 @@ def _observation(
     season: str = "season-1",
     fingerprint: str = "fp",
     include_checkpoint: bool = True,
+    baseline_version: str = "baseline-v1.1",
+    feature_schema_version: str = "challenger-features-v1",
+    active_skill_versions: dict[str, str] | None = None,
 ) -> LearningObservation:
     checkpoints = {}
     if include_checkpoint:
@@ -134,6 +139,9 @@ def _observation(
         baseline_actionable=True,
         season_id=season,
         configuration_fingerprint=fingerprint,
+        baseline_version=baseline_version,
+        feature_schema_version=feature_schema_version,
+        active_skill_versions=active_skill_versions or {},
     )
 
 
@@ -235,7 +243,7 @@ def test_market_integrity_rule_is_only_a_forward_test_candidate() -> None:
     candidates = _build_candidates(rows, RiskMode.BALANCED, "fp", set())
     integrity = [item for item in candidates if item.feature_name == "single_trade_wallet_ratio"]
     assert len(integrity) == 1
-    assert integrity[0].kind == CoachExperimentKind.ENTRY_VETO
+    assert integrity[0].kind == CoachExperimentKind.MANIPULATION_VETO
     assert integrity[0].uplift_lower_bound > 0
 
 
@@ -347,16 +355,40 @@ def test_missing_forward_exits_cannot_qualify() -> None:
         _observation(
             index,
             cutoff + timedelta(seconds=index + 1),
-            outcome=(-0.2 if index < 30 else None),
-            season="season-1" if index < 30 else "season-2",
+            outcome=(-0.2 if index < 90 else None),
+            season="season-1" if index < 90 else "season-2",
         )
-        for index in range(60)
+        for index in range(180)
     ]
     updated = _evaluate_hypothesis(_hypothesis(cutoff), rows, cutoff + timedelta(hours=1))
-    assert updated.forward_observed_count == 60
-    assert updated.forward_usable_count == 30
+    assert updated.forward_observed_count == 180
+    assert updated.forward_usable_count == 90
     assert updated.forward_availability_fraction == 0.5
     assert updated.state == CoachExperimentState.INCONCLUSIVE
+    assert updated.resolution_reason == "maximum_forward_evidence_reached"
+
+
+def test_low_volume_forward_study_expires_without_waiting_forever() -> None:
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        _observation(
+            index,
+            cutoff + timedelta(days=1, seconds=index),
+            outcome=-0.2,
+        )
+        for index in range(10)
+    ]
+
+    updated = _evaluate_hypothesis(
+        _hypothesis(cutoff),
+        rows,
+        cutoff + timedelta(days=91),
+    )
+
+    assert updated.forward_observed_count == 10
+    assert updated.forward_usable_count == 10
+    assert updated.state == CoachExperimentState.INCONCLUSIVE
+    assert updated.resolution_reason == "forward_study_expired"
 
 
 def test_inconclusive_result_is_retained_but_releases_the_context_slot(tmp_path: Path) -> None:
@@ -377,12 +409,12 @@ def test_inconclusive_result_is_retained_but_releases_the_context_slot(tmp_path:
 
     status = coach.status()
 
-    assert status["state"] == "waiting"
+    assert status["state"] == "inconclusive"
     assert status["recent_hypotheses"][0]["state"] == "inconclusive"
     assert status["recent_hypotheses"][0]["context_active"] is True
     gates = {gate["id"]: gate for gate in status["qualification_gates"]}
-    assert gates["experiment_selected"]["state"] == "not_met"
-    assert gates["forward_outcomes"]["state"] == "collecting"
+    assert gates["experiment_selected"]["state"] == "passed"
+    assert gates["forward_outcomes"]["state"] == "not_met"
     assert status["qualification_passed"] < status["qualification_total"]
     later_rows = [
         _observation(index, hypothesis.cutoff_at + timedelta(seconds=index + 1))
@@ -416,6 +448,154 @@ def test_forward_support_needs_multiple_seasons_and_repeated_reads_do_not_mutate
     repeated = _evaluate_hypothesis(updated, rows, evaluated_at + timedelta(minutes=1))
     assert repeated == updated
     assert repeated.updated_at == updated.updated_at
+
+
+def test_forward_evidence_accumulates_durably_inside_exact_provenance() -> None:
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    hypothesis = _hypothesis(cutoff).model_copy(
+        update={"dependency_versions": {"entry": "champion-entry"}}
+    )
+    first = [
+        _observation(
+            index,
+            cutoff + timedelta(seconds=index + 1),
+            season="season-1",
+            active_skill_versions={"entry": "champion-entry"},
+        )
+        for index in range(30)
+    ]
+    first_result = _evaluate_hypothesis(hypothesis, first, cutoff + timedelta(hours=1))
+    assert first_result.forward_usable_count == 30
+
+    second = [
+        _observation(
+            100 + index,
+            cutoff + timedelta(hours=2, seconds=index),
+            season="season-2",
+            active_skill_versions={"entry": "champion-entry"},
+        )
+        for index in range(30)
+    ]
+    wrong_dependency = _observation(
+        999,
+        cutoff + timedelta(hours=2, minutes=1),
+        season="season-2",
+        active_skill_versions={"entry": "different-entry"},
+    )
+    completed = _evaluate_hypothesis(
+        first_result,
+        [*second, wrong_dependency],
+        cutoff + timedelta(hours=3),
+    )
+
+    assert completed.forward_observed_count == 60
+    assert completed.forward_usable_count == 60
+    assert completed.forward_season_count == 2
+    assert completed.state == CoachExperimentState.PROMISING
+    assert wrong_dependency.observation_id not in completed.forward_observation_ids
+
+
+def test_forward_season_gate_requires_meaningful_samples_in_each_season() -> None:
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        _observation(
+            index,
+            cutoff + timedelta(seconds=index + 1),
+            season="season-1" if index < 55 else "season-2",
+        )
+        for index in range(60)
+    ]
+
+    updated = _evaluate_hypothesis(_hypothesis(cutoff), rows, cutoff + timedelta(hours=1))
+
+    assert updated.forward_usable_count == 60
+    assert updated.forward_season_count == 1
+    assert updated.state == CoachExperimentState.TESTING
+
+
+def test_manipulation_lane_can_screen_fixed_multi_signal_patterns() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = []
+    for index in range(30):
+        observation = _observation(index, now + timedelta(seconds=index), momentum=0.1)
+        rows.append(
+            observation.model_copy(
+                update={
+                    "features": {
+                        **observation.features,
+                        "round_trip_volume_ratio": 0.8,
+                        "net_quote_flow_ratio": 0.1,
+                    }
+                }
+            )
+        )
+
+    candidates = _build_candidates(rows, RiskMode.BALANCED, "fp", set())
+    paired = [
+        item
+        for item in candidates
+        if item.skill == ChallengerSkill.MANIPULATION and len(item.conditions) == 2
+    ]
+
+    assert paired
+    assert {condition.feature_name for condition in paired[0].conditions} == {
+        "round_trip_volume_ratio",
+        "net_quote_flow_ratio",
+    }
+
+
+def test_sizing_lane_uses_fee_inclusive_counterfactual_trials() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = []
+    for index in range(30):
+        observation = _observation(index, now + timedelta(seconds=index), momentum=0.1)
+        rows.append(
+            observation.model_copy(
+                update={
+                    "size_trials": {
+                        "1": ChallengerSizeTrial(
+                            multiplier=1,
+                            budget_lamports=100,
+                            token_units=100,
+                            entry_cost_lamports=100,
+                            entry_price_impact_fraction=0.01,
+                            eligible_at_entry=True,
+                            checkpoints={
+                                "300": LearningCheckpoint(
+                                    horizon_seconds=300,
+                                    observed_at=now + timedelta(seconds=300),
+                                    exit_value_lamports=105,
+                                    net_return=0.05,
+                                )
+                            },
+                        ),
+                        "1.5": ChallengerSizeTrial(
+                            multiplier=1.5,
+                            budget_lamports=150,
+                            token_units=150,
+                            entry_cost_lamports=150,
+                            entry_price_impact_fraction=0.015,
+                            eligible_at_entry=True,
+                            checkpoints={
+                                "300": LearningCheckpoint(
+                                    horizon_seconds=300,
+                                    observed_at=now + timedelta(seconds=300),
+                                    exit_value_lamports=175,
+                                    net_return=25 / 150,
+                                )
+                            },
+                        ),
+                    }
+                }
+            )
+        )
+
+    candidates = _build_candidates(rows, RiskMode.BALANCED, "fp", set())
+    sizing = [item for item in candidates if item.skill == ChallengerSkill.SIZING]
+
+    assert len(sizing) == 1
+    assert sizing[0].size_multiplier == 1.5
+    assert sizing[0].uplift_lower_bound > 0
 
 
 def test_negative_forward_evidence_rejects_an_experiment() -> None:
@@ -555,6 +735,90 @@ def test_context_change_during_inference_discards_the_result(tmp_path: Path) -> 
     database.close()
 
 
+def test_pause_during_inference_discards_the_result(tmp_path: Path) -> None:
+    database = Database(tmp_path / "coach-pause-during-inference.sqlite3")
+    now = datetime.now(UTC) - timedelta(hours=1)
+    for index in range(30):
+        database.save_learning_observation(_observation(index, now + timedelta(seconds=index)))
+    enabled = True
+
+    class PausingCoachHttp(FakeCoachHttp):
+        async def ollama_structured(
+            self,
+            *,
+            prompt: str,
+            schema: dict[str, Any],
+            timeout_seconds: float,
+            model: str | None = None,
+        ) -> tuple[str, int] | None:
+            nonlocal enabled
+            enabled = False
+            return await super().ollama_structured(
+                prompt=prompt,
+                schema=schema,
+                timeout_seconds=timeout_seconds,
+                model=model,
+            )
+
+    coach = AiCoach(  # type: ignore[arg-type]
+        database,
+        PausingCoachHttp(),
+        enabled=lambda: enabled,
+        context=lambda: (RiskMode.BALANCED, "fp"),
+        outcomes_seen=lambda: 80,
+        model_provenance=lambda: ("qwen3.5:2b", "digest-1"),
+        can_run=lambda: (True, None),
+    )
+
+    asyncio.run(coach.tick())
+
+    assert coach.paused_reason == "research_paused_during_review"
+    assert coach.hypotheses == []
+    assert database.list_coach_reviews() == []
+    database.close()
+
+
+def test_ready_contribution_works_while_research_paused_and_prioritizes_new_ready_work(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "coach-paused-contribution.sqlite3")
+    now = datetime.now(UTC)
+    waiting = _hypothesis(now).model_copy(
+        update={
+            "hypothesis_id": "waiting-newer",
+            "signature": "waiting-newer-signature",
+            "state": CoachExperimentState.PROMISING,
+            "contribution_state": "waiting_for_champion",
+        }
+    )
+    ready = _hypothesis(now - timedelta(seconds=1)).model_copy(
+        update={
+            "hypothesis_id": "ready-older",
+            "signature": "ready-older-signature",
+            "state": CoachExperimentState.PROMISING,
+            "contribution_state": "ready",
+        }
+    )
+    database.save_coach_hypothesis(waiting)
+    database.save_coach_hypothesis(ready)
+    coach = AiCoach(  # type: ignore[arg-type]
+        database,
+        FakeCoachHttp(),
+        enabled=lambda: False,
+        context=lambda: (RiskMode.BALANCED, "fp"),
+        outcomes_seen=lambda: 100,
+        model_provenance=lambda: ("qwen3.5:2b", "digest-1"),
+        can_run=lambda: (True, None),
+        contribution_enabled=lambda: True,
+    )
+
+    selected = coach.ready_contribution()
+
+    assert selected is not None
+    assert selected.hypothesis_id == "ready-older"
+    database.close()
+
+
 def test_database_round_trips_coach_artifacts(tmp_path: Path) -> None:
     database = Database(tmp_path / "coach-round-trip.sqlite3")
     now = datetime.now(UTC)
@@ -583,6 +847,110 @@ def test_database_round_trips_coach_artifacts(tmp_path: Path) -> None:
     stats = database.storage_stats(force=True)
     assert stats["coach_reviews"] == 1
     assert stats["coach_hypotheses"] == 1
+    database.close()
+
+
+def test_coach_selection_is_atomic_and_duplicate_safe(tmp_path: Path) -> None:
+    database = Database(tmp_path / "coach-atomic.sqlite3")
+    now = datetime.now(UTC)
+    review = CoachReview(
+        review_id="review-atomic",
+        created_at=now,
+        cutoff_at=now,
+        outcomes_seen=80,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="fp",
+        model_name="qwen3.5:2b",
+        prompt_version="v3",
+        schema_version="v3",
+        input_sha256="c" * 64,
+        candidate_count=1,
+        latency_ms=10,
+        valid=True,
+        selected_candidate_id="candidate-atomic",
+        summary="Bounded selection.",
+    )
+    hypothesis = _hypothesis(now).model_copy(update={"coach_review_id": review.review_id})
+
+    assert database.save_coach_selection(review, hypothesis) is True
+    assert database.save_coach_selection(review, hypothesis) is False
+    assert database.storage_stats(force=True)["coach_reviews"] == 1
+    assert database.storage_stats(force=True)["coach_hypotheses"] == 1
+    database.close()
+
+
+def test_coach_pruning_preserves_active_studies_and_their_review(tmp_path: Path) -> None:
+    database = Database(tmp_path / "coach-pruning.sqlite3")
+    now = datetime.now(UTC)
+    active_review = CoachReview(
+        review_id="review-active",
+        created_at=now,
+        cutoff_at=now,
+        outcomes_seen=80,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="fp",
+        model_name="qwen3.5:2b",
+        prompt_version="v3",
+        schema_version="v3",
+        input_sha256="d" * 64,
+        candidate_count=1,
+        latency_ms=10,
+        valid=True,
+        selected_candidate_id="candidate-active",
+    )
+    active = _hypothesis(now).model_copy(update={"coach_review_id": active_review.review_id})
+    terminal_review = active_review.model_copy(
+        update={
+            "review_id": "review-terminal",
+            "created_at": now + timedelta(seconds=1),
+            "cutoff_at": now + timedelta(seconds=1),
+            "input_sha256": "e" * 64,
+        }
+    )
+    terminal = _hypothesis(now + timedelta(seconds=1)).model_copy(
+        update={
+            "hypothesis_id": "hypothesis-terminal",
+            "signature": "signature-terminal",
+            "coach_review_id": terminal_review.review_id,
+            "state": CoachExperimentState.INCONCLUSIVE,
+        }
+    )
+    assert database.save_coach_selection(active_review, active)
+    assert database.save_coach_selection(terminal_review, terminal)
+
+    database.prune_coach_history(max_reviews=1, max_hypotheses=1)
+
+    assert {item.hypothesis_id for item in database.list_coach_hypotheses()} == {
+        active.hypothesis_id,
+        terminal.hypothesis_id,
+    }
+    assert {item.review_id for item in database.list_coach_reviews()} == {
+        active_review.review_id,
+        terminal_review.review_id,
+    }
+    database.close()
+
+
+def test_corrupt_optional_coach_rows_do_not_stop_valid_history(tmp_path: Path) -> None:
+    database = Database(tmp_path / "coach-corrupt.sqlite3")
+    now = datetime.now(UTC)
+    valid = _hypothesis(now)
+    database.save_coach_hypothesis(valid)
+    with database._lock, database._conn:  # noqa: SLF001
+        database._conn.execute(  # noqa: SLF001
+            "INSERT INTO coach_hypotheses VALUES(?,?,?,?,?,?,?)",
+            (
+                "corrupt",
+                (now + timedelta(seconds=1)).isoformat(),
+                "testing",
+                "entry_veto",
+                "balanced",
+                "fp",
+                "{not-json",
+            ),
+        )
+
+    assert database.list_coach_hypotheses() == [valid]
     database.close()
 
 

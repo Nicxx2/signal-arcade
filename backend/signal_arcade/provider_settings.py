@@ -92,6 +92,13 @@ PROVIDER_PRESETS: dict[str, list[dict[str, Any]]] = {
             "paid_mode": False,
         },
         {
+            "id": "helius_economy",
+            "label": "Helius Economy (keyed HTTP + public stream)",
+            "requests_per_minute": 600,
+            "monthly_limit": 500_000,
+            "paid_mode": False,
+        },
+        {
             "id": "alchemy_free",
             "label": "Alchemy Free (15M CU stream reserve)",
             "requests_per_minute": 3_000,

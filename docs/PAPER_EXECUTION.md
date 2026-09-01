@@ -12,22 +12,31 @@ remain in SQLite. The market feed continues updating retained token state and se
 marks. Resume clears decision cooldowns, reassesses every holding against the freshest non-stale
 state and restores exit risk management.
 
-One season always has one immutable profile. After lock, changing either personality or drawdown
-policy starts a durable exits-only transition rather than mutating the running experiment. New
+One season always has one immutable target: account currency, exact starting bankroll, personality
+and drawdown policy. Before activity, the complete target can be replaced atomically without
+creating an empty archived scorecard. After lock, changing any part starts a durable exits-only
+transition rather than mutating the running experiment. New
 entries stop, unfilled buys cancel, and active/dormant positions plus pending sells remain attached
 to the exact policy context that opened them. The old season archives only when it is legitimately
-settleable; its successor receives the canonical fresh bankroll. A normal automatic rollover
-inherits the exact profile unless the user explicitly requested a different one.
+settleable; its successor receives the exact requested currency and bankroll. A normal automatic
+rollover inherits the exact target unless the user explicitly requested a different one. The
+durable operation fingerprints the full target, so a retry is idempotent and a conflicting
+mid-transition edit is rejected rather than partially applied.
 
 The confirmation offers two explicit boundaries. **Finish safely** keeps the original exit policy
 in control and gives dormant inventory the configured recovery window. **End season now** gives
 fresh executable holdings a bounded 90-second opportunity to produce ordinary latency-, fee- and
-impact-aware paper sell receipts. It never turns a last-known mark into a sale. Any holding still
-untradeable at that boundary is archived as immutable unresolved inventory with its token units,
-book cost, last-known indication, evidence time and blockers. The season remains visible but is
-excluded from best-season and performance comparisons; a user-requested exit is also excluded from
-exit-policy proof. The archive, unresolved records and clean successor season commit atomically and
-the durable deadline survives restart.
+impact-aware paper sell receipts. It never turns a last-known mark into a sale. After the recovery
+or settlement window, a zero-value write-off requires healthy global data plus two fresh,
+position-specific route-unavailable observations. A provider gap, restart without fresh proof, or
+still-executable holding remains `incomplete_unknown` and defers a safe/automatic boundary; the
+explicit end-now path instead honours its deadline, archives that unknown record and excludes the
+manual season from comparison claims. Each
+retired holding keeps token units, book cost, last-known indication, evidence time and blockers.
+`End season now` stays visible but is excluded from best-season and performance comparisons; a
+user-requested exit is also excluded from exit-policy proof. The archive, terminal records and
+clean successor season commit atomically, and the durable deadline and exact target survive
+restart.
 
 ## Fill timing
 
@@ -41,7 +50,10 @@ other trader acts. Exit orders use their own latency. If no fresh executable sta
 Pending buys reserve an open-position slot, exposure, and account-currency cash. This prevents a
 burst of qualifying coins from bypassing the selected risk limits before their delayed fills.
 Capacity, drawdown, exposure, conversion, and available cash are checked again at fill time in
-case the risk mode, SOL/USDC rate, or portfolio changed while the order waited.
+case the risk mode, SOL/USDC rate, or portfolio changed while the order waited. A current Baseline
+buy also reruns the deterministic entry thesis at its exact requested size against the fill-time
+snapshot. The broker can cancel a deteriorated order but can never increase it during fill; a
+scaled entry additionally requires market integrity to remain clean.
 
 ## Price and rounding
 
@@ -68,9 +80,22 @@ The UI separates total cash from pending-order reservations, available cash, and
 sell-side value. A mark older than the configured 90-second position window is shown as last-known
 but excluded from headline equity; this prevents hours-old prices from being reported as current
 profit. Closed proceeds return to the bankroll, so the next decision always plans from
-what is actually available. Only realized bankroll growth can adjust future order size: a bounded
-square-root multiplier compounds slowly and remains subject to the selected mode's exposure cap.
-Unrealized marks cannot enlarge a new order.
+what is actually available. Baseline v1.4 starts from the personality's cautious reference size.
+Only mature clean evidence may target more of the realized bankroll, and every selected amount is
+bounded by per-position exposure, remaining total exposure, reserved/available cash and observed
+price impact. Suspicious evidence sizes down; moderate unresolved evidence uses 70% of the
+reference; incomplete or extremely ambiguous evidence waits instead of entering. Unrealized marks
+cannot enlarge a new order, and the policy never tries to consume unused exposure merely because
+capacity exists.
+
+If the user has explicitly activated a qualified Challenger, its Sizing skill remains subordinate
+to that planner. It can choose only a previously proved 0.5×, 1×, 1.5× or 2× counterfactual and can
+size above 1× only while the current deterministic integrity assessment is Clean. The resulting
+amount applies only when that exact multiplier still fits realized cash, reservations,
+per-position and total exposure, fresh route depth and price impact; otherwise a capacity
+abstention leaves the deterministic Baseline amount unchanged. Submission and fill then validate
+the exact frozen receipt and thesis again. A suspended Sizing version also leaves Baseline sizing
+unchanged.
 
 SOL bankrolls use lamports. USDC bankrolls use micro-USDC and conservatively convert each
 SOL-denominated paper cost, fee, proceed, and mark with the fresh observed `price_usd / price_sol`
@@ -94,6 +119,12 @@ a fixed ceiling: a healthy winner can run, while a retracement from its saved pe
 If the evidence set is incomplete or weak at the normal review point, the broker exits instead of
 granting an extension.
 
+For positions opened by Baseline v1.2, v1.3 or v1.4, manipulation evidence can also request an exit only
+after it persists across time-separated checkpoints. One alarming snapshot cannot sell a position;
+uncertain evidence neither advances the warning nor pretends recovery, while a mature clean sample
+resets it. The counters and timestamps persist across restart. Existing route safety still decides
+whether the requested exit can produce a real paper fill.
+
 Stale state or an unconfirmed route never creates a fabricated fill. A position can therefore
 remain open past any clock threshold when no trustworthy executable route exists; it is labelled
 as waiting, conservatively excluded from current equity after the mark-staleness window, and
@@ -105,6 +136,13 @@ Changing risk personality never rewrites a live position. Entry mode and policy 
 with the holding across its normal reassessment, heartbeat/watchdog, stop, trailing, learned
 timing, pending-sell and restart paths. The requested profile becomes active only after the clean
 season boundary.
+
+A qualified active Challenger Exit skill may recommend an earlier normal review learned from the
+same risk cohort's exact executable checkpoints. It cannot postpone the Baseline review, change a
+hard stop or structural exit, extend the absolute ceiling, or turn a stale mark into a paper sale.
+Each learning observation freezes the exact candidate/champion Exit recommendation before its
+future checkpoints, while the broker persists the actual review assessment used on a position. A
+later health suspension removes future Exit influence without rewriting completed evidence.
 
 Each mint can be entered once per paper season. This prevents repeated qualification during one
 trend from turning evaluation into churn. Resetting the paper portfolio clears that guard and
@@ -126,13 +164,15 @@ invented zero exit. Missing conversion, provider health or executable evidence i
 bankruptcy—and pauses the test. Only healthy, sustained proof may end such a season as
 `bankroll_exhausted`; an ordinary enforced halt ends as `auto_drawdown`.
 
-Results defaults to the current currency and exact profile. SOL and USDC, custom drawdown variants,
-disabled drawdown and other personalities remain separate for every count, chart, trend and
-summary. All Seasons is chronological mixed-comparison history, not a single-strategy aggregate.
-Pre-migration seasons whose profile cannot be proven are retained by currency as Legacy / Unknown
-and excluded from modern like-for-like claims. Manually ended seasons and any season with
-unresolved inventory are likewise retained for audit but excluded from improvement, best-return,
-profitability and average-win-rate claims.
+Results defaults to the current exact comparison: currency, starting bankroll, immutable profile
+and terminal-accounting policy. Different amounts, currencies, drawdown variants or personalities
+remain separate for every count, chart, trend and summary. Currency-wide and All Seasons views are
+chronological mixed-comparison history, not one strategy aggregate. Pre-migration seasons remain
+Legacy / Unknown. Empty seasons, manual boundaries and provider-unknown endings remain visible but
+cannot support improvement, best-return, profitability or average-win-rate claims. A safe or
+automatic season with meaningful activity and independently confirmed write-offs remains an honest
+complete paper result—the lost entry cost is part of its outcome and the write-off counts as a
+terminal loss, without inventing a sell fill or learning outcome.
 
 The scanner does not wait for current positions to close. Every incoming event first refreshes
 the matching open position and applies the adaptive exit and permanent risk rules;

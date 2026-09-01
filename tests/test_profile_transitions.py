@@ -32,6 +32,31 @@ def prepare_locked_orchestrator(settings) -> Orchestrator:  # type: ignore[no-un
     return orchestrator
 
 
+def confirm_unavailable_route(
+    orchestrator: Orchestrator,
+    mint: str,
+    observed_at: datetime,
+) -> None:
+    """Provide the two fresh, independent watchdog observations required for a write-off."""
+
+    orchestrator._record_position_route_probe(  # noqa: SLF001 - terminal evidence fixture
+        mint,
+        available=False,
+        observed_at=observed_at - timedelta(seconds=1),
+        slot=101,
+        market_status="dormant",
+        blockers=["route_unavailable"],
+    )
+    orchestrator._record_position_route_probe(  # noqa: SLF001 - terminal evidence fixture
+        mint,
+        available=False,
+        observed_at=observed_at,
+        slot=102,
+        market_status="dormant",
+        blockers=["route_unavailable"],
+    )
+
+
 def test_unstarted_profile_changes_in_place_without_archiving(settings) -> None:  # type: ignore[no-untyped-def]
     orchestrator = Orchestrator(settings)
     asyncio.run(orchestrator.setup_portfolio(QuoteCurrency.SOL, 1_000_000_000))
@@ -44,6 +69,59 @@ def test_unstarted_profile_changes_in_place_without_archiving(settings) -> None:
     assert orchestrator.broker.season_profile["risk_mode"] == "safe"
     assert orchestrator.broker.season_profile["locked_at"] is None
     assert len(orchestrator.database.list_paper_seasons()) == 1
+    close_orchestrator(orchestrator)
+
+
+def test_unstarted_season_can_change_currency_amount_and_profile_in_place(settings) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = Orchestrator(settings)
+    asyncio.run(orchestrator.setup_portfolio(QuoteCurrency.SOL, 1_000_000_000))
+    source_season = orchestrator.broker.season_id
+
+    result = asyncio.run(
+        orchestrator.request_season_profile(
+            RiskMode.AGGRESSIVE,
+            DrawdownPolicy(kind=DrawdownPolicyKind.DISABLED),
+            target_quote_currency=QuoteCurrency.USDC,
+            target_starting_minor=250_000_000,
+        )
+    )
+
+    assert result["transition_required"] is False
+    assert result["quote_currency"] == "USDC"
+    assert result["starting_minor"] == 250_000_000
+    assert orchestrator.broker.season_id == source_season
+    assert orchestrator.broker.quote_currency == QuoteCurrency.USDC
+    assert orchestrator.broker.starting_lamports == 250_000_000
+    assert orchestrator.broker.cash_lamports == 250_000_000
+    assert orchestrator.broker.season_profile is not None
+    assert orchestrator.broker.season_profile["risk_mode"] == "aggressive"
+    assert orchestrator.broker.season_profile["drawdown_policy"]["kind"] == "disabled"
+    assert len(orchestrator.database.list_paper_seasons()) == 1
+    close_orchestrator(orchestrator)
+
+
+def test_locked_transition_starts_the_exact_requested_bankroll(settings) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = prepare_locked_orchestrator(settings)
+
+    requested = asyncio.run(
+        orchestrator.request_season_profile(
+            RiskMode.SAFE,
+            DrawdownPolicy(),
+            target_quote_currency=QuoteCurrency.USDC,
+            target_starting_minor=200_000_000,
+        )
+    )
+    completed = asyncio.run(orchestrator._profile_transition_tick(datetime.now(UTC)))  # noqa: SLF001
+
+    assert requested["target_quote_currency"] == "USDC"
+    assert requested["target_starting_minor"] == 200_000_000
+    assert completed is not None
+    assert orchestrator.broker.quote_currency == QuoteCurrency.USDC
+    assert orchestrator.broker.starting_lamports == 200_000_000
+    assert orchestrator.broker.cash_lamports == 200_000_000
+    seasons = orchestrator.database.list_paper_seasons()
+    assert seasons[1]["quote_currency"] == "USDC"
+    assert seasons[1]["starting_minor"] == 200_000_000
     close_orchestrator(orchestrator)
 
 
@@ -148,12 +226,33 @@ def test_transition_heartbeat_never_executes_a_late_pending_buy(settings) -> Non
 def test_transition_requests_are_idempotent_but_cannot_be_retargeted(settings) -> None:  # type: ignore[no-untyped-def]
     orchestrator = prepare_locked_orchestrator(settings)
 
-    first = asyncio.run(orchestrator.request_risk_mode(RiskMode.SAFE))
-    repeated = asyncio.run(orchestrator.request_risk_mode(RiskMode.SAFE))
+    first = asyncio.run(
+        orchestrator.request_season_profile(
+            RiskMode.SAFE,
+            DrawdownPolicy(),
+            target_quote_currency=QuoteCurrency.USDC,
+            target_starting_minor=100_000_000,
+        )
+    )
+    repeated = asyncio.run(
+        orchestrator.request_season_profile(
+            RiskMode.SAFE,
+            DrawdownPolicy(),
+            target_quote_currency=QuoteCurrency.USDC,
+            target_starting_minor=100_000_000,
+        )
+    )
 
     assert repeated["operation_id"] == first["operation_id"]
     try:
-        asyncio.run(orchestrator.request_risk_mode(RiskMode.AGGRESSIVE))
+        asyncio.run(
+            orchestrator.request_season_profile(
+                RiskMode.SAFE,
+                DrawdownPolicy(),
+                target_quote_currency=QuoteCurrency.USDC,
+                target_starting_minor=101_000_000,
+            )
+        )
     except ValueError as exc:
         assert "wait for the current season operation" in str(exc)
     else:
@@ -214,6 +313,70 @@ def test_dormant_transition_waits_full_healthy_grace_and_revival_resets_it(setti
     operation = orchestrator.season_operation_status()
     assert operation["stage"] == "draining_positions"
     assert operation["dormant_eligible_since"] is None
+    close_orchestrator(orchestrator)
+
+
+def test_terminal_writeoff_requires_distinct_recent_route_probes(settings) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = prepare_locked_orchestrator(settings)
+    now = datetime.now(UTC)
+    position = Position(
+        position_id="probe-position",
+        mint="probe-mint",
+        symbol="PROBE",
+        token_units=1,
+        entry_cost_lamports=100,
+        book_value_lamports=100,
+        opened_at=now - timedelta(hours=1),
+        entry_fill_id="probe-fill",
+        last_mark_lamports=1,
+        last_marked_at=now - timedelta(minutes=10),
+        mark_is_stale=True,
+        mark_is_executable=False,
+        risk_mode_at_entry=RiskMode.BALANCED,
+    )
+    orchestrator.broker.positions[position.mint] = position
+    orchestrator.database.save_position(position)
+    for slot in (101, 102):
+        orchestrator._record_position_route_probe(  # noqa: SLF001
+            position.mint,
+            available=False,
+            observed_at=now,
+            slot=slot,
+            market_status="dormant",
+            blockers=["route_unavailable"],
+        )
+    portfolio = orchestrator.broker.snapshot(orchestrator.risk_mode, persist_peak=False)
+    dispositions, waiting = orchestrator._terminal_position_dispositions(  # noqa: SLF001
+        portfolio,
+        now,
+    )
+    assert waiting == [position.mint]
+    assert dispositions[position.mint]["terminal_disposition"] == "unknown"
+
+    orchestrator._record_position_route_probe(  # noqa: SLF001
+        position.mint,
+        available=False,
+        observed_at=now + timedelta(seconds=1),
+        slot=103,
+        market_status="dormant",
+        blockers=["route_unavailable"],
+    )
+    dispositions, waiting = orchestrator._terminal_position_dispositions(  # noqa: SLF001
+        portfolio,
+        now + timedelta(seconds=1),
+    )
+    assert waiting == []
+    assert dispositions[position.mint]["terminal_disposition"] == "write_off"
+
+    orchestrator._record_position_route_probe(  # noqa: SLF001
+        position.mint,
+        available=False,
+        observed_at=now + timedelta(seconds=181),
+        slot=104,
+        market_status="dormant",
+        blockers=["route_unavailable"],
+    )
+    assert orchestrator._position_route_probes[position.mint]["consecutive"] == 1  # noqa: SLF001
     close_orchestrator(orchestrator)
 
 
@@ -290,37 +453,27 @@ def test_end_now_records_untradeable_inventory_without_fabricating_a_fill(settin
     )
     assert orchestrator.season_operation_status()["stage"] == "settling_manual_exits"
 
-    completed = asyncio.run(
-        orchestrator._profile_transition_tick(deadline + timedelta(seconds=1))  # noqa: SLF001
-    )
+    classified_at = deadline + timedelta(seconds=1)
+    confirm_unavailable_route(orchestrator, position.mint, classified_at)
+    completed = asyncio.run(orchestrator._profile_transition_tick(classified_at))  # noqa: SLF001
     assert completed is not None
     seasons = orchestrator.database.list_paper_seasons()
     archived = seasons[0]
     assert archived["terminal_reason"] == "profile_change_manual"
-    assert archived["result_quality"] == "unresolved"
+    assert archived["result_quality"] == "complete"
+    assert archived["accounting_status"] == "complete_with_writeoffs"
+    assert archived["write_off_count"] == 1
+    assert archived["closed_trades"] == 1
+    assert archived["losses"] == 1
     assert archived["comparable"] is False
     assert archived["open_positions"] == 1
-    assert archived["unresolved_inventory"] == [
-        {
-            "book_value_minor": 985,
-            "entry_cost_minor": 1_000,
-            "last_known_mark_minor": 450,
-            "last_marked_at": position.last_marked_at.isoformat(),
-            "mark_blockers": ["stale_market_data"],
-            "market_status": "dormant",
-            "mint": "unresolved-mint",
-            "position_id": "unresolved-position",
-            "quote_currency": "SOL",
-            "quote_decimals": 9,
-            "recorded_at": (deadline + timedelta(seconds=1)).isoformat(),
-            "retired_at": (deadline + timedelta(seconds=1)).isoformat(),
-            "retirement_reason": "profile_change_manual",
-            "season_id": archived["season_id"],
-            "symbol": "REAL",
-            "token_units": 123,
-            "was_executed": False,
-        }
-    ]
+    retired = archived["unresolved_inventory"][0]
+    assert retired["mint"] == "unresolved-mint"
+    assert retired["token_units"] == 123
+    assert retired["entry_cost_minor"] == 1_000
+    assert retired["terminal_disposition"] == "write_off"
+    assert retired["terminal_evidence"]["policy"] == "two-fresh-route-probes"
+    assert retired["was_executed"] is False
     assert orchestrator.database.list_fills() == []
     assert orchestrator.broker.positions == {}
     close_orchestrator(orchestrator)
@@ -381,6 +534,9 @@ def test_end_now_schedules_real_exits_then_honours_the_bounded_deadline(settings
     assert orchestrator.season_operation_status()["cancelled_manual_exits"] == 1
     assert orchestrator.database.list_fills() == []
     assert orchestrator.database.list_paper_seasons()[0]["comparable"] is False
+    assert orchestrator.database.list_paper_seasons()[0]["accounting_status"] == (
+        "incomplete_unknown"
+    )
     close_orchestrator(orchestrator)
 
 
@@ -465,7 +621,8 @@ def test_end_now_escalation_cannot_race_a_safe_transition_commit(settings) -> No
     assert orchestrator.database.list_paper_seasons()[0]["terminal_reason"] == (
         "profile_change_safe"
     )
-    assert orchestrator.database.list_paper_seasons()[0]["comparable"] is True
+    assert orchestrator.database.list_paper_seasons()[0]["comparable"] is False
+    assert orchestrator.database.list_paper_seasons()[0]["accounting_status"] == "empty"
     close_orchestrator(orchestrator)
 
 
@@ -525,14 +682,14 @@ def test_end_now_deadline_and_unresolved_audit_survive_restart(settings) -> None
     assert recovered["transition_strategy"] == "end_now"
     assert recovered["manual_settlement_started_at"] == requested["manual_settlement_started_at"]
     assert recovered["manual_settlement_deadline"] == deadline.isoformat()
-    assert (
-        asyncio.run(
-            restarted._profile_transition_tick(deadline + timedelta(seconds=1))  # noqa: SLF001
-        )
-        is not None
-    )
+    classified_at = deadline + timedelta(seconds=1)
+    assert asyncio.run(restarted._profile_transition_tick(classified_at)) is not None  # noqa: SLF001
     archived = restarted.database.list_paper_seasons()[0]
     assert archived["unresolved_inventory"][0]["mint"] == "restart-mint"
+    # Route proof is intentionally restart-conservative. End-now still honours its deadline,
+    # retaining the unconfirmed holding as provider-unknown rather than inventing a write-off.
+    assert archived["unresolved_inventory"][0]["terminal_disposition"] == "unknown"
+    assert archived["accounting_status"] == "incomplete_unknown"
     close_orchestrator(restarted)
 
 
@@ -549,7 +706,8 @@ def test_unknown_stored_transition_strategy_fails_closed_to_safe_drain(settings)
     )
     archived = orchestrator.database.list_paper_seasons()[0]
     assert archived["terminal_reason"] == "profile_change_safe"
-    assert archived["comparable"] is True
+    assert archived["comparable"] is False
+    assert archived["accounting_status"] == "empty"
     close_orchestrator(orchestrator)
 
 

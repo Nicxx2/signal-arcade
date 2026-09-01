@@ -40,13 +40,16 @@ are pruned. Ollama model files remain in Ollama's separate store and never count
 
 - `providers/`: official event decoding, Solana RPC mint inspection, DEX/Jupiter/Ollama adapters.
 - `intelligence/`: rolling point-in-time token state, features, risk flags, and baseline score.
-- `intelligence/learning.py`: live-only outcome checkpoints, chronological validation, immutable
-  challenger versions, optional veto-only entry guard, and bounded hold-horizon utility.
+- `intelligence/learning.py`: route-aware live-only outcome checkpoints; independent Entry,
+  Manipulation, Sizing and Exit artifacts; chronological validation; restart-safe common-forward
+  candidate/champion tournaments; bounded composition and per-skill health suspension.
 - `paper/`: integer curve quotes, delayed orders, persistent adaptive exit assessments, receipts,
   positions, and accounting.
 - `ai_lab.py`: optional structured local-model critic, serialized catalog downloads, runtime
   monitoring, strict evidence validation, independent counterfactual outcomes, and per-model
   qualification. Compose supplies a private CPU-first Ollama service with separate model storage.
+- `coach.py`: quiet-time, allowlisted Entry, Manipulation, Sizing and Exit research with
+  exact-cohort forward studies, bounded terminal outcomes and an explicit Challenger handoff.
 - `database.py`: versioned SQLite schema, WAL, batched deduplication, incidents, equity rollups,
   quota and retention state.
 - `orchestrator.py`: one event-time coordinator and fan-out bus.
@@ -57,7 +60,9 @@ are pruned. Ollama model files remain in Ollama's separate store and never count
 
 Provider failures do not stop the ledger or UI. The stream reconnects with bounded exponential
 backoff. Optional HTTP failures remain unknown. Market events enter a bounded queue and are
-persisted in batches. When overwhelmed, the app retains held/pending/learning-critical activity,
+persisted in batches. A short sparse-feed batching wait is skipped whenever backlog already exists,
+so a recovered public feed drains immediately. When overwhelmed, the app retains
+held/pending/learning-critical activity,
 sheds untracked low-priority trades, and records a persistent incident rather than allowing
 unbounded memory or database pressure. UI notifications have their own bounded queue and the
 normal five-second snapshot poll repairs missed notifications. Duplicate events are ignored.
@@ -74,8 +79,9 @@ fill, filled order, balanced ledger entries, position change, and realized P/L a
 one SQLite transaction; an injected failure rolls every effect back before in-memory state moves.
 
 Every modern paper season also stores one immutable profile snapshot: risk personality, the exact
-risk-limit values and policy version, typed portfolio-drawdown policy, effective threshold, and a
-stable profile fingerprint. A unique partial index permits only one current season. A locked
+risk-limit values, Baseline/integrity/sizing policy versions, typed portfolio-drawdown policy,
+effective threshold, and a stable profile fingerprint. A unique partial index permits only one
+current season. A locked
 profile change is a durable `profile_transition` operation: new buys freeze, unfilled buys cancel,
 owned positions and pending exits continue under their entry provenance, and the completed-season
 archive plus successor creation commit atomically. Restart reconciliation treats the old profile
@@ -83,26 +89,38 @@ as authoritative before that boundary and the new profile as authoritative after
 cannot create two current seasons. Pre-profile history remains visible as Legacy / Unknown rather
 than being guessed into a modern cohort.
 
-Results uses a separate comparison key composed of quote currency plus the immutable profile
-fingerprint. SOL and USDC scorecards therefore never share a best-season or improvement claim even
-when their personality and drawdown policy match. All-history and legacy views retain every row
-but suppress aggregate claims whenever currency or exact policy is mixed or unknown.
+Results uses a separate comparison key composed of quote currency, exact starting bankroll, the
+immutable profile fingerprint and terminal-accounting policy version. Different funding amounts,
+SOL/USDC or policy experiments therefore never share a best-season or improvement claim. Currency
+and all-history views retain every row but suppress aggregate claims whenever any comparison
+identity is mixed or unknown.
 
 An explicit `end_now` transition stores a bounded settlement deadline in that same operation.
-Executable positions receive normal paper sell orders; any remaining position is copied into the
-append-only `unresolved_paper_positions` audit before live paper tables are cleared. Season rows
-carry separate result-quality and comparability fields, so a real manual fill remains accounting
-truth while neither user-selected timing nor unresolved inventory can be credited as strategy
-performance. Unknown transition values fail closed to the normal safe-drain behavior.
+Executable positions receive normal paper sell orders. A remaining non-executable position becomes
+a zero-value write-off only after two fresh route-specific failures while global data is healthy;
+otherwise it remains provider-unknown. Safe/automatic boundaries defer, while end-now honours its
+deadline and keeps the manual result outside comparison claims. Terminal inventory is
+copied into the append-only `unresolved_paper_positions` audit before live paper tables are cleared.
+Season rows distinguish complete, confirmed-write-off, provider-unknown, empty and legacy
+accounting. A real manual fill remains accounting truth, while user-selected timing cannot be
+credited as strategy performance. Unknown transition values fail closed to the normal safe-drain
+behavior, and route proof is deliberately recollected after restart.
 
-Learning observations, model versions, AI assessments, and operational incidents also recover
-from SQLite. Learning and AI audit records intentionally survive a paper-bankroll reset. Demo
-events never train the statistical learner or qualify Guarded AI. Missing future observations
-remain unknown rather than becoming invented returns.
+Learning observations, exact route checkpoint attempts, sizing trials, immutable skill artifacts,
+candidate/champion state, active skill versions, AI assessments, Coach studies, and operational
+incidents also recover from SQLite. Coach selection saves its review and hypothesis atomically;
+exact forward observation IDs, values, meaningful-season counts and a per-context lifetime outcome
+clock prevent replay or reset after pruning. Active and contribution-ready studies plus their
+referenced reviews are protected by bounded retention, while an invalid optional Coach row is
+skipped without blocking deterministic startup. Learning and AI audit records intentionally survive
+a paper-bankroll reset. Demo events never train the statistical learner or qualify Guarded AI.
+Missing future observations remain unknown rather than becoming invented returns. Artifact pruning
+protects every version referenced by durable tournament or active state.
 
 Season and learning identity are deliberately separate. The season-profile fingerprint includes
 the drawdown experiment for apples-to-apples portfolio comparison. The decision-configuration
-fingerprint includes the risk personality and trade-learning inputs, but not the portfolio
+fingerprint includes the risk personality, deterministic strategy versions and trade-learning
+inputs, but not the portfolio
 drawdown override or bankroll currency. Default, custom and disabled drawdown seasons—and SOL or
 USDC bankrolls—can therefore contribute honest forward evidence to the same personality Challenger
 while every observation retains its exact season and profile provenance. A portfolio-blocked entry
@@ -113,9 +131,20 @@ is frozen as non-actionable and cannot be credited to a veto policy.
 Raw chain/provider payloads are untrusted. Pydantic contracts, bounded Anchor decoding, account
 layout checks, integer reserve limits, HTTP timeouts, no redirects, and fail-closed decision gates
 sit between external data and simulated execution. The local statistical learner receives only
-normalized saved features. In active mode it may veto a baseline entry after qualification, but
-cannot originate an order, increase size, or bypass any safety gate. Local AI explanations remain
-downstream. The separate AI critic receives only an allowlisted evidence document and cannot
-originate an order; after its own independent Shadow qualification, Guarded may only veto a
-baseline entry. Worker failures are contained and recorded without stopping deterministic market
-processing.
+normalized saved features. Active Entry and Manipulation may only veto a Baseline entry. Active
+Sizing may select only 0.5–2× and may exceed 1× only for a current deterministic Clean integrity
+conclusion; an exact multiplier that no longer fits cash, reservations, per-position/total
+exposure or route impact abstains back to Baseline size, and fill-time revalidation stays
+authoritative. Active Exit may only shorten the normal review. A failed or unverifiable skill and
+its dependants are suspended without granting authority to another version. Local AI explanations
+remain downstream. The separate AI critic receives only an allowlisted evidence document and
+cannot originate an order; after its own independent Shadow qualification, Guarded may only veto
+a baseline entry. The AI Coach can select only deterministic allowlisted studies and always has
+zero direct authority. A supported study needs explicit contribution permission, an existing
+same-skill Champion and a fresh normal Challenger tournament; it cannot create the first Champion,
+skip common-forward proof, replace a Champion directly or survive an incompatible dependency
+change. A newly joined upstream skill also removes downstream authority until the exact new
+composition earns fresh forward proof, while preserving its Champion and history. The Challenger
+boundary revalidates every Coach policy against the deterministic allowlist rather than trusting
+the persisted research row. Worker failures are contained and recorded without stopping
+deterministic market processing.

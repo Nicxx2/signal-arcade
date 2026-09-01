@@ -82,6 +82,7 @@ def assess_exit(
     now: datetime,
     limits: RiskLimits,
     soft_hold_seconds: int | None = None,
+    persistent_integrity_reason: str | None = None,
 ) -> ExitAssessment:
     """Evaluate one open position without inventing a price or bypassing route safety."""
 
@@ -147,6 +148,13 @@ def assess_exit(
             "exit",
             "migration_route_guard",
             f"Curve progress {progress:.1%} is near the unconfirmed migration boundary",
+        )
+
+    if persistent_integrity_reason is not None:
+        return result(
+            "exit",
+            persistent_integrity_reason,
+            "Manipulation evidence persisted across time-separated checkpoints",
         )
 
     if (
