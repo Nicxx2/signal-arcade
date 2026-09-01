@@ -680,8 +680,7 @@ class FeatureEngine:
             values[key] = DataValue(
                 value=value,
                 unit=unit,
-                as_of=item_as_of
-                or (rolling.computed_at if key in rolling_keys else last_event),
+                as_of=item_as_of or (rolling.computed_at if key in rolling_keys else last_event),
                 sources=source_list or sources,
                 freshness_seconds=(
                     rolling_freshness
@@ -896,13 +895,10 @@ def _rolling_trade_metrics(state: TokenState, now: datetime) -> RollingTradeMetr
     trades_5m = tuple(
         trade
         for trade in state.trades
-        if trade.venue == state.venue
-        and 0 <= (now - trade.received_at).total_seconds() <= 300
+        if trade.venue == state.venue and 0 <= (now - trade.received_at).total_seconds() <= 300
     )
     trades_1m = tuple(
-        trade
-        for trade in trades_5m
-        if (now - trade.received_at).total_seconds() <= 60
+        trade for trade in trades_5m if (now - trade.received_at).total_seconds() <= 60
     )
     buys_1m = sum(trade.side == Side.BUY for trade in trades_1m)
     buys_5m = sum(trade.side == Side.BUY for trade in trades_5m)
@@ -1051,11 +1047,7 @@ def _stream_integrity_metrics(trades: list[TradeObservation]) -> dict[str, Integ
         else None
     )
     meaningful_volume_ratio = (
-        sum(
-            trade.quote_lamports
-            for trade in valued
-            if trade.quote_lamports >= meaningful_lamports
-        )
+        sum(trade.quote_lamports for trade in valued if trade.quote_lamports >= meaningful_lamports)
         / gross_quote
         if gross_quote > 0
         else None

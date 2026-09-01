@@ -424,9 +424,8 @@ def assess_market_integrity(
         state = MarketIntegrityState.UNCERTAIN
         if policy_version == INTEGRITY_POLICY_VERSION and not _integrity_window_complete(features):
             evidence.insert(0, "A complete uninterrupted five-minute event window is needed")
-        elif (
-            policy_version == INTEGRITY_POLICY_VERSION
-            and not _current_integrity_core_complete(features)
+        elif policy_version == INTEGRITY_POLICY_VERSION and not _current_integrity_core_complete(
+            features
         ):
             evidence.insert(0, "Complete economic-size and price-path fields are needed")
         else:

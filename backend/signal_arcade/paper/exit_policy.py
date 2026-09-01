@@ -56,15 +56,9 @@ def hold_support(
         )
 
     components = {
-        "buy": (
-            0.0
-            if buy_ratio is None
-            else _clamp((buy_ratio - 0.35) / 0.35) * economic_credit
-        ),
+        "buy": (0.0 if buy_ratio is None else _clamp((buy_ratio - 0.35) / 0.35) * economic_credit),
         "momentum": (
-            0.0
-            if momentum is None
-            else _clamp((momentum + 0.10) / 0.45) * economic_credit
+            0.0 if momentum is None else _clamp((momentum + 0.10) / 0.45) * economic_credit
         ),
         "wallets": 0.0 if wallets is None else _clamp(wallets / 20) * economic_credit,
         "trades": 0.0 if trades is None else _clamp(trades / 20) * economic_credit,

@@ -78,10 +78,14 @@ def _integrity_reference_size_multiplier(
         return 0.60
     if state == MarketIntegrityState.SEVERE:
         return 0.50
-    if baseline_version in {
-        CORROBORATED_BASELINE_VERSION,
-        BASELINE_VERSION,
-    } and state == MarketIntegrityState.UNCERTAIN:
+    if (
+        baseline_version
+        in {
+            CORROBORATED_BASELINE_VERSION,
+            BASELINE_VERSION,
+        }
+        and state == MarketIntegrityState.UNCERTAIN
+    ):
         return UNCERTAIN_INTEGRITY_SIZE_MULTIPLIER
     return 1.0
 
