@@ -42,7 +42,11 @@ are pruned. Ollama model files remain in Ollama's separate store and never count
 - `intelligence/`: rolling point-in-time token state, features, risk flags, and baseline score.
 - `intelligence/learning.py`: route-aware live-only outcome checkpoints; independent Entry,
   Manipulation, Sizing and Exit artifacts; chronological validation; restart-safe common-forward
-  candidate/champion tournaments; bounded composition and per-skill health suspension.
+  candidate/champion tournaments; generation-bound policy evidence; coalesced quiet-time fitting;
+  bounded composition and per-skill health suspension.
+- `intelligence/nonlinear.py`: one lazy-loaded, single-thread CPU XGBoost recipe with deterministic
+  training, finite-input validation and portable JSON serialization. Linear remains the preferred
+  family unless the nonlinear contender earns a material untouched-validation advantage.
 - `paper/`: integer curve quotes, delayed orders, persistent adaptive exit assessments, receipts,
   positions, and accounting.
 - `ai_lab.py`: optional structured local-model critic, serialized catalog downloads, runtime
@@ -51,6 +55,7 @@ are pruned. Ollama model files remain in Ollama's separate store and never count
 - `coach.py`: quiet-time, allowlisted Entry, Manipulation, Sizing and Exit research with
   exact-cohort forward studies, bounded terminal outcomes and an explicit Challenger handoff.
 - `database.py`: versioned SQLite schema, WAL, batched deduplication, incidents, equity rollups,
+  bounded digest-verified statistical model payloads,
   quota and retention state.
 - `orchestrator.py`: one event-time coordinator and fan-out bus.
 - `api.py`: local security middleware, API routes, WebSocket, and built static UI.
@@ -67,10 +72,18 @@ sheds untracked low-priority trades, and records a persistent incident rather th
 unbounded memory or database pressure. Baseline v1.5 treats a represented candidate drop, source
 reconnect or live five-minute trade-buffer eviction as incomplete integrity evidence; that mint
 waits through a fresh continuity window rather than learning from or trading on a partial sample.
+Operational status reports processed, transient, saved, capacity-shed and expired candidate events
+as distinct counters; transient processing is never presented as lost data, and expiry is not
+mislabelled as queue shedding.
 Rolling structural metrics are cached for at most one second during bursts, while reserve/route
 state and critical position events remain authoritative. UI notifications have their own bounded
 queue and the normal five-second snapshot poll repairs missed notifications. Duplicate events are
 ignored.
+Routine learner checkpoints use durable normal priority and rise to critical priority only around
+their due window. Statistical fitting is coalesced per cohort and runs in one background thread
+only while the market queue is empty, processing lag is low and no event batch or maintenance work
+is active. Immediate health suspension and common-forward tournament accounting remain on the
+outcome boundary.
 Ollama reachability is monitored independently; its absence disables local assessments and
 explanations without stopping market processing, the baseline strategy, exits, or accounting.
 
@@ -111,16 +124,26 @@ accounting. A real manual fill remains accounting truth, while user-selected tim
 credited as strategy performance. Unknown transition values fail closed to the normal safe-drain
 behavior, and route proof is deliberately recollected after restart.
 
-Learning observations, exact route checkpoint attempts, sizing trials, immutable skill artifacts,
-candidate/champion state, active skill versions, AI assessments, Coach studies, and operational
-incidents also recover from SQLite. Coach selection saves its review and hypothesis atomically;
+Learning observations, generation-bound policy episodes, actual execution episodes, exact route
+checkpoint attempts, sizing trials, immutable skill artifacts, candidate/champion state, active
+skill versions, AI assessments, Coach studies, and operational incidents also recover from SQLite.
+An actionable policy episode is linked to its order atomically, while actual execution evidence is
+committed in the same transaction as each fill, ledger and position change. Confirmed terminal
+write-offs retain conservative loss evidence; provider-unknown inventory remains unavailable.
+The learner's execution-lane read model refreshes only after that transaction commits; callback
+failure is isolated from accounting, and restart or season-boundary reconciliation reloads SQLite.
+Champion tournaments, active-skill health and downstream join proof read generation-bound Policy
+episodes rather than the Discovery mint index, so a later actionable entry remains eligible after
+an earlier completed PASS without duplicating either trajectory.
+Coach selection saves its review and hypothesis atomically;
 exact forward observation IDs, values, meaningful-season counts and a per-context lifetime outcome
 clock prevent replay or reset after pruning. Active and contribution-ready studies plus their
 referenced reviews are protected by bounded retention, while an invalid optional Coach row is
 skipped without blocking deterministic startup. Learning and AI audit records intentionally survive
 a paper-bankroll reset. Demo events never train the statistical learner or qualify Guarded AI.
-Missing future observations remain unknown rather than becoming invented returns. Artifact pruning
-protects every version referenced by durable tournament or active state.
+Missing future observations remain unknown rather than becoming invented returns. Terminal
+evidence lanes are bounded while pending trajectories are retained. Artifact pruning protects
+every version referenced by durable tournament, active state or Champion history.
 
 Season and learning identity are deliberately separate. The season-profile fingerprint includes
 the drawdown experiment for apples-to-apples portfolio comparison. The decision-configuration

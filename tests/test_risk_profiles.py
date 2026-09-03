@@ -211,7 +211,7 @@ def test_new_season_persists_exact_profile_without_relabelling_legacy(tmp_path: 
     connection.close()
 
     migrated = Database(legacy_path)
-    assert SCHEMA_VERSION == 11
+    assert SCHEMA_VERSION == 13
     legacy = migrated.list_paper_seasons()[0]
     assert legacy["profile"] is None
     assert legacy["profile_provenance"] == "legacy_unknown"

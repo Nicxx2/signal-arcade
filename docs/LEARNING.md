@@ -6,11 +6,24 @@ profit, discover a permanent edge, or safely trade real money.
 
 ## What becomes a lesson
 
-One eligible decision per mint can become a learning observation. The decision must come from
-Solana Mainnet mode, use live market evidence, and have enough age, trades, and wallet breadth to
-be an ENTER or PASS candidate. Synthetic Demo decisions, structurally unsafe tokens, WATCH states,
-and repeated snapshots of the same mint are excluded. This avoids letting fast updates or demo
-patterns dominate the history.
+Learning has three deliberately separate evidence lanes:
+
+- **Discovery** keeps at most one eligible ENTER or PASS observation per mint. It finds broad
+  associations and proposes bounded contenders, but does not by itself prove deployable policy.
+- **Policy proof** stores one actionable Baseline ENTER trajectory per mint and paper season. For
+  qualification and tournaments, only the earliest eligible trajectory for each mint in the exact
+  cohort contributes; later seasons remain auditable but cannot multiply one token into proof. It is
+  generation-bound, qualification-eligible evidence for the exact veto, sizing and exit behavior
+  that could really have acted. If a mint was first observed as PASS, a later genuinely actionable
+  ENTER may still begin this separate trajectory; repeated decisions in the same trajectory cannot
+  manufacture sample size.
+- **Paper execution** begins only at an actual fill and records actual fees, exits, returns and
+  terminal disposition. It audits whole-system behavior but never substitutes selected fills for
+  the untouched counterfactual policy evidence needed for qualification.
+
+Every lane must come from Solana Mainnet mode and live market evidence. Synthetic Demo decisions,
+structurally unsafe tokens, WATCH states, and repeated snapshots of the same eligible identity are
+excluded. This avoids letting fast updates, selection effects or demo patterns dominate proof.
 
 The saved lesson contains the exact point-in-time features and baseline action. Later live trades
 for that mint add fee-inclusive paper outcomes at 1, 5, 10, 15, and 20 minutes. Each outcome uses
@@ -18,7 +31,7 @@ the same integer curve quote and configured protocol/network costs as the paper 
 horizon has no usable future observation within its grace period, it stays **unknown**; it is never
 silently treated as zero or as a loss.
 
-Starting with the `stream-integrity-v5` cohort, each eligible lesson also freezes structural
+Starting with the `stream-integrity-v6` contract, each eligible lesson also freezes structural
 market evidence available from the same five-minute Solana stream: the share of one-trade
 wallets, wallets that rapidly bought and sold, volume attributable to those round trips,
 absolute net quote flow relative to gross volume, buy/sell alternation, two-significant-digit
@@ -52,7 +65,7 @@ a saturated bounded gap tracker fails closed for the whole source. Failed batche
 avoiding duplicate broker side effects. Protected open-position and already-saved outcome events
 continue normally. Missing evidence remains `unknown`; it is never converted to zero. The evidence
 schema is included in the configuration fingerprint and the feature family is
-`challenger-features-v3`, so all
+`challenger-features-v4`, so all
 older observations and models remain readable and auditable but cannot be mixed into the new
 forward cohort as if those fields and continuity guarantees had existed at the time.
 
@@ -65,12 +78,26 @@ made-up sale price.
 
 ## Training and validation
 
-Training begins after at least 80 usable live outcomes and reruns after ten additional outcomes.
-Eighty samples are only enough to attempt a challenger; they are not proof of an edge.
+Training begins after at least 80 usable live discovery outcomes and reruns after ten additional
+outcomes. Eighty samples are only enough to attempt a challenger; they are not proof of an edge.
+Requests are coalesced by exact risk/configuration cohort and fitted by one background worker only
+when the market queue is empty, no batch is in flight, processing lag is low and maintenance is not
+active. A slow fit therefore cannot hold the event-state lock. Shutdown waits for an already
+running fit to finish before closing SQLite; it does not abandon a thread still using the database.
+Immediate active-skill health checks and common-forward tournament updates remain on the outcome
+boundary and are not deferred.
+Those safety and tournament decisions read the authoritative Policy-proof journal, not the
+one-per-mint Discovery index. A later actionable ENTER can therefore advance honest Champion proof
+even when an earlier PASS for the same mint has already completed. If both lanes exist for that
+mint, its Discovery row is excluded from fitting, so the same trajectory cannot train a contender
+and qualify it.
 
-The local learner is a regularized linear model implemented locally with no cloud AI, GPU, or extra
-Python dependency. It uses bounded, named point-in-time features, including the new stream
-integrity evidence. Older
+The primary local learner is a regularized Linear model implemented locally with no cloud AI or
+GPU. Once at least 250 chronological training rows exist, one predeclared shallow XGBoost Entry
+recipe may also be attempted on a single CPU thread. It must reduce untouched validation RMSE by at
+least 2% relative to the matching Linear contender before its added complexity is eligible; a
+marginal result loses to Linear. Both families use the same bounded, named point-in-time features,
+including the stream integrity evidence. Older
 observations form the training section and the newest third form a forward validation section,
 with at least 20 validation examples. Validation is chronological, never randomly shuffled. Any
 training outcome observed on or after the first validation decision is embargoed, so overlapping
@@ -99,18 +126,25 @@ qualifies only when its untouched validation section:
 - has at least a 1% mean outcome in its highest-ranked group; and
 - improves that group over the baseline ranking by at least one percentage point.
 
-Ranking is not enough. Shadow observations also freeze whether a baseline ENTER was genuinely
-submittable under cash, exposure, capacity, and conversion gates. At least 20 such actionable
-validation entries and five proposed vetoes must show a positive conservative fee-inclusive
-uplift bound for the exact veto-only policy. At least 95% of the whole validation section must also
-remain inside the fitted feature distribution. A later out-of-distribution decision always falls
-back to the transparent baseline.
+Ranking is not enough. The `learning-evidence-v2` policy journal independently freezes whether a
+Baseline ENTER was genuinely submittable under cash, exposure, capacity, and conversion gates.
+Only episodes from the exact current risk, configuration, Baseline and feature generation count.
+At least 20 usable policy outcomes, 70% policy-outcome availability, ten supported/kept cases and
+five proposed vetoes are required. No more than 35% of tested vetoes may discard winners, and the
+bounded fee-inclusive uplift must retain a positive conservative lower bound. At least 95% of the
+broad validation section must also remain inside fitted feature support. An out-of-distribution
+policy case is kept by the Baseline—it is never credited as a Challenger veto—and a later
+unfamiliar decision always falls back to the transparent Baseline.
 
 The persisted coefficients are the exact older-section candidate evaluated by those checks. The
 app does not refit that artifact on the validation outcomes after it passes. This gives every
 active version an honest correspondence between its saved metrics and its actual predictions.
 
-Every trained version and its metrics are immutable in SQLite. Failed challengers remain visible
+Every trained version and its metrics are immutable in SQLite. A nonlinear payload is portable
+XGBoost JSON in a separate application-owned SQLite table, limited to 8 MiB and verified by SHA-256
+before loading. The metadata and payload commit together; missing, mismatched, oversized or corrupt
+payloads fail closed and cannot activate. Heavy numerical libraries are loaded only when enough
+evidence exists to fit nonlinear work or a saved nonlinear artifact must be evaluated. Failed challengers remain visible
 instead of being hidden. Small samples, correlated token launches, regime changes, selection bias,
 and many attempted versions can still overfit these checks, so qualification is a guardrail—not a
 profit certificate.
@@ -147,6 +181,12 @@ lessons. A route with missing reserves, a stale or future timestamp, an unverifi
 an unconfirmed migration or an unsupported quote mint records the precise unavailable reason. It
 never receives a fabricated return.
 
+During queue pressure, held positions, pending orders and actual execution outcomes retain the
+critical backpressure path. Routine discovery/policy checkpoints use the normal durable path and
+rise to critical priority only from 15 seconds before a due horizon through its 90-second grace
+window. Execution episodes alone do not keep dead candidate state resident: an actual open
+position already supplies the authoritative retention reason.
+
 Missing five-minute exits remain unknown and are never inserted into regression as fictional
 losses. Once their grace window has resolved, they still count in the availability denominator, so
 a survivor-only set of liquid tokens cannot qualify or activate an entry model. A horizon still
@@ -160,6 +200,14 @@ ensures new lessons still trigger retraining after the retained window fills. Mo
 their validation metrics remain immutable while retained. Version history is bounded to the
 newest 1,000 challengers; active, suspended, champion, latest-candidate and in-flight tournament
 versions are protected from pruning.
+
+Terminal policy and execution evidence is likewise bounded to the newest 5,000 records per lane;
+pending trajectories are never pruned.
+
+Paper-execution evidence is first committed inside the broker's accounting transaction. Only
+after that commit succeeds is the learner's in-memory read model refreshed. A notification failure
+cannot undo or repeat a fill, and restart or a paper-season boundary reloads the authoritative row
+from SQLite, including provider-unknown and confirmed-write-off terminal states.
 
 This is deliberately a bounded rolling memory rather than lossy compression. Aggregating old
 tokens into a few averages would destroy tail events, missing-liquidity evidence, and the feature
@@ -180,8 +228,12 @@ event.
 
 ## Candidate, champion and common-forward proof
 
-A newly qualified artifact is a **candidate**, not automatically the best known skill. If no
-champion exists it can become the initial saved champion. Otherwise both candidate and champion
+A newly qualified artifact is a **candidate**, not automatically the best known skill. When Linear
+and XGBoost finish from the same evidence cutoff, the initial Champion is selected only after both
+are registered: XGBoost must show the predeclared material validation advantage without weaker
+policy proof, while marginal comparisons prefer Linear. Job completion order cannot crown either
+family. If no champion exists the selected candidate can become the initial saved champion.
+Otherwise both candidate and champion
 are frozen before the next outcomes arrive and are evaluated on those same common-forward cases.
 Promotion requires at least 30 common cases, at least 70% executable coverage, positive
 confidence-adjusted improvement and the skill's harm/winner guards. An inconclusive tournament is
@@ -190,16 +242,23 @@ remains below 70%, rather than running forever or learning from a survivor-only 
 champion, counters and decisions are stored in SQLite, so restart cannot erase a loss or restart a
 trial selectively. If the promoted champion is already influencing decisions, its exact proved version
 replaces the old one; downstream skills step out and must re-prove beside the new dependency.
+At most one untested generation per family waits behind an active tournament; a newer untested
+generation supersedes the older one, while an in-flight comparison is never replaced. A queued
+contender begins accumulating common-forward receipts only when its tournament starts.
 
 The Learning tab presents the current Contender, best-proved Champion and actual influence
 separately. A candidate can therefore have fewer passed gates than an older champion without
 destroying that champion; that is healthy exploration, not forgotten learning. It also keeps the
-newest 12 completed Champion milestones per skill cohort: first qualification, promotion, defence
-or an inconclusive 120-case battle. Events are idempotent across restart and shown only for the
-exact current personality/configuration cohort. An installation upgraded from an older version
-keeps its existing Champion but does not fabricate battles that were never recorded.
-The bounded journey is stored beside, rather than inside, the strict skill-state record so an older
-v11 reader can ignore the new history safely. The state and sidecar are committed atomically.
+complete durable sequence of recorded Champion milestones per skill cohort: first qualification,
+promotion, defence or an inconclusive 120-case battle. The UI shows only the newest 12 to stay
+compact. Events are idempotent across restart and shown only for the exact current
+personality/configuration cohort. Every referenced contender or Champion artifact is protected
+from pruning, so lineage remains reconstructable. Deterministic codenames are derived from
+immutable artifact identity and therefore remain stable across clients and restart; they never
+replace the technical version. An installation upgraded from an older version keeps its existing
+Champion but does not fabricate battles that were never recorded. The journey is stored beside,
+rather than inside, the strict skill-state record so an older v11 reader can ignore the new
+history safely. The state and sidecar are committed atomically.
 
 ## Consent, composition and rollback
 
@@ -304,6 +363,16 @@ Guarded is locked to Shadow until that exact model digest and prompt/schema vers
 uplift lower bound, and p95 latency at or below 2.5 seconds. If it later qualifies, its only
 possible action is a high-confidence veto of a baseline ENTER. Changing models returns it to Shadow. These records
 include season and configuration provenance and survive a paper-bankroll reset.
+
+## Deliberately deferred research
+
+This generation adds only one fixed nonlinear Entry recipe. It does not add market-regime
+authority, hyperparameter search, calibrated return probabilities, reinforcement learning or a
+PASS-to-ENTER override. Discovery continues to save eligible PASS counterfactuals for future
+research, but no learned component can turn one into an entry. Any future family or contextual Exit
+contender must use the same point-in-time feature contract, chronological embargo, independent
+policy journal, immutable payload validation and common-forward Champion process; added complexity
+must always be allowed to lose to the Linear contender.
 
 ## Bankroll growth
 

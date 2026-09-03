@@ -4,6 +4,55 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## Unreleased
+
+## 1.10.0 - 2026-09-03
+
+- Add a fixed, single-thread CPU XGBoost Entry contender beside the native Linear learner. It is
+  attempted only after 250 training rows, must beat the Linear validation error by at least 2%,
+  and still passes every existing chronological, independent-policy and common-forward Champion
+  gate; Linear wins marginal comparisons.
+- Store nonlinear model JSON in a bounded, digest-verified SQLite artifact table and commit it
+  atomically with immutable Challenger metadata. Missing, oversized, mismatched or corrupt payloads
+  fail closed and cannot activate or participate in a tournament.
+- Make first-Champion family selection independent of training completion order, keep at most one
+  waiting generation per model family, and start each queued contender on fresh common-forward
+  receipts. Training completed for a no-longer-current mode/configuration remains historical and
+  cannot gain current authority.
+- Add bounded 5-minute and 1-hour event-pipeline telemetry plus passive SQLite WAL pressure status,
+  and show Baseline exact-cohort outcomes without converting unknown exits into losses or wins.
+- Show the actual testing contender, model family, first unmet gate, bounded queue and collapsed
+  artifact provenance in the Learning Lab while preserving its compact desktop and mobile layout;
+  the prominent Demo-separation reminder appears only while Synthetic Demo is actually selected.
+- Separate broad discovery observations from generation-bound, actionable policy proof and actual
+  paper-execution audit episodes. A later actionable ENTER can now create honest policy evidence
+  even when the same mint was first observed as PASS, while one mint-season trajectory remains
+  idempotent and cannot inflate sample size.
+- Commit evidence lifecycle changes atomically with paper orders, fills, ledger entries and
+  positions. Confirmed terminal write-offs retain a conservative loss; provider-unknown dormant
+  inventory remains unavailable rather than receiving fabricated P/L.
+- Move statistical fitting to one coalesced quiet-time worker. Immediate Champion health and
+  tournament safety remain synchronous, while held positions, pending orders and due outcomes keep
+  priority over routine candidate learning during market bursts.
+- Start `challenger-features-v4`, `learner-v5` and `challenger-skill-v2` qualification. New artifacts
+  must prove the exact current `learning-evidence-v2` policy cohort with at least 70% outcome
+  coverage, sufficient kept and vetoed cases, a bounded winner-veto rate and positive conservative
+  value. Out-of-distribution evidence falls back to the Baseline and can never be counted as a
+  successful veto.
+- Preserve the complete, restart-safe Champion journey and every artifact it references while
+  keeping the Learning view compact. Deterministic contender codenames, separated Discovery /
+  Policy proof / Paper execution lanes and a visible current-generation boundary make progress
+  easier to understand without changing promotion standards.
+- Drive retraining, Champion tournaments, active-skill health and downstream joins from the
+  authoritative Policy journal, including a later actionable entry after an earlier completed
+  PASS. Requests arriving during an active quiet-time fit remain queued for the next run.
+- Refresh the in-memory Paper execution lane only after its accounting transaction commits and
+  reconcile unresolved boundary outcomes from SQLite. A display callback failure cannot undo or
+  repeat a fill, and provider-unknown inventory never receives fabricated performance.
+- Keep first-bankroll controls locked in a clear Creating state while the safe event boundary is
+  pending, allow the initial request enough time to finish on a busy upgraded system, and reconcile
+  the authoritative snapshot before presenting a lost response as a failed creation.
+
 ## 1.9.2 - 2026-09-01
 
 - Add Baseline v1.5 / integrity gates v3: raw trade count and wallet breadth now receive only the

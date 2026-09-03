@@ -53,11 +53,21 @@ skills. Entry and Manipulation may only veto an actionable Baseline ENTER. Sizin
 bounded 0.5×, 1×, 1.5× or 2× counterfactual size, with size-up allowed only when current
 deterministic integrity is Clean and every portfolio/execution cap still passes. Exit may only
 shorten the normal review. No skill can create a trade, weaken a gate, lengthen a hold or fabricate
-a fill. Each candidate validates chronologically and must then beat its saved champion on the same
-later common-forward outcomes before replacement; unfamiliar evidence falls back to the Baseline.
+a fill. Entry may compare the native Linear learner with one fixed single-thread CPU XGBoost recipe;
+nonlinear complexity is eligible only after a material untouched-validation improvement, and every
+payload is bounded and digest-verified. Each candidate validates chronologically and must then beat
+its saved champion on the same later common-forward outcomes before replacement; unfamiliar
+evidence falls back to the Baseline.
 One explicit consent activates the qualified Entry champion, while later skills join only after
 separate incremental proof beside the active ensemble. See [LEARNING.md](LEARNING.md) for the exact
 lifecycle and caveats.
+
+Broad discovery, actionable policy proof and actual executions are stored as separate evidence
+lanes. Discovery may fit a contender, but only a `learning-evidence-v2` episode from an untouched,
+actionable Baseline ENTER in the exact current Baseline/configuration/feature cohort can support
+qualification. Missing exits remain in the policy-coverage denominator, unfamiliar rows preserve
+the Baseline instead of becoming credited vetoes, and filled-trade selection cannot substitute for
+the counterfactual policy sample.
 
 The optional Ollama AI Decision Lab is a second, independent experiment. Off is the default.
 Shadow reviews only actionable baseline ENTER candidates and has no control path. It keeps at most

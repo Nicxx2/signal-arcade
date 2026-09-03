@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -21,6 +22,8 @@ from .models import (
     CoachReview,
     Decision,
     FillReceipt,
+    LearningEvidenceEpisode,
+    LearningEvidenceStatus,
     LearningModel,
     LearningObservation,
     MarketEvent,
@@ -29,9 +32,11 @@ from .models import (
     Position,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 TERMINAL_POLICY_VERSION = "executable-boundary-v2"
 CHALLENGER_JOURNEY_SETTING_PREFIX = "challenger_champion_journey_v1:"
+CHALLENGER_PENDING_SETTING_PREFIX = "challenger_pending_versions_v1:"
+MAX_STATISTICAL_MODEL_ARTIFACT_BYTES = 8 * 1024**2
 
 
 class Database:
@@ -162,6 +167,21 @@ class Database:
                     );
                     CREATE INDEX idx_learning_observations_status
                         ON learning_observations(status, created_at);
+                    CREATE TABLE learning_evidence_episodes (
+                        episode_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        lane TEXT NOT NULL,
+                        trajectory_key TEXT NOT NULL,
+                        mint TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        record_json TEXT NOT NULL,
+                        UNIQUE(lane, trajectory_key)
+                    );
+                    CREATE INDEX idx_learning_evidence_pending
+                        ON learning_evidence_episodes(status, mint, created_at);
+                    CREATE INDEX idx_learning_evidence_lane_time
+                        ON learning_evidence_episodes(lane, created_at);
                     CREATE TABLE learning_models (
                         version TEXT PRIMARY KEY,
                         created_at TEXT NOT NULL,
@@ -183,6 +203,14 @@ class Database:
                         ON challenger_skill_artifacts(
                             skill, risk_mode, configuration_fingerprint, created_at
                         );
+                    CREATE TABLE statistical_model_artifacts (
+                        version TEXT PRIMARY KEY,
+                        family TEXT NOT NULL,
+                        payload_format TEXT NOT NULL,
+                        payload_digest TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        payload BLOB NOT NULL
+                    );
                     CREATE TABLE challenger_skill_states (
                         cohort_key TEXT NOT NULL,
                         skill TEXT NOT NULL,
@@ -625,6 +653,43 @@ class Database:
                         """
                     )
                     version = 11
+                if version < 12:
+                    self._conn.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS learning_evidence_episodes (
+                            episode_id TEXT PRIMARY KEY,
+                            idempotency_key TEXT NOT NULL UNIQUE,
+                            lane TEXT NOT NULL,
+                            trajectory_key TEXT NOT NULL,
+                            mint TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            record_json TEXT NOT NULL,
+                            UNIQUE(lane, trajectory_key)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_learning_evidence_pending
+                            ON learning_evidence_episodes(status, mint, created_at);
+                        CREATE INDEX IF NOT EXISTS idx_learning_evidence_lane_time
+                            ON learning_evidence_episodes(lane, created_at);
+                        """
+                    )
+                    version = 12
+                if version < 13:
+                    # Binary/nonlinear payloads are isolated from human-readable model metadata.
+                    # The digest and strict size cap make every load fail closed on corruption.
+                    self._conn.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS statistical_model_artifacts (
+                            version TEXT PRIMARY KEY,
+                            family TEXT NOT NULL,
+                            payload_format TEXT NOT NULL,
+                            payload_digest TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            payload BLOB NOT NULL
+                        );
+                        """
+                    )
+                    version = 13
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def health_check(self) -> bool:
@@ -817,8 +882,10 @@ class Database:
             "equity_rollups": "SELECT COUNT(*) FROM equity_rollups",
             "paper_seasons": "SELECT COUNT(*) FROM paper_seasons",
             "learning_observations": "SELECT COUNT(*) FROM learning_observations",
+            "learning_evidence_episodes": "SELECT COUNT(*) FROM learning_evidence_episodes",
             "learning_models": "SELECT COUNT(*) FROM learning_models",
             "challenger_skill_artifacts": "SELECT COUNT(*) FROM challenger_skill_artifacts",
+            "statistical_model_artifacts": "SELECT COUNT(*) FROM statistical_model_artifacts",
             "challenger_skill_states": "SELECT COUNT(*) FROM challenger_skill_states",
             "ai_critic_assessments": "SELECT COUNT(*) FROM ai_critic_assessments",
             "coach_reviews": "SELECT COUNT(*) FROM coach_reviews",
@@ -1376,6 +1443,99 @@ class Database:
             )
         return [str(row[1]) for row in rows]
 
+    def save_learning_evidence_episode(self, episode: LearningEvidenceEpisode) -> None:
+        """Insert or advance one idempotent, self-contained evidence trajectory."""
+
+        with self._lock, self._conn:
+            self._upsert_learning_evidence_episode(episode)
+        self._invalidate_storage_cache()
+
+    def _upsert_learning_evidence_episode(self, episode: LearningEvidenceEpisode) -> None:
+        existing = self._conn.execute(
+            """SELECT episode_id FROM learning_evidence_episodes
+               WHERE idempotency_key=? OR (lane=? AND trajectory_key=?) LIMIT 1""",
+            (episode.idempotency_key, episode.lane.value, episode.trajectory_key),
+        ).fetchone()
+        if existing is not None and str(existing[0]) != episode.episode_id:
+            raise ValueError("learning evidence idempotency key already identifies another episode")
+        self._conn.execute(
+            """INSERT INTO learning_evidence_episodes(
+                   episode_id,idempotency_key,lane,trajectory_key,mint,created_at,status,record_json
+               ) VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(episode_id) DO UPDATE SET
+                   status=excluded.status,record_json=excluded.record_json""",
+            (
+                episode.episode_id,
+                episode.idempotency_key,
+                episode.lane.value,
+                episode.trajectory_key,
+                episode.mint,
+                episode.created_at.isoformat(),
+                episode.status.value,
+                episode.model_dump_json(),
+            ),
+        )
+
+    def list_learning_evidence_episodes(self) -> list[LearningEvidenceEpisode]:
+        with self._reader_lock:
+            rows = self._reader_conn.execute(
+                "SELECT record_json FROM learning_evidence_episodes ORDER BY created_at"
+            ).fetchall()
+        return [LearningEvidenceEpisode.model_validate_json(row[0]) for row in rows]
+
+    def learning_evidence_for_decision(
+        self,
+        decision_id: str,
+        *,
+        lane: str = "policy",
+    ) -> LearningEvidenceEpisode | None:
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                """SELECT record_json FROM learning_evidence_episodes
+                   WHERE lane=? AND json_extract(record_json,'$.decision_id')=?
+                   ORDER BY created_at LIMIT 1""",
+                (lane, decision_id),
+            ).fetchone()
+        return None if row is None else LearningEvidenceEpisode.model_validate_json(row[0])
+
+    def execution_evidence_for_entry_fill(
+        self,
+        entry_fill_id: str,
+    ) -> LearningEvidenceEpisode | None:
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                """SELECT record_json FROM learning_evidence_episodes
+                   WHERE lane='execution'
+                     AND json_extract(record_json,'$.entry_fill_id')=? LIMIT 1""",
+                (entry_fill_id,),
+            ).fetchone()
+        return None if row is None else LearningEvidenceEpisode.model_validate_json(row[0])
+
+    def prune_learning_evidence(self, max_complete_per_lane: int) -> list[str]:
+        """Bound terminal evidence without ever deleting pending trajectories."""
+
+        if max_complete_per_lane < 1:
+            raise ValueError("max_complete_per_lane must be positive")
+        removed: list[str] = []
+        terminal = ("complete", "unavailable", "cancelled")
+        with self._lock, self._conn:
+            for lane in ("policy", "execution"):
+                rows = self._conn.execute(
+                    """SELECT episode_id FROM learning_evidence_episodes
+                       WHERE lane=? AND status IN (?,?,?)
+                       ORDER BY created_at DESC LIMIT -1 OFFSET ?""",
+                    (lane, *terminal, max_complete_per_lane),
+                ).fetchall()
+                ids = [str(row[0]) for row in rows]
+                self._conn.executemany(
+                    "DELETE FROM learning_evidence_episodes WHERE episode_id=?",
+                    ((episode_id,) for episode_id in ids),
+                )
+                removed.extend(ids)
+        if removed:
+            self._invalidate_storage_cache()
+        return removed
+
     def save_learning_model(self, model: LearningModel) -> None:
         with self._lock, self._conn:
             self._conn.execute(
@@ -1423,6 +1583,10 @@ class Database:
                 "DELETE FROM learning_models WHERE version=?",
                 ((version,) for version in removed),
             )
+            self._conn.executemany(
+                "DELETE FROM statistical_model_artifacts WHERE version=?",
+                ((version,) for version in removed),
+            )
         self._invalidate_storage_cache()
         return removed
 
@@ -1453,12 +1617,154 @@ class Database:
             )
         self._invalidate_storage_cache()
 
+    def save_challenger_artifact_with_payload(
+        self,
+        artifact: ChallengerSkillArtifact,
+        payload: bytes,
+    ) -> None:
+        """Atomically persist a nonlinear skill record and its verified model payload."""
+
+        if artifact.payload_format not in {"json", "ubj"}:
+            raise ValueError("nonlinear challenger payload format is invalid")
+        if not artifact.payload_digest:
+            raise ValueError("nonlinear challenger payload digest is required")
+        if not payload or len(payload) > MAX_STATISTICAL_MODEL_ARTIFACT_BYTES:
+            raise ValueError("statistical model payload size is invalid")
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if artifact.payload_digest != actual_digest:
+            raise ValueError("statistical model payload digest does not match")
+        record_json = artifact.model_dump_json()
+        with self._lock, self._conn:
+            existing_artifact = self._conn.execute(
+                "SELECT record_json FROM challenger_skill_artifacts WHERE version=?",
+                (artifact.version,),
+            ).fetchone()
+            existing_payload = self._conn.execute(
+                """SELECT family,payload_format,payload_digest,payload
+                   FROM statistical_model_artifacts WHERE version=?""",
+                (artifact.version,),
+            ).fetchone()
+            if existing_artifact is not None:
+                if ChallengerSkillArtifact.model_validate_json(existing_artifact[0]) != artifact:
+                    raise ValueError("challenger artifact version already contains different data")
+                if existing_payload is None:
+                    raise ValueError("challenger artifact exists without its nonlinear payload")
+            if existing_payload is not None and (
+                str(existing_payload["family"]) != artifact.model_family.value
+                or str(existing_payload["payload_format"]) != artifact.payload_format
+                or str(existing_payload["payload_digest"]) != artifact.payload_digest
+                or bytes(existing_payload["payload"]) != payload
+            ):
+                raise ValueError("statistical model version already contains different data")
+            if existing_payload is None:
+                self._conn.execute(
+                    "INSERT INTO statistical_model_artifacts VALUES(?,?,?,?,?,?)",
+                    (
+                        artifact.version,
+                        artifact.model_family.value,
+                        artifact.payload_format,
+                        artifact.payload_digest,
+                        artifact.created_at.isoformat(),
+                        payload,
+                    ),
+                )
+            if existing_artifact is None:
+                self._conn.execute(
+                    "INSERT INTO challenger_skill_artifacts VALUES(?,?,?,?,?,?,?)",
+                    (
+                        artifact.version,
+                        artifact.skill.value,
+                        artifact.risk_mode.value,
+                        artifact.configuration_fingerprint,
+                        artifact.created_at.isoformat(),
+                        int(artifact.qualified),
+                        record_json,
+                    ),
+                )
+        self._invalidate_storage_cache()
+
     def list_challenger_artifacts(self) -> list[ChallengerSkillArtifact]:
         with self._reader_lock:
             rows = self._reader_conn.execute(
                 "SELECT record_json FROM challenger_skill_artifacts ORDER BY created_at"
             ).fetchall()
         return [ChallengerSkillArtifact.model_validate_json(row[0]) for row in rows]
+
+    def save_statistical_model_artifact(
+        self,
+        *,
+        version: str,
+        family: str,
+        payload_format: str,
+        payload_digest: str,
+        created_at: datetime,
+        payload: bytes,
+    ) -> None:
+        """Persist one bounded, self-authenticating model payload immutably."""
+
+        if not version or not family:
+            raise ValueError("model artifact identity is required")
+        if payload_format not in {"json", "ubj"}:
+            raise ValueError("unsupported statistical model payload format")
+        if not payload or len(payload) > MAX_STATISTICAL_MODEL_ARTIFACT_BYTES:
+            raise ValueError("statistical model payload size is invalid")
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if payload_digest != actual_digest:
+            raise ValueError("statistical model payload digest does not match")
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                """SELECT family,payload_format,payload_digest,payload
+                   FROM statistical_model_artifacts WHERE version=?""",
+                (version,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["family"]) != family
+                    or str(existing["payload_format"]) != payload_format
+                    or str(existing["payload_digest"]) != payload_digest
+                    or bytes(existing["payload"]) != payload
+                ):
+                    raise ValueError("statistical model version already contains different data")
+                return
+            self._conn.execute(
+                "INSERT INTO statistical_model_artifacts VALUES(?,?,?,?,?,?)",
+                (
+                    version,
+                    family,
+                    payload_format,
+                    payload_digest,
+                    created_at.isoformat(),
+                    payload,
+                ),
+            )
+        self._invalidate_storage_cache()
+
+    def load_statistical_model_artifact(self, version: str) -> dict[str, str | bytes] | None:
+        """Load and verify an application-owned payload before any model library sees it."""
+
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                """SELECT family,payload_format,payload_digest,payload
+                   FROM statistical_model_artifacts WHERE version=?""",
+                (version,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = bytes(row["payload"])
+        if not payload or len(payload) > MAX_STATISTICAL_MODEL_ARTIFACT_BYTES:
+            raise ValueError("stored statistical model payload size is invalid")
+        digest = str(row["payload_digest"])
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise ValueError("stored statistical model payload digest is invalid")
+        payload_format = str(row["payload_format"])
+        if payload_format not in {"json", "ubj"}:
+            raise ValueError("stored statistical model payload format is invalid")
+        return {
+            "family": str(row["family"]),
+            "payload_format": payload_format,
+            "payload_digest": digest,
+            "payload": payload,
+        }
 
     def save_challenger_skill_state(self, state: ChallengerSkillState) -> None:
         with self._lock, self._conn:
@@ -1472,7 +1778,7 @@ class Database:
                     state.updated_at.isoformat(),
                     # Keep the established state payload readable by pre-journey v11 builds.
                     # The additive journal lives in a settings sidecar that those builds ignore.
-                    state.model_dump_json(exclude={"champion_journey"}),
+                    state.model_dump_json(exclude={"champion_journey", "pending_versions"}),
                 ),
             )
             self._upsert_settings(
@@ -1480,7 +1786,8 @@ class Database:
                     (
                         self._challenger_journey_setting_key(state),
                         [event.model_dump(mode="json") for event in state.champion_journey],
-                    )
+                    ),
+                    (self._challenger_pending_setting_key(state), state.pending_versions),
                 ],
                 state.updated_at.isoformat(),
             )
@@ -1495,8 +1802,9 @@ class Database:
             ).fetchall()
             for row in rows:
                 payload = json.loads(row[0])
-                embedded_format = "champion_journey" in payload
+                embedded_format = "champion_journey" in payload or "pending_versions" in payload
                 embedded_journey = payload.pop("champion_journey", [])
+                embedded_pending = payload.pop("pending_versions", [])
                 state = ChallengerSkillState.model_validate(payload)
                 sidecar = self._reader_conn.execute(
                     "SELECT value_json FROM settings WHERE key=?",
@@ -1508,7 +1816,19 @@ class Database:
                 journey = [
                     ChallengerChampionEvent.model_validate(event) for event in journey_payload
                 ]
-                hydrated = state.model_copy(update={"champion_journey": journey})
+                pending_sidecar = self._reader_conn.execute(
+                    "SELECT value_json FROM settings WHERE key=?",
+                    (self._challenger_pending_setting_key(state),),
+                ).fetchone()
+                pending_payload = (
+                    json.loads(pending_sidecar["value_json"])
+                    if pending_sidecar is not None
+                    else embedded_pending
+                )
+                pending = [str(version) for version in pending_payload if isinstance(version, str)]
+                hydrated = state.model_copy(
+                    update={"champion_journey": journey, "pending_versions": pending}
+                )
                 states.append(hydrated)
                 if embedded_format:
                     normalize.append(hydrated)
@@ -1521,6 +1841,10 @@ class Database:
     @staticmethod
     def _challenger_journey_setting_key(state: ChallengerSkillState) -> str:
         return f"{CHALLENGER_JOURNEY_SETTING_PREFIX}{state.cohort_key}:{state.skill.value}"
+
+    @staticmethod
+    def _challenger_pending_setting_key(state: ChallengerSkillState) -> str:
+        return f"{CHALLENGER_PENDING_SETTING_PREFIX}{state.cohort_key}:{state.skill.value}"
 
     def prune_challenger_artifacts(
         self,
@@ -1547,6 +1871,32 @@ class Database:
                     )
                     if version
                 )
+                pending_sidecar = self._conn.execute(
+                    "SELECT value_json FROM settings WHERE key=?",
+                    (self._challenger_pending_setting_key(state),),
+                ).fetchone()
+                if pending_sidecar is not None:
+                    protected.update(
+                        str(version)
+                        for version in json.loads(pending_sidecar["value_json"])
+                        if isinstance(version, str)
+                    )
+                sidecar = self._conn.execute(
+                    "SELECT value_json FROM settings WHERE key=?",
+                    (self._challenger_journey_setting_key(state),),
+                ).fetchone()
+                if sidecar is not None:
+                    for payload in json.loads(sidecar["value_json"]):
+                        event = ChallengerChampionEvent.model_validate(payload)
+                        protected.update(
+                            version
+                            for version in (
+                                event.candidate_version,
+                                event.previous_champion_version,
+                                event.champion_version,
+                            )
+                            if version
+                        )
             versions = [
                 str(row[0])
                 for row in self._conn.execute(
@@ -1561,6 +1911,10 @@ class Database:
             removed = [version for version in versions if version not in keep]
             self._conn.executemany(
                 "DELETE FROM challenger_skill_artifacts WHERE version=?",
+                ((version,) for version in removed),
+            )
+            self._conn.executemany(
+                "DELETE FROM statistical_model_artifacts WHERE version=?",
                 ((version,) for version in removed),
             )
         self._invalidate_storage_cache()
@@ -1986,6 +2340,18 @@ class Database:
                     order.model_dump_json(),
                 ),
             )
+            if order.decision_id:
+                row = self._conn.execute(
+                    """SELECT record_json FROM learning_evidence_episodes
+                       WHERE lane='policy'
+                         AND json_extract(record_json,'$.decision_id')=? LIMIT 1""",
+                    (order.decision_id,),
+                ).fetchone()
+                if row is not None:
+                    episode = LearningEvidenceEpisode.model_validate_json(row[0]).model_copy(
+                        update={"order_id": order.order_id}
+                    )
+                    self._upsert_learning_evidence_episode(episode)
 
     def list_orders(self, statuses: Sequence[str] | None = None) -> list[PaperOrder]:
         with self._reader_lock:
@@ -2060,6 +2426,7 @@ class Database:
         fill: FillReceipt,
         position: Position,
         entries: Iterable[tuple[str, int, int, str]],
+        evidence_episode: LearningEvidenceEpisode | None = None,
     ) -> None:
         """Atomically persist every durable effect of one filled paper buy."""
         rows = self._validated_ledger_entries(entries)
@@ -2079,6 +2446,8 @@ class Database:
                     position.model_dump_json(),
                 ),
             )
+            if evidence_episode is not None:
+                self._upsert_learning_evidence_episode(evidence_episode)
 
     def commit_sell_fill(
         self,
@@ -2087,6 +2456,7 @@ class Database:
         position: Position,
         entries: Iterable[tuple[str, int, int, str]],
         realized_pnl_lamports: int,
+        evidence_episode: LearningEvidenceEpisode | None = None,
     ) -> None:
         """Atomically persist every durable effect of one filled paper sell."""
         rows = self._validated_ledger_entries(entries)
@@ -2112,6 +2482,8 @@ class Database:
                     now,
                 ),
             )
+            if evidence_episode is not None:
+                self._upsert_learning_evidence_episode(evidence_episode)
 
     @staticmethod
     def _validated_ledger_entries(
@@ -2319,6 +2691,7 @@ class Database:
                     unresolved_positions,
                     now,
                 )
+                self._finalize_unresolved_execution_evidence(unresolved_positions, now)
             self._clear_paper_tables()
             self._upsert_settings(
                 [
@@ -2386,6 +2759,7 @@ class Database:
                 unresolved_positions,
                 now,
             )
+            self._finalize_unresolved_execution_evidence(unresolved_positions, now)
             self._clear_paper_tables()
             self._insert_ledger(
                 next_season_id,
@@ -2557,6 +2931,54 @@ class Database:
                     json.dumps(record, separators=(",", ":"), sort_keys=True),
                 ),
             )
+
+    def _finalize_unresolved_execution_evidence(
+        self,
+        positions: Sequence[dict[str, Any]],
+        recorded_at: str,
+    ) -> None:
+        """Close execution episodes before temporary portfolio rows are retired."""
+
+        completed_at = datetime.fromisoformat(recorded_at)
+        for item in positions:
+            entry_fill_id = str(item.get("entry_fill_id") or "")
+            if not entry_fill_id:
+                position_id = str(item.get("position_id") or "")
+                row = self._conn.execute(
+                    "SELECT record_json FROM positions WHERE position_id=?",
+                    (position_id,),
+                ).fetchone()
+                if row is not None:
+                    entry_fill_id = Position.model_validate_json(row[0]).entry_fill_id
+            if not entry_fill_id:
+                continue
+            row = self._conn.execute(
+                """SELECT record_json FROM learning_evidence_episodes
+                   WHERE lane='execution'
+                     AND json_extract(record_json,'$.entry_fill_id')=? LIMIT 1""",
+                (entry_fill_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            episode = LearningEvidenceEpisode.model_validate_json(row[0])
+            disposition = str(item.get("terminal_disposition") or "unknown")
+            if disposition == "write_off":
+                update: dict[str, Any] = {
+                    "status": LearningEvidenceStatus.COMPLETE,
+                    "completed_at": completed_at,
+                    "completion_reason": "confirmed_terminal_write_off",
+                    "realized_return_fraction": -1.0,
+                    "realized_account_minor": 0,
+                    "exit_reason": "confirmed_untradeable_inventory",
+                }
+            else:
+                update = {
+                    "status": LearningEvidenceStatus.UNAVAILABLE,
+                    "completed_at": completed_at,
+                    "completion_reason": "unresolved_season_boundary",
+                    "exit_reason": str(item.get("retirement_reason") or "season_boundary"),
+                }
+            self._upsert_learning_evidence_episode(episode.model_copy(update=update))
 
     @staticmethod
     def _validate_unresolved_inventory(

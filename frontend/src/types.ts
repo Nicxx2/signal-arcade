@@ -295,6 +295,13 @@ export interface ProviderSettingsUpdate {
 export interface LearningModelSummary {
   version: string;
   created_at: string;
+  model_family?: "linear" | "xgboost" | "deterministic";
+  implementation_version?: string;
+  recipe_version?: string;
+  training_cutoff_at?: string | null;
+  evidence_cohort_digest?: string | null;
+  payload_format?: "inline" | "json" | "ubj";
+  payload_digest?: string | null;
   outcomes_seen: number;
   risk_mode: RiskMode | null;
   configuration_fingerprint: string | null;
@@ -313,10 +320,15 @@ export interface LearningModelSummary {
   overall_mean_return: number;
   validation_in_distribution_fraction: number;
   policy_validation_count: number;
+  policy_observed_count: number;
+  policy_outcome_availability_fraction: number;
+  policy_supported_count: number;
   policy_veto_count: number;
   policy_winner_veto_count: number;
+  policy_winner_veto_fraction: number;
   policy_mean_uplift: number | null;
   policy_uplift_lower_bound: number | null;
+  qualification_evidence_schema_version: string | null;
   qualified: boolean;
 }
 
@@ -337,7 +349,15 @@ export interface ChallengerSkillStatus {
   state: "collecting" | "collecting_proof" | "candidate_testing" | "qualified" | "active" | "suspended";
   latest_candidate: {
     version: string;
+    codename?: string;
     created_at: string;
+    model_family?: "linear" | "xgboost" | "deterministic";
+    implementation_version?: string;
+    recipe_version?: string;
+    training_cutoff_at?: string | null;
+    evidence_cohort_digest?: string | null;
+    payload_format?: "inline" | "json" | "ubj";
+    payload_digest?: string | null;
     skill: string;
     outcomes_seen: number;
     sample_count: number;
@@ -349,7 +369,10 @@ export interface ChallengerSkillStatus {
     parameters: Record<string, unknown>;
   } | null;
   testing_version: string | null;
+  testing_candidate?: ChallengerSkillStatus["latest_candidate"];
+  pending_versions?: string[];
   champion: ChallengerSkillStatus["latest_candidate"];
+  champion_generation?: number | null;
   active_version: string | null;
   common_forward_count: number;
   tournament: Record<string, number | boolean | string | null>;
@@ -372,8 +395,12 @@ export interface ChallengerChampionEvent {
   skill: ChallengerSkillStatus["skill"];
   kind: "first_champion" | "promoted" | "defended" | "inconclusive";
   candidate_version: string;
+  candidate_codename?: string;
   previous_champion_version: string | null;
+  previous_champion_codename?: string | null;
   champion_version: string;
+  champion_codename?: string;
+  champion_generation?: number | null;
   common_observed_count: number;
   common_usable_count: number;
   availability_fraction: number;
@@ -456,6 +483,57 @@ export interface LearningStatus {
   active_skill_versions?: Partial<Record<"entry" | "manipulation" | "sizing" | "exit", string>>;
   skills?: ChallengerSkillStatus[];
   champion_journey?: ChallengerChampionEvent[];
+  evidence_lanes?: Array<{
+    id: "discovery" | "policy" | "execution";
+    label: string;
+    purpose: string;
+    observed_count: number;
+    usable_count: number;
+    pending_count: number;
+    unavailable_count: number;
+    qualification_role: "proposal" | "authoritative" | "audit";
+  }>;
+  baseline_scorecard?: {
+    risk_mode: RiskMode;
+    configuration_fingerprint: string | null;
+    baseline_version: string;
+    policy: {
+      observed_count: number;
+      usable_count: number;
+      availability_fraction: number;
+      mean_return: number | null;
+      median_return: number | null;
+      conservative_return: number | null;
+      positive_fraction: number | null;
+      median_entry_impact_fraction: number | null;
+      cost_basis: string;
+    };
+    executions: Array<{
+      currency: string;
+      observed_count: number;
+      realized_count: number;
+      unresolved_count: number;
+      mean_return: number | null;
+      median_return: number | null;
+      conservative_return: number | null;
+      positive_fraction: number | null;
+      total_entry_minor: number;
+      total_fee_minor: number;
+      median_hold_seconds: number | null;
+    }>;
+    decisions: {
+      observed_count: number;
+      actions: Record<string, number>;
+      top_blockers: Array<{ reason: string; count: number }>;
+    };
+    changes_policy: false;
+  };
+  evidence_contract?: {
+    evidence_schema_version: string;
+    feature_schema_version: string;
+    baseline_version: string;
+    collection_started_at: string | null;
+  };
   challenger_common_forward_minimum?: number;
   challenger_minimum_availability?: number;
   qualification_gates?: ReadinessGate[];
@@ -708,6 +786,8 @@ export interface StorageStatus {
   live_bytes: number;
   reclaimable_bytes: number;
   wal_bytes: number;
+  wal_database_fraction?: number;
+  wal_pressure_state?: "quiet" | "watch" | "attention";
   total_disk_bytes: number;
   max_database_bytes: number;
   raw_trade_retention_hours: number;
@@ -945,11 +1025,25 @@ export interface Snapshot {
     ephemeral: number;
     critical_processed: number;
     dropped: number;
+    shed_candidate_events?: number;
     expired_candidate_events?: number;
     queue_utilization: number;
     last_processed_at: string | null;
     last_source_event_at: string | null;
     processing_lag_seconds: number;
+    recent_windows?: Record<
+      "5m" | "1h",
+      {
+        received: number;
+        processed: number;
+        shed: number;
+        expired: number;
+        dropped: number;
+        drop_fraction: number;
+        processing_lag_p50_seconds: number;
+        processing_lag_p95_seconds: number;
+      }
+    >;
     degraded: boolean;
     degraded_reasons: string[];
   };

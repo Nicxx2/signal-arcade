@@ -74,7 +74,15 @@ when that newer context is absent. Fee-free or instant fills are never implied.
 Every virtual cash movement is balanced in a double-entry ledger. Buy cost becomes inventory;
 network fees become expense. Sell proceeds remove book inventory and record gain or loss. The
 portfolio survives restart from SQLite. Each fill and all of its order, ledger, position, and
-realized-P/L effects commit atomically, so a process failure cannot leave a half-applied fill.
+realized-P/L effects commit atomically, so a process failure cannot leave a half-applied fill. The
+actual paper-execution evidence episode begins and completes inside those same transactions. It is
+an execution audit, not a replacement for untouched policy counterfactuals: selecting only filled
+trades would otherwise bias Challenger qualification. A confirmed terminal write-off records a
+conservative loss without inventing a sell fill; provider-unknown dormant inventory remains
+unavailable rather than receiving fabricated P/L.
+After commit, the Learning read model is notified so the Paper execution lane reflects the fill
+without requiring restart. Notification errors cannot roll back or repeat committed accounting;
+restart and paper-season boundaries reconcile the display from SQLite.
 
 The UI separates total cash from pending-order reservations, available cash, and freshly marked
 sell-side value. A mark older than the configured 90-second position window is shown as last-known

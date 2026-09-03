@@ -340,7 +340,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await orchestrator.snapshot_view()
 
     @app.put("/api/v1/storage-settings", dependencies=[Depends(normal_operation)])
-    async def update_storage_settings(body: StorageSettingsRequest) -> dict[str, int]:
+    async def update_storage_settings(body: StorageSettingsRequest) -> dict[str, Any]:
         result = await orchestrator.configure_storage(
             int(body.max_database_gb * 1024**3),
             body.raw_trade_retention_hours,

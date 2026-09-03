@@ -331,10 +331,15 @@ function qualifiedLearningModel(version: string): NonNullable<Snapshot["learning
     overall_mean_return: 0.01,
     validation_in_distribution_fraction: 0.98,
     policy_validation_count: 30,
+    policy_observed_count: 32,
+    policy_outcome_availability_fraction: 0.94,
+    policy_supported_count: 22,
     policy_veto_count: 8,
     policy_winner_veto_count: 0,
+    policy_winner_veto_fraction: 0,
     policy_mean_uplift: 0.03,
     policy_uplift_lower_bound: 0.012,
+    qualification_evidence_schema_version: "learning-evidence-v2",
     qualified: true,
   };
 }
@@ -353,6 +358,8 @@ function challengerSkillStatus(
       version,
       created_at: new Date().toISOString(),
       skill,
+      model_family: "linear",
+      recipe_version: "linear-v1",
       outcomes_seen: 120,
       sample_count: 100,
       training_count: 70,
@@ -367,6 +374,8 @@ function challengerSkillStatus(
       version,
       created_at: new Date().toISOString(),
       skill,
+      model_family: "linear",
+      recipe_version: "linear-v1",
       outcomes_seen: 120,
       sample_count: 100,
       training_count: 70,
@@ -950,10 +959,15 @@ test("shows authoritative proof gates separately from the next Challenger evalua
         overall_mean_return: 0.01,
         validation_in_distribution_fraction: 0.98,
         policy_validation_count: 30,
+        policy_observed_count: 32,
+        policy_outcome_availability_fraction: 0.94,
+        policy_supported_count: 22,
         policy_veto_count: 8,
         policy_winner_veto_count: 0,
+        policy_winner_veto_fraction: 0,
         policy_mean_uplift: 0.03,
         policy_uplift_lower_bound: 0.012,
+        qualification_evidence_schema_version: "learning-evidence-v2",
         qualified: true,
       },
       qualification_passed: 2,
@@ -962,6 +976,17 @@ test("shows authoritative proof gates separately from the next Challenger evalua
         { id: "usable", label: "Usable outcomes", current: 113, target: 80, comparison: ">=" as const, state: "passed" as const, unit: "count" as const, detail: "Independent fee-inclusive outcomes." },
         { id: "coverage", label: "Current executable coverage", current: 0.74, target: 0.7, comparison: ">=" as const, state: "passed" as const, unit: "fraction" as const, detail: "Current exits remain measurable." },
       ],
+      evidence_lanes: [
+        { id: "discovery" as const, label: "Discovery", purpose: "Finds associations and proposes bounded contenders.", observed_count: 113, usable_count: 80, pending_count: 25, unavailable_count: 8, qualification_role: "proposal" as const },
+        { id: "policy" as const, label: "Policy proof", purpose: "Judges untouched Baseline entries in this exact personality.", observed_count: 32, usable_count: 30, pending_count: 1, unavailable_count: 1, qualification_role: "authoritative" as const },
+        { id: "execution" as const, label: "Paper executions", purpose: "Audits actual fills, exits, fees, and unresolved routes.", observed_count: 18, usable_count: 15, pending_count: 2, unavailable_count: 1, qualification_role: "audit" as const },
+      ],
+      evidence_contract: {
+        evidence_schema_version: "learning-evidence-v2",
+        feature_schema_version: "challenger-features-v4",
+        baseline_version: "baseline-v1.4",
+        collection_started_at: "2026-09-01T12:00:00Z",
+      },
     },
   } satisfies Snapshot;
   window.localStorage.setItem(learningUiKey, JSON.stringify({ version: 2, initialized: true, activeView: "overview", expandedSections: [], seenMilestoneIds: [] }));
@@ -979,6 +1004,12 @@ test("shows authoritative proof gates separately from the next Challenger evalua
   expect(screen.getByText("2 / 2 proof gates")).toBeInTheDocument();
   expect(screen.getByText("Current executable coverage")).toBeInTheDocument();
   expect(screen.getByText(/next evaluation timing is separate/i)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Show learning evidence" }));
+  const lanes = screen.getByRole("region", { name: "Separated learning evidence lanes" });
+  expect(lanes).toHaveTextContent("Policy proof");
+  expect(lanes).toHaveTextContent("Can qualify");
+  expect(lanes).toHaveTextContent("30 usable");
+  expect(screen.getByText(/Older evidence remains preserved but cannot silently qualify/)).toBeInTheDocument();
   await waitFor(() => expect(JSON.parse(window.localStorage.getItem(learningUiKey) ?? "null").seenMilestoneIds).toContain("challenger-ready-challenger-ready-1"));
   first.unmount();
 
@@ -1035,7 +1066,11 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   exitSkill.latest_candidate = {
     ...exitSkill.latest_candidate!,
     version: exitSkill.testing_version,
+    model_family: "xgboost",
+    recipe_version: "shallow-hist-v1",
   };
+  exitSkill.testing_candidate = exitSkill.latest_candidate;
+  exitSkill.pending_versions = ["challenger-skill-v3-exit"];
   exitSkill.common_forward_count = 18;
   const skills: ChallengerSkillStatus[] = [
     entrySkill,
@@ -1051,6 +1086,10 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
     candidate_version: "challenger-skill-v2-sizing",
     previous_champion_version: "challenger-skill-v1-sizing",
     champion_version: "challenger-skill-v2-sizing",
+    candidate_codename: "Violet Balancer",
+    previous_champion_codename: "Quiet Steward",
+    champion_codename: "Violet Balancer",
+    champion_generation: 2,
     common_observed_count: 32,
     common_usable_count: 30,
     availability_fraction: 0.9375,
@@ -1089,11 +1128,14 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Contender");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Best proved");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("18 / 30 shared outcomes");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Nonlinear XGBoost");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("1 queued");
   const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
   expect(journeyToggle).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("A Champion means safer forward proof, never guaranteed profit.")).not.toBeInTheDocument();
   fireEvent.click(journeyToggle);
   expect(screen.getAllByText("New Champion earned").length).toBeGreaterThanOrEqual(1);
+  expect(screen.getByText(/Champion v2 · Violet Balancer · New Champion earned/)).toBeInTheDocument();
   expect(screen.getByText(/30 shared outcomes · \+1\.2% conservative edge/)).toBeInTheDocument();
   expect(screen.getByText(/never guaranteed profit/)).toBeInTheDocument();
 });
@@ -1402,6 +1444,7 @@ test("keeps core settings visible while secondary model and provider details sta
 
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   expect(screen.getByText("Data health")).toBeInTheDocument();
+  expect(screen.getByText("0 processed · 0 transient · 0 saved · 0 shed · 0 expired")).toBeInTheDocument();
   expect(screen.getByText("Storage budget")).toBeInTheDocument();
   expect(screen.getByText("Selected model")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Show local AI models" })).toHaveAttribute("aria-expanded", "false");
@@ -2659,6 +2702,86 @@ test("fresh installs require a bankroll and do not start trading automatically",
   expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/engine/start"))).toBe(false);
 });
 
+test("keeps setup controls in a creating state while the server transaction is pending", async () => {
+  const fresh = {
+    ...snapshot,
+    running: false,
+    portfolio: {
+      ...snapshot.portfolio,
+      initialized: false,
+      cash_lamports: 0,
+      available_cash_lamports: 0,
+      starting_lamports: 0,
+      equity_lamports: 0,
+    },
+  } satisfies Snapshot;
+  let finishSetup: (() => void) | null = null;
+  const pendingSetup = new Promise<{ ok: boolean; json: () => Promise<{ initialized: true }> }>(
+    (resolve) => {
+      finishSetup = () => resolve({ ok: true, json: async () => ({ initialized: true }) });
+    },
+  );
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string) => (
+    path.includes("/portfolio/setup")
+      ? pendingSetup
+      : Promise.resolve({ ok: true, json: async () => fresh })
+  )));
+  render(<App />);
+
+  expect(await screen.findByText("Choose the bankroll. Start when ready.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Create paper bankroll" }));
+
+  const creating = await screen.findByRole("button", { name: "Creating…" });
+  expect(creating).toBeDisabled();
+  expect(screen.getByLabelText("Starting amount")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Use USDC for paper bankroll" })).toBeDisabled();
+  expect(screen.queryByText(/took too long/i)).not.toBeInTheDocument();
+
+  await act(async () => {
+    finishSetup?.();
+    await pendingSetup;
+  });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Create paper bankroll" })).toBeEnabled());
+});
+
+test("reconciles authoritative bankroll state after a lost setup response", async () => {
+  const fresh = {
+    ...snapshot,
+    running: false,
+    portfolio: {
+      ...snapshot.portfolio,
+      initialized: false,
+      cash_lamports: 0,
+      available_cash_lamports: 0,
+      starting_lamports: 0,
+      equity_lamports: 0,
+    },
+  } satisfies Snapshot;
+  const initialized = {
+    ...snapshot,
+    running: false,
+    portfolio: { ...snapshot.portfolio, initialized: true },
+  } satisfies Snapshot;
+  let setupAttempted = false;
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string) => {
+    if (path.includes("/portfolio/setup")) {
+      setupAttempted = true;
+      return Promise.reject(new TypeError("response connection closed"));
+    }
+    return Promise.resolve({
+      ok: true,
+      json: async () => setupAttempted ? initialized : fresh,
+    });
+  }));
+  render(<App />);
+
+  expect(await screen.findByText("Choose the bankroll. Start when ready.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Create paper bankroll" }));
+
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  expect(screen.queryByText(/response connection closed/i)).not.toBeInTheDocument();
+});
+
 test("chooses a deliberate first-season personality and typed drawdown policy", async () => {
   const fresh = {
     ...snapshot,
@@ -2901,10 +3024,15 @@ test("separates the training minimum from progress toward the next challenger", 
         overall_mean_return: -0.02,
         validation_in_distribution_fraction: 0.96,
         policy_validation_count: 20,
+        policy_observed_count: 28,
+        policy_outcome_availability_fraction: 0.71,
+        policy_supported_count: 15,
         policy_veto_count: 5,
         policy_winner_veto_count: 1,
+        policy_winner_veto_fraction: 0.2,
         policy_mean_uplift: -0.01,
         policy_uplift_lower_bound: -0.02,
+        qualification_evidence_schema_version: "learning-evidence-v2",
         qualified: false,
       },
     },
@@ -2918,6 +3046,7 @@ test("separates the training minimum from progress toward the next challenger", 
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  expect(screen.queryByText("Demo experience stays separate")).not.toBeInTheDocument();
   expect(screen.getByText("976 usable")).toBeInTheDocument();
   expect(screen.getByText("Minimum 80 met · 1 more usable outcome until the next challenger")).toBeInTheDocument();
   expect(screen.queryByText("976 / 80")).not.toBeInTheDocument();

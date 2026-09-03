@@ -84,7 +84,14 @@ async function clickButton(label) {
 
 async function preparePage() {
   await evaluate(`(() => {
-    window.scrollTo(0, 0);
+    // Active horizontal tab strips may call scrollIntoView when their selection changes.
+    // Disable smooth document scrolling for the capture and force the page origin so a
+    // newly selected Learning sub-view cannot leave the full application clipped off-screen.
+    document.documentElement.style.scrollBehavior = "auto";
+    document.body.style.scrollBehavior = "auto";
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    document.documentElement.scrollLeft = 0;
+    document.body.scrollLeft = 0;
     document.querySelectorAll(".token-card, .decision-row, .decision-board-row, .leaderboard-row, .fill-row")
       .forEach((element) => {
         if (/\\b(fuck|fucking|shit|bitch|cunt)\\b/i.test(element.textContent || "")) {
@@ -98,6 +105,34 @@ async function preparePage() {
   })()`);
   await evaluate("document.fonts?.ready ?? Promise.resolve()");
   await wait(350);
+}
+
+async function chooseMostUsefulSeasonComparison() {
+  const opened = await evaluate(`(() => {
+    const trigger = document.querySelector(".season-comparison-trigger");
+    if (!(trigger instanceof HTMLButtonElement)) return false;
+    trigger.click();
+    return true;
+  })()`);
+  if (!opened) return;
+  await waitFor("document.querySelector('.season-comparison-dialog')");
+  await wait(250);
+  await evaluate(`(() => {
+    const candidates = [...document.querySelectorAll('.season-comparison-options [role="radio"]')]
+      .filter((button) => {
+        const detail = button.querySelector("small")?.textContent ?? "";
+        return /Baseline v1\\.5/i.test(detail) && /Modern accounting/i.test(detail);
+      });
+    const score = (button) => {
+      const text = button.textContent ?? "";
+      const range = text.match(/S(\\d+)[–-]S(\\d+)/);
+      const span = range ? Number(range[2]) - Number(range[1]) + 1 : 1;
+      return span + (/Automatic finish/i.test(text) ? 0.25 : 0);
+    };
+    candidates.sort((left, right) => score(right) - score(left));
+    candidates[0]?.click();
+  })()`);
+  await wait(700);
 }
 
 async function captureViewport(filename) {
@@ -189,6 +224,8 @@ await captureViewport("02-decision-board.png");
 await clickButton("Results");
 await clickButton("Seasons");
 await waitFor("document.body.innerText.includes('Is the strategy improving each season?')");
+await waitFor("document.querySelector('.season-comparison-trigger')", 60_000);
+await chooseMostUsefulSeasonComparison();
 await captureViewport("03-season-progress.png");
 
 await clickButton("Learning");

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
@@ -22,6 +24,9 @@ from ..models import (
     EventKind,
     FeatureSnapshot,
     FillReceipt,
+    LearningEvidenceEpisode,
+    LearningEvidenceLane,
+    LearningEvidenceStatus,
     MarketIntegrityState,
     OrderStatus,
     PaperOrder,
@@ -147,6 +152,34 @@ class PaperBroker:
             ),
         )
         self._last_equity_recorded_at: datetime | None = None
+        self._evidence_observer: Callable[[LearningEvidenceEpisode], None] | None = None
+
+    def set_evidence_observer(
+        self,
+        observer: Callable[[LearningEvidenceEpisode], None] | None,
+    ) -> None:
+        """Receive post-commit execution updates without coupling accounting to the UI cache."""
+
+        self._evidence_observer = observer
+
+    def _notify_evidence_observer(self, episode: LearningEvidenceEpisode | None) -> None:
+        if episode is None or self._evidence_observer is None:
+            return
+        try:
+            # Notification is deliberately after the SQLite transaction. A read-model failure
+            # must never roll back or duplicate a real paper fill.
+            self._evidence_observer(episode)
+        except Exception:
+            logger.exception("Could not refresh the live execution-evidence view")
+
+    def _refresh_unresolved_evidence(self, unresolved: list[dict[str, Any]]) -> None:
+        for item in unresolved:
+            entry_fill_id = str(item.get("entry_fill_id") or "")
+            if not entry_fill_id:
+                continue
+            self._notify_evidence_observer(
+                self.database.execution_evidence_for_entry_fill(entry_fill_id)
+            )
 
     def initialize(
         self,
@@ -895,6 +928,7 @@ class PaperBroker:
         return [
             {
                 "position_id": position.position_id,
+                "entry_fill_id": position.entry_fill_id,
                 "mint": position.mint,
                 "symbol": position.symbol,
                 "token_units": position.token_units,
@@ -1086,9 +1120,17 @@ class PaperBroker:
             pool_quote_token_account=state.pool_quote_token_account,
             quote_mint=state.quote_mint,
         )
-        self.database.commit_buy_fill(order, receipt, position, entries)
+        evidence_episode = self._execution_episode_for_buy(order, receipt, state)
+        self.database.commit_buy_fill(
+            order,
+            receipt,
+            position,
+            entries,
+            evidence_episode=evidence_episode,
+        )
         self.positions[order.mint] = position
         self.traded_mints.add(order.mint)
+        self._notify_evidence_observer(evidence_episode)
 
     def _account_sell(self, order: PaperOrder, receipt: FillReceipt) -> None:
         position = self.positions[order.mint]
@@ -1114,8 +1156,155 @@ class PaperBroker:
             )
         realized = receipt.account_net_minor - position.entry_cost_lamports
         running = int(self.database.get_setting("realized_pnl_lamports", 0)) + realized
-        self.database.commit_sell_fill(order, receipt, position, entries, running)
+        evidence_episode = self.database.execution_evidence_for_entry_fill(position.entry_fill_id)
+        if evidence_episode is not None:
+            exit_reason = (
+                receipt.exit_assessment.reason
+                if receipt.exit_assessment is not None
+                else next(
+                    (
+                        assumption.removeprefix("scheduled_reason:")
+                        for assumption in receipt.assumptions
+                        if assumption.startswith("scheduled_reason:")
+                    ),
+                    "paper_exit_filled",
+                )
+            )
+            evidence_episode = evidence_episode.model_copy(
+                update={
+                    "status": LearningEvidenceStatus.COMPLETE,
+                    "completed_at": receipt.filled_at,
+                    "completion_reason": "paper_exit_filled",
+                    "exit_fill_id": receipt.fill_id,
+                    "realized_return_fraction": receipt.realized_return_fraction,
+                    "realized_account_minor": receipt.account_net_minor,
+                    "total_fee_account_minor": (
+                        evidence_episode.total_fee_account_minor
+                        + receipt.account_protocol_fee_minor
+                        + receipt.account_network_fee_minor
+                    ),
+                    "exit_reason": exit_reason,
+                }
+            )
+        self.database.commit_sell_fill(
+            order,
+            receipt,
+            position,
+            entries,
+            running,
+            evidence_episode=evidence_episode,
+        )
         self.positions.pop(order.mint, None)
+        self._notify_evidence_observer(evidence_episode)
+
+    def _execution_episode_for_buy(
+        self,
+        order: PaperOrder,
+        receipt: FillReceipt,
+        state: TokenState,
+    ) -> LearningEvidenceEpisode:
+        """Build the self-contained episode committed atomically beside a real paper fill."""
+
+        decision = self.database.get_decision(order.decision_id) if order.decision_id else None
+        policy = (
+            self.database.learning_evidence_for_decision(order.decision_id)
+            if order.decision_id
+            else None
+        )
+        season_id = (
+            policy.season_id
+            if policy is not None
+            else decision.season_id
+            if decision is not None
+            else self.season_id
+        )
+        baseline_version = (
+            policy.baseline_version if policy is not None else order.baseline_version_at_entry
+        )
+        feature_schema_version = (
+            policy.feature_schema_version if policy is not None else "execution-evidence-v1"
+        )
+        trajectory_material = "\n".join(
+            (
+                "learning-evidence-v2",
+                "execution",
+                season_id or "unseasoned",
+                order.mint,
+                baseline_version,
+                feature_schema_version,
+            )
+        )
+        trajectory_key = hashlib.sha256(trajectory_material.encode("utf-8")).hexdigest()
+        return LearningEvidenceEpisode(
+            episode_id=f"execution-{receipt.fill_id}",
+            idempotency_key=f"execution:{receipt.fill_id}",
+            lane=LearningEvidenceLane.EXECUTION,
+            status=LearningEvidenceStatus.PENDING,
+            trajectory_key=trajectory_key,
+            mint=order.mint,
+            symbol=order.symbol,
+            created_at=receipt.filled_at,
+            entry_at=receipt.filled_at,
+            qualification_eligible=False,
+            decision_id=order.decision_id,
+            order_id=order.order_id,
+            entry_fill_id=receipt.fill_id,
+            season_id=season_id,
+            season_profile_fingerprint=(
+                policy.season_profile_fingerprint
+                if policy is not None
+                else decision.season_profile_fingerprint
+                if decision is not None
+                else (
+                    self.season_profile.get("profile_fingerprint")
+                    if self.season_profile is not None
+                    else None
+                )
+            ),
+            risk_mode=(
+                order.risk_mode_at_entry
+                or (policy.risk_mode if policy is not None else None)
+                or (decision.risk_mode if decision is not None else None)
+                or RiskMode.BALANCED
+            ),
+            account_currency=receipt.account_currency,
+            configuration_fingerprint=(
+                policy.configuration_fingerprint
+                if policy is not None
+                else decision.configuration_fingerprint
+                if decision is not None
+                else None
+            ),
+            baseline_version=baseline_version,
+            feature_schema_version=feature_schema_version,
+            baseline_action=(
+                policy.baseline_action
+                if policy is not None
+                else decision.action
+                if decision is not None
+                else DecisionAction.ENTER
+            ),
+            baseline_actionable=True,
+            features=dict(policy.features) if policy is not None else {},
+            active_skill_versions=(
+                dict(policy.active_skill_versions) if policy is not None else {}
+            ),
+            challenger_evaluations=(
+                dict(policy.challenger_evaluations) if policy is not None else {}
+            ),
+            token_units=receipt.token_units,
+            entry_cost_lamports=receipt.net_sol_lamports,
+            entry_account_minor=receipt.account_net_minor,
+            entry_price_impact_fraction=receipt.price_impact_fraction,
+            fee_bps=state.fee_bps or self.settings.pump_fee_bps,
+            venue=receipt.venue,
+            quote_mint=state.quote_mint,
+            entry_route_event_id=receipt.source_event_id,
+            entry_reserve_observed_at=state.last_reserve_at or state.last_event_at,
+            total_fee_account_minor=(
+                receipt.account_protocol_fee_minor + receipt.account_network_fee_minor
+            ),
+        )
 
     def _mark_position(
         self,
@@ -1641,6 +1830,7 @@ class PaperBroker:
             unresolved_positions=unresolved,
             comparable=not unresolved,
         )
+        self._refresh_unresolved_evidence(unresolved)
         self.positions.clear()
         self.pending.clear()
         self.traded_mints.clear()
@@ -1705,6 +1895,7 @@ class PaperBroker:
             # comparable; only unknown inventory makes the boundary incomplete.
             comparable=comparable,
         )
+        self._refresh_unresolved_evidence(unresolved)
         self.positions.clear()
         self.pending.clear()
         self.traded_mints.clear()

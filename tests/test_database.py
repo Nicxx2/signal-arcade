@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -7,15 +8,27 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from signal_arcade.database import SCHEMA_VERSION, TERMINAL_POLICY_VERSION, Database
+from signal_arcade.database import (
+    MAX_STATISTICAL_MODEL_ARTIFACT_BYTES,
+    SCHEMA_VERSION,
+    TERMINAL_POLICY_VERSION,
+    Database,
+)
 from signal_arcade.models import (
     ChallengerChampionEvent,
     ChallengerSkill,
     ChallengerSkillArtifact,
     ChallengerSkillState,
+    DecisionAction,
     EventKind,
+    LearningEvidenceEpisode,
+    LearningEvidenceLane,
+    LearningEvidenceStatus,
     MarketEvent,
+    PaperOrder,
     RiskMode,
+    Side,
+    StatisticalModelFamily,
 )
 
 
@@ -279,6 +292,102 @@ def test_v11_adds_multiskill_challenger_without_rewriting_legacy_learning(
     upgraded.close()
 
 
+def test_v13_adds_bounded_digest_verified_statistical_artifacts(tmp_path: Path) -> None:
+    path = tmp_path / "v12-statistical-artifacts.sqlite3"
+    legacy = Database(path)
+    legacy.initialize_portfolio("season-v1.9.2", 1_000_000_000, "USDC")
+    legacy.set_setting("v1.9.2-upgrade-marker", {"preserved": True})
+    legacy_artifact = ChallengerSkillArtifact(
+        version="v1.9.2-entry-champion",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="v1.9.2-config",
+        baseline_version="baseline-v1.5",
+        feature_schema_version="challenger-features-v3",
+        qualified=True,
+    )
+    legacy_state = ChallengerSkillState(
+        cohort_key="v1.9.2-entry-cohort",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="v1.9.2-config",
+        baseline_version="baseline-v1.5",
+        feature_schema_version="challenger-features-v3",
+        latest_candidate_version=legacy_artifact.version,
+        champion_version=legacy_artifact.version,
+    )
+    legacy.save_challenger_artifact(legacy_artifact)
+    legacy.save_challenger_skill_state(legacy_state)
+    legacy._conn.execute("DROP TABLE statistical_model_artifacts")  # noqa: SLF001
+    legacy._conn.execute("PRAGMA user_version=12")  # noqa: SLF001
+    legacy._conn.commit()  # noqa: SLF001
+    legacy.close()
+
+    upgraded = Database(path)
+    assert upgraded.get_setting("v1.9.2-upgrade-marker") == {"preserved": True}
+    assert upgraded.get_setting("season_id") == "season-v1.9.2"
+    assert upgraded.get_setting("quote_currency") == "USDC"
+    assert upgraded.ledger_balance("cash") == 1_000_000_000
+    current_season = upgraded.current_paper_season()
+    assert current_season is not None
+    assert current_season["season_id"] == "season-v1.9.2"
+    assert upgraded.list_challenger_artifacts() == [legacy_artifact]
+    assert upgraded.list_challenger_skill_states() == [legacy_state]
+    payload = b'{"learner":{"type":"bounded-test"}}'
+    digest = hashlib.sha256(payload).hexdigest()
+    now = datetime.now(UTC)
+    upgraded.save_statistical_model_artifact(
+        version="nonlinear-test-v1",
+        family="xgboost",
+        payload_format="json",
+        payload_digest=digest,
+        created_at=now,
+        payload=payload,
+    )
+    upgraded.save_statistical_model_artifact(
+        version="nonlinear-test-v1",
+        family="xgboost",
+        payload_format="json",
+        payload_digest=digest,
+        created_at=now,
+        payload=payload,
+    )
+    loaded = upgraded.load_statistical_model_artifact("nonlinear-test-v1")
+    assert loaded is not None
+    assert loaded["payload"] == payload
+    assert loaded["payload_digest"] == digest
+    assert upgraded.storage_stats(force=True)["statistical_model_artifacts"] == 1
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 13  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="digest"):
+        upgraded.save_statistical_model_artifact(
+            version="bad-digest",
+            family="xgboost",
+            payload_format="json",
+            payload_digest="0" * 64,
+            created_at=now,
+            payload=payload,
+        )
+    with pytest.raises(ValueError, match="size"):
+        upgraded.save_statistical_model_artifact(
+            version="oversized",
+            family="xgboost",
+            payload_format="json",
+            payload_digest="0" * 64,
+            created_at=now,
+            payload=b"x" * (MAX_STATISTICAL_MODEL_ARTIFACT_BYTES + 1),
+        )
+
+    upgraded._conn.execute(  # noqa: SLF001 - simulate on-disk corruption after commit
+        "UPDATE statistical_model_artifacts SET payload=? WHERE version=?",
+        (b"corrupt", "nonlinear-test-v1"),
+    )
+    upgraded._conn.commit()  # noqa: SLF001
+    with pytest.raises(ValueError, match="digest"):
+        upgraded.load_statistical_model_artifact("nonlinear-test-v1")
+    upgraded.close()
+
+
 def test_embedded_champion_journey_is_migrated_to_rollback_safe_sidecar(
     tmp_path: Path,
 ) -> None:
@@ -298,6 +407,7 @@ def test_embedded_champion_journey_is_migrated_to_rollback_safe_sidecar(
         baseline_version="baseline-v1.2",
         feature_schema_version="features-v2",
         champion_version="embedded-champion",
+        pending_versions=["embedded-pending"],
         champion_journey=[event],
     )
     database._conn.execute(  # noqa: SLF001 - seed the short-lived embedded format
@@ -318,7 +428,93 @@ def test_embedded_champion_journey_is_migrated_to_rollback_safe_sidecar(
         ).fetchone()[0]
     )
     assert "champion_journey" not in normalized
+    assert "pending_versions" not in normalized
     assert database.list_challenger_skill_states()[0].champion_journey == [event]
+    assert database.list_challenger_skill_states()[0].pending_versions == ["embedded-pending"]
+    database.close()
+
+
+def test_nonlinear_challenger_record_and_payload_commit_atomically(tmp_path: Path) -> None:
+    database = Database(tmp_path / "challenger-payload.sqlite3")
+    payload = b'{"learner":{"type":"bounded-test"}}'
+    digest = hashlib.sha256(payload).hexdigest()
+    artifact = ChallengerSkillArtifact(
+        version="nonlinear-challenger-v1",
+        skill=ChallengerSkill.ENTRY,
+        model_family=StatisticalModelFamily.XGBOOST,
+        implementation_version="xgboost-test",
+        recipe_version="test-v1",
+        payload_format="json",
+        payload_digest=digest,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="payload-config",
+        baseline_version="baseline-v1.4",
+        feature_schema_version="challenger-features-v4",
+    )
+
+    database.save_challenger_artifact_with_payload(artifact, payload)
+    database.save_challenger_artifact_with_payload(artifact, payload)
+
+    assert database.list_challenger_artifacts() == [artifact]
+    stored = database.load_statistical_model_artifact(artifact.version)
+    assert stored is not None and stored["payload"] == payload
+    with pytest.raises(ValueError, match="digest"):
+        database.save_challenger_artifact_with_payload(artifact, b"different")
+    assert database.list_challenger_artifacts() == [artifact]
+    database.close()
+
+
+def test_challenger_pruning_preserves_artifacts_referenced_by_durable_journey(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "journey-pruning.sqlite3")
+    now = datetime.now(UTC)
+    champion = ChallengerSkillArtifact(
+        version="journey-champion",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="journey-config",
+        baseline_version="baseline-v1.4",
+        feature_schema_version="challenger-features-v4",
+        qualified=True,
+        created_at=now,
+    )
+    old_contender = champion.model_copy(
+        update={"version": "journey-old-contender", "created_at": now - timedelta(days=1)}
+    )
+    disposable = champion.model_copy(
+        update={"version": "journey-disposable", "created_at": now - timedelta(days=2)}
+    )
+    for artifact in (champion, old_contender, disposable):
+        database.save_challenger_artifact(artifact)
+    state = ChallengerSkillState(
+        cohort_key="journey-cohort",
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="journey-config",
+        baseline_version="baseline-v1.4",
+        feature_schema_version="challenger-features-v4",
+        latest_candidate_version=champion.version,
+        champion_version=champion.version,
+        champion_journey=[
+            ChallengerChampionEvent(
+                event_id="journey-defence",
+                occurred_at=now,
+                skill=ChallengerSkill.ENTRY,
+                kind="defended",
+                candidate_version=old_contender.version,
+                previous_champion_version=champion.version,
+                champion_version=champion.version,
+            )
+        ],
+    )
+    database.save_challenger_skill_state(state)
+
+    assert database.prune_challenger_artifacts(1) == [disposable.version]
+    assert {item.version for item in database.list_challenger_artifacts()} == {
+        champion.version,
+        old_contender.version,
+    }
     database.close()
 
 
@@ -483,6 +679,133 @@ def test_reset_rejects_a_writeoff_without_confirmed_route_evidence(tmp_path: Pat
     assert database.get_setting("portfolio_initialized") is True
     assert database.list_paper_seasons()[0]["status"] == "current"
     assert database.ledger_balance("cash") == 1_000_000_000
+    database.close()
+
+
+def execution_episode(
+    now: datetime, *, episode_id: str = "execution-one"
+) -> LearningEvidenceEpisode:
+    return LearningEvidenceEpisode(
+        episode_id=episode_id,
+        idempotency_key=episode_id,
+        lane=LearningEvidenceLane.EXECUTION,
+        trajectory_key=episode_id,
+        mint="mint-retired",
+        symbol="RETIRED",
+        created_at=now,
+        entry_at=now,
+        entry_fill_id="entry-fill",
+        season_id="season-one",
+        risk_mode=RiskMode.BALANCED,
+        baseline_version="baseline-test",
+        feature_schema_version="features-test",
+        baseline_action=DecisionAction.ENTER,
+        baseline_actionable=True,
+        entry_account_minor=100,
+        total_fee_account_minor=2,
+    )
+
+
+def unresolved_episode_inventory(
+    now: datetime,
+    *,
+    disposition: str,
+) -> dict[str, object]:
+    item: dict[str, object] = {
+        "position_id": "position-retired",
+        "entry_fill_id": "entry-fill",
+        "mint": "mint-retired",
+        "symbol": "RETIRED",
+        "was_executed": False,
+        "terminal_disposition": disposition,
+    }
+    if disposition == "write_off":
+        item["terminal_evidence"] = {
+            "policy": "two-fresh-route-probes",
+            "global_market_healthy": True,
+            "probe": {
+                "outcome": "unavailable",
+                "consecutive": 2,
+                "slot": 101,
+                "first_observed_at": (now - timedelta(seconds=2)).isoformat(),
+                "observed_at": (now - timedelta(seconds=1)).isoformat(),
+            },
+        }
+    return item
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_status", "expected_return"),
+    [
+        ("unknown", LearningEvidenceStatus.UNAVAILABLE, None),
+        ("write_off", LearningEvidenceStatus.COMPLETE, -1.0),
+    ],
+)
+def test_reset_finalizes_execution_evidence_without_fabricating_unknown_returns(
+    tmp_path: Path,
+    disposition: str,
+    expected_status: LearningEvidenceStatus,
+    expected_return: float | None,
+) -> None:
+    database = Database(tmp_path / f"execution-{disposition}.sqlite3")
+    now = datetime.now(UTC)
+    database.initialize_portfolio("season-one", 1_000, "SOL")
+    database.save_learning_evidence_episode(execution_episode(now))
+    summary = {
+        "ending_equity_minor": 900,
+        "last_known_ending_equity_minor": 900,
+        "peak_equity_minor": 1_000,
+        "realized_pnl_minor": 0,
+        "net_pnl_minor": -100,
+        "total_fees_minor": 2,
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "break_even": 0,
+        "ending_drawdown_fraction": 0.1,
+        "open_positions": 1,
+        "meaningful_activity": True,
+    }
+
+    database.reset_paper_state(
+        summary,
+        unresolved_positions=[unresolved_episode_inventory(now, disposition=disposition)],
+    )
+
+    episode = database.list_learning_evidence_episodes()[0]
+    assert episode.status == expected_status
+    assert episode.realized_return_fraction == expected_return
+    assert episode.completed_at is not None
+    assert episode.entry_fill_id == "entry-fill"
+    database.close()
+
+
+def test_save_order_links_policy_episode_atomically(tmp_path: Path) -> None:
+    database = Database(tmp_path / "policy-order-link.sqlite3")
+    now = datetime.now(UTC)
+    episode = execution_episode(now, episode_id="policy-one").model_copy(
+        update={
+            "lane": LearningEvidenceLane.POLICY,
+            "decision_id": "decision-one",
+            "entry_fill_id": None,
+        }
+    )
+    database.save_learning_evidence_episode(episode)
+    order = PaperOrder(
+        order_id="order-one",
+        decision_id="decision-one",
+        mint=episode.mint,
+        symbol=episode.symbol,
+        side=Side.BUY,
+        requested_sol_lamports=100,
+        created_at=now,
+        fill_after=now,
+    )
+
+    database.save_order(order)
+
+    linked = database.list_learning_evidence_episodes()[0]
+    assert linked.order_id == order.order_id
     database.close()
 
 

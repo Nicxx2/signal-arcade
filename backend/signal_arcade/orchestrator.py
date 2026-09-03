@@ -4,14 +4,16 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from . import __version__
@@ -86,6 +88,8 @@ AUTO_NEW_SEASON_CLOCK_CHECKPOINT_SECONDS = 30
 _STREAM_INCIDENT_GRACE_SECONDS = 15.0
 _QUEUE_INCIDENT_GRACE_SECONDS = 15.0
 _QUEUE_INCIDENT_QUIET_SECONDS = 10.0
+_PIPELINE_RECENT_WINDOWS_SECONDS = (300, 3_600)
+_PIPELINE_LAG_BOUNDS_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
 _INTEGRITY_LEARNING_CLEAN_WINDOW_SECONDS = 5 * 60
 _POSITION_WATCHDOG_FREE_MIN_SECONDS = 8.0
 _POSITION_WATCHDOG_PAID_MIN_SECONDS = 2.0
@@ -354,6 +358,7 @@ class Orchestrator:
             configuration_fingerprint=self._configuration_fingerprint,
             baseline_version=lambda: self._active_strategy_versions()["baseline_version"],
         )
+        self.broker.set_evidence_observer(self.learning.remember_committed_evidence)
         self.bus = EventBus()
         self.stop_event = asyncio.Event()
         self.source_stop = asyncio.Event()
@@ -376,6 +381,10 @@ class Orchestrator:
         self.last_event_processed_at: datetime | None = None
         self.last_source_event_at: datetime | None = None
         self.last_processing_lag_seconds = 0.0
+        # One aggregate bucket per active wall-clock second keeps a genuine hour of recent
+        # throughput evidence without retaining individual high-volume market events.
+        self._pipeline_recent: deque[dict[str, Any]] = deque(maxlen=3_601)
+        self._pipeline_recent_lock = Lock()
         self._last_drop_at: datetime | None = None
         self._integrity_stream_gap_at: datetime | None = None
         self._integrity_mint_gap_at: OrderedDict[str, datetime] = OrderedDict()
@@ -394,6 +403,7 @@ class Orchestrator:
         self._event_worker_incident_active = "market_event_worker" in active_incident_scopes
         self._enrichment_incident_active = "enrichment_worker" in active_incident_scopes
         self._heartbeat_incident_active = "heartbeat_worker" in active_incident_scopes
+        self._learning_trainer_incident_active = "learning_trainer" in active_incident_scopes
         self.service_running = False
         self.running = bool(self.database.get_setting("trading_enabled", False))
         self.auto_new_season_enabled = bool(
@@ -456,7 +466,7 @@ class Orchestrator:
             )
         )
         self.event_counts: defaultdict[str, int] = defaultdict(int)
-        self._storage_snapshot = self.database.storage_stats()
+        self._storage_snapshot = self._storage_health_view(self.database.storage_stats())
         self._last_stream_reconnects = 0
         self._stream_incident_active = "solana_stream" in active_incident_scopes
         self._stream_interrupt_started_at: datetime | None = None
@@ -567,6 +577,8 @@ class Orchestrator:
         await self.coach.start()
         self.tasks.add(asyncio.create_task(self._event_worker_loop(), name="event-worker"))
         await self._start_source()
+        self.learning.request_current_training()
+        self.tasks.add(asyncio.create_task(self._learning_trainer_loop(), name="learning-trainer"))
         self.tasks.add(asyncio.create_task(self._enrichment_loop(), name="enrichment"))
         self.tasks.add(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
         self.tasks.add(
@@ -582,10 +594,16 @@ class Orchestrator:
         tasks = list(self.tasks)
         if self.source_task:
             tasks.append(self.source_task)
-        for task in tasks:
+        # Cancelling asyncio.to_thread does not stop its worker. Let an in-flight fit finish
+        # against the still-open database while every real-time task is cancelled immediately.
+        learning_tasks = [task for task in tasks if task.get_name() == "learning-trainer"]
+        cancellable_tasks = [task for task in tasks if task not in learning_tasks]
+        for task in cancellable_tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if cancellable_tasks:
+            await asyncio.gather(*cancellable_tasks, return_exceptions=True)
+        if learning_tasks:
+            await asyncio.gather(*learning_tasks, return_exceptions=True)
         self.tasks.clear()
         self.source_task = None
         await self.coach.stop()
@@ -672,7 +690,6 @@ class Orchestrator:
     def _critical_event(self, event: MarketEvent) -> bool:
         return bool(
             event.mint in self.broker.positions
-            or self.learning.has_pending_mint(event.mint or "")
             or self.ai_lab.has_pending_outcome(event.mint or "")
             or self.broker.has_pending_for(event.mint or "")
         )
@@ -767,14 +784,20 @@ class Orchestrator:
     def _event_priority(self, event: MarketEvent) -> int:
         if self._critical_event(event):
             return 0
+        learning_priority = self.learning.pending_event_priority(
+            event.mint or "", event.received_at
+        )
+        if learning_priority is not None:
+            return learning_priority
         if event.kind != EventKind.TRADE:
             return 1
         return 2
 
-    def _durable_event(self, event: MarketEvent) -> bool:
+    @staticmethod
+    def _durable_event(event: MarketEvent, priority: int) -> bool:
         """Keep structural and tracked evidence; candidate ticks remain bounded in memory."""
 
-        return event.kind != EventKind.TRADE or self._critical_event(event)
+        return event.kind != EventKind.TRADE or priority < 2
 
     def _remember_ephemeral_event(self, event_id: str) -> bool:
         if event_id in self._ephemeral_event_ids:
@@ -862,6 +885,105 @@ class Orchestrator:
         self._queue_pressure_detail = detail
         self._queue_pressure_metadata = metadata
 
+    def _record_pipeline_recent(
+        self,
+        kind: str,
+        *,
+        observed_at: datetime | None = None,
+        count: int = 1,
+        lag_seconds: float | None = None,
+    ) -> None:
+        """Record bounded per-second counters and a lag histogram for recent diagnostics."""
+
+        if count <= 0:
+            return
+        at = observed_at or datetime.now(UTC)
+        second = int(at.timestamp())
+        if kind not in {"enqueued", "processed", "shed", "expired"}:
+            raise ValueError(f"unknown pipeline metric: {kind}")
+        with self._pipeline_recent_lock:
+            if not self._pipeline_recent or self._pipeline_recent[-1]["second"] != second:
+                self._pipeline_recent.append(
+                    {
+                        "second": second,
+                        "enqueued": 0,
+                        "processed": 0,
+                        "shed": 0,
+                        "expired": 0,
+                        "lag_count": 0,
+                        "lag_histogram": [0] * (len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1),
+                    }
+                )
+            bucket = self._pipeline_recent[-1]
+            bucket[kind] += count
+            if lag_seconds is None:
+                return
+            lag = max(0.0, float(lag_seconds))
+            index = next(
+                (
+                    candidate
+                    for candidate, bound in enumerate(_PIPELINE_LAG_BOUNDS_SECONDS)
+                    if lag <= bound
+                ),
+                len(_PIPELINE_LAG_BOUNDS_SECONDS),
+            )
+            bucket["lag_count"] += count
+            bucket["lag_histogram"][index] += count
+
+    @staticmethod
+    def _pipeline_histogram_percentile(histogram: list[int], percentile: float) -> float:
+        total = sum(histogram)
+        if total <= 0:
+            return 0.0
+        target = max(1, math.ceil(total * percentile))
+        cumulative = 0
+        for index, count in enumerate(histogram):
+            cumulative += count
+            if cumulative >= target:
+                if index < len(_PIPELINE_LAG_BOUNDS_SECONDS):
+                    return _PIPELINE_LAG_BOUNDS_SECONDS[index]
+                return _PIPELINE_LAG_BOUNDS_SECONDS[-1]
+        return _PIPELINE_LAG_BOUNDS_SECONDS[-1]
+
+    def _recent_pipeline_windows(self, now: datetime) -> dict[str, dict[str, float | int]]:
+        """Summarise fixed recent windows; lifetime counters remain separately available."""
+
+        now_second = int(now.timestamp())
+        result: dict[str, dict[str, float | int]] = {}
+        # Dashboard snapshots run in a worker thread while the event loop records new buckets.
+        # Hold this small lock for the bounded aggregation so deque iteration and current-bucket
+        # histogram updates are observed atomically.
+        with self._pipeline_recent_lock:
+            for window_seconds in _PIPELINE_RECENT_WINDOWS_SECONDS:
+                cutoff = now_second - window_seconds
+                buckets = [item for item in self._pipeline_recent if item["second"] >= cutoff]
+                enqueued = sum(int(item["enqueued"]) for item in buckets)
+                shed = sum(int(item["shed"]) for item in buckets)
+                expired = sum(int(item["expired"]) for item in buckets)
+                processed = sum(int(item["processed"]) for item in buckets)
+                received = enqueued + shed
+                dropped = shed + expired
+                histogram = [
+                    sum(int(item["lag_histogram"][index]) for item in buckets)
+                    for index in range(len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1)
+                ]
+                label = "5m" if window_seconds == 300 else "1h"
+                result[label] = {
+                    "received": received,
+                    "processed": processed,
+                    "shed": shed,
+                    "expired": expired,
+                    "dropped": dropped,
+                    "drop_fraction": dropped / received if received else 0.0,
+                    "processing_lag_p50_seconds": self._pipeline_histogram_percentile(
+                        histogram, 0.50
+                    ),
+                    "processing_lag_p95_seconds": self._pipeline_histogram_percentile(
+                        histogram, 0.95
+                    ),
+                }
+        return result
+
     def _clear_queue_pressure(self) -> None:
         self._queue_pressure_started_at = None
         self._queue_pressure_detail = ""
@@ -915,7 +1037,8 @@ class Orchestrator:
                 title="Market burst handled automatically",
                 detail=(
                     "Low-priority candidate traffic briefly exceeded capacity and was reduced. "
-                    "Held-position, pending-order and saved outcome events remained protected."
+                    "Held-position, pending-order, AI-outcome and due learning-checkpoint events "
+                    "remained protected; affected learning continuity was invalidated."
                 ),
                 metadata=metadata,
             )
@@ -1006,6 +1129,49 @@ class Orchestrator:
             async with asyncio.timeout(delay_seconds):
                 await self.stop_event.wait()
 
+    def _learning_training_can_run(self) -> bool:
+        """Admit CPU fitting only while the real-time market path is genuinely quiet."""
+
+        return bool(
+            not self._maintenance_requested
+            and not self._storage_maintenance_active
+            and self.event_queue.empty()
+            and self._event_batches_in_flight == 0
+            and self.last_processing_lag_seconds < 1
+        )
+
+    async def _learning_trainer_loop(self) -> None:
+        """Run coalesced fitting off the event lock and yield whenever market work exists."""
+
+        while not self.stop_event.is_set():
+            if not self.learning.has_pending_training() or not self._learning_training_can_run():
+                await self._wait_for_stop(1)
+                continue
+            try:
+                ran = await asyncio.to_thread(self.learning.run_next_training)
+                if (
+                    ran
+                    and self._learning_trainer_incident_active
+                    and await self._resolve_incidents_safe("learning_trainer")
+                ):
+                    self._learning_trainer_incident_active = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Background Challenger training recovered from an error")
+                self._learning_trainer_incident_active = True
+                await self._record_incident_safe(
+                    scope="learning_trainer",
+                    severity="warning",
+                    title="Challenger training will retry",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    metadata=self.learning.training_status(),
+                )
+                await self._wait_for_stop(5)
+            else:
+                # Let a newly arrived market batch claim the CPU before another cohort starts.
+                await self._wait_for_stop(0.25)
+
     async def enqueue_event(self, event: MarketEvent) -> None:
         """Keep provider I/O responsive while a bounded worker processes market bursts."""
 
@@ -1017,22 +1183,26 @@ class Orchestrator:
         try:
             self.event_queue.put_nowait(queued)
             self.events_enqueued += 1
+            self._record_pipeline_recent("enqueued")
             return
         except asyncio.QueueFull:
             if priority == 0:
-                # Held-position, pending-order and learning outcome updates are never silently
-                # discarded. Backpressure is safer than fabricating continuity from a gap.
+                # Held-position, pending-order, AI-outcome and due learning-checkpoint updates
+                # are never silently discarded. Backpressure is safer than fabricated continuity.
                 await self.event_queue.put(queued)
                 self.events_enqueued += 1
+                self._record_pipeline_recent("enqueued")
                 return
         self.events_dropped += 1
         dropped_at = datetime.now(UTC)
+        self._record_pipeline_recent("shed", observed_at=dropped_at)
         self._note_integrity_mint_gap(event.mint, dropped_at)
         self._note_queue_pressure(
             dropped_at,
             detail=(
-                "Low-priority candidate events were shed. Held-position, pending-order and "
-                "saved outcome events use backpressure and are not silently dropped."
+                "Low-priority market events were shed. Held-position, pending-order, AI-outcome "
+                "and due learning-checkpoint events use backpressure; any affected learning "
+                "mint is marked with a continuity gap."
             ),
             metadata={"dropped_total": self.events_dropped},
         )
@@ -1081,6 +1251,11 @@ class Orchestrator:
                     if expired_count:
                         self.expired_candidate_events += expired_count
                         self.events_dropped += expired_count
+                        self._record_pipeline_recent(
+                            "expired",
+                            observed_at=batch_now,
+                            count=expired_count,
+                        )
                         for _priority, _sequence, expired_event in expired_items:
                             self._note_integrity_mint_gap(expired_event.mint, batch_now)
                         self._note_queue_pressure(
@@ -1088,12 +1263,12 @@ class Orchestrator:
                             detail=(
                                 "Expired low-priority candidate events were skipped so current "
                                 "market evidence could catch up. Held-position, pending-order "
-                                "and saved outcome events remain protected."
+                                "and due learning-checkpoint events remain protected."
                             ),
                             metadata={"expired_candidate_total": self.expired_candidate_events},
                         )
                     durable_events = [
-                        item[2] for item in working_batch if self._durable_event(item[2])
+                        item[2] for item in working_batch if self._durable_event(item[2], item[0])
                     ]
                     durable_ids = {event.event_id for event in durable_events}
                     inserted = (
@@ -1124,6 +1299,11 @@ class Orchestrator:
                         self.last_source_event_at = event.received_at
                         self.last_processing_lag_seconds = max(
                             0.0, (processed_at - event.received_at).total_seconds()
+                        )
+                        self._record_pipeline_recent(
+                            "processed",
+                            observed_at=processed_at,
+                            lag_seconds=self.last_processing_lag_seconds,
                         )
                     if self._event_worker_incident_active and await self._resolve_incidents_safe(
                         "market_event_worker"
@@ -1319,6 +1499,16 @@ class Orchestrator:
                         )
                         is None
                     )
+                if integrity_learning_eligible:
+                    # Freeze the untouched Baseline and active-skill receipts before either the
+                    # statistical Challenger or optional Local AI can alter this decision.
+                    await asyncio.to_thread(
+                        self.learning.register,
+                        baseline_decision,
+                        state,
+                        live=not self.demo_mode,
+                        evaluation_actionable=baseline_entry_actionable,
+                    )
                 decision = self.learning.assess(
                     baseline_decision,
                     live=not self.demo_mode and integrity_learning_eligible,
@@ -1349,6 +1539,8 @@ class Orchestrator:
                         decision,
                         sol_usd_price=sol_usd_price,
                     )
+                    if order is not None:
+                        self.learning.link_policy_order(decision.decision_id, order.order_id)
                     if blocker:
                         decision = decision.model_copy(
                             update={
@@ -1359,14 +1551,6 @@ class Orchestrator:
                 if self._should_record_decision(decision):
                     await asyncio.to_thread(self.database.save_decision, decision)
                     self.last_recorded_decision[state.mint] = decision
-                if integrity_learning_eligible:
-                    await asyncio.to_thread(
-                        self.learning.register,
-                        baseline_decision,
-                        state,
-                        live=not self.demo_mode,
-                        evaluation_actionable=baseline_entry_actionable,
-                    )
                 if baseline_entry_actionable and integrity_learning_eligible:
                     self.ai_lab.enqueue_shadow(baseline_decision, state)
                 self.last_decision_at[state.mint] = event.received_at
@@ -1506,7 +1690,7 @@ class Orchestrator:
         payload: dict[str, Any] = {
             # Frozen evidence semantics are part of provenance. A schema change starts a new
             # forward cohort while retaining every older observation and model for audit.
-            "learning_evidence_schema": "stream-integrity-v5",
+            "learning_evidence_schema": "stream-integrity-v6",
             "risk_mode": mode.value,
             "demo_mode": self.demo_mode,
             "fees": {
@@ -1907,9 +2091,11 @@ class Orchestrator:
                 return
             await asyncio.to_thread(self.database.prune_incidents)
             await asyncio.to_thread(self.database.prune_ai_assessments)
-            self._storage_snapshot = await asyncio.to_thread(
-                self.database.storage_stats,
-                force=True,
+            self._storage_snapshot = self._storage_health_view(
+                await asyncio.to_thread(
+                    self.database.storage_stats,
+                    force=True,
+                )
             )
             self.last_maintenance_at = now
         finally:
@@ -4389,6 +4575,7 @@ class Orchestrator:
         task_states = {task.get_name(): not task.done() for task in self.tasks}
         return {
             "event_worker": task_states.get("event-worker", False),
+            "learning_trainer": task_states.get("learning-trainer", False),
             "enrichment_worker": task_states.get("enrichment", False),
             "heartbeat_worker": task_states.get("heartbeat", False),
             "position_watchdog": task_states.get("position-watchdog", False),
@@ -4477,6 +4664,10 @@ class Orchestrator:
             "ephemeral": self.events_ephemeral,
             "critical_processed": self.critical_events_processed,
             "dropped": self.events_dropped,
+            "shed_candidate_events": max(
+                0,
+                self.events_dropped - self.expired_candidate_events,
+            ),
             "expired_candidate_events": self.expired_candidate_events,
             "last_processed_at": (
                 self.last_event_processed_at.isoformat() if self.last_event_processed_at else None
@@ -4485,6 +4676,8 @@ class Orchestrator:
                 self.last_source_event_at.isoformat() if self.last_source_event_at else None
             ),
             "processing_lag_seconds": self.last_processing_lag_seconds,
+            "recent_windows": self._recent_pipeline_windows(now),
+            "learning_training": self.learning.training_status(),
             "degraded": bool(reasons),
             "degraded_reasons": reasons,
         }
@@ -4658,6 +4851,26 @@ class Orchestrator:
             "max_database_bytes": self.storage_max_bytes,
             "raw_trade_retention_hours": self.raw_trade_retention_hours,
             "maintenance_interval_seconds": 300,
+        }
+
+    @staticmethod
+    def _storage_health_view(stats: dict[str, int]) -> dict[str, Any]:
+        """Annotate WAL pressure without running a checkpoint from an interactive read."""
+
+        database_bytes = max(1, int(stats.get("database_bytes", 0)))
+        wal_bytes = max(0, int(stats.get("wal_bytes", 0)))
+        ratio = wal_bytes / database_bytes
+        pressure = (
+            "attention"
+            if wal_bytes >= 512 * 1024**2 or ratio >= 0.25
+            else "watch"
+            if wal_bytes >= 64 * 1024**2 or ratio >= 0.10
+            else "quiet"
+        )
+        return {
+            **stats,
+            "wal_database_fraction": ratio,
+            "wal_pressure_state": pressure,
         }
 
     async def configure_storage(

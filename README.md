@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.9.2
+# 🧠 Signal Arcade v1.10.0
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach can observe the same saved outcomes without slowing or controlling the
 trading path. No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.9.2-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.10.0-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -20,16 +20,18 @@ trading path. No wallet keys, live orders, paid provider or cloud AI are require
 
 ## 📸 See it in action
 
-These captures come from the visually equivalent v1.9.1 interface. They show genuine paper
-results—including wins, losses, excluded legacy history and evidence that is still
-collecting—instead of a staged guaranteed-profit demo.
+These v1.10.0 captures come from a genuine local paper run rather than a staged guaranteed-profit
+demo. They intentionally show real wins, losses, modeled fees, retained history and learning that
+is still collecting. The Learning Lab separates Discovery, authoritative Policy proof and Paper
+execution audit evidence, gives immutable contenders stable friendly codenames, and identifies
+Linear and nonlinear XGBoost recipes.
 
 ### The Arena
 
 Paper equity, the season-locked risk profile, drawdown policy, unattended continuity, positions
 and recent decisions stay together without hiding the assumptions behind the score.
 
-![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/01-arena-overview.png)
+![Signal Arcade Arena](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/01-arena-overview.png)
 
 ### Season progress
 
@@ -37,7 +39,7 @@ Compare win rate, drawdown, fees and net return across every retained paper seas
 freeze their currency, starting bankroll, exact profile and accounting-boundary policy for
 like-for-like filters; older history remains clearly labelled without unsupported claims.
 
-![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/03-season-progress.png)
+![Signal Arcade season progress](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/03-season-progress.png)
 
 ### Learning Lab and AI Coach Room
 
@@ -47,34 +49,34 @@ then compete with their saved champions on common forward evidence. The local AI
 separate, shadow-only researcher. With explicit permission, one supported Coach idea may enter the
 matching Challenger skill as a normal contender; it never replaces a Champion or trades directly.
 
-![Signal Arcade Challenger Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/04-learning-lab.png)
+![Signal Arcade Challenger Learning Lab](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/04-learning-lab.png)
 
 <details>
 <summary><strong>📷 More screenshots</strong></summary>
 
 ### Decision board
 
-![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/02-decision-board.png)
+![Signal Arcade decision board](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/02-decision-board.png)
 
 ### Replay receipts and modeled friction
 
-![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/08-replay-receipts.png)
+![Signal Arcade replay receipts](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/08-replay-receipts.png)
 
 ### AI Coach Room
 
-![Signal Arcade AI Coach Room](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/09-ai-coach-room.png)
+![Signal Arcade AI Coach Room](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/09-ai-coach-room.png)
 
 ### Provider budgets and pacing
 
-![Signal Arcade data providers](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/05-data-providers.png)
+![Signal Arcade data providers](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/05-data-providers.png)
 
 ### Optional local AI models
 
-![Signal Arcade local AI models](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/06-local-ai.png)
+![Signal Arcade local AI models](https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/06-local-ai.png)
 
 ### Mobile layout
 
-<img src="https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.9.1/07-mobile-arena.png" alt="Signal Arcade mobile Arena" width="430">
+<img src="https://raw.githubusercontent.com/Nicxx2/signal-arcade/main/docs/screenshots/v1.10.0/07-mobile-arena.png" alt="Signal Arcade mobile Arena" width="430">
 
 </details>
 
@@ -82,7 +84,7 @@ matching Challenger skill as a normal contender; it never replaces a Champion or
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.9 |
+| Player | What it does | Influence in v1.10 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | One explicit consent activates a qualified Entry champion; later skills can join only after independent forward proof and remain monitored |
@@ -99,9 +101,13 @@ matching Challenger skill as a normal contender; it never replaces a Champion or
   endings remain visible but never become strategy-performance claims.
 - 🧠 **Explainable decisions and fills** — Opportunity, danger, confidence, execution, fees,
   impact and latency remain attached to the exact point-in-time evidence used.
-- 📚 **Learning must earn trust** — Each Challenger skill trains and validates chronologically with
+- 📚 **Learning must earn trust** — Linear remains the simple default; after enough evidence, a
+  fixed single-thread CPU XGBoost Entry contender may compete only when it materially improves
+  untouched validation. Each Challenger skill trains and validates chronologically with
   outcome embargoes, then a frozen candidate must beat the saved champion on the same later
-  outcomes. Qualified influence is bounded, versioned, auditable and suspended if health degrades.
+  outcomes. Discovery can propose a contender, but only exact-cohort actionable policy episodes
+  can qualify it; actual fills remain a separate execution audit. Qualified influence is bounded,
+  versioned, auditable and suspended if health degrades.
 - 🔎 **Manipulation-aware decisions** — Wallet loops, gross-versus-net flow, trade structure and
   price paths require mature, independently corroborated evidence. A new entry waits for minimum
   integrity coverage, and an extreme isolated warning must resolve before the Baseline acts;
@@ -113,6 +119,8 @@ matching Challenger skill as a normal contender; it never replaces a Champion or
   exposure, stale-data, mint, route and executable-exit protections remain active.
 - 🔄 **Built for unattended runs** — Auto season rollover uses 1–24 hours of verified healthy,
   dormant evidence; brief source interruptions pause the clock instead of becoming proof.
+- 📊 **Honest throughput status** — Processed, transient, saved, capacity-shed and expired events
+  are shown separately, so high-volume in-memory work is not mistaken for lost market data.
 - 🔌 **Keyless and local by default** — Public Solana RPC and DEX Screener work without accounts;
   guided or custom providers and the private Ollama companion are optional. Helius Economy can
   reserve the key for paced HTTP safety lookups while retaining the default live stream.
@@ -137,7 +145,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.9.2
+    image: nicxx2/signal-arcade:1.10.0
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -242,6 +250,17 @@ rather than treating update downtime as market evidence. If preparation cannot f
 normal operation and reports the reason. Users who deliberately prefer a rolling tag can use
 `nicxx2/signal-arcade:latest` instead.
 
+Upgrading from v1.9.2 to v1.10.0 is additive: the existing bankroll, open positions, pending order
+accounting, seasons, settings, evidence and Champion history remain in the same data volume. The
+Baseline stays on v1.5, so an in-progress season keeps its trading policy. Earlier
+`challenger-features-v3` artifacts remain preserved for audit but cannot silently gain v4 authority;
+the upgraded Challenger safely collects the new evidence contract in Shadow until a current
+Champion earns every qualification and common-forward gate.
+
+The database migration is transactional and forward-only. If returning to v1.9.2 must remain an
+option, snapshot the named `signal-arcade-data` volume before the first v1.10.0 start; do not point
+an older image at a database that v1.10.0 has already upgraded.
+
 > Portainer users can paste the same Compose file into the Web editor and define
 > `SIGNAL_ARCADE_ADMIN_PASSWORD` as a stack environment variable.
 
@@ -284,14 +303,24 @@ evidence may extend a winner past its normal review point, but it cannot remove 
 - Training and validation remain chronological with embargoes to reduce look-ahead leakage.
 - A candidate and current champion are frozen before a common-forward tournament; small, lucky or
   survivor-only cohorts cannot replace the champion.
-- The Learning Lab keeps a compact, restart-safe Champion journey for completed battles only;
-  historical Champions remain valid without invented promotions or profit claims.
+- The Learning Lab durably keeps every recorded Champion milestone and referenced artifact while
+  showing only a compact recent view; historical Champions remain valid without invented
+  promotions or profit claims.
 - One explicit activation grants consent to the qualified Entry champion. Later qualified skills
   auto-join only after proving value beside the active upstream ensemble.
 - Active skills continue monitoring later unseen outcomes. A degraded or unverifiable skill and
   every dependent downstream skill are suspended without weakening the Baseline.
 - Unfinished forward horizons remain pending rather than counting as unavailable, and every
   retraining trigger stays inside the exact personality/configuration cohort that produced it.
+- Champion proof and active-skill health use the authoritative Policy journal, so a later real
+  entry after an earlier PASS remains valid without manufacturing another Discovery sample. Only
+  one exact-cohort Policy trajectory per mint may contribute, and its Discovery twin is excluded
+  from fitting so training and qualification evidence stay disjoint.
+- Fitting runs only through one coalesced quiet-time worker; outcome safety, Champion health and
+  common-forward tournament accounting remain immediate.
+- Nonlinear artifacts use portable JSON with a bounded size and SHA-256 verification. Linear wins
+  marginal family comparisons, and neither training order nor a missing/corrupt payload can create
+  a Champion or influence.
 - A proved Sizing multiplier applies only when that exact amount still fits all deterministic cash,
   exposure, reservation and route-impact limits; otherwise the valid Baseline size is preserved.
 - Demo tokens can never train or activate the live-paper learner.

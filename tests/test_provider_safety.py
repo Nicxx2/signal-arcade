@@ -1451,11 +1451,110 @@ def test_full_queue_marks_only_the_dropped_candidate_integrity_window(tmp_path: 
     asyncio.run(exercise())
 
     assert orchestrator.events_dropped == 1
+    assert orchestrator.event_pipeline_status()["shed_candidate_events"] == 1
     assert dropped_mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
     assert queued_mint not in orchestrator._integrity_mint_gap_at  # noqa: SLF001
     assert orchestrator._integrity_learning_window_complete(dropped_mint, now) is False  # noqa: SLF001
     assert orchestrator._integrity_learning_window_complete(queued_mint, now) is True  # noqa: SLF001
     orchestrator.database.close()
+
+
+def test_recent_pipeline_windows_are_bounded_and_distinguish_local_shedding(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    orchestrator._record_pipeline_recent(  # noqa: SLF001 - bounded telemetry boundary
+        "enqueued", observed_at=now - timedelta(hours=2), count=100
+    )
+    orchestrator._record_pipeline_recent(  # noqa: SLF001
+        "enqueued", observed_at=now - timedelta(minutes=10), count=5
+    )
+    orchestrator._record_pipeline_recent("enqueued", observed_at=now, count=3)  # noqa: SLF001
+    orchestrator._record_pipeline_recent(  # noqa: SLF001
+        "processed", observed_at=now, lag_seconds=0.2
+    )
+    orchestrator._record_pipeline_recent(  # noqa: SLF001
+        "processed", observed_at=now, lag_seconds=12.0
+    )
+    orchestrator._record_pipeline_recent("shed", observed_at=now)  # noqa: SLF001
+    orchestrator._record_pipeline_recent("expired", observed_at=now)  # noqa: SLF001
+
+    windows = orchestrator._recent_pipeline_windows(now)  # noqa: SLF001
+    assert windows["5m"] == {
+        "received": 4,
+        "processed": 2,
+        "shed": 1,
+        "expired": 1,
+        "dropped": 2,
+        "drop_fraction": 0.5,
+        "processing_lag_p50_seconds": 0.25,
+        "processing_lag_p95_seconds": 30.0,
+    }
+    assert windows["1h"]["received"] == 9
+    assert len(orchestrator._pipeline_recent) == 3  # noqa: SLF001
+    orchestrator.database.close()
+
+
+def test_recent_pipeline_windows_are_thread_safe_during_dashboard_reads(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    start = threading.Event()
+    errors: list[BaseException] = []
+
+    def write_buckets() -> None:
+        start.wait()
+        try:
+            for index in range(4_000):
+                orchestrator._record_pipeline_recent(  # noqa: SLF001
+                    "processed",
+                    observed_at=now + timedelta(seconds=index),
+                    lag_seconds=index % 30,
+                )
+        except BaseException as exc:  # pragma: no cover - asserted in the caller
+            errors.append(exc)
+
+    def read_windows() -> None:
+        start.wait()
+        try:
+            for index in range(500):
+                orchestrator._recent_pipeline_windows(  # noqa: SLF001
+                    now + timedelta(seconds=index)
+                )
+        except BaseException as exc:  # pragma: no cover - asserted in the caller
+            errors.append(exc)
+
+    writer = threading.Thread(target=write_buckets)
+    reader = threading.Thread(target=read_windows)
+    writer.start()
+    reader.start()
+    start.set()
+    writer.join(timeout=10)
+    reader.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not reader.is_alive()
+    assert errors == []
+    assert len(orchestrator._pipeline_recent) <= 3_601  # noqa: SLF001
+    orchestrator.database.close()
+
+
+def test_storage_wal_pressure_is_observational_and_thresholded() -> None:
+    quiet = Orchestrator._storage_health_view(  # noqa: SLF001
+        {"database_bytes": 1_000_000_000, "wal_bytes": 10_000_000}
+    )
+    watch = Orchestrator._storage_health_view(  # noqa: SLF001
+        {"database_bytes": 1_000_000_000, "wal_bytes": 120_000_000}
+    )
+    attention = Orchestrator._storage_health_view(  # noqa: SLF001
+        {"database_bytes": 1_000_000_000, "wal_bytes": 600_000_000}
+    )
+    assert quiet["wal_pressure_state"] == "quiet"
+    assert watch["wal_pressure_state"] == "watch"
+    assert attention["wal_pressure_state"] == "attention"
+    assert attention["wal_database_fraction"] == 0.6
 
 
 def test_worker_fast_forwards_expired_candidate_ticks_but_not_protected_events(
@@ -1496,6 +1595,7 @@ def test_worker_fast_forwards_expired_candidate_ticks_but_not_protected_events(
     assert orchestrator.events_processed == 0
     assert orchestrator.expired_candidate_events == 1
     assert orchestrator.events_dropped == 1
+    assert orchestrator.event_pipeline_status()["shed_candidate_events"] == 0
     assert mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
     assert orchestrator._expired_candidate_event(0, expired, now) is False  # noqa: SLF001
     orchestrator.database.close()

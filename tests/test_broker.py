@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from signal_arcade.database import Database
 from signal_arcade.intelligence.features import TokenState
+from signal_arcade.intelligence.learning import LearningEngine
 from signal_arcade.models import (
     RISK_LIMITS,
     ChallengerEvaluationReceipt,
@@ -226,6 +227,8 @@ def test_pending_order_recovers_after_restart(settings) -> None:  # type: ignore
 def test_realized_profit_returns_to_cash_and_scales_cautiously(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     broker = make_broker(database, settings)
+    learner = LearningEngine(database, settings, baseline_version=lambda: "baseline-v1.1")
+    broker.set_evidence_observer(learner.remember_committed_evidence)
     now = datetime.now(UTC)
     starting = broker.cash_lamports
     assert broker.submit_decision(make_decision(now)) is not None
@@ -244,6 +247,15 @@ def test_realized_profit_returns_to_cash_and_scales_cautiously(settings) -> None
         now=now,
         mode=RiskMode.BALANCED,
     )
+    entry_episode = database.list_learning_evidence_episodes()[0]
+    assert entry_episode.lane.value == "execution"
+    assert entry_episode.status.value == "pending"
+    assert entry_episode.entry_fill_id is not None
+    assert entry_episode.entry_at == entry_episode.created_at
+    assert learner.evidence_episodes[entry_episode.episode_id].status.value == "pending"
+    # Actual execution is tracked by the broker position; it does not consume a second protected
+    # learning stream subscription unless a separate policy episode exists.
+    assert learner.has_pending_mint(entry_episode.mint) is False
 
     profitable_state = TokenState(
         mint="mint",
@@ -279,6 +291,76 @@ def test_realized_profit_returns_to_cash_and_scales_cautiously(settings) -> None
     assert portfolio.cash_lamports == starting + portfolio.realized_pnl_lamports
     assert portfolio.equity_lamports == portfolio.cash_lamports
     assert 0.025 < broker.planned_order_size_sol(RiskMode.BALANCED) <= 0.0375
+    completed_episode = database.list_learning_evidence_episodes()[0]
+    assert completed_episode.status.value == "complete"
+    assert completed_episode.exit_fill_id == receipts[0].fill_id
+    assert completed_episode.realized_return_fraction == receipts[0].realized_return_fraction
+    assert completed_episode.total_fee_account_minor > entry_episode.total_fee_account_minor
+    assert learner.evidence_episodes[entry_episode.episode_id].status.value == "complete"
+    database.close()
+
+
+def test_execution_evidence_view_refreshes_after_unresolved_reset(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    learner = LearningEngine(database, settings, baseline_version=lambda: "baseline-v1.1")
+    broker.set_evidence_observer(learner.remember_committed_evidence)
+    now = datetime.now(UTC)
+    assert broker.submit_decision(make_decision(now, "reset-evidence")) is not None
+    state = TokenState(
+        mint="reset-evidence",
+        symbol="TEST",
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+    assert broker.on_market_state(
+        state=state,
+        features=make_features(now, "reset-evidence"),
+        event_kind=EventKind.TRADE,
+        source_event_id="reset-entry",
+        now=now,
+        mode=RiskMode.BALANCED,
+    )
+    episode = next(iter(learner.evidence_episodes.values()))
+    assert episode.status.value == "pending"
+
+    broker.reset()
+
+    assert learner.evidence_episodes[episode.episode_id].status.value == "unavailable"
+    assert learner.evidence_episodes[episode.episode_id].realized_return_fraction is None
+    database.close()
+
+
+def test_execution_evidence_observer_failure_cannot_rollback_a_fill(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    broker.set_evidence_observer(
+        lambda _episode: (_ for _ in ()).throw(RuntimeError("read model unavailable"))
+    )
+    now = datetime.now(UTC)
+    assert broker.submit_decision(make_decision(now, "observer-failure")) is not None
+    state = TokenState(
+        mint="observer-failure",
+        symbol="TEST",
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+
+    receipts = broker.on_market_state(
+        state=state,
+        features=make_features(now, "observer-failure"),
+        event_kind=EventKind.TRADE,
+        source_event_id="observer-entry",
+        now=now,
+        mode=RiskMode.BALANCED,
+    )
+
+    assert len(receipts) == 1
+    assert "observer-failure" in broker.positions
+    assert database.list_positions()[0].mint == "observer-failure"
+    assert database.list_learning_evidence_episodes()[0].status.value == "pending"
     database.close()
 
 
@@ -777,6 +859,7 @@ def test_fill_database_failure_rolls_back_every_accounting_effect(settings) -> N
     assert database.list_orders()[0].status.value == "pending"
     assert database.list_fills() == []
     assert database.list_positions() == []
+    assert database.list_learning_evidence_episodes() == []
     database.close()
 
 

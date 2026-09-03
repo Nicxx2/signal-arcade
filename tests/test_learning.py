@@ -9,6 +9,8 @@ from signal_arcade.intelligence.features import TokenState
 from signal_arcade.intelligence.learning import (
     FEATURE_NAMES,
     FEATURE_SCHEMA_VERSION,
+    LEARNER_VERSION_PREFIX,
+    LEARNING_EVIDENCE_SCHEMA_VERSION,
     MANIPULATION_FEATURE_NAMES,
     SIZING_FEATURE_NAMES,
     LearningEngine,
@@ -18,6 +20,7 @@ from signal_arcade.intelligence.learning import (
 from signal_arcade.models import (
     ChallengerSkill,
     ChallengerSkillArtifact,
+    ChallengerSkillState,
     CoachCondition,
     CoachExperimentKind,
     CoachExperimentState,
@@ -29,6 +32,9 @@ from signal_arcade.models import (
     FeatureSnapshot,
     IntegrityAssessment,
     LearningCheckpoint,
+    LearningEvidenceEpisode,
+    LearningEvidenceLane,
+    LearningEvidenceStatus,
     LearningMode,
     LearningModel,
     LearningObservation,
@@ -36,6 +42,7 @@ from signal_arcade.models import (
     MarketIntegrityState,
     RiskMode,
     SizingAssessment,
+    StatisticalModelFamily,
 )
 from signal_arcade.paper.curve_math import quote_buy, quote_sell
 from signal_arcade.strategy import BASELINE_VERSION, PREVIOUS_BASELINE_VERSION
@@ -99,6 +106,8 @@ def make_decision(now: datetime, mint: str, opportunity: float = 0.8) -> Decisio
         blockers=[],
         feature_snapshot=snapshot,
         planned_order_size_sol=0.025,
+        model_version=BASELINE_VERSION,
+        season_id="test-season",
     )
 
 
@@ -124,9 +133,60 @@ def make_state(mint: str) -> TokenState:
     )
 
 
+def policy_episode_for(learner: LearningEngine, mint: str) -> LearningEvidenceEpisode:
+    return next(
+        episode
+        for episode in learner.evidence_episodes.values()
+        if episode.mint == mint and episode.lane == LearningEvidenceLane.POLICY
+    )
+
+
+def resolve_policy_primary(
+    learner: LearningEngine,
+    mint: str,
+    observed_at: datetime,
+    outcome: float | None,
+) -> LearningEvidenceEpisode:
+    episode = policy_episode_for(learner, mint)
+    episode.checkpoints["300"] = LearningCheckpoint(
+        horizon_seconds=300,
+        observed_at=observed_at,
+        net_return=outcome,
+        exit_value_lamports=None if outcome is None else max(0, int((1 + outcome) * 1_000_000)),
+        missing_reason="route_unavailable" if outcome is None else None,
+    )
+    learner.database.save_learning_evidence_episode(episode)
+    return episode
+
+
+def resolve_forward_primary(
+    learner: LearningEngine,
+    mint: str,
+    observed_at: datetime,
+    outcome: float | None,
+    *,
+    missing_reason: str | None = None,
+) -> None:
+    """Resolve the discovery view and authoritative policy journal for one test entry."""
+
+    checkpoint = LearningCheckpoint(
+        horizon_seconds=300,
+        observed_at=observed_at,
+        net_return=outcome,
+        exit_value_lamports=None if outcome is None else max(0, int((1 + outcome) * 1_000_000)),
+        missing_reason=missing_reason,
+    )
+    observation = learner.observations[mint]
+    observation.checkpoints["300"] = checkpoint.model_copy(deep=True)
+    learner.database.save_learning_observation(observation)
+    episode = policy_episode_for(learner, mint)
+    episode.checkpoints["300"] = checkpoint.model_copy(deep=True)
+    learner.database.save_learning_evidence_episode(episode)
+
+
 def qualified_model(version: str, prediction: float, outcomes_seen: int) -> LearningModel:
     return LearningModel(
-        version=f"learner-v4-{version}",
+        version=f"{LEARNER_VERSION_PREFIX}{version}",
         outcomes_seen=outcomes_seen,
         risk_mode=RiskMode.BALANCED,
         sample_count=80,
@@ -148,10 +208,15 @@ def qualified_model(version: str, prediction: float, outcomes_seen: int) -> Lear
         overall_mean_return=0.05,
         validation_in_distribution_fraction=1.0,
         policy_validation_count=20,
+        policy_observed_count=20,
+        policy_outcome_availability_fraction=1.0,
+        policy_supported_count=15,
         policy_veto_count=5,
         policy_winner_veto_count=0,
+        policy_winner_veto_fraction=0.0,
         policy_mean_uplift=0.05,
         policy_uplift_lower_bound=0.01,
+        qualification_evidence_schema_version=LEARNING_EVIDENCE_SCHEMA_VERSION,
         qualified=True,
     )
 
@@ -214,6 +279,154 @@ def test_unqualified_skill_candidate_is_collecting_proof_not_suspended(settings)
     database.close()
 
 
+def test_deferred_family_selection_requires_nonlinear_complexity_to_be_earned(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings, configuration_fingerprint=lambda: "family-config")
+    monkeypatch.setattr(learner, "_load_nonlinear_artifact", lambda _artifact: object())
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        "family-config",
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    now = datetime.now(UTC)
+
+    def candidate(
+        version: str, family: StatisticalModelFamily, rmse: float
+    ) -> ChallengerSkillArtifact:
+        return ChallengerSkillArtifact(
+            version=version,
+            created_at=now,
+            skill=ChallengerSkill.ENTRY,
+            model_family=family,
+            risk_mode=RiskMode.BALANCED,
+            configuration_fingerprint="family-config",
+            baseline_version=BASELINE_VERSION,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            metrics={"validation_rmse": rmse, "policy_uplift_lower": 0.02},
+            qualified=True,
+        )
+
+    linear = candidate("linear-family", StatisticalModelFamily.LINEAR, 0.10)
+    marginal = candidate("marginal-xgb", StatisticalModelFamily.XGBOOST, 0.099)
+    state = ChallengerSkillState(
+        cohort_key=cohort_key,
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint="family-config",
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        pending_versions=[linear.version, marginal.version],
+    )
+    learner.skill_artifacts.update({linear.version: linear, marginal.version: marginal})
+
+    learner._start_next_skill_tournament(state)  # noqa: SLF001
+
+    assert state.champion_version == linear.version
+    assert state.testing_version == marginal.version
+
+    clearly_better = candidate("clear-xgb", StatisticalModelFamily.XGBOOST, 0.07)
+    fresh_state = state.model_copy(
+        update={
+            "champion_version": None,
+            "testing_version": None,
+            "pending_versions": [linear.version, clearly_better.version],
+            "champion_journey": [],
+        }
+    )
+    learner.skill_artifacts[clearly_better.version] = clearly_better
+
+    learner._start_next_skill_tournament(fresh_state)  # noqa: SLF001
+
+    assert fresh_state.champion_version == clearly_better.version
+    assert fresh_state.testing_version == linear.version
+
+    perfect_linear = candidate("perfect-linear", StatisticalModelFamily.LINEAR, 0.0)
+    perfect_nonlinear = candidate("perfect-xgb", StatisticalModelFamily.XGBOOST, 0.0)
+    perfect_state = state.model_copy(
+        update={
+            "champion_version": None,
+            "testing_version": None,
+            "pending_versions": [perfect_linear.version, perfect_nonlinear.version],
+            "champion_journey": [],
+        }
+    )
+    learner.skill_artifacts.update(
+        {
+            perfect_linear.version: perfect_linear,
+            perfect_nonlinear.version: perfect_nonlinear,
+        }
+    )
+
+    learner._start_next_skill_tournament(perfect_state)  # noqa: SLF001
+
+    assert perfect_state.champion_version == perfect_linear.version
+    assert perfect_state.testing_version == perfect_nonlinear.version
+    database.close()
+
+
+def test_unavailable_champion_does_not_discard_available_contender(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "unavailable-champion-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        configuration,
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    champion = ChallengerSkillArtifact(
+        version="missing-xgb-champion",
+        skill=ChallengerSkill.ENTRY,
+        model_family=StatisticalModelFamily.XGBOOST,
+        payload_format="json",
+        payload_digest="0" * 64,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        qualified=True,
+    )
+    contender = champion.model_copy(
+        update={
+            "version": "available-linear-contender",
+            "model_family": StatisticalModelFamily.LINEAR,
+            "payload_format": "inline",
+            "payload_digest": "",
+        }
+    )
+    state = ChallengerSkillState(
+        cohort_key=cohort_key,
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        champion_version=champion.version,
+        testing_version=contender.version,
+    )
+    learner.skill_artifacts.update({champion.version: champion, contender.version: contender})
+    learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)] = state
+
+    learner._advance_entry_tournaments()  # noqa: SLF001
+
+    assert state.champion_version == champion.version
+    assert state.suspended_version == champion.version
+    assert state.testing_version is None
+    assert state.pending_versions == [contender.version]
+    assert contender.version not in state.rejected_versions
+    database.close()
+
+
 def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     learner = LearningEngine(database, settings)
@@ -253,7 +466,7 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
 
     improved = make_state("mint-live")
     improved.virtual_quote_reserves = 45_000_000_000
-    assert learner.observe_market(improved, now + timedelta(seconds=60), live=True) == 1
+    assert learner.observe_market(improved, now + timedelta(seconds=60), live=True) == 2
     first = learner.observations["mint-live"].checkpoints["60"]
     assert first.net_return is not None
     assert first.exit_value_lamports is not None
@@ -275,10 +488,10 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
     assert first.net_return == pytest.approx(
         (exit_quote.wallet_sol_lamports - entry.wallet_sol_lamports) / entry.wallet_sol_lamports
     )
-    assert learner.observe_market(improved, now + timedelta(seconds=300), live=True) == 1
-    assert learner.observe_market(improved, now + timedelta(seconds=600), live=True) == 1
-    assert learner.observe_market(improved, now + timedelta(seconds=900), live=True) == 1
-    assert learner.observe_market(improved, now + timedelta(seconds=1_200), live=True) == 1
+    assert learner.observe_market(improved, now + timedelta(seconds=300), live=True) == 2
+    assert learner.observe_market(improved, now + timedelta(seconds=600), live=True) == 2
+    assert learner.observe_market(improved, now + timedelta(seconds=900), live=True) == 2
+    assert learner.observe_market(improved, now + timedelta(seconds=1_200), live=True) == 2
     observation = learner.observations["mint-live"]
     assert observation.status == LearningObservationStatus.COMPLETE
     assert learner.has_pending_mint("mint-live") is False
@@ -286,6 +499,7 @@ def test_learning_uses_live_forward_costed_outcomes_only(settings) -> None:  # t
     assert database.list_learning_observations()[0].status == LearningObservationStatus.COMPLETE
     database.reset_paper_state()
     assert len(database.list_learning_observations()) == 1
+    assert len(database.list_learning_evidence_episodes()) == 1
     database.close()
 
 
@@ -417,13 +631,16 @@ def test_candidate_replaces_champion_only_on_common_forward_evidence(settings) -
         )
         observation = learner.observations[mint]
         assert set(observation.challenger_evaluations) == {original_champion, contender}
-        observation.checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observed_at + timedelta(seconds=300),
-            net_return=-0.10,
-            exit_value_lamports=1,
+        assert set(policy_episode_for(learner, mint).challenger_evaluations) == {
+            original_champion,
+            contender,
+        }
+        resolve_forward_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            -0.10,
         )
-        database.save_learning_observation(observation)
         learner._advance_entry_tournaments()  # noqa: SLF001
         if index < 29:
             assert state.champion_version == original_champion
@@ -438,6 +655,12 @@ def test_candidate_replaces_champion_only_on_common_forward_evidence(settings) -
     promotion = state.champion_journey[-1]
     assert promotion.previous_champion_version == original_champion
     assert promotion.champion_version == contender
+    assert (
+        next(item for item in learner.skill_statuses() if item["skill"] == "entry")[
+            "champion_generation"
+        ]
+        == 2
+    )
     assert promotion.common_usable_count == 30
     learner._advance_entry_tournaments()  # noqa: SLF001 - a settled battle is idempotent
     assert [event.kind for event in state.champion_journey] == ["first_champion", "promoted"]
@@ -475,7 +698,9 @@ def test_candidate_replaces_champion_only_on_common_forward_evidence(settings) -
     database.close()
 
 
-def test_champion_journey_is_bounded_idempotent_and_cohort_isolated(settings) -> None:  # type: ignore[no-untyped-def]
+def test_champion_journey_is_durable_idempotent_and_recent_view_is_cohort_isolated(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     configuration = "champion-history-current"
     learner = LearningEngine(
@@ -508,7 +733,7 @@ def test_champion_journey_is_bounded_idempotent_and_cohort_isolated(settings) ->
             uplift_lower_bound=-0.02,
             occurred_at=now + timedelta(minutes=index + 1),
         )
-    assert len(state.champion_journey) == 12
+    assert len(state.champion_journey) == 15
     retained_ids = [event.event_id for event in state.champion_journey]
     learner._append_champion_event(  # noqa: SLF001 - duplicate must remain a no-op
         state,
@@ -522,6 +747,10 @@ def test_champion_journey_is_bounded_idempotent_and_cohort_isolated(settings) ->
     )
     assert [event.event_id for event in state.champion_journey] == retained_ids
     database.save_challenger_skill_state(state)
+    recent_view = learner.champion_journey()
+    assert all(event["champion_codename"] for event in recent_view)
+    assert all(event["candidate_codename"] for event in recent_view)
+    assert {event["champion_generation"] for event in recent_view} == {1}
 
     learner.current_risk_mode = RiskMode.SAFE
     assert learner.champion_journey() == []
@@ -533,7 +762,8 @@ def test_champion_journey_is_bounded_idempotent_and_cohort_isolated(settings) ->
     )
     restarted_state = next(iter(restarted.skill_states.values()))
     assert [event.event_id for event in restarted_state.champion_journey] == retained_ids
-    assert len(restarted.champion_journey()) == 12
+    assert len(restarted_state.champion_journey) == 15
+    assert restarted.champion_journey() == recent_view
     database.close()
 
 
@@ -583,14 +813,12 @@ def test_champion_journey_records_a_real_common_forward_defence(settings) -> Non
             live=True,
             evaluation_actionable=True,
         )
-        observation = learner.observations[mint]
-        observation.checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observed_at + timedelta(seconds=300),
-            net_return=0.10,
-            exit_value_lamports=1,
+        resolve_forward_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            0.10,
         )
-        database.save_learning_observation(observation)
         learner._advance_entry_tournaments()  # noqa: SLF001
 
     assert state.champion_version == original_champion
@@ -647,15 +875,13 @@ def test_champion_journey_closes_a_max_length_tie_as_inconclusive(settings) -> N
             live=True,
             evaluation_actionable=True,
         )
-        observation = learner.observations[mint]
         outcome = -0.10 if index % 10 < 3 else 0.043
-        observation.checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observed_at + timedelta(seconds=300),
-            net_return=outcome,
-            exit_value_lamports=1,
+        resolve_forward_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            outcome,
         )
-        database.save_learning_observation(observation)
         learner._advance_entry_tournaments()  # noqa: SLF001
 
     assert state.champion_version == original_champion
@@ -712,15 +938,13 @@ def test_champion_tournament_cannot_run_forever_on_poor_outcome_coverage(setting
             live=True,
             evaluation_actionable=True,
         )
-        observation = learner.observations[mint]
-        observation.checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observed_at + timedelta(seconds=300),
-            net_return=None if index < 53 else 0.043,
-            exit_value_lamports=None if index < 53 else 1,
+        resolve_forward_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            None if index < 53 else 0.043,
             missing_reason="route_unavailable" if index < 53 else None,
         )
-        database.save_learning_observation(observation)
         learner._advance_entry_tournaments()  # noqa: SLF001
 
     assert state.champion_version == original_champion
@@ -773,7 +997,7 @@ def test_retraining_interval_counts_only_new_outcomes_in_the_exact_cohort(settin
     database.close()
 
 
-def test_primary_resolution_retrains_the_cohort_that_actually_changed(
+def test_primary_resolution_queues_the_cohort_that_actually_changed(
     settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -790,7 +1014,7 @@ def test_primary_resolution_retrains_the_cohort_that_actually_changed(
     calls: list[tuple[RiskMode | None, str | None]] = []
     monkeypatch.setattr(
         learner,
-        "_retrain_if_ready",
+        "request_retraining",
         lambda *, target_mode=None, target_configuration=None: calls.append(
             (target_mode, target_configuration)
         ),
@@ -808,6 +1032,83 @@ def test_primary_resolution_retrains_the_cohort_that_actually_changed(
     database.close()
 
 
+def test_learning_event_priority_only_backpressures_exact_horizon_windows(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    mint = "priority-window"
+    assert learner.register(make_decision(now, mint), make_state(mint), live=True)
+
+    assert learner.pending_event_priority(mint, now + timedelta(seconds=10)) == 1
+    assert learner.pending_event_priority(mint, now + timedelta(seconds=45)) == 0
+    assert learner.pending_event_priority("untracked", now) is None
+    database.close()
+
+
+def test_background_training_requests_coalesce_and_run_one_cohort(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    calls: list[tuple[RiskMode | None, str | None]] = []
+    monkeypatch.setattr(
+        learner,
+        "_retrain_if_ready",
+        lambda *, target_mode=None, target_configuration=None: calls.append(
+            (target_mode, target_configuration)
+        ),
+    )
+    learner.request_retraining(
+        target_mode=RiskMode.BALANCED,
+        target_configuration="same-cohort",
+    )
+    learner.request_retraining(
+        target_mode=RiskMode.BALANCED,
+        target_configuration="same-cohort",
+    )
+
+    assert learner.training_status()["queued"] == 1
+    assert learner.run_next_training() is True
+    assert calls == [(RiskMode.BALANCED, "same-cohort")]
+    assert learner.training_status()["state"] == "idle"
+    assert learner.training_status()["runs"] == 1
+    database.close()
+
+
+def test_training_request_arriving_during_active_fit_is_not_lost(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    calls: list[tuple[RiskMode | None, str | None]] = []
+
+    def fit(*, target_mode=None, target_configuration=None):  # type: ignore[no-untyped-def]
+        calls.append((target_mode, target_configuration))
+        if len(calls) == 1:
+            learner.request_retraining(
+                target_mode=RiskMode.BALANCED,
+                target_configuration="same-cohort",
+            )
+
+    monkeypatch.setattr(learner, "_retrain_if_ready", fit)
+    learner.request_retraining(
+        target_mode=RiskMode.BALANCED,
+        target_configuration="same-cohort",
+    )
+
+    assert learner.run_next_training() is True
+    assert learner.training_status()["queued"] == 1
+    assert learner.run_next_training() is True
+    assert calls == [
+        (RiskMode.BALANCED, "same-cohort"),
+        (RiskMode.BALANCED, "same-cohort"),
+    ]
+    assert learner.training_status()["state"] == "idle"
+    database.close()
+
+
 def test_manipulation_skill_learns_an_independent_veto_policy(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     learner = LearningEngine(database, settings)
@@ -816,7 +1117,7 @@ def test_manipulation_skill_learns_an_independent_veto_policy(settings) -> None:
     rows: list[tuple[LearningObservation, float]] = []
     for index in range(80):
         manipulated = index % 2 == 0
-        observed_at = now + timedelta(seconds=index)
+        observed_at = now + timedelta(minutes=index * 10)
         mint = f"manipulation-{index}"
         decision = make_decision(observed_at, mint).model_copy(
             update={
@@ -840,6 +1141,12 @@ def test_manipulation_skill_learns_an_independent_veto_policy(settings) -> None:
             evaluation_actionable=True,
         )
         outcome = -0.40 if manipulated else 0.20
+        resolve_policy_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            outcome,
+        )
         rows.append((learner.observations[mint], outcome))
 
     learner._publish_manipulation_artifact(  # noqa: SLF001 - validate skill boundary
@@ -900,7 +1207,7 @@ def test_sizing_skill_learns_only_from_bounded_executable_size_trials(settings) 
     rows: list[tuple[LearningObservation, float]] = []
     for index in range(80):
         strong = index % 2 == 0
-        observed_at = now + timedelta(seconds=index)
+        observed_at = now + timedelta(minutes=index * 10)
         mint = f"sizing-{index}"
         decision = make_decision(
             observed_at,
@@ -919,9 +1226,10 @@ def test_sizing_skill_learns_only_from_bounded_executable_size_trials(settings) 
             evaluation_actionable=True,
         )
         observation = learner.observations[mint]
-        baseline_cost = observation.size_trials["1"].entry_cost_lamports
+        episode = policy_episode_for(learner, mint)
+        baseline_cost = episode.size_trials["1"].entry_cost_lamports
         assert baseline_cost is not None
-        for trial in observation.size_trials.values():
+        for trial in episode.size_trials.values():
             if not trial.eligible_at_entry or trial.entry_cost_lamports is None:
                 continue
             normalized_profit = trial.multiplier * (0.10 if strong else -0.10)
@@ -935,6 +1243,12 @@ def test_sizing_skill_learns_only_from_bounded_executable_size_trials(settings) 
                 net_return=(exit_value - trial.entry_cost_lamports) / trial.entry_cost_lamports,
                 exit_value_lamports=exit_value,
             )
+        resolve_policy_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            0.10 if strong else -0.10,
+        )
         rows.append((observation, 0.10 if strong else -0.10))
 
     learner._publish_sizing_artifact(  # noqa: SLF001 - validate sizing proof boundary
@@ -952,7 +1266,7 @@ def test_sizing_skill_learns_only_from_bounded_executable_size_trials(settings) 
         if artifact.skill.value == "sizing"
     )
     assert specialist.qualified is True
-    assert specialist.metrics["policy_changes"] == 20
+    assert specialist.metrics["policy_changes"] == specialist.validation_count
     assert specialist.metrics["harm_count"] == 0
     state = next(state for state in learner.skill_states.values() if state.skill.value == "sizing")
     assert state.champion_version == specialist.version
@@ -1001,13 +1315,17 @@ def test_exit_skill_can_only_qualify_an_earlier_bounded_review(settings) -> None
             evaluation_actionable=True,
         )
         observation = learner.observations[mint]
+        episode = policy_episode_for(learner, mint)
         for horizon, outcome in ((60, 0.20), (300, 0.10), (600, 0.0)):
-            observation.checkpoints[str(horizon)] = LearningCheckpoint(
+            checkpoint = LearningCheckpoint(
                 horizon_seconds=horizon,
                 observed_at=observed_at + timedelta(seconds=horizon),
                 net_return=outcome,
                 exit_value_lamports=1,
             )
+            observation.checkpoints[str(horizon)] = checkpoint
+            episode.checkpoints[str(horizon)] = checkpoint.model_copy(deep=True)
+        database.save_learning_evidence_episode(episode)
 
     learner._publish_exit_artifact(  # noqa: SLF001 - validate independent exit proof
         risk_mode=RiskMode.BALANCED,
@@ -1116,12 +1434,11 @@ def test_one_consent_activates_entry_and_later_skill_joins_only_after_common_pro
             live=True,
             evaluation_actionable=True,
         )
-        observation = learner.observations[mint]
-        observation.checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observed_at + timedelta(seconds=300),
-            net_return=-0.10,
-            exit_value_lamports=1,
+        resolve_forward_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            -0.10,
         )
     learner._govern_skill_ensemble()  # noqa: SLF001
     assert set(learner.active_skill_versions) == {"entry", "manipulation"}
@@ -1440,11 +1757,11 @@ def test_harmful_active_entry_skill_suspends_without_revoking_consent(settings) 
             live=True,
             evaluation_actionable=True,
         )
-        learner.observations[mint].checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observed_at + timedelta(seconds=300),
-            net_return=0.10,
-            exit_value_lamports=1,
+        resolve_forward_primary(
+            learner,
+            mint,
+            observed_at + timedelta(seconds=300),
+            0.10,
         )
     learner._govern_skill_ensemble()  # noqa: SLF001
     assert learner.mode == LearningMode.SHADOW
@@ -1520,10 +1837,12 @@ def test_pending_active_outcomes_do_not_count_as_unverifiable_health(settings) -
     assert health["observed_count"] == 0
     assert health["state"] == "collecting"
 
-    for observation in learner.observations.values():
-        observation.checkpoints["300"] = LearningCheckpoint(
-            horizon_seconds=300,
-            observed_at=observation.created_at + timedelta(seconds=390),
+    for mint, observation in learner.observations.items():
+        resolve_forward_primary(
+            learner,
+            mint,
+            observation.created_at + timedelta(seconds=390),
+            None,
             missing_reason="stale_cached_route",
         )
     health = learner._skill_health(ChallengerSkill.ENTRY, active_version)  # noqa: SLF001
@@ -1552,6 +1871,219 @@ def test_incomplete_integrity_evidence_never_becomes_zero_filled_learning(
 
     assert learner.register(decision, make_state(decision.mint), live=True) is False
     assert decision.mint not in learner.observations
+    database.close()
+
+
+def test_actionable_policy_evidence_is_not_blocked_by_an_earlier_pass(
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: "config-one",
+    )
+    now = datetime.now(UTC)
+    mint = "pass-then-actionable"
+    state = make_state(mint)
+    first_pass = make_decision(now, mint).model_copy(
+        update={
+            "decision_id": "decision-pass-first",
+            "action": DecisionAction.PASS,
+            "season_id": "season-one",
+            "configuration_fingerprint": "config-one",
+        }
+    )
+    assert learner.register(first_pass, state, live=True, evaluation_actionable=False)
+    assert learner.observations[mint].baseline_action == DecisionAction.PASS
+    # Let the discovery-only PASS finish first. A later actionable entry must still advance
+    # training and Champion proof from its independent policy journal.
+    learner.observe_market(state, now + timedelta(seconds=1_200), live=True)
+    assert learner.observations[mint].status == LearningObservationStatus.COMPLETE
+    with learner._training_request_lock:  # noqa: SLF001 - isolate the later policy signal
+        learner._training_requests.clear()  # noqa: SLF001
+
+    actionable = make_decision(now + timedelta(seconds=1_300), mint).model_copy(
+        update={
+            "decision_id": "decision-enter-later",
+            "season_id": "season-one",
+            "configuration_fingerprint": "config-one",
+        }
+    )
+    assert learner.register(actionable, state, live=True, evaluation_actionable=True)
+    episodes = database.list_learning_evidence_episodes()
+    assert len(episodes) == 1
+    assert episodes[0].lane == LearningEvidenceLane.POLICY
+    assert episodes[0].status == LearningEvidenceStatus.PENDING
+    assert episodes[0].decision_id == actionable.decision_id
+    assert episodes[0].qualification_eligible is True
+
+    # Repeated decisions in one mint-season trajectory cannot manufacture sample size.
+    repeated = actionable.model_copy(
+        update={
+            "decision_id": "decision-enter-repeated",
+            "created_at": actionable.created_at + timedelta(seconds=30),
+        }
+    )
+    assert learner.register(repeated, state, live=True, evaluation_actionable=True) is False
+    assert len(database.list_learning_evidence_episodes()) == 1
+    status = learner.status(demo_mode=False)
+    lanes = {lane["id"]: lane for lane in status["evidence_lanes"]}
+    assert lanes["discovery"]["qualification_role"] == "proposal"
+    assert lanes["policy"] == {
+        "id": "policy",
+        "label": "Policy proof",
+        "purpose": "Judges untouched Baseline entries in this exact personality.",
+        "observed_count": 1,
+        "usable_count": 0,
+        "pending_count": 1,
+        "unavailable_count": 0,
+        "qualification_role": "authoritative",
+    }
+    assert lanes["execution"]["qualification_role"] == "audit"
+    assert status["evidence_contract"]["collection_started_at"] == actionable.created_at.isoformat()
+    assert learner.has_pending_training() is False
+    learner.observe_market(
+        state,
+        actionable.created_at + timedelta(seconds=300),
+        live=True,
+    )
+    assert policy_episode_for(learner, mint).checkpoints["300"].net_return is not None
+    assert learner.has_pending_training() is True
+    episode_id = episodes[0].episode_id
+    monkeypatch.setattr(database, "prune_learning_observations", lambda _limit: [])
+    monkeypatch.setattr(database, "prune_learning_evidence", lambda _limit: [episode_id])
+    learner._prune_complete_history()  # noqa: SLF001 - memory/storage pruning boundary
+    assert episode_id not in learner.evidence_episodes
+    assert mint not in learner._evidence_episode_ids_by_mint  # noqa: SLF001
+    database.close()
+
+
+def test_policy_proof_is_unique_by_mint_and_disjoint_from_discovery_training(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "independent-proof-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    now = datetime.now(UTC)
+    mint = "repeat-across-seasons"
+    state = make_state(mint)
+
+    first = make_decision(now, mint).model_copy(
+        update={
+            "decision_id": "independent-first",
+            "season_id": "season-one",
+            "configuration_fingerprint": configuration,
+        }
+    )
+    assert learner.register(first, state, live=True, evaluation_actionable=True)
+    resolve_forward_primary(learner, mint, now + timedelta(seconds=300), 0.05)
+
+    second = make_decision(now + timedelta(hours=1), mint).model_copy(
+        update={
+            "decision_id": "independent-second",
+            "season_id": "season-two",
+            "configuration_fingerprint": configuration,
+        }
+    )
+    assert learner.register(second, state, live=True, evaluation_actionable=True)
+    episodes = [
+        episode
+        for episode in learner.evidence_episodes.values()
+        if episode.lane == LearningEvidenceLane.POLICY and episode.mint == mint
+    ]
+    assert len(episodes) == 2  # Both seasons remain auditable.
+    assert (
+        len(
+            learner._policy_evidence(  # noqa: SLF001 - proof independence boundary
+                mode=RiskMode.BALANCED,
+                configuration_fingerprint=configuration,
+                baseline_version=BASELINE_VERSION,
+            )
+        )
+        == 1
+    )
+    assert (
+        learner._policy_evidence(  # noqa: SLF001 - cutoff must not enable a second attempt
+            mode=RiskMode.BALANCED,
+            configuration_fingerprint=configuration,
+            baseline_version=BASELINE_VERSION,
+            not_before=now + timedelta(minutes=30),
+        )
+        == []
+    )
+    assert (
+        learner._training_rows(  # noqa: SLF001 - lane separation boundary
+            mode=RiskMode.BALANCED,
+            configuration_fingerprint=configuration,
+            match_configuration=True,
+        )
+        == []
+    )
+
+    discovery_mint = "discovery-only"
+    discovery = make_decision(now + timedelta(hours=2), discovery_mint).model_copy(
+        update={
+            "decision_id": "discovery-only-decision",
+            "action": DecisionAction.PASS,
+            "season_id": "season-two",
+            "configuration_fingerprint": configuration,
+        }
+    )
+    assert learner.register(
+        discovery,
+        make_state(discovery_mint),
+        live=True,
+        evaluation_actionable=False,
+    )
+    learner.observations[discovery_mint].checkpoints["300"] = LearningCheckpoint(
+        horizon_seconds=300,
+        observed_at=discovery.created_at + timedelta(seconds=300),
+        net_return=0.02,
+        exit_value_lamports=1_020_000,
+    )
+    rows = learner._training_rows(  # noqa: SLF001 - lane separation boundary
+        mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        match_configuration=True,
+    )
+    assert [observation.mint for observation, _ in rows] == [discovery_mint]
+    scorecard = learner.baseline_scorecard()
+    assert scorecard["changes_policy"] is False
+    assert scorecard["policy"]["observed_count"] == 1
+    assert scorecard["policy"]["usable_count"] == 1
+    assert scorecard["policy"]["median_return"] == 0.05
+    assert scorecard["policy"]["cost_basis"] == ("modeled_entry_exit_protocol_and_network_costs")
+    database.close()
+
+
+def test_policy_and_discovery_checkpoints_enforce_real_quote_reserves(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    now = datetime.now(UTC)
+    mint = "real-quote-guard"
+    state = make_state(mint)
+    state.real_quote_reserves = 1
+    decision = make_decision(now, mint).model_copy(
+        update={
+            "season_id": "season-real-quote",
+            "configuration_fingerprint": "config-real-quote",
+        }
+    )
+    assert learner.register(decision, state, live=True, evaluation_actionable=True)
+
+    assert learner.observe_market(state, now + timedelta(seconds=300), live=True) == 4
+    discovery = learner.observations[mint].checkpoints["300"]
+    policy = next(iter(learner.evidence_episodes.values())).checkpoints["300"]
+    assert discovery.net_return is None
+    assert policy.net_return is None
+    assert discovery.missing_reason == "executable_exit_quote_unavailable"
+    assert policy.missing_reason == "executable_exit_quote_unavailable"
     database.close()
 
 
@@ -1729,7 +2261,11 @@ def test_model_history_keeps_protected_and_newest_versions(settings) -> None:  #
 
 @pytest.mark.parametrize(
     "legacy_version",
-    ["learner-v1-80-legacy", "learner-v3-80-pre-integrity"],
+    [
+        "learner-v1-80-legacy",
+        "learner-v3-80-pre-integrity",
+        "learner-v4-80-pre-policy-journal",
+    ],
 )
 def test_legacy_refit_model_cannot_be_newly_activated(
     settings,
@@ -1766,6 +2302,30 @@ def test_claimed_qualified_model_without_policy_proof_cannot_activate(settings) 
     assert learner.status(demo_mode=False)["activation_available"] is False
     with pytest.raises(ValueError, match="newest challenger"):
         learner.set_mode(LearningMode.ACTIVE)
+    database.close()
+
+
+@pytest.mark.parametrize(
+    "unsafe_update",
+    [
+        {"qualification_evidence_schema_version": None},
+        {"policy_outcome_availability_fraction": 0.69},
+        {"policy_supported_count": 9},
+        {"policy_winner_veto_fraction": 0.36},
+    ],
+)
+def test_entry_model_fails_closed_on_incomplete_or_over_vetoing_policy_proof(
+    settings,
+    unsafe_update: dict[str, object],
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    learner = LearningEngine(database, settings)
+    safe = qualified_model("complete-policy-proof", 0.2, 80)
+    assert learner._model_is_eligible(safe) is True  # noqa: SLF001
+
+    unsafe = safe.model_copy(update=unsafe_update)
+
+    assert learner._model_is_eligible(unsafe) is False  # noqa: SLF001
     database.close()
 
 
@@ -2012,8 +2572,9 @@ def test_active_learner_returns_to_shadow_when_risk_or_configuration_changes(
 
 def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
+    configuration = "qualification-policy-journal"
     now = datetime.now(UTC) - timedelta(hours=2)
-    for index in range(79):
+    for index in range(80):
         # Both chronological sections contain winners and losers. Qualification must prove the
         # exact deployed veto policy, not merely rank a validation tail containing only winners.
         opportunity = float(index % 2)
@@ -2072,14 +2633,60 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
                 )
             },
             status=LearningObservationStatus.COMPLETE,
+            season_id=f"season-{index}",
+            configuration_fingerprint=configuration,
+            baseline_version=BASELINE_VERSION,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
         )
         database.save_learning_observation(observation)
+        checkpoint = observation.checkpoints["300"]
+        database.save_learning_evidence_episode(
+            LearningEvidenceEpisode(
+                episode_id=f"policy-{index}",
+                idempotency_key=f"policy-{index}",
+                evidence_schema_version=LEARNING_EVIDENCE_SCHEMA_VERSION,
+                lane=LearningEvidenceLane.POLICY,
+                status=LearningEvidenceStatus.COMPLETE,
+                trajectory_key=f"proof-trajectory-{index}",
+                mint=f"proof-{index}",
+                symbol=observation.symbol,
+                created_at=observation.created_at,
+                entry_at=observation.created_at,
+                completed_at=checkpoint.observed_at,
+                source_mode="solana_mainnet",
+                qualification_eligible=True,
+                decision_id=f"proof-decision-{index}",
+                season_id=observation.season_id,
+                risk_mode=observation.risk_mode,
+                configuration_fingerprint=configuration,
+                baseline_version=BASELINE_VERSION,
+                feature_schema_version=FEATURE_SCHEMA_VERSION,
+                baseline_action=DecisionAction.ENTER,
+                baseline_actionable=True,
+                features=dict(observation.features),
+                token_units=observation.token_units,
+                entry_cost_lamports=observation.entry_cost_lamports,
+                fee_bps=observation.fee_bps,
+                checkpoints={"300": checkpoint.model_copy(deep=True)},
+            )
+        )
 
-    learner = LearningEngine(database, settings)
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
     final_now = now + timedelta(minutes=90)
-    final_decision = make_decision(final_now, "history-final", 1.0)
+    final_decision = make_decision(final_now, "history-final", 1.0).model_copy(
+        update={"configuration_fingerprint": configuration, "season_id": "season-final"}
+    )
     final_state = make_state("history-final")
-    assert learner.register(final_decision, final_state, live=True)
+    assert learner.register(
+        final_decision,
+        final_state,
+        live=True,
+        evaluation_actionable=True,
+    )
     learner.observations["history-final"].checkpoints["300"] = LearningCheckpoint(
         horizon_seconds=300,
         observed_at=final_now + timedelta(seconds=300),
@@ -2087,6 +2694,12 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
         exit_value_lamports=2_000_000,
     )
     learner.database.save_learning_observation(learner.observations["history-final"])
+    resolve_policy_primary(
+        learner,
+        "history-final",
+        final_now + timedelta(seconds=300),
+        0.5,
+    )
     learner._retrain_if_ready()  # noqa: SLF001 - force the public lifecycle's training boundary
 
     assert learner.latest_model is not None
@@ -2106,16 +2719,28 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
     assert learner.latest_model.policy_uplift_lower_bound > 0
     learner.set_mode(LearningMode.ACTIVE)
 
-    supported = learner.assess(make_decision(datetime.now(UTC), "high", 1.0), live=True)
+    supported = learner.assess(
+        make_decision(datetime.now(UTC), "high", 1.0).model_copy(
+            update={"configuration_fingerprint": configuration}
+        ),
+        live=True,
+    )
     assert supported.action == DecisionAction.ENTER
     assert supported.learning_assessment is not None
     assert supported.learning_assessment.applied is True
 
-    cautioned = learner.assess(make_decision(datetime.now(UTC), "low", 0.0), live=True)
+    cautioned = learner.assess(
+        make_decision(datetime.now(UTC), "low", 0.0).model_copy(
+            update={"configuration_fingerprint": configuration}
+        ),
+        live=True,
+    )
     assert cautioned.action == DecisionAction.PASS
-    assert "learner_conservative_return_not_positive" in cautioned.blockers
+    assert "challenger_entry_veto" in cautioned.blockers
 
-    unusual = make_decision(datetime.now(UTC), "unusual", 1.0)
+    unusual = make_decision(datetime.now(UTC), "unusual", 1.0).model_copy(
+        update={"configuration_fingerprint": configuration}
+    )
     unusual.feature_snapshot.values["wallet_volume_hhi"].value = 1.0
     assessed_unusual = learner.assess(unusual, live=True)
     assert assessed_unusual.action == DecisionAction.ENTER
@@ -2124,7 +2749,9 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
     assert assessed_unusual.learning_assessment.verdict == "out_of_distribution"
 
     portfolio_blocked = learner.assess(
-        make_decision(datetime.now(UTC), "portfolio-blocked", 0.0),
+        make_decision(datetime.now(UTC), "portfolio-blocked", 0.0).model_copy(
+            update={"configuration_fingerprint": configuration}
+        ),
         live=True,
         baseline_actionable=False,
     )
@@ -2133,7 +2760,10 @@ def test_qualified_challenger_can_only_veto_baseline_entries(settings) -> None: 
     assert portfolio_blocked.learning_assessment.applied is False
 
     unsafe = make_decision(datetime.now(UTC), "unsafe", 1.0).model_copy(
-        update={"action": DecisionAction.ABSTAIN}
+        update={
+            "action": DecisionAction.ABSTAIN,
+            "configuration_fingerprint": configuration,
+        }
     )
     assessed_unsafe = learner.assess(unsafe, live=True)
     assert assessed_unsafe.action == DecisionAction.ABSTAIN

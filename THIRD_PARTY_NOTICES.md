@@ -17,6 +17,10 @@ Application dependencies and their licenses are recorded by `pyproject.toml`, `p
 and `pnpm-lock.yaml`. No source code was copied from the untrusted reference bot repository that
 motivated the project.
 
+The optional statistical Challenger uses the CPU-only XGBoost 3.4.1 Python package, distributed
+under the Apache License 2.0. Signal Arcade fixes its recipe, thread budget, and random seed and
+stores only application-created, digest-verified model JSON.
+
 The supplied Compose stacks reference the official `ollama/ollama:0.33.1` image as a separate
 optional service. Ollama is distributed under its upstream MIT license; it is not copied into the
 Signal Arcade application image. Models downloaded by a user remain separate artifacts and may

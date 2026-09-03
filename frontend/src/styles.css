@@ -380,9 +380,18 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
 .challenger-skill-card > p { color: #8290a8; font-size: 9px; line-height: 1.45; margin: 10px 0 12px; }
 .challenger-skill-facts { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
 .challenger-skill-facts span { border: 1px solid rgba(126,139,166,.13); border-radius: 9px; min-width: 0; padding: 8px; }
-.challenger-skill-facts small, .challenger-skill-facts strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.challenger-skill-facts small, .challenger-skill-facts strong, .challenger-skill-facts em { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .challenger-skill-facts small { color: #6f7c93; font-size: 7px; }
 .challenger-skill-facts strong { color: #dce4f4; font-size: 9px; margin-top: 3px; }
+.challenger-skill-facts em { color: #8178ff; font-size: 7px; font-style: normal; margin-top: 3px; }
+.challenger-skill-card > p.challenger-waiting { background: rgba(240,189,97,.045); border: 1px solid rgba(240,189,97,.14); border-radius: 8px; color: #7f8ca1; margin: 9px 0 0; padding: 8px; }
+.challenger-waiting span { color: #e1b967; display: block; font-size: 7px; font-weight: 800; letter-spacing: .06em; margin-bottom: 2px; text-transform: uppercase; }
+.challenger-artifact-details { border-top: 1px solid rgba(126,139,166,.11); margin-top: 10px; padding-top: 8px; }
+.challenger-artifact-details summary { color: #8178ff; cursor: pointer; font-size: 8px; font-weight: 800; list-style-position: inside; }
+.challenger-artifact-details > div { display: grid; gap: 6px; grid-template-columns: repeat(2,minmax(0,1fr)); padding-top: 8px; }
+.challenger-artifact-details span { min-width: 0; }
+.challenger-artifact-details small, .challenger-artifact-details strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.challenger-artifact-details small { color: #6f7c93; font-size: 7px; }.challenger-artifact-details strong { color: #bfc9da; font-size: 8px; margin-top: 2px; }
 .challenger-skill-card footer { border-top: 1px solid rgba(126,139,166,.11); color: #75839a; font-size: 8px; margin-top: 10px; padding-top: 9px; }
 .champion-journey-list { list-style: none; margin: 0; padding: 0; }
 .champion-journey-list li { border-bottom: 1px solid rgba(126,139,166,.11); display: grid; grid-template-columns: 30px minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 11px 2px; }
@@ -397,6 +406,19 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
 .champion-journey-list time { color: #69778f; font-size: 8px; white-space: nowrap; }
 .champion-journey-note { align-items: center; border-top: 1px solid rgba(126,139,166,.11); color: #748299; display: flex; font-size: 8px; gap: 6px; margin: 8px 0 0; padding-top: 11px; }
 .champion-journey-note svg { color: #51dfad; flex: 0 0 auto; }
+.learning-evidence-lanes { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin-bottom: 10px; }
+.evidence-lane { background: rgba(10,18,34,.42); border: 1px solid rgba(126,139,166,.16); border-radius: 12px; min-width: 0; padding: 12px; }
+.evidence-lane.lane-authoritative { border-color: rgba(129,120,255,.34); background: rgba(129,120,255,.055); }
+.evidence-lane header { align-items: center; display: flex; gap: 8px; justify-content: space-between; }
+.evidence-lane header strong { color: #dce4f4; font-size: 10px; }
+.evidence-lane header span { border: 1px solid rgba(126,139,166,.2); border-radius: 999px; color: #8190a7; font-size: 7px; font-weight: 800; padding: 4px 6px; text-transform: uppercase; white-space: nowrap; }
+.evidence-lane.lane-authoritative header span { border-color: rgba(129,120,255,.3); color: #a69fff; }
+.evidence-lane p { color: #7f8da5; font-size: 8px; line-height: 1.45; margin: 8px 0 10px; }
+.evidence-lane div b, .evidence-lane div small { display: block; }
+.evidence-lane div b { color: #eef2ff; font-size: 10px; }
+.evidence-lane div small { color: #6f7c92; font-size: 7px; line-height: 1.45; margin-top: 3px; }
+.evidence-generation-note { align-items: center; color: #748299; display: flex; font-size: 8px; gap: 6px; margin: 0 0 14px; }
+.evidence-generation-note svg { color: #51dfad; flex: 0 0 auto; }
 .challenger-controls > div:first-child strong, .challenger-controls > div:first-child small { display: block; }.challenger-controls > div:first-child strong { font-size: 10px; }.challenger-controls > div:first-child small { margin-top: 3px; color: #7c899d; font-size: 8px; line-height: 1.4; }
 .learning-disclosure-body > .learning-demo-note { margin: 0 0 12px; }
 .local-ai-boundary { margin-bottom: 12px; border: 1px solid rgba(77,163,255,.16); border-radius: 11px; padding: 11px 13px; display: flex; align-items: flex-start; gap: 9px; background: rgba(77,163,255,.035); }
@@ -647,6 +669,7 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
 .mode-option > span { display: grid; grid-template-columns: auto 1fr; align-items: center; column-gap: 10px; }.mode-option small { grid-column: 2; color: var(--muted); margin-top: 3px; }.mode-option input { accent-color: var(--purple); }
 .source-confirm { margin-top: 12px; border: 1px solid rgba(247,185,85,.22); border-radius: 11px; padding: 13px; background: rgba(247,185,85,.055); }.source-confirm > strong { color: #f1c675; font-size: 12px; }.source-confirm > p { margin: 6px 0 12px; color: #9eabc0; font-size: 10px; line-height: 1.5; }.source-confirm > div { display: flex; justify-content: flex-end; gap: 8px; }.source-confirm .button { margin: 0; }
 .health-rows > div, .quota-row { display: flex; justify-content: space-between; gap: 20px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 12px; }.health-rows span { color: var(--muted); }.health-summary { margin-top: 13px; display: flex; gap: 8px; align-items: center; font-size: 12px; }.health-summary span { width: 8px; height: 8px; border-radius: 50%; }.health-summary.healthy span { background: var(--mint); }.health-summary.unhealthy span { background: var(--red); }
+.pipeline-summary > span { flex: 0 0 auto; }.pipeline-summary strong, .pipeline-summary small { display: block; }.pipeline-summary small { color: var(--muted); font-size: 9px; line-height: 1.5; margin-top: 3px; }
 .storage-meter { height: 7px; margin: 14px 0 8px; border-radius: 99px; background: #263047; overflow: hidden; }.storage-meter span { height: 100%; display: block; border-radius: inherit; background: linear-gradient(90deg, var(--mint), #f0bd61); }
 .storage-summary { display: flex; justify-content: space-between; gap: 12px; color: #dce1ea; font-size: 11px; }.storage-summary span { color: var(--muted); text-align: right; }
 .storage-form { margin-top: 16px; display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: end; }.storage-form label { color: #aeb8c8; font-size: 10px; }.storage-form label > input { width: calc(100% - 40px); margin-top: 6px; border: 1px solid #303c54; border-radius: 8px 0 0 8px; padding: 9px; background: #0c1422; color: #d7dce7; }.storage-form label > span { display: inline-block; width: 40px; border: 1px solid #303c54; border-left: 0; border-radius: 0 8px 8px 0; padding: 9px 5px; color: #818da2; background: #141d2e; text-align: center; }
@@ -801,6 +824,8 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
   .learning-milestones article { border-left: 0; border-top: 1px solid #29364d; padding: 9px 0 0; }
   .challenger-controls { align-items: stretch; flex-direction: column; }
   .challenger-skill-grid { grid-template-columns: 1fr; }
+  .challenger-artifact-details > div { grid-template-columns: 1fr; }
+  .learning-evidence-lanes { grid-template-columns: 1fr; }
   .coach-lane-grid { grid-template-columns: 1fr; }
   .coach-heading-actions, .coach-contribution-control { width: 100%; align-items: stretch; flex-direction: column; }
   .coach-heading-actions .button, .coach-contribution-control .button { width: 100%; }

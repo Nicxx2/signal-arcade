@@ -95,6 +95,14 @@ class ChallengerSkill(StrEnum):
     EXIT = "exit"
 
 
+class StatisticalModelFamily(StrEnum):
+    """Bounded statistical implementations that may propose Challenger artifacts."""
+
+    LINEAR = "linear"
+    XGBOOST = "xgboost"
+    DETERMINISTIC = "deterministic"
+
+
 class AiDecisionMode(StrEnum):
     OFF = "off"
     SHADOW = "shadow"
@@ -110,6 +118,20 @@ class AiCriticVerdict(StrEnum):
 class LearningObservationStatus(StrEnum):
     PENDING = "pending"
     COMPLETE = "complete"
+
+
+class LearningEvidenceLane(StrEnum):
+    """Purpose of one immutable learning-evidence trajectory."""
+
+    POLICY = "policy"
+    EXECUTION = "execution"
+
+
+class LearningEvidenceStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETE = "complete"
+    UNAVAILABLE = "unavailable"
+    CANCELLED = "cancelled"
 
 
 class CoachExperimentKind(StrEnum):
@@ -365,11 +387,83 @@ class LearningObservation(BaseModel):
     feature_schema_version: str = "challenger-features-v1"
 
 
+class LearningEvidenceEpisode(BaseModel):
+    """Self-contained, generation-bound evidence that survives paper-season cleanup.
+
+    Discovery/ranking observations remain in ``LearningObservation`` for backward
+    compatibility. This journal records the two economically distinct lanes that
+    must not be conflated with them: deployable policy counterfactuals and actual
+    paper executions.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    episode_id: str
+    idempotency_key: str
+    evidence_schema_version: str = "learning-evidence-v2"
+    lane: LearningEvidenceLane
+    status: LearningEvidenceStatus = LearningEvidenceStatus.PENDING
+    trajectory_key: str
+    mint: str
+    symbol: str
+    created_at: datetime
+    entry_at: datetime
+    completed_at: datetime | None = None
+    completion_reason: str | None = None
+    source_mode: str = "solana_mainnet"
+    synthetic: bool = False
+    qualification_eligible: bool = False
+
+    decision_id: str | None = None
+    order_id: str | None = None
+    entry_fill_id: str | None = None
+    exit_fill_id: str | None = None
+    season_id: str | None = None
+    season_profile_fingerprint: str | None = None
+    risk_mode: RiskMode
+    account_currency: QuoteCurrency | None = None
+    configuration_fingerprint: str | None = None
+    baseline_version: str
+    feature_schema_version: str
+    baseline_action: DecisionAction
+    baseline_actionable: bool = False
+    features: dict[str, float] = Field(default_factory=dict)
+    active_skill_versions: dict[str, str] = Field(default_factory=dict)
+    challenger_evaluations: dict[str, ChallengerEvaluationReceipt] = Field(default_factory=dict)
+    size_trials: dict[str, ChallengerSizeTrial] = Field(default_factory=dict)
+
+    token_units: int | None = Field(default=None, gt=0)
+    entry_cost_lamports: int | None = Field(default=None, gt=0)
+    entry_account_minor: int | None = Field(default=None, ge=0)
+    entry_price_impact_fraction: float | None = Field(default=None, ge=0, le=1)
+    fee_bps: int = Field(default=0, ge=0, le=10_000)
+    venue: str | None = None
+    quote_mint: str | None = None
+    entry_route_event_id: str | None = None
+    entry_reserve_observed_at: datetime | None = None
+    checkpoints: dict[str, LearningCheckpoint] = Field(default_factory=dict)
+    checkpoint_attempts: dict[str, int] = Field(default_factory=dict)
+
+    realized_return_fraction: float | None = Field(default=None, ge=-1, le=10)
+    realized_account_minor: int | None = None
+    total_fee_account_minor: int = Field(default=0, ge=0)
+    exit_reason: str | None = None
+
+
 class LearningModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: str
     created_at: datetime = Field(default_factory=utc_now)
+    model_family: StatisticalModelFamily = StatisticalModelFamily.LINEAR
+    implementation_version: str = "native-ridge-v1"
+    recipe_version: str = "linear-v1"
+    hyperparameters: dict[str, int | float | str | bool] = Field(default_factory=dict)
+    training_seed: int = 0
+    training_cutoff_at: datetime | None = None
+    evidence_cohort_digest: str | None = None
+    payload_format: Literal["inline", "json", "ubj"] = "inline"
+    payload_digest: str | None = None
     # Monotonic count of usable outcomes seen, independent of the bounded training window.
     outcomes_seen: int = Field(default=0, ge=0)
     risk_mode: RiskMode | None = None
@@ -393,10 +487,15 @@ class LearningModel(BaseModel):
     overall_mean_return: float = Field(ge=-1, le=10)
     validation_in_distribution_fraction: float = Field(default=0.0, ge=0, le=1)
     policy_validation_count: int = Field(default=0, ge=0)
+    policy_observed_count: int = Field(default=0, ge=0)
+    policy_outcome_availability_fraction: float = Field(default=0.0, ge=0, le=1)
+    policy_supported_count: int = Field(default=0, ge=0)
     policy_veto_count: int = Field(default=0, ge=0)
     policy_winner_veto_count: int = Field(default=0, ge=0)
+    policy_winner_veto_fraction: float = Field(default=0.0, ge=0, le=1)
     policy_mean_uplift: float | None = Field(default=None, ge=-10, le=10)
     policy_uplift_lower_bound: float | None = Field(default=None, ge=-10, le=10)
+    qualification_evidence_schema_version: str | None = None
     qualified: bool = False
 
 
@@ -413,6 +512,15 @@ class ChallengerSkillArtifact(BaseModel):
     schema_version: str = "challenger-skill-v1"
     skill: ChallengerSkill
     created_at: datetime = Field(default_factory=utc_now)
+    model_family: StatisticalModelFamily = StatisticalModelFamily.LINEAR
+    implementation_version: str = "native-ridge-v1"
+    recipe_version: str = "linear-v1"
+    hyperparameters: dict[str, int | float | str | bool] = Field(default_factory=dict)
+    training_seed: int = 0
+    training_cutoff_at: datetime | None = None
+    evidence_cohort_digest: str | None = None
+    payload_format: Literal["inline", "json", "ubj"] = "inline"
+    payload_digest: str | None = None
     risk_mode: RiskMode
     configuration_fingerprint: str
     baseline_version: str
@@ -433,7 +541,7 @@ class ChallengerSkillArtifact(BaseModel):
 
 
 class ChallengerChampionEvent(BaseModel):
-    """Bounded, durable record of one honest Champion milestone."""
+    """Durable record of one honest Champion milestone."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -465,6 +573,7 @@ class ChallengerSkillState(BaseModel):
     feature_schema_version: str
     latest_candidate_version: str | None = None
     testing_version: str | None = None
+    pending_versions: list[str] = Field(default_factory=list)
     champion_version: str | None = None
     active_version: str | None = None
     active_dependencies: dict[str, str] = Field(default_factory=dict)

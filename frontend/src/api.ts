@@ -113,7 +113,7 @@ export const api = {
     request<{ initialized: true; quote_currency: QuoteCurrency; starting_minor: number; running: false }>("/api/v1/portfolio/setup", {
       method: "POST",
       body: JSON.stringify({ quote_currency, starting_amount, risk_mode, drawdown_policy }),
-    }),
+    }, 120_000),
   startEngine: () =>
     request<{ running: true }>("/api/v1/engine/start", { method: "POST" }),
   stopEngine: () =>

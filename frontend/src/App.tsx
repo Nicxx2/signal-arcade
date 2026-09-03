@@ -745,6 +745,25 @@ export default function App() {
       await refresh();
       return null;
     } catch (cause) {
+      // The setup transaction can safely outlive a disconnected/aborted HTTP response while it
+      // waits for the event boundary. Reconcile once against authoritative server state before
+      // inviting a retry that could only produce a confusing duplicate-initialization response.
+      try {
+        const confirmed = await api.snapshot();
+        setSnapshot(confirmed);
+        if (
+          confirmed.portfolio.initialized
+          || (
+            confirmed.season_operation?.kind === "setup"
+            && confirmed.season_operation.state === "running"
+          )
+        ) {
+          resolveIssue("setup");
+          return null;
+        }
+      } catch {
+        // Preserve the original setup error; normal polling continues independently.
+      }
       reportIssue("setup", "Paper bankroll was not created", cause);
       return friendlyError(cause);
     } finally {
@@ -1387,19 +1406,19 @@ function SetupArena({ snapshot, busy, setupPortfolio }: {
     </section>
     <article className="card setup-card">
       <div className="setup-intro"><strong>Virtual starting balance</strong><p>This is paper money only. No wallet, seed phrase, or real funds are used.</p></div>
-      <form onSubmit={(event) => void submit(event)} noValidate>
-        <fieldset className="currency-choice"><legend>Account currency</legend><button type="button" className={currency === "SOL" ? "active" : ""} onClick={() => chooseCurrency("SOL")} aria-pressed={currency === "SOL"} aria-label="Use SOL for paper bankroll"><strong>SOL</strong><small>Native Solana accounting</small></button><button type="button" className={currency === "USDC" ? "active" : ""} onClick={() => chooseCurrency("USDC")} aria-pressed={currency === "USDC"} aria-label="Use USDC for paper bankroll"><strong>USDC</strong><small>Dollar-denominated accounting</small></button></fieldset>
-        <fieldset className="risk-setup-choice"><legend>First-season personality</legend><div>{RISK_MODES.map((mode) => {
+      <form onSubmit={(event) => void submit(event)} noValidate aria-busy={busy}>
+        <fieldset className="currency-choice" disabled={busy}><legend>Account currency</legend><button type="button" className={currency === "SOL" ? "active" : ""} onClick={() => chooseCurrency("SOL")} aria-pressed={currency === "SOL"} aria-label="Use SOL for paper bankroll"><strong>SOL</strong><small>Native Solana accounting</small></button><button type="button" className={currency === "USDC" ? "active" : ""} onClick={() => chooseCurrency("USDC")} aria-pressed={currency === "USDC"} aria-label="Use USDC for paper bankroll"><strong>USDC</strong><small>Dollar-denominated accounting</small></button></fieldset>
+        <fieldset className="risk-setup-choice" disabled={busy}><legend>First-season personality</legend><div>{RISK_MODES.map((mode) => {
           const profile = snapshot.season_profile_catalog.find((item) => item.risk_mode === mode) ?? null;
           return <button type="button" role="radio" aria-checked={riskMode === mode} className={riskMode === mode ? "active" : ""} onClick={() => setRiskMode(mode)} key={mode}><strong>{riskModeLabel(mode)}</strong><span>{riskCopy(mode)}</span><small>{profileLimitSummary(profile)}</small></button>;
         })}</div><small><ShieldCheck size={13} /> Structural, mint, route, stale-data and executable-market safety stay active in every personality.</small></fieldset>
         <details className="setup-drawdown-settings"><summary>Advanced: portfolio drawdown halt <ChevronDown size={13} /></summary><div>
-          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "default"} onChange={() => { setDrawdownKind("default"); setError(null); }} /> Personality default</label>
-          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "custom"} onChange={() => { setDrawdownKind("custom"); setError(null); }} /> Custom</label>
-          {drawdownKind === "custom" && <label className="setup-drawdown-custom"><input aria-label="First season custom drawdown percentage" inputMode="decimal" value={customDrawdown} onChange={(event) => { setCustomDrawdown(event.target.value); setError(null); }} /><b>%</b></label>}
-          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "disabled"} onChange={() => { setDrawdownKind("disabled"); setError(null); }} /> Off</label>
+          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "default"} disabled={busy} onChange={() => { setDrawdownKind("default"); setError(null); }} /> Personality default</label>
+          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "custom"} disabled={busy} onChange={() => { setDrawdownKind("custom"); setError(null); }} /> Custom</label>
+          {drawdownKind === "custom" && <label className="setup-drawdown-custom"><input aria-label="First season custom drawdown percentage" inputMode="decimal" value={customDrawdown} disabled={busy} onChange={(event) => { setCustomDrawdown(event.target.value); setError(null); }} /><b>%</b></label>}
+          <label><input type="radio" name="setup-drawdown" checked={drawdownKind === "disabled"} disabled={busy} onChange={() => { setDrawdownKind("disabled"); setError(null); }} /> Off</label>
         </div><p>Off disables only the portfolio-level halt. Trade exits, exposure, position limits and permanent data safety remain active.</p></details>
-        <label className="bankroll-input"><span>Starting amount</span><div><input value={amount} onChange={(event) => { setAmount(event.target.value); setError(null); }} inputMode="decimal" autoComplete="off" aria-label="Starting amount" aria-describedby={error ? "bankroll-help bankroll-error" : "bankroll-help"} /><strong>{currency}</strong></div><small id="bankroll-help">You can reset the paper season later to choose a different amount or currency.</small></label>
+        <label className="bankroll-input"><span>Starting amount</span><div><input value={amount} disabled={busy} onChange={(event) => { setAmount(event.target.value); setError(null); }} inputMode="decimal" autoComplete="off" aria-label="Starting amount" aria-describedby={error ? "bankroll-help bankroll-error" : "bankroll-help"} /><strong>{currency}</strong></div><small id="bankroll-help">You can reset the paper season later to choose a different amount or currency.</small></label>
         {error && <p className="setup-error" id="bankroll-error" role="alert">{error}</p>}
         <div className="setup-foot"><p>{currency === "USDC" ? "Live USDC accounting converts simulated SOL costs using fresh observed SOL/USD data and abstains if that conversion is unavailable." : "SOL mode accounts directly in lamports, including simulated protocol and network fees."}</p><button className="button setup-submit" disabled={busy}>{busy ? <span className="mini-loader" /> : <CircleDollarSign size={16} />}{busy ? "Creating…" : "Create paper bankroll"}</button></div>
       </form>
@@ -1660,6 +1679,12 @@ function championEventDetail(event: ChallengerChampionEvent): string {
   return `${compact(event.common_usable_count)} shared outcomes · neither policy proved a safe advantage.`;
 }
 
+function modelFamilyLabel(family?: "linear" | "xgboost" | "deterministic"): string {
+  if (family === "xgboost") return "Nonlinear XGBoost";
+  if (family === "deterministic") return "Deterministic policy";
+  return "Linear learner";
+}
+
 function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
   snapshot: Snapshot;
   setLearningMode: (mode: LearningMode) => Promise<void>;
@@ -1716,6 +1741,9 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
   const challengerTotal = learning.qualification_total ?? challengerGates.length;
   const skillStatuses = learning.skills ?? [];
   const championJourney = learning.champion_journey ?? [];
+  const evidenceLanes = learning.evidence_lanes ?? [];
+  const baselineScorecard = learning.baseline_scorecard;
+  const baselinePolicy = baselineScorecard?.policy;
   const latestChampionEvent = championJourney[0] ?? null;
   const commonForwardMinimum = learning.challenger_common_forward_minimum ?? 30;
   const minimumTournamentAvailability = learning.challenger_minimum_availability ?? 0.70;
@@ -1802,11 +1830,17 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
         <div><ShieldCheck size={19} /><span><strong>Does not fit itself</strong><small>The Challenger studies measured outcomes separately; the Baseline stays predictable.</small></span></div>
         <div><RotateCcw size={19} /><span><strong>Always available as fallback</strong><small>If learned behavior becomes harmful or unverifiable, control returns here automatically.</small></span></div>
       </article>
+      {baselinePolicy && <section className="stats-grid learning-stats" aria-label="Current Baseline evidence">
+        <Stat label="Independent entries" value={compact(baselinePolicy.usable_count)} hint={`${compact(baselinePolicy.observed_count)} outcomes observed`} />
+        <Stat label="Median outcome" value={baselinePolicy.median_return === null ? "Collecting" : percentSigned(baselinePolicy.median_return)} hint="After modeled entry, exit and fees" tone={baselinePolicy.median_return === null ? undefined : baselinePolicy.median_return >= 0 ? "good" : "bad"} />
+        <Stat label="Conservative floor" value={baselinePolicy.conservative_return === null ? "Collecting" : percentSigned(baselinePolicy.conservative_return)} hint="95% confidence-adjusted mean" tone={baselinePolicy.conservative_return === null ? undefined : baselinePolicy.conservative_return >= 0 ? "good" : "bad"} />
+        <Stat label="Outcome coverage" value={percent(baselinePolicy.availability_fraction)} hint="Unknown exits stay unknown" />
+      </section>}
     </>}
 
     {activeView === "challenger" && <>
       <div className="learning-view-heading"><div><span>Statistical Challenger</span><h2>Learns from forward, fee-inclusive outcomes without changing the Baseline</h2></div><strong>{learning.mode === "active" ? "Active" : learning.mode === "off" ? "Off" : "Shadow"} · {challengerState}</strong></div>
-      {learning.demo_excluded && <div className="learning-demo-note"><ShieldCheck size={17} /><div><strong>Demo experience stays separate</strong><p>Synthetic tokens can never train or activate the live learner.</p></div></div>}
+      {snapshot.demo_mode && learning.demo_excluded && <div className="learning-demo-note"><ShieldCheck size={17} /><div><strong>Demo experience stays separate</strong><p>Synthetic tokens can never train or activate the live learner.</p></div></div>}
 
       <div className="challenger-controls">
         <div><strong>Challenger control</strong><small>The next evaluation is not an unlock. Every proof gate must pass independently.</small></div>
@@ -1836,8 +1870,9 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
       {skillStatuses.length > 0 && <section className="challenger-skill-grid" aria-label="Challenger skills">
         {skillStatuses.map((skill) => {
           const passed = skill.gates.filter((gate) => gate.state === "passed").length;
-          const candidate = skill.latest_candidate;
+          const candidate = skill.testing_candidate ?? skill.latest_candidate;
           const latestSkillEvent = championJourney.find((event) => event.skill === skill.skill);
+          const waitingGate = skill.gates.find((gate) => gate.state !== "passed") ?? null;
           const contenderState = skill.testing_version
             ? "Testing"
             : !candidate
@@ -1865,11 +1900,21 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
             <header><div><span>{skill.skill}</span><strong>{skill.label}</strong></div><b>{title(skill.state)}</b></header>
             <p>{skill.skill === "entry" ? "Selects among entries the Baseline already approved." : skill.skill === "manipulation" ? "Learns recurring adversarial flow patterns and may only veto." : skill.skill === "sizing" ? "Tests bounded 0.5x–2x sizes under the same executable route." : "May move the normal review earlier; hard exits never move."}</p>
             <div className="challenger-skill-facts">
-              <span><small>Contender</small><strong>{contenderState}</strong></span>
-              <span><small>Best proved</small><strong>{skill.champion ? "Champion" : "None yet"}</strong></span>
+              <span><small>Contender</small><strong title={candidate?.version}>{candidate?.codename ?? contenderState}</strong>{candidate && <em>{modelFamilyLabel(candidate.model_family)}</em>}</span>
+              <span><small>Best proved</small><strong title={skill.champion?.version}>{skill.champion ? `${skill.champion_generation ? `Champion v${skill.champion_generation} · ` : ""}${skill.champion.codename ?? "Champion"}` : "None yet"}</strong>{skill.champion && <em>{modelFamilyLabel(skill.champion.model_family)}</em>}</span>
               <span><small>Influence</small><strong>{skill.active_version ? "Active" : skill.state === "suspended" ? "Suspended" : "Shadow"}</strong></span>
             </div>
-            <footer><span>{passed} / {skill.gates.length} skill gates</span><span>{battleProgress}</span></footer>
+            {!candidate?.qualified && waitingGate && <p className="challenger-waiting"><span>Waiting for evidence</span>{waitingGate.label} · {waitingGate.detail}</p>}
+            {(candidate || skill.champion) && <details className="challenger-artifact-details">
+              <summary>Artifact details</summary>
+              <div>
+                {candidate && <span><small>Contender recipe</small><strong>{modelFamilyLabel(candidate.model_family)} · {candidate.recipe_version ?? "legacy recipe"}</strong></span>}
+                {candidate && <span><small>Evidence split</small><strong>{compact(candidate.training_count)} train · {compact(candidate.validation_count)} validation</strong></span>}
+                {skill.champion && <span><small>Champion recipe</small><strong>{modelFamilyLabel(skill.champion.model_family)} · {skill.champion.recipe_version ?? "legacy recipe"}</strong></span>}
+                {candidate?.training_cutoff_at && <span><small>Frozen cutoff</small><strong>{shortDate(candidate.training_cutoff_at)}</strong></span>}
+              </div>
+            </details>}
+            <footer><span>{passed} / {skill.gates.length} skill gates</span><span>{battleProgress}{(skill.pending_versions?.length ?? 0) > 0 ? ` · ${skill.pending_versions!.length} queued` : ""}</span></footer>
           </article>;
         })}
       </section>}
@@ -1886,7 +1931,7 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
           ? <ol className="champion-journey-list" aria-label="Recent Challenger Champion milestones">
             {championJourney.slice(0, 8).map((event) => <li key={event.event_id}>
               <span className={`champion-journey-icon event-${event.kind}`} aria-hidden="true">{event.kind === "promoted" || event.kind === "first_champion" ? <Trophy size={14} /> : <ShieldCheck size={14} />}</span>
-              <span><small>{CHALLENGER_SKILL_LABELS[event.skill]}</small><strong>{championEventTitle(event)}</strong><em>{championEventDetail(event)}</em></span>
+              <span><small>{CHALLENGER_SKILL_LABELS[event.skill]}</small><strong title={event.champion_version}>{event.champion_generation ? `Champion v${event.champion_generation} · ` : ""}{event.champion_codename ? `${event.champion_codename} · ` : ""}{championEventTitle(event)}</strong><em>{championEventDetail(event)}</em></span>
               <time dateTime={event.occurred_at}>{shortDate(event.occurred_at)}</time>
             </li>)}
           </ol>
@@ -1913,6 +1958,20 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
         open={expandedSections.has("learning_evidence")}
         onToggle={() => toggleSection("learning_evidence")}
       >
+        {evidenceLanes.length > 0 && <>
+          <div className="learning-evidence-lanes" role="region" aria-label="Separated learning evidence lanes">
+            {evidenceLanes.map((lane) => <article key={lane.id} className={`evidence-lane lane-${lane.qualification_role}`}>
+              <header><strong>{lane.label}</strong><span>{lane.qualification_role === "authoritative" ? "Can qualify" : lane.qualification_role === "proposal" ? "Proposes" : "Audit only"}</span></header>
+              <p>{lane.purpose}</p>
+              <div><b>{compact(lane.usable_count)} usable</b><small>{compact(lane.observed_count)} observed · {compact(lane.pending_count)} unfolding · {compact(lane.unavailable_count)} unknown</small></div>
+            </article>)}
+          </div>
+          <p className="evidence-generation-note"><ShieldCheck size={13} />
+            {learning.evidence_contract?.collection_started_at
+              ? <>Current retained proof begins {shortDate(learning.evidence_contract.collection_started_at)}. Older evidence remains preserved but cannot silently qualify this policy.</>
+              : <>Current proof generation is waiting for its first actionable Baseline entry. Older evidence remains preserved but cannot silently qualify it.</>}
+          </p>
+        </>}
         <div className="learning-grid">
           <article className="card learning-card">
             <SectionHeader title="Forward test" subtitle="Newest observations are never used to fit the challenger being judged" />
@@ -3089,7 +3148,7 @@ function SettingsView({ snapshot, refresh, busy, setBusy, reportIssue, resolveIs
         <SectionHeader title="Data health" subtitle="The engine abstains when required evidence is stale" />
         <HealthRows health={snapshot.provider_health} />
         <div className={`health-summary ${snapshot.database_ok ? "healthy" : "unhealthy"}`}><span />SQLite connection {snapshot.database_ok ? "healthy" : "failed"}</div>
-        <div className={`health-summary ${snapshot.event_pipeline.degraded ? "unhealthy" : "healthy"}`}><span />Market processing {snapshot.event_pipeline.degraded ? snapshot.event_pipeline.degraded_reasons.map(humanize).join(", ") : "current"} · {compact(snapshot.event_pipeline.processed)} handled ({compact(snapshot.event_pipeline.persisted)} retained)</div>
+        <div className={`health-summary pipeline-summary ${snapshot.event_pipeline.degraded ? "unhealthy" : "healthy"}`}><span /><div><strong>Market processing {snapshot.event_pipeline.degraded ? snapshot.event_pipeline.degraded_reasons.map(humanize).join(", ") : "current"}</strong><small>{compact(snapshot.event_pipeline.processed)} processed · {compact(snapshot.event_pipeline.ephemeral)} transient · {compact(snapshot.event_pipeline.persisted)} saved · {compact(snapshot.event_pipeline.shed_candidate_events ?? Math.max(0, snapshot.event_pipeline.dropped - (snapshot.event_pipeline.expired_candidate_events ?? 0)))} shed · {compact(snapshot.event_pipeline.expired_candidate_events ?? 0)} expired</small></div></div>
       </article>
       <StorageManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <AiModelManager snapshot={snapshot} refresh={refresh} reportIssue={reportIssue} resolveIssue={resolveIssue} />
