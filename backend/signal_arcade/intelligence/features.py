@@ -118,10 +118,14 @@ class TokenState:
         # The live orchestrator rejects queue-order and slot regressions before this method. A
         # monotonic effective timestamp is still required for direct integrations and for the
         # rare case where a host clock is corrected backwards while slots continue forwards.
-        effective_at = (
-            max(self.last_event_at, event.received_at)
-            if self.last_event_at is not None
-            else event.received_at
+        effective_at = max(
+            observed_at
+            for observed_at in (
+                event.received_at,
+                self.last_event_at,
+                self.last_reserve_at,
+            )
+            if observed_at is not None
         )
         reserve_observed = any(
             _number(payload, key) > 0
@@ -515,6 +519,7 @@ class FeatureEngine:
         values: dict[str, Any],
         slot: int,
         at: datetime,
+        observation_id: str,
     ) -> bool:
         with self._lock:
             state = self.tokens.get(mint)
@@ -523,6 +528,7 @@ class FeatureEngine:
                 or state.venue != "pump_curve"
                 or not curve_address
                 or state.curve_address != curve_address
+                or not observation_id
                 or slot < max(state.last_slot, state.last_reserve_slot)
                 or (state.last_reserve_slot > 0 and slot <= state.last_reserve_slot)
             ):
@@ -555,9 +561,11 @@ class FeatureEngine:
                 _number(values, "token_total_supply"),
             )
             state.complete = bool(values.get("complete", state.complete))
-            state.last_reserve_at = at
+            state.last_reserve_at = max(state.last_reserve_at, at) if state.last_reserve_at else at
             state.last_reserve_slot = slot
             state.reserve_source = "solana_rpc:position_watchdog"
+            state.last_reserve_event_id = observation_id
+            state.last_reserve_signature = None
             return True
 
     def refresh_pumpswap_reserves(
@@ -572,6 +580,7 @@ class FeatureEngine:
         virtual_quote_reserves: int,
         slot: int,
         at: datetime,
+        observation_id: str,
     ) -> bool:
         with self._lock:
             state = self.tokens.get(mint)
@@ -582,6 +591,7 @@ class FeatureEngine:
                 or state.pool_address != pool_address
                 or state.pool_base_token_account != base_token_account
                 or state.pool_quote_token_account != quote_token_account
+                or not observation_id
                 or slot < max(state.last_slot, state.last_reserve_slot)
                 or (state.last_reserve_slot > 0 and slot <= state.last_reserve_slot)
                 or base_amount <= 0
@@ -595,9 +605,11 @@ class FeatureEngine:
             state.real_quote_reserves = quote_amount
             if state.initial_real_token_reserves == 0:
                 state.initial_real_token_reserves = base_amount
-            state.last_reserve_at = at
+            state.last_reserve_at = max(state.last_reserve_at, at) if state.last_reserve_at else at
             state.last_reserve_slot = slot
             state.reserve_source = "solana_rpc:position_watchdog"
+            state.last_reserve_event_id = observation_id
+            state.last_reserve_signature = None
             return True
 
     def _snapshot_state(

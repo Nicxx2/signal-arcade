@@ -7,7 +7,7 @@ from threading import Event
 
 import pytest
 from signal_arcade.intelligence.decision import DecisionEngine, assess_market_integrity
-from signal_arcade.intelligence.features import FeatureEngine
+from signal_arcade.intelligence.features import FeatureEngine, TokenState
 from signal_arcade.models import (
     DataValue,
     DecisionAction,
@@ -281,6 +281,8 @@ def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
             },
         )
     )
+    engine.tokens[mint].last_reserve_event_id = "older-stream-event"
+    engine.tokens[mint].last_reserve_signature = "older-stream-signature"
 
     assert engine.refresh_pump_curve(
         mint,
@@ -294,6 +296,7 @@ def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
         },
         slot=2,
         at=now,
+        observation_id="solana-rpc:2:mint",
     )
     regular = engine.snapshot(mint, now)
     position = engine.position_snapshot(mint, now)
@@ -304,6 +307,8 @@ def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
     assert position.values["trade_count_5m"].value == 1
     assert position.values["price_sol"].sources == ["solana_rpc:position_watchdog"]
     assert engine.tokens[mint].real_quote_reserves == 2_000_000
+    assert engine.tokens[mint].last_reserve_event_id == "solana-rpc:2:mint"
+    assert engine.tokens[mint].last_reserve_signature is None
     assert (
         engine.refresh_pump_curve(
             mint,
@@ -316,6 +321,7 @@ def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
             },
             slot=2,
             at=now + timedelta(seconds=10),
+            observation_id="solana-rpc:2:mint-repeated",
         )
         is False
     )
@@ -332,6 +338,7 @@ def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
             },
             slot=3,
             at=now,
+            observation_id="solana-rpc:3:wrong-route",
         )
         is False
     )
@@ -346,9 +353,89 @@ def test_position_rpc_refresh_updates_only_reserve_freshness() -> None:
             },
             slot=0,
             at=now,
+            observation_id="solana-rpc:0:mint",
         )
         is False
     )
+
+
+def test_rpc_refresh_provenance_and_event_time_remain_causal_across_clock_rollback() -> None:
+    engine = FeatureEngine(stale_market_seconds=20)
+    now = datetime.now(UTC)
+    mint = "Mint111111111111111111111111111111111111111"
+    pool = "Pool111111111111111111111111111111111111111"
+    base_account = "Base111111111111111111111111111111111111111"
+    quote_account = "Quote11111111111111111111111111111111111111"
+    state = TokenState(
+        mint=mint,
+        venue="pump_swap",
+        pool_address=pool,
+        pool_base_token_account=base_account,
+        pool_quote_token_account=quote_account,
+        route_verified=True,
+        quote_mint="So11111111111111111111111111111111111111112",
+        last_event_at=now - timedelta(seconds=5),
+        last_event_id="older-stream-event",
+        last_slot=10,
+        last_reserve_at=now - timedelta(seconds=5),
+        last_reserve_slot=10,
+        last_reserve_event_id="older-stream-event",
+        last_reserve_signature="older-stream-signature",
+    )
+    engine.tokens[mint] = state
+
+    assert engine.refresh_pumpswap_reserves(
+        mint,
+        pool_address=pool,
+        base_token_account=base_account,
+        quote_token_account=quote_account,
+        base_amount=900_000,
+        quote_amount=2_000_000,
+        virtual_quote_reserves=1_000_000,
+        slot=11,
+        at=now,
+        observation_id=f"solana-rpc:11:{mint}",
+    )
+    assert state.last_reserve_event_id == f"solana-rpc:11:{mint}"
+    assert state.last_reserve_signature is None
+
+    assert engine.refresh_pumpswap_reserves(
+        mint,
+        pool_address=pool,
+        base_token_account=base_account,
+        quote_token_account=quote_account,
+        base_amount=899_500,
+        quote_amount=2_000_500,
+        virtual_quote_reserves=1_000_000,
+        slot=12,
+        at=now - timedelta(seconds=1),
+        observation_id=f"solana-rpc:12:{mint}",
+    )
+    assert state.last_reserve_at == now
+
+    engine.apply(
+        MarketEvent(
+            event_id="higher-slot-after-clock-rollback",
+            source="solana:test",
+            kind=EventKind.TRADE,
+            mint=mint,
+            slot=13,
+            received_at=now - timedelta(seconds=1),
+            payload={
+                "event_name": "BuyEvent",
+                "is_buy": True,
+                "user": "wallet",
+                "base_amount_out": 1_000,
+                "quote_amount_in": 1_000,
+                "pool_base_amount": 899_000,
+                "pool_quote_amount": 2_001_000,
+                "virtual_quote_reserves": 1_000_000,
+            },
+        )
+    )
+    assert state.last_event_at == now
+    assert state.last_reserve_at == now
+    assert state.last_reserve_slot == 13
 
 
 def test_missing_enrichment_is_unknown_not_zero() -> None:

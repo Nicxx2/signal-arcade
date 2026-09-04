@@ -835,6 +835,61 @@ def test_elapsed_order_uses_latest_fresh_reserves_without_waiting_for_another_tr
     database.close()
 
 
+def test_future_reserve_defers_due_order_without_mutating_accounting(settings) -> None:  # type: ignore[no-untyped-def]
+    settings.entry_latency_ms = 850
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    started_at = datetime.now(UTC)
+    order = broker.submit_decision(make_decision(started_at))
+    assert order is not None
+    fill_at = order.fill_after + timedelta(milliseconds=1)
+    reserve_at = fill_at + timedelta(seconds=1)
+    state = TokenState(
+        mint="mint",
+        symbol="TEST",
+        last_event_at=reserve_at,
+        last_event_id="future-reserve",
+        last_reserve_at=reserve_at,
+        last_reserve_slot=101,
+        last_reserve_event_id="solana-rpc:101:mint",
+        reserve_source="solana_rpc:position_watchdog",
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+    cash_before = broker.cash_lamports
+    ledger_before = database.ledger_balance("cash")
+
+    assert (
+        broker.process_due_orders(
+            state=state,
+            features=make_features(fill_at),
+            source_event_id="solana-rpc:101:mint",
+            now=fill_at,
+            mode=RiskMode.BALANCED,
+        )
+        == []
+    )
+    assert order.order_id in broker.pending
+    assert broker.cash_lamports == cash_before
+    assert database.ledger_balance("cash") == ledger_before
+    assert database.list_fills() == []
+    assert broker.positions == {}
+
+    receipts = broker.process_due_orders(
+        state=state,
+        features=make_features(reserve_at),
+        source_event_id="solana-rpc:101:mint",
+        now=reserve_at,
+        mode=RiskMode.BALANCED,
+    )
+    assert len(receipts) == 1
+    assert receipts[0].reserve_snapshot is not None
+    assert receipts[0].reserve_snapshot.observed_at == reserve_at
+    assert receipts[0].reserve_snapshot.event_id == "solana-rpc:101:mint"
+    database.close()
+
+
 def test_stale_position_mark_is_separated_from_conservative_equity(settings) -> None:  # type: ignore[no-untyped-def]
     database = Database(settings.database_path)
     broker = make_broker(database, settings)

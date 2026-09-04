@@ -55,6 +55,16 @@ is verified, a late bonding-curve trade cannot replace its reserves. Broker and 
 independently reject a fill before its order, configured latency or paper position; explicit
 zero-latency configurations may still produce a legitimate same-timestamp fill.
 
+The held-position watchdog timestamps an RPC account observation only after its response returns
+and while holding the same causal boundary used by event processing. A successfully decoded Pump
+or PumpSwap snapshot advances that mint's slot/sequence fence; partial, wrong-owner or wrong-route
+responses advance nothing. Restart recovery replays live evidence by authoritative Solana slot,
+while host-clock correction cannot move an event or reserve clock backwards. Every watchdog
+snapshot receives its own `solana-rpc:<slot>:<mint>` observation ID and never inherits an older
+stream signature. If any integration still proposes a fill before the retained reserve time, the
+broker preserves the pending order and all accounting unchanged, and the database independently
+rejects the impossible commit.
+
 Pending buys reserve an open-position slot, exposure, and account-currency cash. This prevents a
 burst of qualifying coins from bypassing the selected risk limits before their delayed fills.
 Capacity, drawdown, exposure, conversion, and available cash are checked again at fill time in

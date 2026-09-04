@@ -775,6 +775,12 @@ class PaperBroker:
         illiquid positions, so the clock loop may now use the latest observed executable state.
         """
         receipts: list[FillReceipt] = []
+        reserve_observed_at = state.last_reserve_at or state.last_event_at
+        if reserve_observed_at is not None and reserve_observed_at > now:
+            # Preserve the pending order and every accounting balance. The strict database
+            # validator remains the final authority, but a recovered clock must never reach it
+            # with a reserve observation that is causally newer than the proposed fill.
+            return []
         self._mark_position(
             state,
             features,

@@ -21,6 +21,7 @@ from signal_arcade.models import (
     EventKind,
     FeatureSnapshot,
     MarketEvent,
+    PaperOrder,
     Position,
     QuoteCurrency,
     RiskMode,
@@ -1181,7 +1182,7 @@ def test_quiet_held_curve_is_refreshed_without_faking_a_trade(
         },
     )
 
-    receipts = orchestrator._apply_position_watchdog_result(  # noqa: SLF001
+    receipts, refreshed, slot = orchestrator._apply_position_watchdog_result(  # noqa: SLF001
         [
             {
                 "mint": mint,
@@ -1203,9 +1204,13 @@ def test_quiet_held_curve_is_refreshed_without_faking_a_trade(
 
     position = orchestrator.broker.positions[mint]
     assert receipts == []
+    assert refreshed == {mint}
+    assert slot == 11
     assert state.last_event_at == observed
     assert len(state.trades) == 0
     assert state.last_reserve_at == now
+    assert state.last_reserve_event_id == f"solana-rpc:11:{mint}"
+    assert state.last_reserve_signature is None
     assert position.mark_is_stale is False
     assert position.mark_is_executable is True
     assert position.last_marked_at == now
@@ -2007,6 +2012,246 @@ def test_priority_inversion_cannot_reverse_one_mints_market_chronology(tmp_path:
     assert len(state.trades) == 1
     assert orchestrator.reordered_events == 1
     assert mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
+    orchestrator.database.close()
+
+
+def test_restart_rebuild_uses_solana_slots_instead_of_arrival_time(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=False, _env_file=None)
+    database = Database(settings.database_path)
+    now = datetime.now(UTC)
+    mint = "restart-causal-mint"
+    curve = "Curve".ljust(32, "1")
+    newer_state = MarketEvent(
+        event_id="slot-20-arrived-first",
+        source=f"solana:{PUMP_PROGRAM}",
+        kind=EventKind.TRADE,
+        mint=mint,
+        slot=20,
+        received_at=now,
+        payload={
+            "bonding_curve": curve,
+            "is_buy": True,
+            "user": "newer-wallet",
+            "token_amount": 10,
+            "sol_amount": 10,
+            "virtual_token_reserves": 900,
+            "virtual_sol_reserves": 4_000,
+            "real_token_reserves": 700,
+        },
+    )
+    delayed_older_state = MarketEvent(
+        event_id="slot-10-arrived-later",
+        source=f"solana:{PUMP_PROGRAM}",
+        kind=EventKind.TRADE,
+        mint=mint,
+        slot=10,
+        received_at=now + timedelta(seconds=1),
+        payload={
+            "bonding_curve": curve,
+            "is_buy": False,
+            "user": "older-wallet",
+            "token_amount": 20,
+            "sol_amount": 20,
+            "virtual_token_reserves": 1_000,
+            "virtual_sol_reserves": 2_000,
+            "real_token_reserves": 800,
+        },
+    )
+    assert database.append_events([newer_state, delayed_older_state]) == {
+        newer_state.event_id,
+        delayed_older_state.event_id,
+    }
+    database.close()
+
+    orchestrator = Orchestrator(settings)
+    rebuilt = orchestrator.features.tokens[mint]
+    assert rebuilt.last_slot == 20
+    assert rebuilt.last_reserve_slot == 20
+    assert rebuilt.last_event_id == newer_state.event_id
+    assert rebuilt.virtual_quote_reserves == 4_000
+    assert [trade.user for trade in rebuilt.trades] == ["older-wallet", "newer-wallet"]
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_watchdog_snapshot_fences_only_preexisting_same_or_lower_slot_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=False, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    requested_at = datetime.now(UTC) - timedelta(seconds=5)
+    mint = "Mint".ljust(32, "1")
+    curve = "Curve".ljust(32, "1")
+    state = TokenState(
+        mint=mint,
+        symbol="WATCH",
+        curve_address=curve,
+        last_event_at=requested_at,
+        last_event_id="stream-slot-10",
+        last_slot=10,
+        last_reserve_at=requested_at,
+        last_reserve_slot=10,
+        last_reserve_event_id="stream-slot-10",
+        last_reserve_signature="stream-signature",
+        virtual_token_reserves=1_000_000,
+        virtual_quote_reserves=2_000_000,
+        real_token_reserves=800_000,
+    )
+    orchestrator.features.tokens[mint] = state
+    orchestrator.broker.positions[mint] = Position(
+        position_id="position",
+        mint=mint,
+        symbol="WATCH",
+        token_units=1,
+        entry_cost_lamports=1,
+        book_value_lamports=1,
+        opened_at=requested_at,
+        entry_fill_id="fill",
+    )
+    invalid_mint = "Invalid".ljust(32, "1")
+    invalid_curve = "InvalidCurve".ljust(32, "1")
+    invalid_state = TokenState(
+        mint=invalid_mint,
+        symbol="INVALID",
+        curve_address=invalid_curve,
+        last_event_at=requested_at,
+        last_slot=10,
+        last_reserve_at=requested_at,
+        last_reserve_slot=10,
+        virtual_token_reserves=1_000_000,
+        virtual_quote_reserves=2_000_000,
+        real_token_reserves=800_000,
+    )
+    orchestrator.features.tokens[invalid_mint] = invalid_state
+    orchestrator.broker.positions[invalid_mint] = Position(
+        position_id="invalid-position",
+        mint=invalid_mint,
+        symbol="INVALID",
+        token_units=1,
+        entry_cost_lamports=1,
+        book_value_lamports=1,
+        opened_at=requested_at,
+        entry_fill_id="invalid-fill",
+    )
+    orchestrator._event_sequence = 7  # noqa: SLF001
+
+    async def multiple_accounts(
+        _requested: list[str],
+        *,
+        min_context_slot: int | None = None,
+        critical: bool = False,
+    ) -> dict[str, object]:
+        assert min_context_slot == 10
+        assert critical is False
+        return {
+            "slot": 11,
+            "accounts": {
+                curve: {"owner": PUMP_PROGRAM, "raw": b"curve"},
+                invalid_curve: {"owner": "wrong-owner", "raw": b"curve"},
+            },
+        }
+
+    monkeypatch.setattr(orchestrator.http, "solana_multiple_accounts", multiple_accounts)
+    monkeypatch.setattr(
+        orchestrator.solana,
+        "decode_pump_bonding_curve",
+        lambda _raw: {
+            "virtual_token_reserves": 900_000,
+            "virtual_quote_reserves": 3_000_000,
+            "real_token_reserves": 700_000,
+        },
+    )
+    before_refresh = datetime.now(UTC)
+    assert asyncio.run(orchestrator._position_watchdog_tick(requested_at)) == []  # noqa: SLF001
+    assert state.last_reserve_at is not None and state.last_reserve_at >= before_refresh
+    assert state.last_reserve_event_id == f"solana-rpc:11:{mint}"
+    assert state.last_reserve_signature is None
+    assert orchestrator._event_order_by_mint[mint] == (11, 7)  # noqa: SLF001
+    assert invalid_state.last_reserve_slot == 10
+    assert invalid_mint not in orchestrator._event_order_by_mint  # noqa: SLF001
+
+    queued_same_slot = MarketEvent(
+        event_id="queued-same-slot",
+        source=f"solana:{PUMP_PROGRAM}",
+        kind=EventKind.TRADE,
+        mint=mint,
+        slot=11,
+        received_at=state.last_reserve_at - timedelta(milliseconds=1),
+    )
+    assert orchestrator._accept_event_order(queued_same_slot, 7) is False  # noqa: SLF001
+    later_same_slot = queued_same_slot.model_copy(
+        update={
+            "event_id": "later-same-slot",
+            "received_at": state.last_reserve_at + timedelta(milliseconds=1),
+        }
+    )
+    assert orchestrator._accept_event_order(later_same_slot, 8) is True  # noqa: SLF001
+    lower_slot = queued_same_slot.model_copy(
+        update={"event_id": "lower-slot", "slot": 10, "received_at": state.last_reserve_at}
+    )
+    assert orchestrator._accept_event_order(lower_slot, 9) is False  # noqa: SLF001
+    higher_slot_after_clock_rollback = queued_same_slot.model_copy(
+        update={
+            "event_id": "higher-slot",
+            "slot": 12,
+            "received_at": state.last_reserve_at - timedelta(seconds=1),
+        }
+    )
+    assert (  # noqa: SLF001
+        orchestrator._accept_event_order(higher_slot_after_clock_rollback, 10) is True
+    )
+    assert orchestrator.reordered_events == 2
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_heartbeat_uses_latest_reserve_clock_and_provenance_for_each_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    requested_at = datetime.now(UTC)
+    reserve_at = requested_at + timedelta(seconds=2)
+    mint = "heartbeat-causal-mint"
+    state = TokenState(
+        mint=mint,
+        symbol="HEART",
+        last_event_at=requested_at,
+        last_event_id="older-stream-event",
+        last_reserve_at=reserve_at,
+        last_reserve_slot=22,
+        last_reserve_event_id=f"solana-rpc:22:{mint}",
+        reserve_source="solana_rpc:position_watchdog",
+        virtual_token_reserves=1_000_000,
+        virtual_quote_reserves=2_000_000,
+        real_token_reserves=800_000,
+    )
+    orchestrator.features.tokens[mint] = state
+    orchestrator.broker.pending["pending"] = PaperOrder(
+        order_id="pending",
+        mint=mint,
+        symbol="HEART",
+        side="buy",
+        requested_sol_lamports=1,
+        created_at=requested_at,
+        fill_after=requested_at,
+    )
+    orchestrator.running = True
+    observed: list[tuple[datetime, str]] = []
+
+    def process_due_orders(**kwargs: object) -> list[object]:
+        observed_at = kwargs["now"]
+        source_event_id = kwargs["source_event_id"]
+        assert isinstance(observed_at, datetime)
+        assert isinstance(source_event_id, str)
+        observed.append((observed_at, source_event_id))
+        return []
+
+    monkeypatch.setattr(orchestrator.broker, "process_due_orders", process_due_orders)
+    orchestrator._heartbeat_tick(requested_at)  # noqa: SLF001
+
+    assert observed == [(reserve_at, f"solana-rpc:22:{mint}")]
+    asyncio.run(orchestrator.http.close())
     orchestrator.database.close()
 
 

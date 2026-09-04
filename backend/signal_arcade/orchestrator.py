@@ -555,10 +555,12 @@ class Orchestrator:
         )
         events.extend(self.database.events_for_mints(tracked_mints))
         # ``events_for_mints`` can contribute older rows that are outside the global recent-event
-        # limit. Sorting after the union prevents those rows from overwriting the newest reserve
-        # state during restart recovery.
+        # limit. Rebuild live token state in authoritative Solana-slot order so a later-arriving
+        # lower-slot row cannot overwrite newer reserves after a restart. Synthetic/demo evidence
+        # deliberately retains its wall-clock ordering. Live slot-less rows are replayed first;
+        # any authoritative slotted observation therefore wins the final executable state.
         unique = {event.event_id: event for event in events}
-        ordered = sorted(
+        received_order = sorted(
             unique.values(),
             key=lambda event: (
                 event.received_at,
@@ -566,11 +568,22 @@ class Orchestrator:
                 event.event_id,
             ),
         )
-        for event in ordered:
+        for event in received_order:
             self.solana.remember_pool_mapping(event.payload)
-            is_demo_event = event.source.startswith("demo:")
-            if is_demo_event == self.demo_mode:
-                self.features.apply(event)
+        selected = [
+            event for event in received_order if event.source.startswith("demo:") == self.demo_mode
+        ]
+        if not self.demo_mode:
+            selected.sort(
+                key=lambda event: (
+                    0 if not event.slot or event.slot <= 0 else 1,
+                    event.slot or 0,
+                    event.received_at,
+                    event.event_id,
+                )
+            )
+        for event in selected:
+            self.features.apply(event)
         for mint, position in self.broker.positions.items():
             state = self.features.tokens.get(mint)
             if state is None:
@@ -843,21 +856,29 @@ class Orchestrator:
         cursor = self._event_order_by_mint.get(mint)
         state = self.features.tokens.get(mint)
         if cursor is None:
-            last_slot = state.last_slot if state is not None else 0
-            cursor = (last_slot, 0)
-        last_slot, last_sequence = cursor
+            cursor = (0, 0)
+        cursor_slot, cursor_sequence = cursor
+        state_slot = max(state.last_slot, state.last_reserve_slot) if state is not None else 0
+        if state_slot > cursor_slot:
+            last_slot, last_sequence = state_slot, 0
+        else:
+            last_slot, last_sequence = cursor_slot, cursor_sequence
         same_slot_or_slotless = event_slot == 0 or last_slot == 0 or event_slot == last_slot
+        state_boundary_at = None
+        if state is not None:
+            state_times = [
+                observed_at
+                for observed_at in (state.last_event_at, state.last_reserve_at)
+                if observed_at is not None
+            ]
+            state_boundary_at = max(state_times) if state_times else None
         reordered = bool(
             (event_slot > 0 and last_slot > 0 and event_slot < last_slot)
             or (
                 same_slot_or_slotless
                 and (
                     sequence <= last_sequence
-                    or (
-                        state is not None
-                        and state.last_event_at is not None
-                        and event.received_at < state.last_event_at
-                    )
+                    or (state_boundary_at is not None and event.received_at < state_boundary_at)
                 )
             )
         )
@@ -872,6 +893,15 @@ class Orchestrator:
         else:
             self._event_order_by_mint[mint] = (last_slot, sequence)
         return True
+
+    def _advance_event_order_boundary(self, mint: str, slot: int, sequence: int) -> None:
+        """Fence queued stream rows that predate an accepted RPC account snapshot."""
+
+        cursor_slot, cursor_sequence = self._event_order_by_mint.get(mint, (0, 0))
+        if slot > cursor_slot:
+            self._event_order_by_mint[mint] = (slot, sequence)
+        elif slot == cursor_slot:
+            self._event_order_by_mint[mint] = (slot, max(sequence, cursor_sequence))
 
     def _event_regresses_verified_route(self, event: MarketEvent) -> bool:
         """Ignore late bonding-curve trades after the executable route migrated to PumpSwap."""
@@ -1485,7 +1515,15 @@ class Orchestrator:
             state = self.features.apply(event)
             if state is None:
                 return False
-            observed_at = max(event.received_at, state.last_event_at or event.received_at)
+            observed_at = max(
+                observed
+                for observed in (
+                    event.received_at,
+                    state.last_event_at,
+                    state.last_reserve_at,
+                )
+                if observed is not None
+            )
 
             is_trade = event.kind == EventKind.TRADE
             if is_trade and self.learning.has_pending_mint(state.mint):
@@ -2570,7 +2608,7 @@ class Orchestrator:
                 waiting_for_probe.append(position.mint)
         return dispositions, waiting_for_probe
 
-    async def _position_watchdog_tick(self, now: datetime) -> list[FillReceipt]:
+    async def _position_watchdog_tick(self, _requested_at: datetime) -> list[FillReceipt]:
         targets, _addresses, _minimum_slot = self._position_watchdog_targets()
         batches = self._position_watchdog_batches(targets)
         if not batches:
@@ -2590,14 +2628,21 @@ class Orchestrator:
                 # Discard any live result that was already in flight when that switch began.
                 if self.demo_mode:
                     return []
-                receipts.extend(
-                    await asyncio.to_thread(
-                        self._apply_position_watchdog_result,
-                        batch_targets,
-                        result,
-                        now,
-                    )
+                observed_at = datetime.now(UTC)
+                batch_receipts, refreshed, slot = await asyncio.to_thread(
+                    self._apply_position_watchdog_result,
+                    batch_targets,
+                    result,
+                    observed_at,
                 )
+                receipts.extend(batch_receipts)
+                # enqueue_event may continue assigning sequence numbers while the account decode
+                # runs in a worker thread. Fence every row already observed by this point; a later
+                # same-slot event remains admissible, while any queued pre-snapshot row cannot
+                # regress the exact reserve snapshot.
+                boundary_sequence = self._event_sequence
+                for mint in refreshed:
+                    self._advance_event_order_boundary(mint, slot, boundary_sequence)
         return receipts
 
     def _apply_position_watchdog_result(
@@ -2605,11 +2650,11 @@ class Orchestrator:
         targets: list[dict[str, Any]],
         result: dict[str, Any],
         now: datetime,
-    ) -> list[FillReceipt]:
+    ) -> tuple[list[FillReceipt], set[str], int]:
         slot = int(result.get("slot") or 0)
         accounts = result.get("accounts")
         if slot <= 0 or not isinstance(accounts, dict):
-            return []
+            return [], set(), 0
         refreshed: set[str] = set()
         for target in targets:
             mint = str(target["mint"])
@@ -2625,6 +2670,7 @@ class Orchestrator:
                     values=values,
                     slot=slot,
                     at=now,
+                    observation_id=f"solana-rpc:{slot}:{mint}",
                 ):
                     refreshed.add(mint)
                 continue
@@ -2685,21 +2731,29 @@ class Orchestrator:
                 virtual_quote_reserves=virtual_quote,
                 slot=slot,
                 at=now,
+                observation_id=f"solana-rpc:{slot}:{mint}",
             ):
                 refreshed.add(mint)
 
         receipts: list[FillReceipt] = []
         for mint in refreshed:
             state = self.features.tokens.get(mint)
-            snapshot = self.features.position_snapshot(mint, now)
-            if state is None or snapshot is None or mint not in self.broker.positions:
+            if state is None or mint not in self.broker.positions:
+                continue
+            market_now = max(
+                observed_at
+                for observed_at in (now, state.last_event_at, state.last_reserve_at)
+                if observed_at is not None
+            )
+            snapshot = self.features.position_snapshot(mint, market_now)
+            if snapshot is None:
                 continue
             sol_usd_price = self._sol_usd_price(snapshot)
-            if self.running or self._profile_transition_exit_management_active(now):
+            if self.running or self._profile_transition_exit_management_active(market_now):
                 self.broker.reassess_position(
                     state=state,
                     features=snapshot,
-                    now=now,
+                    now=market_now,
                     mode=self.risk_mode,
                     sol_usd_price=sol_usd_price,
                     soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
@@ -2709,7 +2763,7 @@ class Orchestrator:
                         state=state,
                         features=snapshot,
                         source_event_id=f"solana-rpc:{slot}:{mint}",
-                        now=now,
+                        now=market_now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
                     )
@@ -2718,7 +2772,7 @@ class Orchestrator:
                 self.broker.observe_market_state(
                     state=state,
                     features=snapshot,
-                    now=now,
+                    now=market_now,
                     sol_usd_price=sol_usd_price,
                 )
         observed_positions = {
@@ -2731,15 +2785,25 @@ class Orchestrator:
             if position is None:
                 self._position_route_probes.pop(mint, None)
                 continue
+            state = self.features.tokens.get(mint)
+            probe_at = max(
+                observed_at
+                for observed_at in (
+                    now,
+                    state.last_event_at if state else None,
+                    state.last_reserve_at if state else None,
+                )
+                if observed_at is not None
+            )
             self._record_position_route_probe(
                 mint,
                 available=position.market_status.value == "active",
-                observed_at=now,
+                observed_at=probe_at,
                 slot=slot,
                 market_status=position.market_status.value,
                 blockers=list(position.mark_blockers),
             )
-        return receipts
+        return receipts, refreshed, slot
 
     def _enrichment_candidates(self, limit: int = 20) -> list[TokenState]:
         """Keep held/pending tokens fresh before spending calls on new candidates."""
@@ -2762,9 +2826,11 @@ class Orchestrator:
 
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
-            now = datetime.now(UTC)
             try:
                 async with self._event_lock:
+                    # Do not reuse a timestamp captured before waiting behind the market/watchdog
+                    # lock. It could otherwise predate a reserve snapshot accepted while waiting.
+                    now = datetime.now(UTC)
                     receipts, expired, learning_updates, ai_updates = await asyncio.to_thread(
                         self._heartbeat_tick,
                         now,
@@ -2828,10 +2894,20 @@ class Orchestrator:
             )
             for mint in active_mints:
                 state = self.features.tokens.get(mint)
+                market_times = [
+                    observed_at
+                    for observed_at in (
+                        now,
+                        state.last_event_at if state else None,
+                        state.last_reserve_at if state else None,
+                    )
+                    if observed_at is not None
+                ]
+                market_now = max(market_times)
                 snapshot = (
-                    self.features.position_snapshot(mint, now)
+                    self.features.position_snapshot(mint, market_now)
                     if mint in self.broker.positions
-                    else self.features.snapshot(mint, now)
+                    else self.features.snapshot(mint, market_now)
                 )
                 if state is None or snapshot is None:
                     continue
@@ -2840,7 +2916,7 @@ class Orchestrator:
                     self.broker.reassess_position(
                         state=state,
                         features=snapshot,
-                        now=now,
+                        now=market_now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
                         soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
@@ -2849,8 +2925,12 @@ class Orchestrator:
                     self.broker.process_due_orders(
                         state=state,
                         features=snapshot,
-                        source_event_id=state.last_event_id or f"observed-state:{mint}",
-                        now=now,
+                        source_event_id=(
+                            state.last_reserve_event_id
+                            or state.last_event_id
+                            or f"observed-state:{mint}"
+                        ),
+                        now=market_now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
                     )

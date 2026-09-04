@@ -6,6 +6,21 @@ would require a deliberate V2 release.
 
 ## Unreleased
 
+## 1.10.2 - 2026-09-04
+
+- Make held-position RPC observations causal with the live event stream: reserve time is assigned
+  only after the response has returned and the shared event boundary is held, accepted snapshots
+  fence already-queued same/lower-slot rows, and genuinely later same-slot or higher-slot evidence
+  remains usable.
+- Rebuild live feature state in authoritative Solana-slot order after restart, keep reserve and
+  event clocks monotonic across host-clock correction, and retain the existing arrival-time model
+  for deterministic Synthetic Demo events.
+- Give Pump and PumpSwap watchdog refreshes exact synthetic observation IDs while clearing stale
+  stream signatures, so every new paper receipt identifies the reserve source it actually used.
+- Add a broker-level fail-closed guard that defers—without failing or mutating—the pending order
+  when a proposed fill precedes its reserve observation. The independent database chronology
+  validator remains strict, and no schema, Baseline or Challenger authority cohort changes.
+
 ## 1.10.1 - 2026-09-04
 
 - Make the Challenger view easier to follow without changing model authority: Entry now shows its

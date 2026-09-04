@@ -78,14 +78,19 @@ mislabelled as queue shedding.
 Priority never becomes market time: a per-mint cursor uses Solana slot first and observed enqueue
 order within the same or slot-less stream, rejecting regressions before they can reach features,
 paper execution, learning or AI. Restart recovery unions tracked and recent raw events, deduplicates
-them and sorts the result chronologically before rebuilding state. A verified PumpSwap route cannot
-be overwritten by a late bonding-curve trade.
+them and replays live evidence by authoritative Solana slot before rebuilding state; deterministic
+Demo evidence retains arrival order. A successfully decoded held-position RPC snapshot advances the
+same mint boundary, while partial or invalid account responses advance nothing. Reserve and event
+timestamps remain monotonic across host-clock correction. A verified PumpSwap route cannot be
+overwritten by a late bonding-curve trade.
 Rolling structural metrics are cached for at most one second during bursts, while reserve/route
 state and critical position events remain authoritative. UI notifications have their own bounded
 queue and the normal five-second snapshot poll repairs missed notifications. Duplicate events are
-ignored. Each new fill embeds its complete reserve snapshot, and atomic database commits
-independently enforce order, latency and position chronology. Impossible legacy timing is
-quarantined without rewriting immutable receipts or ledger history.
+ignored. Each new fill embeds its complete reserve snapshot—including an exact RPC observation ID
+when the watchdog supplied it—and atomic database commits independently enforce order, latency and
+position chronology. The broker first defers any fill whose reserve lies in its future without
+mutating the pending order or accounting. Impossible legacy timing is quarantined without rewriting
+immutable receipts or ledger history.
 The feature window and its per-mint causal/cooldown indexes share one bounded pruning lifecycle.
 Held positions, pending orders, statistical checkpoints, and queued or saved Local AI outcomes are
 retained until their work resolves; inactive entry candidates and their indexes expire together.
