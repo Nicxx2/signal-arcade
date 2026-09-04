@@ -1,4 +1,4 @@
-FROM node:24-alpine AS web
+FROM node:26-alpine AS web
 WORKDIR /build
 RUN corepack enable
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
