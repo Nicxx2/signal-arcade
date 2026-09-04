@@ -65,9 +65,11 @@ a saturated bounded gap tracker fails closed for the whole source. Failed batche
 avoiding duplicate broker side effects. Protected open-position and already-saved outcome events
 continue normally. Missing evidence remains `unknown`; it is never converted to zero. The evidence
 schema is included in the configuration fingerprint and the feature family is
-`challenger-features-v4`, so all
+`challenger-features-v5`, so all
 older observations and models remain readable and auditable but cannot be mixed into the new
-forward cohort as if those fields and continuity guarantees had existed at the time.
+forward cohort as if those fields, continuity and strict per-mint causal ordering guarantees had
+existed at the time. An impossible legacy execution is likewise retained for audit but cannot
+become qualification evidence.
 
 The five-minute net return remains the Entry skill's training target. The five horizons also
 form conservative hold-timing comparisons against the exact normal review for each mode: 5 minutes
@@ -250,8 +252,26 @@ The Learning tab presents the current Contender, best-proved Champion and actual
 separately. A candidate can therefore have fewer passed gates than an older champion without
 destroying that champion; that is healthy exploration, not forgotten learning. It also keeps the
 complete durable sequence of recorded Champion milestones per skill cohort: first qualification,
-promotion, defence or an inconclusive 120-case battle. The UI shows only the newest 12 to stay
-compact. Events are idempotent across restart and shown only for the exact current
+promotion, defence or an inconclusive 120-case battle. The initial snapshot carries only the newest
+eight events; older events are fetched in bounded cursor pages only when requested. Pagination is
+locked to the exact active cohort, so a personality or decision-relevant configuration change
+cannot mix two histories in one view. Each battle can show the actual Champion and contender,
+model families, shared forward sample, outcome coverage, mean edge, conservative floor and the
+engine's recorded resolution. A defence counts as a crown retention because the contender did not
+prove the replacement margin; it is not presented as a guaranteed profit or outright trading win.
+Per-skill reign records are calculated from the complete retained cohort history and distinguish
+Active, Shadow and safely Suspended Champions.
+
+Entry also exposes a compact nonlinear eligibility line. Its row count comes only from the newest
+matching Linear artifact in the exact current risk, configuration, Baseline and feature cohort;
+older large artifacts cannot inflate it. Reaching 250 rows means only that the fixed XGBoost recipe
+may be attempted. The UI separately reports testing, qualification, Champion and active states, so
+eligibility can never look like promotion progress; a safely suspended nonlinear Champion is
+labelled separately as well. Detailed proof sections begin collapsed and
+Entry's authoritative qualification gates are labelled **Entry's road to influence**; the other
+three skills retain their own independent proof inside their skill cards.
+
+Events are idempotent across restart and shown only for the exact current
 personality/configuration cohort. Every referenced contender or Champion artifact is protected
 from pruning, so lineage remains reconstructable. Deterministic codenames are derived from
 immutable artifact identity and therefore remain stable across clients and restart; they never

@@ -1063,6 +1063,47 @@ def test_exact_checks_run_before_bounded_concurrent_metadata(
     orchestrator.database.close()
 
 
+def test_candidate_pruning_bounds_causal_caches_and_preserves_ai_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path, demo_mode=True, candidate_window_minutes=30, _env_file=None
+    )
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    stale_at = now - timedelta(minutes=31)
+    stale_mint = "StaleMint".ljust(40, "1")
+    ai_mint = "AiTrackedMint".ljust(40, "2")
+    for mint in (stale_mint, ai_mint):
+        orchestrator.features.tokens[mint] = TokenState(mint=mint, last_event_at=stale_at)
+        orchestrator._event_order_by_mint[mint] = (10, 10)  # noqa: SLF001
+        orchestrator.last_decision_at[mint] = stale_at
+        # Only cache membership matters here; the entry is deliberately never evaluated.
+        orchestrator.last_recorded_decision[mint] = object()  # type: ignore[assignment]
+    # Runtime membership is all pruning needs; no AI assessment is evaluated in this test.
+    orchestrator.ai_lab.pending_outcomes[ai_mint] = [object()]  # type: ignore[list-item]
+    orchestrator.last_maintenance_at = now
+
+    async def no_exact_checks(_now: datetime, _execution_mints: set[str]) -> None:
+        return None
+
+    async def no_metadata(_mint: str) -> None:
+        return None
+
+    monkeypatch.setattr(orchestrator, "_verify_candidate_accounts", no_exact_checks)
+    monkeypatch.setattr(orchestrator.http, "dexscreener_token", no_metadata)
+    asyncio.run(orchestrator._enrichment_tick(now))  # noqa: SLF001
+
+    assert stale_mint not in orchestrator.features.tokens
+    assert stale_mint not in orchestrator._event_order_by_mint  # noqa: SLF001
+    assert stale_mint not in orchestrator.last_decision_at
+    assert stale_mint not in orchestrator.last_recorded_decision
+    assert ai_mint in orchestrator.features.tokens
+    assert ai_mint in orchestrator._event_order_by_mint  # noqa: SLF001
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
 def test_held_pumpswap_route_is_verified_from_program_owned_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1487,6 +1528,7 @@ def test_recent_pipeline_windows_are_bounded_and_distinguish_local_shedding(
         "processed": 2,
         "shed": 1,
         "expired": 1,
+        "reordered": 0,
         "dropped": 2,
         "drop_fraction": 0.5,
         "processing_lag_p50_seconds": 0.25,
@@ -1793,11 +1835,17 @@ def test_failed_worker_batch_marks_each_represented_mint_without_global_pause(
     second = first.model_copy(update={"event_id": "second-failed-event", "mint": second_mint})
     handled = 0
 
-    async def fail_partway_through_batch(_event: MarketEvent) -> None:
+    async def fail_partway_through_batch(
+        _event: MarketEvent,
+        *,
+        sequence: int | None = None,
+    ) -> bool:
         nonlocal handled
+        assert sequence is not None
         handled += 1
         if handled == 2:
             raise RuntimeError("test batch failure")
+        return True
 
     monkeypatch.setattr(orchestrator, "_handle_persisted_event", fail_partway_through_batch)
 
@@ -1845,7 +1893,12 @@ def test_failed_worker_batch_with_unknown_mint_fails_closed_source_wide(
         payload={},
     )
 
-    async def fail_event(_event: MarketEvent) -> None:
+    async def fail_event(
+        _event: MarketEvent,
+        *,
+        sequence: int | None = None,
+    ) -> None:
+        assert sequence is not None
         raise RuntimeError("test unidentified failure")
 
     monkeypatch.setattr(orchestrator, "_handle_persisted_event", fail_event)
@@ -1915,6 +1968,45 @@ def test_integrity_gap_tracking_fails_closed_at_bounded_cardinality(tmp_path: Pa
     )
 
     asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_priority_inversion_cannot_reverse_one_mints_market_chronology(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    now = datetime.now(UTC)
+    mint = "priority-ordered-mint"
+    newer = MarketEvent(
+        event_id="newer-critical",
+        source="demo:test",
+        kind=EventKind.TRADE,
+        mint=mint,
+        slot=55,
+        received_at=now + timedelta(seconds=10),
+        payload={"is_buy": True, "token_amount": 10, "quote_amount": 10},
+    )
+    older = MarketEvent(
+        event_id="older-candidate",
+        source="demo:test",
+        kind=EventKind.TRADE,
+        mint=mint,
+        slot=55,
+        received_at=now + timedelta(seconds=2),
+        payload={"is_buy": False, "token_amount": 20, "quote_amount": 20},
+    )
+
+    async def exercise() -> None:
+        assert await orchestrator._handle_persisted_event(newer, sequence=20) is True  # noqa: SLF001
+        assert await orchestrator._handle_persisted_event(older, sequence=10) is False  # noqa: SLF001
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+    state = orchestrator.features.tokens[mint]
+    assert state.last_event_id == newer.event_id
+    assert state.last_event_at == newer.received_at
+    assert len(state.trades) == 1
+    assert orchestrator.reordered_events == 1
+    assert mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
     orchestrator.database.close()
 
 

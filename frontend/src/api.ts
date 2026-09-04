@@ -1,4 +1,4 @@
-import type { AiDecisionMode, AiLabStatus, AiModelDownload, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
+import type { AiDecisionMode, AiLabStatus, AiModelDownload, ChallengerJourneyPage, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000): Promise<T> {
   const controller = new AbortController();
@@ -59,6 +59,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ mode }),
     }),
+  championJourney: (cursor?: string, signal?: AbortSignal) => request<ChallengerJourneyPage>(
+    `/api/v1/learning/champion-journey?limit=8${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+    { signal },
+  ),
   aiLab: () => request<AiLabStatus>("/api/v1/ai-lab"),
   setAiMode: (mode: AiDecisionMode) =>
     request<AiLabStatus>("/api/v1/ai-lab/mode", {

@@ -51,6 +51,17 @@ def test_health_and_snapshot_are_paper_only(settings) -> None:  # type: ignore[n
         assert snapshot.json()["storage"]["coach_reviews"] == 0
         assert snapshot.json()["storage"]["coach_hypotheses"] == 0
         assert snapshot.json()["storage"]["max_database_bytes"] == 5 * 1024**3
+        learning = snapshot.json()["learning"]
+        assert learning["nonlinear_entry"]["entry_only"] is True
+        assert learning["champion_records"] == []
+        assert learning["champion_journey_total"] == 0
+        journey = client.get("/api/v1/learning/champion-journey?limit=8")
+        assert journey.status_code == 200
+        assert journey.json() == {"events": [], "total": 0, "next_cursor": None}
+        stale_cursor = client.get(
+            "/api/v1/learning/champion-journey?limit=8&cursor=old-cohort-event"
+        )
+        assert stale_cursor.status_code == 409
 
 
 def test_automatic_season_policy_is_opt_in_validated_and_persistent(settings) -> None:  # type: ignore[no-untyped-def]

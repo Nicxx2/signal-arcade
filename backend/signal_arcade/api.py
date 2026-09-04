@@ -339,6 +339,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # while preserving a fill/portfolio boundary for an internally consistent P/L view.
         return await orchestrator.snapshot_view()
 
+    @app.get("/api/v1/learning/champion-journey")
+    async def champion_journey(
+        limit: int = Query(default=8, ge=1, le=50),
+        cursor: str | None = Query(default=None, min_length=1, max_length=180),
+    ) -> dict[str, Any]:
+        try:
+            return orchestrator.learning.champion_journey_page(limit=limit, cursor=cursor)
+        except ValueError as exc:
+            # A personality/configuration change legitimately invalidates an old page cursor.
+            # Ask the browser to restart from its new cohort instead of mixing histories.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.put("/api/v1/storage-settings", dependencies=[Depends(normal_operation)])
     async def update_storage_settings(body: StorageSettingsRequest) -> dict[str, Any]:
         result = await orchestrator.configure_storage(

@@ -847,6 +847,25 @@ class PaperOrder(BaseModel):
     baseline_version_at_entry: str = "baseline-v1.1"
 
 
+class ExecutionReserveSnapshot(BaseModel):
+    """Self-contained market state used for one immutable paper fill."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_at: datetime
+    event_id: str | None = None
+    signature: str | None = None
+    slot: int = Field(default=0, ge=0)
+    source: str
+    venue: str
+    quote_mint: str
+    virtual_token_reserves: int = Field(ge=0)
+    virtual_quote_reserves: int = Field(ge=0)
+    real_token_reserves: int = Field(ge=0)
+    real_quote_reserves: int | None = Field(default=None, ge=0)
+    fee_bps: int = Field(ge=0, le=10_000)
+
+
 class FillReceipt(BaseModel):
     fill_id: str
     order_id: str
@@ -863,6 +882,10 @@ class FillReceipt(BaseModel):
     latency_ms: int = Field(ge=0)
     source_event_id: str
     venue: str
+    execution_model_version: str = "constant-product-v1"
+    # Added in v1.10.1. None keeps older immutable receipts readable while making every new fill
+    # independently reproducible after bounded raw-market history is pruned.
+    reserve_snapshot: ExecutionReserveSnapshot | None = None
     assumptions: list[str] = Field(default_factory=list)
     account_currency: QuoteCurrency = QuoteCurrency.SOL
     account_decimals: int = Field(default=9, ge=0, le=18)

@@ -75,10 +75,20 @@ waits through a fresh continuity window rather than learning from or trading on 
 Operational status reports processed, transient, saved, capacity-shed and expired candidate events
 as distinct counters; transient processing is never presented as lost data, and expiry is not
 mislabelled as queue shedding.
+Priority never becomes market time: a per-mint cursor uses Solana slot first and observed enqueue
+order within the same or slot-less stream, rejecting regressions before they can reach features,
+paper execution, learning or AI. Restart recovery unions tracked and recent raw events, deduplicates
+them and sorts the result chronologically before rebuilding state. A verified PumpSwap route cannot
+be overwritten by a late bonding-curve trade.
 Rolling structural metrics are cached for at most one second during bursts, while reserve/route
 state and critical position events remain authoritative. UI notifications have their own bounded
 queue and the normal five-second snapshot poll repairs missed notifications. Duplicate events are
-ignored.
+ignored. Each new fill embeds its complete reserve snapshot, and atomic database commits
+independently enforce order, latency and position chronology. Impossible legacy timing is
+quarantined without rewriting immutable receipts or ledger history.
+The feature window and its per-mint causal/cooldown indexes share one bounded pruning lifecycle.
+Held positions, pending orders, statistical checkpoints, and queued or saved Local AI outcomes are
+retained until their work resolves; inactive entry candidates and their indexes expire together.
 Routine learner checkpoints use durable normal priority and rise to critical priority only around
 their due window. Statistical fitting is coalesced per cohort and runs in one background thread
 only while the market queue is empty, processing lag is low and no event batch or maintenance work

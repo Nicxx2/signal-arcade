@@ -21,6 +21,7 @@ import {
   RotateCcw,
   Save,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   TrendingUp,
@@ -42,6 +43,7 @@ import type {
   DecisionAction,
   DrawdownPolicy,
   ChallengerChampionEvent,
+  ChallengerChampionRecord,
   EquityPoint,
   FeatureSnapshot,
   Fill,
@@ -1122,6 +1124,8 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
   const capacityPositionCount = portfolio.positions.filter((item) => item.market_status !== "dormant").length;
   const autoSeasonHours = Math.max(1, Math.round(snapshot.season_automation.grace_seconds / 3600));
   const autoSeasonChip = autoSeasonStatusChip(snapshot.season_automation, autoSeasonHours);
+  const executionAuditQuarantined = snapshot.paper_execution_audit?.status === "quarantined";
+  const executionAuditIssueCount = snapshot.paper_execution_audit?.issues.length ?? 0;
   const profileTransition = snapshot.season_operation?.kind === "profile_transition"
     && snapshot.season_operation.state === "running";
   const profileLocked = snapshot.season_profile === null || snapshot.season_profile.locked_at !== null;
@@ -1190,11 +1194,12 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
     <>
       <section className="page-heading">
         <div><span className="eyebrow"><Radio size={14} /> The Arena</span><h1>Your strategy, playing forward.</h1><p>Real market observations. Virtual {portfolio.quote_currency}. Every assumption visible.</p></div>
-        <div className={`engine-control ${snapshot.running ? "running" : "stopped"}`}><div><strong><span />{profileTransition ? "Changing season profile" : `Paper engine ${snapshot.running ? "running" : "stopped"}`}</strong><small>{profileTransition ? "New entries are paused while the old season safely settles." : snapshot.running ? "Analyzing and managing the paper portfolio." : portfolio.positions.length ? "Positions are preserved and still marked from fresh data." : "No new paper decisions or fills will occur."}</small></div><button onClick={() => void setEngineRunning(!snapshot.running)} disabled={busy || profileTransition}>{profileTransition ? <RotateCcw size={15} /> : snapshot.running ? <Pause size={15} /> : <Play size={15} />}{profileTransition ? "Settling" : snapshot.running ? "Stop" : hasHistory ? "Resume" : "Start"}</button></div>
+        <div className={`engine-control ${snapshot.running ? "running" : "stopped"}`}><div><strong><span />{executionAuditQuarantined ? "Paper engine audit-paused" : profileTransition ? "Changing season profile" : `Paper engine ${snapshot.running ? "running" : "stopped"}`}</strong><small>{executionAuditQuarantined ? "This preserved season cannot trade or qualify learning until a clean new season starts." : profileTransition ? "New entries are paused while the old season safely settles." : snapshot.running ? "Analyzing and managing the paper portfolio." : portfolio.positions.length ? "Positions are preserved and still marked from fresh data." : "No new paper decisions or fills will occur."}</small></div><button onClick={() => void setEngineRunning(!snapshot.running)} disabled={busy || profileTransition || executionAuditQuarantined}>{executionAuditQuarantined ? <ShieldAlert size={15} /> : profileTransition ? <RotateCcw size={15} /> : snapshot.running ? <Pause size={15} /> : <Play size={15} />}{executionAuditQuarantined ? "Audit hold" : profileTransition ? "Settling" : snapshot.running ? "Stop" : hasHistory ? "Resume" : "Start"}</button></div>
       </section>
 
       <div className={`market-state-line ${snapshot.demo_mode ? "demo" : "live"}`}><span />{snapshot.demo_mode ? "Synthetic demo market" : "Solana mainnet paper feed"}{!snapshot.running && <small>Market observations continue while the paper engine is stopped.</small>}</div>
 
+      {executionAuditQuarantined && <div className="execution-audit-note" role="alert"><ShieldAlert size={17} /><div><strong>Current season preserved but not trusted</strong><p>{executionAuditIssueCount} impossible execution record{executionAuditIssueCount === 1 ? " was" : "s were"} detected. Its figures remain visible for audit, but are excluded from results and learning. Start a new season to resume safely.</p></div></div>}
       {portfolio.risk_halted && <div className="risk-halt-note"><AlertTriangle size={17} /><div><strong>New entries are risk-paused</strong><p>The drawdown guardrail is active. Existing positions still receive exit management when fresh executable data is available.</p></div></div>}
       {portfolio.excluded_position_count > 0 && <div className="stale-value-note"><History size={17} /><div><strong>{portfolio.excluded_position_count} position{portfolio.excluded_position_count === 1 ? " is" : "s are"} outside executable equity</strong><p>{portfolio.route_blocked_position_count > 0 ? `${portfolio.route_blocked_position_count} fresh but exit-blocked. ` : ""}{portfolio.stale_position_count > 0 ? `${portfolio.stale_position_count} dormant without a fresh market. ` : ""}Headline equity excludes {money(portfolio.excluded_invested_value_lamports, portfolio.quote_currency, portfolio.quote_decimals)} of indicative or last-known value; last-known equity is {money(portfolio.last_known_equity_lamports, portfolio.quote_currency, portfolio.quote_decimals)}.</p></div></div>}
 
@@ -1679,10 +1684,208 @@ function championEventDetail(event: ChallengerChampionEvent): string {
   return `${compact(event.common_usable_count)} shared outcomes · neither policy proved a safe advantage.`;
 }
 
-function modelFamilyLabel(family?: "linear" | "xgboost" | "deterministic"): string {
+function modelFamilyLabel(family?: "linear" | "xgboost" | "deterministic" | null): string {
   if (family === "xgboost") return "Nonlinear XGBoost";
   if (family === "deterministic") return "Deterministic policy";
-  return "Linear learner";
+  return family === "linear" ? "Linear learner" : "Legacy model";
+}
+
+function nonlinearEntryLabel(state: NonNullable<Snapshot["learning"]["nonlinear_entry"]>["state"]): string {
+  return {
+    collecting: "Collecting",
+    eligible: "Eligible",
+    testing: "In battle",
+    queued: "Proof passed",
+    qualified: "Qualified",
+    champion: "Champion",
+    active: "Active",
+    suspended: "Suspended safely",
+    linear_retained: "Linear retained",
+    proof_not_met: "Proof not met",
+  }[state];
+}
+
+function NonlinearEntryProgress({ status }: { status: NonNullable<Snapshot["learning"]["nonlinear_entry"]> }) {
+  const minimum = Math.max(1, status.minimum_training_samples);
+  const eligible = Math.max(0, status.eligible_training_count);
+  const shown = Math.min(eligible, minimum);
+  const thresholdMet = eligible >= minimum;
+  return <div className={`nonlinear-entry state-${status.state}`}>
+    <div className="nonlinear-entry-heading">
+      <span><strong>Nonlinear contender</strong><small>XGBoost · Entry only</small></span>
+      <b>{nonlinearEntryLabel(status.state)}</b>
+    </div>
+    <div className="nonlinear-entry-progress-copy">
+      <span>{thresholdMet ? `${eligible.toLocaleString()} eligible rows` : `${eligible.toLocaleString()} / ${minimum.toLocaleString()} training rows`}</span>
+      <small>{thresholdMet ? `${minimum.toLocaleString()}-row eligibility threshold met` : "Eligibility—not promotion progress"}</small>
+    </div>
+    <div className="nonlinear-entry-progress" role="progressbar" aria-label="XGBoost Entry training eligibility" aria-valuemin={0} aria-valuemax={minimum} aria-valuenow={shown}><span style={{ width: `${shown / minimum * 100}%` }} /></div>
+    <details>
+      <summary>How nonlinear Entry earns a place</summary>
+      <p>After enough exact-cohort training rows exist, XGBoost must materially beat Linear and then pass the same independent proof and Champion battle. Reaching the row threshold alone grants no influence.</p>
+      <small>Required validation improvement over Linear: {percent(status.required_linear_improvement_fraction)}.</small>
+    </details>
+  </div>;
+}
+
+function ReigningChampions({ records }: { records: ChallengerChampionRecord[] }) {
+  if (!records.length) return null;
+  return <section className="reigning-champions" aria-labelledby="reigning-champions-title">
+    <header><div><span>Current best proved</span><strong id="reigning-champions-title">Reigning Champions</strong></div><small>{records.length} / 4 skills crowned</small></header>
+    <div>
+      {records.map((record) => <article key={record.skill}>
+        <span>{CHALLENGER_SKILL_LABELS[record.skill]}</span>
+        <strong title={record.champion_version}>{record.champion_generation ? `Champion v${record.champion_generation} · ` : ""}{record.champion_codename}</strong>
+        <p><b>{record.retained_count}</b> crown {record.retained_count === 1 ? "retention" : "retentions"}{record.inconclusive_count ? ` · ${record.inconclusive_count} inconclusive` : ""}</p>
+        <small>{modelFamilyLabel(record.model_family)} · {record.influence_state === "suspended" ? "Suspended safely" : record.active || record.influence_state === "active" ? "Active" : "Shadow"}{record.crowned_at ? ` · since ${shortDate(record.crowned_at)}` : " · recorded reign predates journey history"}</small>
+      </article>)}
+    </div>
+    <p><ShieldCheck size={13} />A retention means a contender did not prove a safe replacement advantage; it is not automatically an outright win.</p>
+  </section>;
+}
+
+function championBattleOutcome(event: ChallengerChampionEvent): string {
+  if (event.kind === "first_champion") return "First Champion crowned";
+  if (event.kind === "promoted") return "New Champion earned";
+  if (event.kind === "defended") return "Crown retained";
+  return "No safe winner";
+}
+
+function championBattleHeadline(event: ChallengerChampionEvent): string {
+  const champion = event.champion_codename ?? "Saved Champion";
+  const candidate = event.candidate_codename ?? "Contender";
+  if (event.kind === "first_champion") return `${champion} was crowned`;
+  const savedChampion = event.kind === "promoted"
+    ? event.previous_champion_codename ?? "the previous Champion"
+    : champion;
+  const namesCollide = candidate === savedChampion;
+  const shownCandidate = namesCollide ? `${candidate} (contender)` : candidate;
+  const shownChampion = namesCollide ? `${savedChampion} (saved Champion)` : savedChampion;
+  if (event.kind === "promoted") {
+    return `${shownCandidate} replaced ${shownChampion}`;
+  }
+  if (event.kind === "defended") return `${shownChampion} retained the crown against ${shownCandidate}`;
+  return `${shownCandidate} did not produce a safe winner against ${shownChampion}`;
+}
+
+function ChampionBattleDialog({ event, onClose }: { event: ChallengerChampionEvent; onClose: () => void }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialog?.focus();
+    const keydown = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") {
+        keyboardEvent.preventDefault();
+        onClose();
+        return;
+      }
+      if (keyboardEvent.key !== "Tab" || !dialog) return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), summary, [href], [tabindex]:not([tabindex="-1"])')];
+      if (!focusable.length) {
+        keyboardEvent.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (keyboardEvent.shiftKey && document.activeElement === first) {
+        keyboardEvent.preventDefault();
+        last.focus();
+      } else if (!keyboardEvent.shiftKey && document.activeElement === last) {
+        keyboardEvent.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", keydown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", keydown);
+    };
+  }, [onClose]);
+  const firstChampion = event.kind === "first_champion";
+  return <div className="champion-battle-backdrop" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}>
+    <section ref={dialogRef} className="champion-battle-dialog" role="dialog" aria-modal="true" aria-labelledby="champion-battle-title" aria-describedby="champion-battle-resolution" tabIndex={-1}>
+      <header><div><span>{CHALLENGER_SKILL_LABELS[event.skill]} · {shortDateTime(event.occurred_at)}</span><strong id="champion-battle-title">{championBattleOutcome(event)}</strong></div><button type="button" onClick={onClose} aria-label="Close battle details"><X size={17} /></button></header>
+      <div className="champion-battle-body">
+        <div className={`champion-battle-result event-${event.kind}`}><Trophy size={18} /><div><strong>{championBattleHeadline(event)}</strong><small>{event.champion_generation ? `Champion v${event.champion_generation}` : "Recorded Champion event"}</small></div></div>
+        {!firstChampion && <div className="champion-battle-players">
+          <article><span>Saved Champion</span><strong>{event.previous_champion_codename ?? event.champion_codename ?? "Champion"}</strong><small>{modelFamilyLabel(event.previous_champion_model_family ?? event.champion_model_family)}</small></article>
+          <b>VS</b>
+          <article><span>Contender</span><strong>{event.candidate_codename ?? "Contender"}</strong><small>{modelFamilyLabel(event.candidate_model_family)}</small></article>
+        </div>}
+        {firstChampion ? <p className="champion-battle-first">This policy established the first recorded Champion for {CHALLENGER_SKILL_LABELS[event.skill].toLowerCase()} after passing its independent proof.</p> : <div className="champion-battle-metrics">
+          <span><small>Shared outcomes</small><strong>{event.common_usable_count.toLocaleString()}</strong><em>{event.common_observed_count.toLocaleString()} observed</em></span>
+          <span><small>Outcome coverage</small><strong>{percent(event.availability_fraction)}</strong></span>
+          <span><small>Contender mean edge</small><strong>{event.mean_uplift === null ? "Unknown" : percentSigned(event.mean_uplift)}</strong></span>
+          <span><small>Conservative floor</small><strong>{event.uplift_lower_bound === null ? "Unknown" : percentSigned(event.uplift_lower_bound)}</strong></span>
+        </div>}
+        <p className="champion-battle-resolution" id="champion-battle-resolution"><ShieldCheck size={14} />{event.resolution ?? (event.kind === "promoted" ? "The contender proved a safe replacement advantage." : event.kind === "defended" ? "The contender did not prove the safe advantage required for replacement." : event.kind === "inconclusive" ? "The battle ended without a trustworthy replacement result." : "The first Champion passed its independent proof.")}</p>
+        <details className="champion-battle-technical"><summary>Technical identities</summary><div><span><small>Champion artifact</small><strong>{event.champion_version}</strong></span>{!firstChampion && <span><small>Contender artifact</small><strong>{event.candidate_version}</strong></span>}{event.champion_recipe_version && <span><small>Champion recipe</small><strong>{event.champion_recipe_version}</strong></span>}{event.candidate_recipe_version && <span><small>Contender recipe</small><strong>{event.candidate_recipe_version}</strong></span>}</div></details>
+      </div>
+    </section>
+  </div>;
+}
+
+function ChampionJourney({ initialEvents, total, nextCursor }: { initialEvents: ChallengerChampionEvent[]; total: number; nextCursor: string | null }) {
+  const [seenEvents, setSeenEvents] = useState(initialEvents);
+  const [historyTotal, setHistoryTotal] = useState(Math.max(total, initialEvents.length));
+  const [loadedCursor, setLoadedCursor] = useState<string | null | undefined>(undefined);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<ChallengerChampionEvent | null>(null);
+  const lastTrigger = useRef<HTMLButtonElement | null>(null);
+  const requestController = useRef<AbortController | null>(null);
+  useEffect(() => () => requestController.current?.abort(), []);
+  const events = useMemo(() => {
+    const unique = new Map(seenEvents.map((event) => [event.event_id, event]));
+    initialEvents.forEach((event) => unique.set(event.event_id, event));
+    return [...unique.values()].sort((left, right) => Date.parse(right.occurred_at) - Date.parse(left.occurred_at));
+  }, [initialEvents, seenEvents]);
+  const cursor = loadedCursor === undefined ? nextCursor : loadedCursor;
+  const displayTotal = Math.max(total, historyTotal, events.length);
+  const loadOlder = async () => {
+    if (!cursor || loading) return;
+    requestController.current?.abort();
+    const controller = new AbortController();
+    requestController.current = controller;
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const page = await api.championJourney(cursor, controller.signal);
+      setSeenEvents((current) => {
+        const unique = new Map(current.map((event) => [event.event_id, event]));
+        page.events.forEach((event) => unique.set(event.event_id, event));
+        return [...unique.values()].sort((left, right) => Date.parse(right.occurred_at) - Date.parse(left.occurred_at));
+      });
+      setHistoryTotal(page.total);
+      setLoadedCursor(page.next_cursor);
+    } catch (cause) {
+      if (!controller.signal.aborted) setLoadError(friendlyError(cause));
+    } finally {
+      if (requestController.current === controller) requestController.current = null;
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  };
+  const closeBattle = useCallback(() => {
+    setSelected(null);
+    window.requestAnimationFrame(() => lastTrigger.current?.focus());
+  }, []);
+  return <>
+    {events.length > 0
+      ? <ol className="champion-journey-list" aria-label="Recent Challenger Champion battles">
+        {events.map((event) => <li key={event.event_id}>
+          <span className={`champion-journey-icon event-${event.kind}`} aria-hidden="true">{event.kind === "promoted" || event.kind === "first_champion" ? <Trophy size={14} /> : <ShieldCheck size={14} />}</span>
+          <span><small>{CHALLENGER_SKILL_LABELS[event.skill]} · {shortTime(event.occurred_at)}</small><strong title={event.champion_version}>{championBattleHeadline(event)}</strong><em>{championEventDetail(event)}</em></span>
+          <span className="champion-journey-actions"><time dateTime={event.occurred_at}>{shortDate(event.occurred_at)}</time><button type="button" onClick={(mouseEvent) => { lastTrigger.current = mouseEvent.currentTarget; setSelected(event); }}>View battle</button></span>
+        </li>)}
+      </ol>
+      : <EmptyState icon={<History size={22} />} title="No recorded Champion battles yet" copy="Existing Champions remain valid. Honest journey history begins with the next completed challenge; Signal Arcade does not invent past battles." />}
+    {(cursor || loadError) && <div className="champion-journey-more"><span>{events.length.toLocaleString()} of {displayTotal.toLocaleString()} recorded events</span>{cursor && <button className="button ghost" type="button" disabled={loading} onClick={() => void loadOlder()}>{loading ? "Loading…" : "Load older battles"}</button>}{loadError && <small role="status">{loadError}</small>}</div>}
+    <p className="champion-journey-note"><ShieldCheck size={13} />Season profit stays in Results. A Champion means safer forward proof, never guaranteed profit.</p>
+    {selected && <ChampionBattleDialog event={selected} onClose={closeBattle} />}
+  </>;
 }
 
 function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
@@ -1741,10 +1944,14 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
   const challengerTotal = learning.qualification_total ?? challengerGates.length;
   const skillStatuses = learning.skills ?? [];
   const championJourney = learning.champion_journey ?? [];
+  const championRecords = learning.champion_records ?? [];
+  const championJourneyTotal = learning.champion_journey_total ?? championJourney.length;
+  const championJourneyCursor = learning.champion_journey_next_cursor ?? null;
+  const championJourneyKey = learning.champion_journey_cohort_key
+    ?? `${snapshot.risk_mode}:${learning.latest_model?.configuration_fingerprint ?? "legacy"}:${championRecords.map((record) => record.champion_version).join(",")}`;
   const evidenceLanes = learning.evidence_lanes ?? [];
   const baselineScorecard = learning.baseline_scorecard;
   const baselinePolicy = baselineScorecard?.policy;
-  const latestChampionEvent = championJourney[0] ?? null;
   const commonForwardMinimum = learning.challenger_common_forward_minimum ?? 30;
   const minimumTournamentAvailability = learning.challenger_minimum_availability ?? 0.70;
   const activeSkillCount = Math.max(1, Object.keys(learning.active_skill_versions ?? {}).length);
@@ -1904,6 +2111,7 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
               <span><small>Best proved</small><strong title={skill.champion?.version}>{skill.champion ? `${skill.champion_generation ? `Champion v${skill.champion_generation} · ` : ""}${skill.champion.codename ?? "Champion"}` : "None yet"}</strong>{skill.champion && <em>{modelFamilyLabel(skill.champion.model_family)}</em>}</span>
               <span><small>Influence</small><strong>{skill.active_version ? "Active" : skill.state === "suspended" ? "Suspended" : "Shadow"}</strong></span>
             </div>
+            {skill.skill === "entry" && learning.nonlinear_entry && <NonlinearEntryProgress status={learning.nonlinear_entry} />}
             {!candidate?.qualified && waitingGate && <p className="challenger-waiting"><span>Waiting for evidence</span>{waitingGate.label} · {waitingGate.detail}</p>}
             {(candidate || skill.champion) && <details className="challenger-artifact-details">
               <summary>Artifact details</summary>
@@ -1919,34 +2127,28 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
         })}
       </section>}
 
+      <ReigningChampions records={championRecords} />
+
       <LearningDisclosure
         id="champion-journey-details"
         title="Champion journey"
-        subtitle="Recent honest promotions and defences for this personality"
-        summary={latestChampionEvent ? championEventTitle(latestChampionEvent) : "Waiting for first Champion"}
+        subtitle="Recent recorded battles for this personality"
+        summary={championJourneyTotal ? `${championRecords.length} reigning · ${championJourneyTotal} events` : "Waiting for first Champion"}
         open={expandedSections.has("champion_journey")}
         onToggle={() => toggleSection("champion_journey")}
       >
-        {championJourney.length > 0
-          ? <ol className="champion-journey-list" aria-label="Recent Challenger Champion milestones">
-            {championJourney.slice(0, 8).map((event) => <li key={event.event_id}>
-              <span className={`champion-journey-icon event-${event.kind}`} aria-hidden="true">{event.kind === "promoted" || event.kind === "first_champion" ? <Trophy size={14} /> : <ShieldCheck size={14} />}</span>
-              <span><small>{CHALLENGER_SKILL_LABELS[event.skill]}</small><strong title={event.champion_version}>{event.champion_generation ? `Champion v${event.champion_generation} · ` : ""}{event.champion_codename ? `${event.champion_codename} · ` : ""}{championEventTitle(event)}</strong><em>{championEventDetail(event)}</em></span>
-              <time dateTime={event.occurred_at}>{shortDate(event.occurred_at)}</time>
-            </li>)}
-          </ol>
-          : <EmptyState icon={<History size={22} />} title="No recorded Champion battles yet" copy="Existing Champions remain valid. Honest journey history begins with the next completed challenge; Signal Arcade does not invent past battles." />}
-        <p className="champion-journey-note"><ShieldCheck size={13} />Season profit stays in Results. A Champion means safer forward proof, never guaranteed profit.</p>
+        <ChampionJourney key={championJourneyKey} initialEvents={championJourney} total={championJourneyTotal} nextCursor={championJourneyCursor} />
       </LearningDisclosure>
 
       <LearningDisclosure
         id="challenger-readiness-details"
-        title="Road to influence"
-        subtitle="Authoritative proof gates from the engine"
-        summary={challengerTotal ? `${challengerPassed} / ${challengerTotal} passed` : "Collecting"}
+        title="Entry’s road to influence"
+        subtitle="Foundational activation proof from the engine"
+        summary={challengerTotal ? `Entry · ${challengerPassed} / ${challengerTotal} passed` : "Entry · collecting"}
         open={expandedSections.has("challenger_proof")}
         onToggle={() => toggleSection("challenger_proof")}
       >
+        <p className="entry-influence-note"><ShieldCheck size={14} /><span><strong>Entry is the Challenger’s foundation.</strong> It may select or reject opportunities already approved by the Baseline, but it cannot invent trades. Manipulation, Sizing and Exit can join later only after their own independent proof.</span></p>
         <ReadinessGates gates={challengerGates} emptyCopy="This running backend predates detailed proof gates; qualification remains safely server-controlled." />
       </LearningDisclosure>
 
@@ -2327,19 +2529,21 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
     {data && <div className="results-exit-insight"><ShieldCheck size={15} /><div><strong>Exit audit</strong><span>{data.summary.closed_trades === 0
       ? "Exit evidence and winner reversals will appear after the first closed trade."
       : `${data.summary.audited_exits} of ${data.summary.closed_trades} closed trade${data.summary.closed_trades === 1 ? "" : "s"} ${data.summary.closed_trades === 1 ? "includes" : "include"} saved exit evidence. ${data.summary.winner_reversals ? `${data.summary.winner_reversals} ${data.summary.winner_reversals === 1 ? "trade was" : "trades were"} positive before closing negative.` : "No winner reversals recorded."}`}</span></div></div>}
+    {!!data?.summary.invalid_results && <div className="results-audit-warning" role="alert"><AlertTriangle size={15} /><div><strong>Legacy result not counted</strong><span>{data.summary.invalid_results} preserved paper result{data.summary.invalid_results === 1 ? " has" : "s have"} impossible execution timing. It remains visible under Latest for audit and is excluded from scores and learning.</span></div></div>}
     <div className="leaderboard-table" role="table" aria-busy={loading || changingSort}>
       <div className="leaderboard-row leaderboard-head" role="row"><span>Rank</span><span>Token</span><span>Paper P/L</span><span>Fees</span><span>Held</span><span>Outcome</span><span /></div>
       {data?.rows.map((row, index) => {
         const tokenLabel = tokenDisplayLabel(row.symbol, row.mint);
-        return <div className="leaderboard-row" role="row" key={`${row.mint}-${row.status}`}>
+        const invalidExecution = row.audit_status === "invalid";
+        return <div className={`leaderboard-row${invalidExecution ? " audit-invalid" : ""}`} role="row" key={`${row.mint}-${row.status}`}>
         <span className="leader-rank">#{index + 1}</span>
         <span className="leaderboard-token"><strong title={tokenSymbolKnown(row.symbol) ? undefined : row.mint}>{tokenLabel}</strong><small>{shortMint(row.mint)} · {row.status}{row.status === "open" && row.market_status !== "active" ? ` · ${humanize(row.market_status)}` : ""}</small><MintActions mint={row.mint} symbol={row.symbol} compact /></span>
-        <span className={`leaderboard-pnl ${row.pnl_minor >= 0 ? "positive" : "negative"}`}><strong>{signedMoney(row.pnl_minor, row.quote_currency, row.quote_decimals)}</strong><small>{row.status === "open" && !row.mark_is_executable ? `conservative · ${signedMoney(row.last_known_pnl_minor, row.quote_currency, row.quote_decimals)} last known` : percentSigned(row.return_fraction)}</small><small className="leaderboard-mobile-fee">{money(row.fees_minor, row.quote_currency, row.quote_decimals)} fees</small></span>
+        <span className={`leaderboard-pnl ${invalidExecution ? "" : row.pnl_minor >= 0 ? "positive" : "negative"}`}><strong>{invalidExecution ? "Not counted" : signedMoney(row.pnl_minor, row.quote_currency, row.quote_decimals)}</strong><small>{invalidExecution ? row.audit_reason ?? "Invalid execution chronology" : row.status === "open" && !row.mark_is_executable ? `conservative · ${signedMoney(row.last_known_pnl_minor, row.quote_currency, row.quote_decimals)} last known` : percentSigned(row.return_fraction)}</small>{!invalidExecution && <small className="leaderboard-mobile-fee">{money(row.fees_minor, row.quote_currency, row.quote_decimals)} fees</small>}</span>
         <span className="leaderboard-fees">{money(row.fees_minor, row.quote_currency, row.quote_decimals)}</span>
-        <span className="leaderboard-held">{duration(row.hold_seconds)}</span>
-        <span className="leaderboard-outcome">{row.exit_assessment ? <button className="exit-review-toggle" aria-expanded={reviewingMint === row.mint} onClick={() => setReviewingMint((current) => current === row.mint ? null : row.mint)}>{humanize(row.exit_assessment.reason)}</button> : row.exit_reason ? humanize(row.exit_reason) : row.status === "open" ? "Still open" : "Closed"}</span>
+        <span className="leaderboard-held">{invalidExecution || row.hold_seconds === null ? "—" : duration(row.hold_seconds)}</span>
+        <span className="leaderboard-outcome">{invalidExecution ? "Execution audit" : row.exit_assessment ? <button className="exit-review-toggle" aria-expanded={reviewingMint === row.mint} onClick={() => setReviewingMint((current) => current === row.mint ? null : row.mint)}>{humanize(row.exit_assessment.reason)}</button> : row.exit_reason ? humanize(row.exit_reason) : row.status === "open" ? "Still open" : "Closed"}</span>
         <span className="leaderboard-actions">{row.entry_decision_id && <button className="quick-explain" onClick={() => void explainEntry(row.entry_decision_id!)} disabled={explainingId === row.entry_decision_id}>{explainingId === row.entry_decision_id ? <span className="mini-loader" /> : <Sparkles size={14} />}Why it bought</button>}</span>
-        {reviewingMint === row.mint && row.exit_assessment && <div className="leaderboard-exit-review"><div><strong>Why it sold</strong><small>{humanize(row.exit_assessment.reason)} · policy {row.exit_assessment.policy_version}</small></div><div><span>Hold support<strong>{percent(row.exit_assessment.support_score)}</strong></span><span>Best marked return<strong>{row.peak_return_fraction === null ? "—" : percentSigned(row.peak_return_fraction)}</strong></span><span>Peak profit captured<strong>{row.peak_capture_fraction === null ? "—" : percentSigned(row.peak_capture_fraction)}</strong></span><span>Entry mode<strong>{row.entry_risk_mode ? title(row.entry_risk_mode) : "Legacy"}</strong></span></div>{row.exit_assessment.evidence.length > 0 && <p>{row.exit_assessment.evidence.join(" · ")}</p>}</div>}
+        {!invalidExecution && reviewingMint === row.mint && row.exit_assessment && <div className="leaderboard-exit-review"><div><strong>Why it sold</strong><small>{humanize(row.exit_assessment.reason)} · policy {row.exit_assessment.policy_version}</small></div><div><span>Hold support<strong>{percent(row.exit_assessment.support_score)}</strong></span><span>Best marked return<strong>{row.peak_return_fraction === null ? "—" : percentSigned(row.peak_return_fraction)}</strong></span><span>Peak profit captured<strong>{row.peak_capture_fraction === null ? "—" : percentSigned(row.peak_capture_fraction)}</strong></span><span>Entry mode<strong>{row.entry_risk_mode ? title(row.entry_risk_mode) : "Legacy"}</strong></span></div>{row.exit_assessment.evidence.length > 0 && <p>{row.exit_assessment.evidence.join(" · ")}</p>}</div>}
       </div>})}
       {data !== null && data.sort === sort && !loading && !data.rows.length && <EmptyState icon={<Trophy size={22} />} title={sort === "recent" ? "No current-season trades yet" : "No closed trades this season yet"} copy={sort === "recent" ? "New paper entries will appear here with simulated fees and saved evidence." : "Choose Latest to review any open positions while completed trades continue accumulating."} />}
       {data !== null && data.sort === sort && !loading && hiddenResultRows > 0 && <div className="leaderboard-list-note">Showing {data.rows.length.toLocaleString()} of {availableRows.toLocaleString()} {sort === "recent" ? "current-season trades, newest first." : `closed trades, ${sort === "profit" ? "highest net results" : "largest net losses"} first.`}</div>}
@@ -3851,6 +4055,18 @@ function shortDate(value: string) {
   return Number.isFinite(timestamp)
     ? new Date(timestamp).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })
     : "Unknown date";
+}
+function shortTime(value: string) {
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : "Unknown time";
+}
+function shortDateTime(value: string) {
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+    : "Unknown time";
 }
 function formatBytes(value: number) {
   if (!Number.isFinite(value) || value < 0) return "—";

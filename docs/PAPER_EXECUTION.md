@@ -47,6 +47,14 @@ is not required: a real transaction can execute against unchanged on-chain reser
 other trader acts. Exit orders use their own latency. If no fresh executable state exists within
 90 seconds after eligibility, the order fails instead of inventing a fill.
 
+The bounded runtime queue may prioritize a held position over ordinary candidate traffic, but a
+per-mint slot/arrival cursor keeps that scheduling choice from reversing market chronology. A
+lower-slot event, a reordered event inside the same slot, or a same-route clock regression cannot
+change features, marks, orders, fills, learning checkpoints or AI outcomes. Once a PumpSwap route
+is verified, a late bonding-curve trade cannot replace its reserves. Broker and database invariants
+independently reject a fill before its order, configured latency or paper position; explicit
+zero-latency configurations may still produce a legitimate same-timestamp fill.
+
 Pending buys reserve an open-position slot, exposure, and account-currency cash. This prevents a
 burst of qualifying coins from bypassing the selected risk limits before their delayed fills.
 Capacity, drawdown, exposure, conversion, and available cash are checked again at fill time in
@@ -63,11 +71,18 @@ protocol fees plus simulated network and priority fees. Marks use the executable
 estimate, so opening equity immediately reflects round-trip friction.
 
 Every receipt records gross quote amount, token units, protocol fee, network fee, price impact,
-latency, source event, venue, and its assumptions. A sell receipt also freezes the full exit
+latency, triggering event, venue, and its assumptions. New receipts also embed the exact reserve
+observation time, event ID, signature, slot, source, quote mint, fee rate and integer reserve values
+used by the quote, so the execution remains reproducible after bounded raw events are pruned. A sell
+receipt also freezes the full exit
 assessment, entry mode, realized return, best executable mark, and peak return before the position
 is removed. Results can therefore explain a closed trade from immutable evidence instead of a
 reconstructed or current-state story. Older receipts remain readable and are labelled as legacy
-when that newer context is absent. Fee-free or instant fills are never implied.
+when that newer context is absent. If an upgrade finds impossible timing in the retained
+current-season receipts, the season is preserved but stopped and excluded from rankings,
+comparisons and learning until a new season begins. Completed historical season summaries remain
+preserved as originally archived because their cleared per-fill receipt stream cannot be
+retroactively reconstructed. Fee-free or instant fills are never implied.
 
 ## Accounting
 

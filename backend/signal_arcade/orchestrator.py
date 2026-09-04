@@ -368,6 +368,10 @@ class Orchestrator:
             asyncio.PriorityQueue(maxsize=settings.event_queue_max)
         )
         self._event_sequence = 0
+        # Priority protects held positions and due outcomes during public-stream bursts. Keep a
+        # separate per-mint cursor so that this scheduling optimization can never reverse market
+        # chronology for execution or learning.
+        self._event_order_by_mint: dict[str, tuple[int, int]] = {}
         self._ephemeral_event_ids: OrderedDict[str, None] = OrderedDict()
         self._max_ephemeral_event_ids = max(10_000, settings.event_queue_max * 4)
         self.events_enqueued = 0
@@ -377,6 +381,8 @@ class Orchestrator:
         self.critical_events_processed = 0
         self.events_dropped = 0
         self.expired_candidate_events = 0
+        self.reordered_events = 0
+        self.route_regression_events = 0
         self._event_batches_in_flight = 0
         self.last_event_processed_at: datetime | None = None
         self.last_source_event_at: datetime | None = None
@@ -406,6 +412,7 @@ class Orchestrator:
         self._learning_trainer_incident_active = "learning_trainer" in active_incident_scopes
         self.service_running = False
         self.running = bool(self.database.get_setting("trading_enabled", False))
+        self._paper_execution_issues = self.broker.chronology_issues()
         self.auto_new_season_enabled = bool(
             self.database.get_setting("auto_new_season_enabled", False)
         )
@@ -439,6 +446,20 @@ class Orchestrator:
             and stored_season_operation.get("state") == "running"
             and stored_season_operation.get("kind") == "profile_transition"
         )
+        if self._paper_execution_issues:
+            self.running = False
+            self.database.set_setting("trading_enabled", False)
+            self.database.record_incident(
+                scope="paper_execution_chronology",
+                severity="error",
+                title="A legacy paper result has impossible execution timing",
+                detail=(
+                    "The affected current season is preserved for audit but cannot trade, "
+                    "qualify learning, or count as a comparable result. Start a new season "
+                    "before resuming the paper engine."
+                ),
+                metadata={"issues": self._paper_execution_issues[:20]},
+            )
         if not self.broker.initialized:
             self.running = False
             self.database.set_setting("trading_enabled", False)
@@ -528,14 +549,24 @@ class Orchestrator:
         self._rebuild_features()
 
     def _rebuild_features(self) -> None:
-        seen: set[str] = set()
         events = self.database.recent_events(limit=20_000)
-        tracked_mints = set(self.broker.positions) | self.learning.pending_mints
+        tracked_mints = (
+            set(self.broker.positions) | self.learning.pending_mints | self.ai_lab.tracked_mints
+        )
         events.extend(self.database.events_for_mints(tracked_mints))
-        for event in events:
-            if event.event_id in seen:
-                continue
-            seen.add(event.event_id)
+        # ``events_for_mints`` can contribute older rows that are outside the global recent-event
+        # limit. Sorting after the union prevents those rows from overwriting the newest reserve
+        # state during restart recovery.
+        unique = {event.event_id: event for event in events}
+        ordered = sorted(
+            unique.values(),
+            key=lambda event: (
+                event.received_at,
+                event.slot if event.slot is not None else -1,
+                event.event_id,
+            ),
+        )
+        for event in ordered:
             self.solana.remember_pool_mapping(event.payload)
             is_demo_event = event.source.startswith("demo:")
             if is_demo_event == self.demo_mode:
@@ -649,10 +680,12 @@ class Orchestrator:
             self.database.set_setting("trading_enabled", False)
             self.broker.cancel_pending_orders(datetime.now(UTC), "market_source_changed")
             self.broker.reset()
+            self._paper_execution_issues = []
             self._set_auto_new_season_eligible_since(None)
             self._ui_leaderboard_cache.clear()
             self._ui_seasons_cache = None
             self.features = FeatureEngine(stale_market_seconds=self.settings.stale_market_seconds)
+            self._event_order_by_mint.clear()
             self.last_decision_at.clear()
             self.last_recorded_decision.clear()
             self.enriched_at.clear()
@@ -662,6 +695,7 @@ class Orchestrator:
             self._candidate_verification_retry_at.clear()
             self.event_counts.clear()
             await self._start_source()
+        await self._resolve_incidents_safe("paper_execution_chronology")
         await self.bus.publish(
             {
                 "type": "mode_changed",
@@ -793,6 +827,65 @@ class Orchestrator:
             return 1
         return 2
 
+    def _accept_event_order(self, event: MarketEvent, sequence: int) -> bool:
+        """Keep each token causal even when a newer critical event jumps the queue.
+
+        Solana slot is authoritative across blocks. Within one slot (and for synthetic or
+        slot-less integrations), the local enqueue sequence preserves the exact order observed by
+        this process. A higher slot remains valid after a host-clock correction even when its
+        wall-clock timestamp is slightly earlier.
+        """
+
+        mint = event.mint
+        if not mint:
+            return True
+        event_slot = event.slot or 0
+        cursor = self._event_order_by_mint.get(mint)
+        state = self.features.tokens.get(mint)
+        if cursor is None:
+            last_slot = state.last_slot if state is not None else 0
+            cursor = (last_slot, 0)
+        last_slot, last_sequence = cursor
+        same_slot_or_slotless = event_slot == 0 or last_slot == 0 or event_slot == last_slot
+        reordered = bool(
+            (event_slot > 0 and last_slot > 0 and event_slot < last_slot)
+            or (
+                same_slot_or_slotless
+                and (
+                    sequence <= last_sequence
+                    or (
+                        state is not None
+                        and state.last_event_at is not None
+                        and event.received_at < state.last_event_at
+                    )
+                )
+            )
+        )
+        if reordered:
+            self.reordered_events += 1
+            observed_at = datetime.now(UTC)
+            self._record_pipeline_recent("reordered", observed_at=observed_at)
+            self._note_integrity_mint_gap(mint, observed_at)
+            return False
+        if event_slot > last_slot:
+            self._event_order_by_mint[mint] = (event_slot, sequence)
+        else:
+            self._event_order_by_mint[mint] = (last_slot, sequence)
+        return True
+
+    def _event_regresses_verified_route(self, event: MarketEvent) -> bool:
+        """Ignore late bonding-curve trades after the executable route migrated to PumpSwap."""
+
+        if event.kind != EventKind.TRADE or not event.mint:
+            return False
+        state = self.features.tokens.get(event.mint)
+        return bool(
+            state is not None
+            and state.venue == "pump_swap"
+            and state.route_verified
+            and event.source == f"solana:{PUMP_PROGRAM}"
+        )
+
     @staticmethod
     def _durable_event(event: MarketEvent, priority: int) -> bool:
         """Keep structural and tracked evidence; candidate ticks remain bounded in memory."""
@@ -899,7 +992,7 @@ class Orchestrator:
             return
         at = observed_at or datetime.now(UTC)
         second = int(at.timestamp())
-        if kind not in {"enqueued", "processed", "shed", "expired"}:
+        if kind not in {"enqueued", "processed", "shed", "expired", "reordered"}:
             raise ValueError(f"unknown pipeline metric: {kind}")
         with self._pipeline_recent_lock:
             if not self._pipeline_recent or self._pipeline_recent[-1]["second"] != second:
@@ -910,6 +1003,7 @@ class Orchestrator:
                         "processed": 0,
                         "shed": 0,
                         "expired": 0,
+                        "reordered": 0,
                         "lag_count": 0,
                         "lag_histogram": [0] * (len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1),
                     }
@@ -956,23 +1050,33 @@ class Orchestrator:
         with self._pipeline_recent_lock:
             for window_seconds in _PIPELINE_RECENT_WINDOWS_SECONDS:
                 cutoff = now_second - window_seconds
-                buckets = [item for item in self._pipeline_recent if item["second"] >= cutoff]
-                enqueued = sum(int(item["enqueued"]) for item in buckets)
-                shed = sum(int(item["shed"]) for item in buckets)
-                expired = sum(int(item["expired"]) for item in buckets)
-                processed = sum(int(item["processed"]) for item in buckets)
+                enqueued = 0
+                processed = 0
+                shed = 0
+                expired = 0
+                reordered = 0
+                histogram = [0] * (len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1)
+                # Aggregate every selected bucket once. The prior per-field/per-histogram scans
+                # multiplied dashboard CPU and lock hold time during public-stream bursts.
+                for item in self._pipeline_recent:
+                    if item["second"] < cutoff or item["second"] > now_second:
+                        continue
+                    enqueued += int(item["enqueued"])
+                    processed += int(item["processed"])
+                    shed += int(item["shed"])
+                    expired += int(item["expired"])
+                    reordered += int(item.get("reordered", 0))
+                    for index, count in enumerate(item["lag_histogram"]):
+                        histogram[index] += int(count)
                 received = enqueued + shed
                 dropped = shed + expired
-                histogram = [
-                    sum(int(item["lag_histogram"][index]) for item in buckets)
-                    for index in range(len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1)
-                ]
                 label = "5m" if window_seconds == 300 else "1h"
                 result[label] = {
                     "received": received,
                     "processed": processed,
                     "shed": shed,
                     "expired": expired,
+                    "reordered": reordered,
                     "dropped": dropped,
                     "drop_fraction": dropped / received if received else 0.0,
                     "processing_lag_p50_seconds": self._pipeline_histogram_percentile(
@@ -1277,22 +1381,35 @@ class Orchestrator:
                         else set()
                     )
                     handled_ids: set[str] = set()
-                    for priority, _sequence, event in working_batch:
+                    for priority, sequence, event in working_batch:
                         if event.event_id in handled_ids:
                             continue
                         handled_ids.add(event.event_id)
                         durable = event.event_id in durable_ids
+                        effective_priority = self._event_priority(event)
+                        if not durable and self._durable_event(event, effective_priority):
+                            # An event may have entered as an ordinary candidate and become the
+                            # first executable tick after an order was submitted earlier in this
+                            # batch. Persist it before any fill can reference it.
+                            durable = await asyncio.to_thread(
+                                self.database.append_event,
+                                event,
+                            )
+                            if not durable:
+                                continue
                         if durable:
-                            if event.event_id not in inserted:
+                            if event.event_id not in inserted and event.event_id in durable_ids:
                                 continue
                             self.events_persisted += 1
                         else:
                             if not self._remember_ephemeral_event(event.event_id):
                                 continue
                             self.events_ephemeral += 1
-                        await self._handle_persisted_event(event)
+                        handled = await self._handle_persisted_event(event, sequence=sequence)
+                        if not handled:
+                            continue
                         self.events_processed += 1
-                        if priority == 0:
+                        if priority == 0 or effective_priority == 0:
                             self.critical_events_processed += 1
                         processed_at = datetime.now(UTC)
                         self.last_event_processed_at = processed_at
@@ -1346,25 +1463,40 @@ class Orchestrator:
             return
         inserted = await asyncio.to_thread(self.database.append_event, event)
         if inserted:
-            await self._handle_persisted_event(event)
+            self._event_sequence += 1
+            await self._handle_persisted_event(event, sequence=self._event_sequence)
 
-    async def _handle_persisted_event(self, event: MarketEvent) -> None:
+    async def _handle_persisted_event(
+        self,
+        event: MarketEvent,
+        *,
+        sequence: int | None = None,
+    ) -> bool:
         async with self._event_lock:
+            if sequence is None:
+                self._event_sequence += 1
+                sequence = self._event_sequence
+            if self._event_regresses_verified_route(event):
+                self.route_regression_events += 1
+                return False
+            if not self._accept_event_order(event, sequence):
+                return False
             self.event_counts[event.kind.value] += 1
             state = self.features.apply(event)
             if state is None:
-                return
+                return False
+            observed_at = max(event.received_at, state.last_event_at or event.received_at)
 
             is_trade = event.kind == EventKind.TRADE
             if is_trade and self.learning.has_pending_mint(state.mint):
                 await asyncio.to_thread(
                     self.learning.observe_market,
                     state,
-                    event.received_at,
+                    observed_at,
                     live=not self.demo_mode,
                 )
             if is_trade and self.ai_lab.has_pending_outcome(state.mint):
-                await asyncio.to_thread(self.ai_lab.observe_market, state, event.received_at)
+                await asyncio.to_thread(self.ai_lab.observe_market, state, observed_at)
 
             broker_tracked = bool(
                 state.mint in self.broker.positions or self.broker.has_pending_for(state.mint)
@@ -1378,7 +1510,7 @@ class Orchestrator:
             decision_cooldown_seconds = self._candidate_decision_cooldown_seconds()
             cooled_down = bool(
                 previous is None
-                or (event.received_at - previous).total_seconds() >= decision_cooldown_seconds
+                or (observed_at - previous).total_seconds() >= decision_cooldown_seconds
             )
             should_evaluate = bool(
                 self.running
@@ -1393,12 +1525,12 @@ class Orchestrator:
             # trade is wasteful: unowned candidates only need a new score after their decision
             # cooldown, while positions/pending orders still receive every executable update.
             if not broker_tracked and not should_evaluate:
-                return
-            snapshot = self.features.snapshot(state.mint, event.received_at)
+                return True
+            snapshot = self.features.snapshot(state.mint, observed_at)
             if snapshot is None:
-                return
+                return True
             integrity_window_complete = self._integrity_learning_window_complete(
-                state.mint, event.received_at
+                state.mint, observed_at
             )
             trade_buffer = snapshot.values.get("trade_buffer_saturated")
             if trade_buffer is not None and trade_buffer.value is True:
@@ -1410,7 +1542,7 @@ class Orchestrator:
                         "integrity_window_complete": DataValue(
                             value=integrity_window_complete,
                             unit="boolean",
-                            as_of=event.received_at,
+                            as_of=observed_at,
                             sources=["event_pipeline"],
                             freshness_seconds=0.0,
                             quality=1.0,
@@ -1435,7 +1567,7 @@ class Orchestrator:
                     features=snapshot,
                     event_kind=event.kind,
                     source_event_id=event.event_id,
-                    now=event.received_at,
+                    now=observed_at,
                     mode=self.risk_mode,
                     sol_usd_price=sol_usd_price,
                     soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
@@ -1446,7 +1578,7 @@ class Orchestrator:
                     self.broker.observe_market_state,
                     state=state,
                     features=snapshot,
-                    now=event.received_at,
+                    now=observed_at,
                     sol_usd_price=sol_usd_price,
                 )
             else:
@@ -1553,7 +1685,7 @@ class Orchestrator:
                     self.last_recorded_decision[state.mint] = decision
                 if baseline_entry_actionable and integrity_learning_eligible:
                     self.ai_lab.enqueue_shadow(baseline_decision, state)
-                self.last_decision_at[state.mint] = event.received_at
+                self.last_decision_at[state.mint] = observed_at
             if decision is not None or order is not None or receipts:
                 await self.bus.publish(
                     {
@@ -1563,6 +1695,7 @@ class Orchestrator:
                         "fill_ids": [receipt.fill_id for receipt in receipts],
                     }
                 )
+            return True
 
     def _should_record_decision(self, decision: Decision) -> bool:
         """Keep meaningful checkpoints without duplicating an unchanged full snapshot."""
@@ -1746,10 +1879,29 @@ class Orchestrator:
         execution_mints.update(order.mint for order in self.broker.pending.values())
         keep_mints = set(execution_mints)
         keep_mints.update(self.learning.pending_mints)
+        keep_mints.update(self.ai_lab.tracked_mints)
         inactive_before = now - timedelta(minutes=self.settings.candidate_window_minutes)
         removed = self.features.prune(inactive_before, keep_mints)
         if removed:
-            current_mints = self.features.tokens
+            current_mints = set(self.features.tokens)
+            # Every per-candidate cache follows the same bounded lifecycle as feature state.
+            # Otherwise a high-volume public stream would prune token windows but retain an
+            # unbounded chronology/cooldown index for every mint ever observed.
+            self._event_order_by_mint = {
+                mint: value
+                for mint, value in self._event_order_by_mint.items()
+                if mint in current_mints
+            }
+            self.last_decision_at = {
+                mint: value
+                for mint, value in self.last_decision_at.items()
+                if mint in current_mints
+            }
+            self.last_recorded_decision = {
+                mint: value
+                for mint, value in self.last_recorded_decision.items()
+                if mint in current_mints
+            }
             self.enriched_at = defaultdict(
                 lambda: None,
                 {mint: value for mint, value in self.enriched_at.items() if mint in current_mints},
@@ -3241,6 +3393,12 @@ class Orchestrator:
         portfolio: PortfolioSnapshot,
         now: datetime,
     ) -> tuple[str, str, bool]:
+        if self._paper_execution_issues:
+            return (
+                "execution_audit_required",
+                "Start a new season; this preserved season contains an impossible legacy fill.",
+                False,
+            )
         if self._maintenance_requested:
             return (
                 "maintenance",
@@ -4441,6 +4599,7 @@ class Orchestrator:
                     profile.model_dump(mode="json"),
                 )
                 self.running = False
+                self._paper_execution_issues = []
                 self.risk_mode = selected_mode
                 self.learning.set_risk_mode(selected_mode)
                 await asyncio.to_thread(
@@ -4471,6 +4630,11 @@ class Orchestrator:
     async def resume_trading(self) -> None:
         if not self.broker.initialized:
             raise ValueError("create a paper bankroll before starting")
+        if self._paper_execution_issues:
+            raise ValueError(
+                "start a new season before resuming; this preserved season has an impossible "
+                "legacy paper-execution timestamp"
+            )
         if self.running:
             return
         operation = await self._begin_season_operation(
@@ -4654,6 +4818,8 @@ class Orchestrator:
             reasons.append("worker_recovering")
         if recent_drop:
             reasons.append("recent_candidate_shedding")
+        if self._paper_execution_issues:
+            reasons.append("paper_execution_quarantined")
         return {
             "queue_depth": depth,
             "queue_capacity": capacity,
@@ -4669,6 +4835,8 @@ class Orchestrator:
                 self.events_dropped - self.expired_candidate_events,
             ),
             "expired_candidate_events": self.expired_candidate_events,
+            "reordered_events": self.reordered_events,
+            "route_regression_events": self.route_regression_events,
             "last_processed_at": (
                 self.last_event_processed_at.isoformat() if self.last_event_processed_at else None
             ),
@@ -4760,6 +4928,10 @@ class Orchestrator:
             "server_time": server_time.isoformat(),
             "demo_mode": self.demo_mode,
             "paper_only": True,
+            "paper_execution_audit": {
+                "status": "quarantined" if self._paper_execution_issues else "verified",
+                "issues": list(self._paper_execution_issues),
+            },
             "risk_mode": self.risk_mode.value,
             "season_profile": self.broker.season_profile,
             "season_profile_provenance": (
@@ -5192,6 +5364,10 @@ class Orchestrator:
     ) -> dict[str, Any]:
         fills = self.database.list_fills(100_000)
         orders = {order.order_id: order for order in self.database.list_orders()}
+        chronology_issues = self.broker.chronology_issues(fills=fills)
+        issues_by_mint: dict[str, list[str]] = defaultdict(list)
+        for issue in chronology_issues:
+            issues_by_mint[str(issue["mint"])].append(str(issue["reason"]))
         buys = {fill.mint: fill for fill in fills if fill.side.value == "buy"}
         sells = {fill.mint: fill for fill in fills if fill.side.value == "sell"}
         position_rows = (
@@ -5234,6 +5410,15 @@ class Orchestrator:
             peak_profit = (
                 max(0, sell.peak_account_minor - buy.account_net_minor) if sell is not None else 0
             )
+            audit_reasons = issues_by_mint.get(mint, [])
+            audit_status = (
+                "invalid"
+                if audit_reasons
+                else "legacy_unverified"
+                if buy.reserve_snapshot is None
+                or (sell is not None and sell.reserve_snapshot is None)
+                else "verified"
+            )
             rows.append(
                 {
                     "mint": mint,
@@ -5250,10 +5435,14 @@ class Orchestrator:
                     "opened_at": buy.filled_at.isoformat(),
                     "closed_at": ended_at.isoformat() if ended_at else None,
                     "hold_seconds": (
-                        max(0.0, (ended_at - buy.filled_at).total_seconds())
+                        None
+                        if audit_status == "invalid"
+                        else (ended_at - buy.filled_at).total_seconds()
                         if ended_at
                         else max(0.0, (datetime.now(UTC) - buy.filled_at).total_seconds())
                     ),
+                    "audit_status": audit_status,
+                    "audit_reason": audit_reasons[0] if audit_reasons else None,
                     "exit_reason": exit_reason,
                     "exit_assessment": (
                         sell.exit_assessment.model_dump(mode="json")
@@ -5284,7 +5473,8 @@ class Orchestrator:
                 }
             )
         closed = [row for row in rows if row["status"] == "closed"]
-        visible_rows = rows if sort == "recent" else closed
+        valid_closed = [row for row in closed if row["audit_status"] != "invalid"]
+        visible_rows = rows if sort == "recent" else valid_closed
         key = (
             (lambda row: row["pnl_minor"])
             if sort in {"profit", "loss"}
@@ -5297,7 +5487,7 @@ class Orchestrator:
         )
         peak_captures = [
             row["peak_capture_fraction"]
-            for row in closed
+            for row in valid_closed
             if row["peak_capture_fraction"] is not None
         ]
         return {
@@ -5305,22 +5495,28 @@ class Orchestrator:
             "rows": visible_rows[:limit],
             "available_rows": len(visible_rows),
             "summary": {
-                "closed_trades": len(closed),
+                "closed_trades": len(valid_closed),
                 "open_trades": sum(row["status"] == "open" for row in rows),
-                "wins": sum(row["pnl_minor"] > 0 for row in closed),
-                "losses": sum(row["pnl_minor"] < 0 for row in closed),
-                "total_realized_pnl_minor": sum(row["pnl_minor"] for row in closed),
-                "audited_exits": sum(row["exit_assessment"] is not None for row in closed),
+                "wins": sum(row["pnl_minor"] > 0 for row in valid_closed),
+                "losses": sum(row["pnl_minor"] < 0 for row in valid_closed),
+                "total_realized_pnl_minor": sum(row["pnl_minor"] for row in valid_closed),
+                "invalid_results": len(closed) - len(valid_closed),
+                "legacy_unverified_results": sum(
+                    row["audit_status"] == "legacy_unverified" for row in valid_closed
+                ),
+                "audited_exits": sum(row["exit_assessment"] is not None for row in valid_closed),
                 "winner_reversals": sum(
                     row["peak_return_fraction"] is not None
                     and row["peak_return_fraction"] > 0
                     and row["pnl_minor"] < 0
-                    for row in closed
+                    for row in valid_closed
                 ),
                 "average_peak_capture_fraction": (
                     sum(peak_captures) / len(peak_captures) if peak_captures else None
                 ),
-                "total_fees_minor": sum(row["fees_minor"] for row in rows),
+                "total_fees_minor": sum(
+                    row["fees_minor"] for row in rows if row["audit_status"] != "invalid"
+                ),
                 "quote_currency": result_currency,
                 "quote_decimals": result_decimals,
             },
@@ -5397,6 +5593,7 @@ class Orchestrator:
             # Archiving a season is atomic but may briefly wait behind a bounded maintenance
             # writer on a long-running database. Never make that wait freeze health or polling.
             await asyncio.to_thread(self.broker.reset)
+            self._paper_execution_issues = []
             self._auto_new_season_eligible_since = None
             self._auto_new_season_paused_since = None
             self._auto_new_season_last_observed_at = None
@@ -5405,6 +5602,7 @@ class Orchestrator:
             self.last_recorded_decision.clear()
             self._ui_leaderboard_cache.clear()
             self._ui_seasons_cache = None
+        await self._resolve_incidents_safe("paper_execution_chronology")
 
     async def reset_portfolio(self) -> None:
         await self.pause_trading()

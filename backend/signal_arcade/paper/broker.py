@@ -22,6 +22,7 @@ from ..models import (
     Decision,
     DecisionAction,
     EventKind,
+    ExecutionReserveSnapshot,
     FeatureSnapshot,
     FillReceipt,
     LearningEvidenceEpisode,
@@ -314,6 +315,7 @@ class PaperBroker:
             side=Side.BUY,
             requested_sol_lamports=request,
             reserved_account_minor=required,
+            created_at=decision.created_at,
             fill_after=decision.created_at + timedelta(milliseconds=self.settings.entry_latency_ms),
             risk_mode_at_entry=decision.risk_mode,
             baseline_version_at_entry=decision.model_version.split("+", maxsplit=1)[0],
@@ -780,7 +782,12 @@ class PaperBroker:
             self._mark_timestamp(state, features, now),
         )
         for order in list(self.pending.values()):
-            if order.mint != state.mint or now < order.fill_after:
+            if order.mint != state.mint or now < order.created_at or now < order.fill_after:
+                continue
+            sell_position = self.positions.get(order.mint) if order.side == Side.SELL else None
+            if sell_position is not None and now < sell_position.opened_at:
+                # A priority queue may deliver a retained older candidate after a critical tick.
+                # It must never fill an exit before the position existed.
                 continue
             unfillable = UNFILLABLE_BUY_FLAGS if order.side == Side.BUY else UNFILLABLE_SELL_FLAGS
             if any(flag in unfillable for flag in features.hard_flags):
@@ -966,6 +973,8 @@ class PaperBroker:
         now: datetime,
         sol_usd_price: float | None,
     ) -> FillReceipt | None:
+        if now < order.created_at or now < order.fill_after:
+            return None
         network = self.settings.network_fee_lamports + self.settings.priority_fee_lamports
         fee_bps = state.fee_bps or self.settings.pump_fee_bps
         sell_position: Position | None = None
@@ -983,6 +992,8 @@ class PaperBroker:
                 sell_position = self.positions.get(order.mint)
                 if sell_position is None:
                     raise ValueError("position no longer exists")
+                if now < sell_position.opened_at:
+                    return None
                 quote = quote_sell(
                     virtual_token_reserves=state.virtual_token_reserves,
                     virtual_sol_reserves=state.virtual_quote_reserves,
@@ -1040,6 +1051,20 @@ class PaperBroker:
             latency_ms=max(0, int((now - order.created_at).total_seconds() * 1000)),
             source_event_id=source_event_id,
             venue=state.venue,
+            reserve_snapshot=ExecutionReserveSnapshot(
+                observed_at=state.last_reserve_at or state.last_event_at or now,
+                event_id=state.last_reserve_event_id,
+                signature=state.last_reserve_signature,
+                slot=state.last_reserve_slot,
+                source=state.reserve_source or "unknown",
+                venue=state.venue,
+                quote_mint=state.quote_mint,
+                virtual_token_reserves=state.virtual_token_reserves,
+                virtual_quote_reserves=state.virtual_quote_reserves,
+                real_token_reserves=state.real_token_reserves,
+                real_quote_reserves=state.real_quote_reserves,
+                fee_bps=fee_bps,
+            ),
             assumptions=[
                 *(
                     [order.failure_reason]
@@ -1072,7 +1097,10 @@ class PaperBroker:
             peak_return_fraction=(
                 max(-1.0, min(10.0, peak_return)) if peak_return is not None else None
             ),
-            **account_values,
+            account_gross_minor=account_values["account_gross_minor"],
+            account_protocol_fee_minor=account_values["account_protocol_fee_minor"],
+            account_network_fee_minor=account_values["account_network_fee_minor"],
+            account_net_minor=account_values["account_net_minor"],
         )
         filled_order = order.model_copy(update={"status": OrderStatus.FILLED, "filled_at": now})
         if order.side == Side.BUY:
@@ -1081,7 +1109,10 @@ class PaperBroker:
                 state,
                 features,
                 sol_usd_price,
-                self._mark_timestamp(state, features, now),
+                # The entry just executed at ``now`` against this still-fresh reserve snapshot.
+                # Its initial sell-side mark therefore begins at the position boundary even when
+                # an idle pool's latest reserve event predates the configured order latency.
+                now,
             )
         else:
             self._account_sell(filled_order, receipt)
@@ -1316,6 +1347,11 @@ class PaperBroker:
         position = self.positions.get(state.mint)
         if position is None:
             return
+        effective_marked_at = marked_at or state.last_event_at or datetime.now(UTC)
+        if effective_marked_at < position.opened_at or (
+            position.last_marked_at is not None and effective_marked_at < position.last_marked_at
+        ):
+            return
         position.venue = state.venue
         position.curve_address = state.curve_address
         position.pool_address = state.pool_address
@@ -1348,7 +1384,7 @@ class PaperBroker:
             position.unrealized_pnl_lamports = (
                 position.last_mark_lamports - position.entry_cost_lamports
             )
-            position.last_marked_at = marked_at or state.last_event_at or datetime.now(UTC)
+            position.last_marked_at = effective_marked_at
             position.mark_age_seconds = 0
             position.mark_is_stale = False
         except ValueError as exc:
@@ -1404,6 +1440,8 @@ class PaperBroker:
     ) -> None:
         position = self.positions.get(state.mint)
         if position is None or self.has_pending_for(state.mint, Side.SELL):
+            return
+        if now < position.opened_at:
             return
         limits = self._position_exit_limits(position, mode)
         integrity_exit_reason = self._persistent_integrity_exit_reason(
@@ -1788,11 +1826,20 @@ class PaperBroker:
 
         portfolio = self.snapshot(persist_peak=False)
         fills = self.database.list_fills(100_000)
+        chronology_issues = self.chronology_issues(fills=fills)
+        invalid_fill_ids = {
+            str(issue["fill_id"]) for issue in chronology_issues if issue.get("fill_id") is not None
+        }
         buys = {fill.mint: fill for fill in fills if fill.side == Side.BUY}
         closed_pnl = [
             fill.account_net_minor - buys[fill.mint].account_net_minor
             for fill in fills
-            if fill.side == Side.SELL and fill.mint in buys
+            if (
+                fill.side == Side.SELL
+                and fill.mint in buys
+                and fill.fill_id not in invalid_fill_ids
+                and buys[fill.mint].fill_id not in invalid_fill_ids
+            )
         ]
         total_fees = sum(
             fill.account_protocol_fee_minor + fill.account_network_fee_minor for fill in fills
@@ -1817,7 +1864,75 @@ class PaperBroker:
             # A durable position is itself evidence of a filled entry. Keeping that invariant in
             # the summary also makes recovery resilient to a partially imported legacy fill log.
             "meaningful_activity": bool(buys or portfolio.positions or closed_pnl),
+            "execution_audit_issue_count": len(chronology_issues),
         }
+
+    def chronology_issues(
+        self,
+        *,
+        fills: list[FillReceipt] | None = None,
+    ) -> list[dict[str, str]]:
+        """Find impossible current-season paper chronology without rewriting its audit trail."""
+
+        current_fills = fills if fills is not None else self.database.list_fills(100_000)
+        orders = {order.order_id: order for order in self.database.list_orders()}
+        ordered_fills = sorted(current_fills, key=lambda item: (item.filled_at, item.fill_id))
+        # Build entry lookup independently from the scan. A valid zero-latency sell may share the
+        # buy timestamp; random receipt IDs must never decide whether that sell has an entry.
+        buys: dict[str, FillReceipt] = {}
+        for fill in ordered_fills:
+            if fill.side == Side.BUY:
+                buys.setdefault(fill.mint, fill)
+        issues: list[dict[str, str]] = []
+        for fill in ordered_fills:
+            order = orders.get(fill.order_id)
+            reason: str | None = None
+            if order is None:
+                reason = "matching paper order is unavailable"
+            elif order.mint != fill.mint or order.side != fill.side:
+                reason = "fill does not match its paper order"
+            elif order.status != OrderStatus.FILLED:
+                reason = "paper order is not recorded as filled"
+            elif order.fill_after < order.created_at:
+                reason = "paper order latency boundary predates creation"
+            elif order.filled_at is None or order.filled_at != fill.filled_at:
+                reason = "filled order and receipt disagree on execution time"
+            elif fill.filled_at < order.created_at:
+                reason = "fill predates its paper order"
+            elif fill.filled_at < order.fill_after:
+                reason = "fill predates configured execution latency"
+            elif (
+                fill.reserve_snapshot is not None
+                and fill.reserve_snapshot.observed_at > fill.filled_at
+            ):
+                reason = "fill uses a reserve observation from the future"
+            elif fill.reserve_snapshot is not None and fill.reserve_snapshot.venue != fill.venue:
+                reason = "fill venue does not match its reserve observation"
+            elif fill.side == Side.SELL:
+                entry = buys.get(fill.mint)
+                opened_at = fill.position_opened_at or (entry.filled_at if entry else None)
+                if entry is None:
+                    reason = "sell has no preceding current-season buy"
+                elif (
+                    fill.position_opened_at is not None
+                    and fill.position_opened_at != entry.filled_at
+                ):
+                    reason = "sell does not reference its entry boundary"
+                elif opened_at is not None and fill.filled_at < opened_at:
+                    reason = "sell predates its paper position"
+                elif fill.filled_at < entry.filled_at:
+                    reason = "sell predates its entry fill"
+            if reason is not None:
+                issues.append(
+                    {
+                        "fill_id": fill.fill_id,
+                        "order_id": fill.order_id,
+                        "mint": fill.mint,
+                        "side": fill.side.value,
+                        "reason": reason,
+                    }
+                )
+        return issues
 
     def reset(self) -> None:
         summary = self.season_summary() if self.initialized else None
@@ -1825,10 +1940,11 @@ class PaperBroker:
         unresolved = (
             self.unresolved_position_records(now, reason="manual_reset") if self.initialized else []
         )
+        chronology_issues = self.chronology_issues() if self.initialized else []
         self.database.reset_paper_state(
             summary,
             unresolved_positions=unresolved,
-            comparable=not unresolved,
+            comparable=not unresolved and not chronology_issues,
         )
         self._refresh_unresolved_evidence(unresolved)
         self.positions.clear()
@@ -1875,6 +1991,7 @@ class PaperBroker:
         if resolved_profile is not None:
             resolved_profile["locked_at"] = now.isoformat() if next_running else None
         summary = self.season_summary()
+        chronology_issues = self.chronology_issues()
         unresolved = self.unresolved_position_records(
             now,
             reason=terminal_reason,
@@ -1893,7 +2010,7 @@ class PaperBroker:
             # The database distinguishes confirmed write-offs from genuinely unknown
             # inventory.  A confirmed write-off is a real paper outcome and may remain
             # comparable; only unknown inventory makes the boundary incomplete.
-            comparable=comparable,
+            comparable=comparable and not chronology_issues,
         )
         self._refresh_unresolved_evidence(unresolved)
         self.positions.clear()

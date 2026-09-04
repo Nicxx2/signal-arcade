@@ -174,6 +174,21 @@ export interface Fill {
   price_impact_fraction: number;
   latency_ms: number;
   venue: string;
+  execution_model_version?: string;
+  reserve_snapshot?: {
+    observed_at: string;
+    event_id: string | null;
+    signature: string | null;
+    slot: number;
+    source: string;
+    venue: string;
+    quote_mint: string;
+    virtual_token_reserves: number;
+    virtual_quote_reserves: number;
+    real_token_reserves: number;
+    real_quote_reserves: number | null;
+    fee_bps: number;
+  } | null;
   assumptions: string[];
   account_currency: QuoteCurrency;
   account_decimals: number;
@@ -406,6 +421,43 @@ export interface ChallengerChampionEvent {
   availability_fraction: number;
   mean_uplift: number | null;
   uplift_lower_bound: number | null;
+  candidate_model_family?: "linear" | "xgboost" | "deterministic" | null;
+  candidate_recipe_version?: string | null;
+  champion_model_family?: "linear" | "xgboost" | "deterministic" | null;
+  champion_recipe_version?: string | null;
+  previous_champion_model_family?: "linear" | "xgboost" | "deterministic" | null;
+  resolution?: string;
+}
+
+export interface ChallengerChampionRecord {
+  skill: ChallengerSkillStatus["skill"];
+  champion_version: string;
+  champion_codename: string;
+  champion_generation: number | null;
+  model_family: "linear" | "xgboost" | "deterministic" | null;
+  recipe_version: string | null;
+  crowned_at: string | null;
+  retained_count: number;
+  inconclusive_count: number;
+  recorded_battle_count: number;
+  active: boolean;
+  influence_state?: "active" | "shadow" | "suspended";
+  history_complete: boolean;
+}
+
+export interface ChallengerJourneyPage {
+  events: ChallengerChampionEvent[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface NonlinearEntryStatus {
+  state: "collecting" | "eligible" | "testing" | "queued" | "qualified" | "champion" | "active" | "suspended" | "linear_retained" | "proof_not_met";
+  eligible_training_count: number;
+  minimum_training_samples: number;
+  required_linear_improvement_fraction: number;
+  latest_artifact: ChallengerSkillStatus["latest_candidate"];
+  entry_only: true;
 }
 
 export interface LearningStatus {
@@ -482,7 +534,12 @@ export interface LearningStatus {
   consent_granted?: boolean;
   active_skill_versions?: Partial<Record<"entry" | "manipulation" | "sizing" | "exit", string>>;
   skills?: ChallengerSkillStatus[];
+  nonlinear_entry?: NonlinearEntryStatus;
+  champion_records?: ChallengerChampionRecord[];
   champion_journey?: ChallengerChampionEvent[];
+  champion_journey_total?: number;
+  champion_journey_next_cursor?: string | null;
+  champion_journey_cohort_key?: string | null;
   evidence_lanes?: Array<{
     id: "discovery" | "policy" | "execution";
     label: string;
@@ -805,7 +862,9 @@ export interface LeaderboardRow {
   fees_minor: number;
   opened_at: string;
   closed_at: string | null;
-  hold_seconds: number;
+  hold_seconds: number | null;
+  audit_status?: "verified" | "legacy_unverified" | "invalid";
+  audit_reason?: string | null;
   exit_reason: string | null;
   exit_assessment: ExitAssessment | null;
   peak_return_fraction: number | null;
@@ -829,6 +888,8 @@ export interface Leaderboard {
     wins: number;
     losses: number;
     total_realized_pnl_minor: number;
+    invalid_results?: number;
+    legacy_unverified_results?: number;
     audited_exits: number;
     winner_reversals: number;
     average_peak_capture_fraction: number | null;
@@ -1007,6 +1068,16 @@ export interface Snapshot {
   snapshot_age_seconds?: number;
   demo_mode: boolean;
   paper_only: boolean;
+  paper_execution_audit?: {
+    status: "verified" | "quarantined";
+    issues: Array<{
+      fill_id: string;
+      order_id: string;
+      mint: string;
+      side: "buy" | "sell";
+      reason: string;
+    }>;
+  };
   risk_mode: RiskMode;
   season_profile: SeasonProfile | null;
   season_profile_provenance: "exact" | "legacy_unknown";
@@ -1027,6 +1098,8 @@ export interface Snapshot {
     dropped: number;
     shed_candidate_events?: number;
     expired_candidate_events?: number;
+    reordered_events?: number;
+    route_regression_events?: number;
     queue_utilization: number;
     last_processed_at: string | null;
     last_source_event_at: string | null;
@@ -1038,6 +1111,7 @@ export interface Snapshot {
         processed: number;
         shed: number;
         expired: number;
+        reordered?: number;
         dropped: number;
         drop_fraction: number;
         processing_lag_p50_seconds: number;

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -19,11 +20,14 @@ from signal_arcade.models import (
     FeatureSnapshot,
     IntegrityAssessment,
     MarketIntegrityState,
+    PaperOrder,
     Position,
     QuoteCurrency,
     RiskMode,
+    Side,
     SizingAssessment,
 )
+from signal_arcade.orchestrator import Orchestrator
 from signal_arcade.paper.broker import EQUITY_PEAK_BASIS, PaperBroker
 from signal_arcade.strategy import (
     BASELINE_VERSION,
@@ -198,6 +202,8 @@ def test_order_fills_only_on_eligible_future_state(settings) -> None:  # type: i
     )
     assert len(receipts) == 1
     assert receipts[0].source_event_id == "future-event"
+    assert receipts[0].reserve_snapshot is not None
+    assert receipts[0].reserve_snapshot.virtual_quote_reserves == 30_000_000_000
     assert broker.cash_lamports < broker.starting_lamports
     assert "mint" in broker.positions
     assert database.ledger_balance("cash") == broker.cash_lamports
@@ -205,6 +211,202 @@ def test_order_fills_only_on_eligible_future_state(settings) -> None:  # type: i
     database.delete_position(position.position_id)
     assert broker.submit_decision(make_decision(now + timedelta(seconds=30))) is None
     database.close()
+
+
+def test_older_market_time_cannot_mark_or_sell_a_newer_position(
+    settings, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    settings.exit_latency_ms = 1_100
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    started_at = datetime.now(UTC)
+    buy_order = broker.submit_decision(make_decision(started_at))
+    assert buy_order is not None
+    entry_at = started_at + timedelta(seconds=10)
+    state = TokenState(
+        mint="mint",
+        symbol="TEST",
+        last_event_at=entry_at,
+        last_reserve_at=entry_at,
+        last_reserve_slot=100,
+        last_reserve_event_id="entry-reserve",
+        reserve_source="test",
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+    entry = broker.process_due_orders(
+        state=state,
+        features=make_features(entry_at),
+        source_event_id="entry-event",
+        now=entry_at,
+        mode=RiskMode.BALANCED,
+    )
+    assert len(entry) == 1
+    position = broker.positions["mint"]
+    prior_marked_at = position.last_marked_at
+    sell_order = PaperOrder(
+        order_id="sell-after-entry",
+        mint="mint",
+        symbol="TEST",
+        side=Side.SELL,
+        requested_token_units=position.token_units,
+        created_at=entry_at + timedelta(milliseconds=100),
+        fill_after=entry_at + timedelta(milliseconds=1_200),
+    )
+    broker.pending[sell_order.order_id] = sell_order
+    database.save_order(sell_order)
+
+    old_time = started_at + timedelta(seconds=2)
+    assert (
+        broker.process_due_orders(
+            state=state,
+            features=make_features(old_time),
+            source_event_id="older-event",
+            now=old_time,
+            mode=RiskMode.BALANCED,
+        )
+        == []
+    )
+    assert broker.positions["mint"].last_marked_at == prior_marked_at
+    assert sell_order.order_id in broker.pending
+
+    exit_at = entry_at + timedelta(seconds=2)
+    state.last_event_at = exit_at
+    state.last_reserve_at = exit_at
+    state.last_reserve_event_id = "exit-reserve"
+    exited = broker.process_due_orders(
+        state=state,
+        features=make_features(exit_at),
+        source_event_id="exit-event",
+        now=exit_at,
+        mode=RiskMode.BALANCED,
+    )
+    assert len(exited) == 1
+    assert exited[0].filled_at >= position.opened_at
+    assert exited[0].latency_ms >= settings.exit_latency_ms
+    assert broker.chronology_issues() == []
+    impossible_exit = exited[0].model_copy(
+        update={"filled_at": position.opened_at - timedelta(seconds=1)}
+    )
+    issues = broker.chronology_issues(fills=[entry[0], impossible_exit])
+    assert any(
+        issue["reason"] == "filled order and receipt disagree on execution time" for issue in issues
+    )
+    saved_sell = next(
+        order for order in database.list_orders() if order.order_id == exited[0].order_id
+    )
+    impossible_order = saved_sell.model_copy(update={"filled_at": impossible_exit.filled_at})
+    with pytest.raises(ValueError, match="predate"):
+        database._validate_fill_commit(  # noqa: SLF001
+            impossible_order,
+            impossible_exit,
+            position=position,
+        )
+
+    # Exact timestamp ties are valid with an explicit zero-latency configuration. Receipt UUID
+    # ordering must not make the sell appear to precede its entry.
+    saved_buy = next(
+        order for order in database.list_orders() if order.order_id == buy_order.order_id
+    )
+    tied_buy_order = saved_buy.model_copy(update={"filled_at": exit_at})
+    tied_buy = entry[0].model_copy(update={"fill_id": "z-entry", "filled_at": exit_at})
+    tied_sell = exited[0].model_copy(
+        update={"fill_id": "a-exit", "filled_at": exit_at, "position_opened_at": exit_at}
+    )
+    monkeypatch.setattr(database, "list_orders", lambda: [tied_buy_order, saved_sell])
+    assert broker.chronology_issues(fills=[tied_sell, tied_buy]) == []
+
+    mismatched_order = saved_sell.model_copy(
+        update={"filled_at": exited[0].filled_at + timedelta(microseconds=1)}
+    )
+    with pytest.raises(ValueError, match="share one execution time"):
+        database._validate_fill_commit(  # noqa: SLF001
+            mismatched_order,
+            exited[0],
+            position=position,
+        )
+    assert exited[0].reserve_snapshot is not None
+    future_reserve = exited[0].model_copy(
+        update={
+            "reserve_snapshot": exited[0].reserve_snapshot.model_copy(
+                update={"observed_at": exited[0].filled_at + timedelta(microseconds=1)}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="reserve observation from the future"):
+        database._validate_fill_commit(  # noqa: SLF001
+            saved_sell,
+            future_reserve,
+            position=position,
+        )
+    database.close()
+
+
+def test_upgrade_quarantines_an_impossible_legacy_fill(settings) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    broker = make_broker(database, settings)
+    now = datetime.now(UTC)
+    assert broker.submit_decision(make_decision(now)) is not None
+    state = TokenState(
+        mint="mint",
+        symbol="TEST",
+        last_event_at=now,
+        last_reserve_at=now,
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_quote_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+    )
+    entry = broker.process_due_orders(
+        state=state,
+        features=make_features(now),
+        source_event_id="entry",
+        now=now,
+        mode=RiskMode.BALANCED,
+    )[0]
+    position = broker.positions["mint"]
+    sell = PaperOrder(
+        order_id="legacy-sell",
+        mint="mint",
+        symbol="TEST",
+        side=Side.SELL,
+        requested_token_units=position.token_units,
+        created_at=now + timedelta(seconds=1),
+        fill_after=now + timedelta(seconds=1),
+    )
+    broker.pending[sell.order_id] = sell
+    database.save_order(sell)
+    state.last_event_at = now + timedelta(seconds=1)
+    state.last_reserve_at = now + timedelta(seconds=1)
+    exit_receipt = broker.process_due_orders(
+        state=state,
+        features=make_features(now + timedelta(seconds=1)),
+        source_event_id="exit",
+        now=now + timedelta(seconds=1),
+        mode=RiskMode.BALANCED,
+    )[0]
+    impossible_at = entry.filled_at - timedelta(seconds=1)
+    impossible = exit_receipt.model_copy(update={"filled_at": impossible_at})
+    with database._lock, database._conn:  # noqa: SLF001 - simulate a pre-fix immutable receipt
+        database._conn.execute(  # noqa: SLF001
+            "UPDATE fills SET filled_at=?,record_json=? WHERE fill_id=?",
+            (impossible_at.isoformat(), impossible.model_dump_json(), impossible.fill_id),
+        )
+    database.set_setting("trading_enabled", True)
+    database.close()
+
+    recovered = Orchestrator(settings)
+    assert recovered.running is False
+    assert recovered._paper_execution_issues  # noqa: SLF001
+    assert "paper_execution_quarantined" in recovered.event_pipeline_status()["degraded_reasons"]
+    with pytest.raises(ValueError, match="start a new season"):
+        asyncio.run(recovered.resume_trading())
+    assert any(
+        incident.scope == "paper_execution_chronology"
+        for incident in recovered.database.list_incidents(20)
+    )
+    asyncio.run(recovered.http.close())
+    recovered.database.close()
 
 
 def test_pending_order_recovers_after_restart(settings) -> None:  # type: ignore[no-untyped-def]

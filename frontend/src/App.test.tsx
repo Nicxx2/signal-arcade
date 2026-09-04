@@ -748,7 +748,7 @@ test("keeps detailed learning evidence tidy until requested", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   const evidenceToggle = screen.getByRole("button", { name: "Show learning evidence" });
-  const proofToggle = screen.getByRole("button", { name: "Show road to influence" });
+  const proofToggle = screen.getByRole("button", { name: "Show entry’s road to influence" });
   const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
   expect(evidenceToggle).toHaveAttribute("aria-expanded", "false");
   expect(proofToggle).toHaveAttribute("aria-expanded", "false");
@@ -819,7 +819,7 @@ test("migrates the old Learning layout to a clean collapsed Overview", async () 
 
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByRole("button", { name: "Show learning evidence" })).toHaveAttribute("aria-expanded", "false");
-  expect(screen.getByRole("button", { name: "Show road to influence" })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: "Show entry’s road to influence" })).toHaveAttribute("aria-expanded", "false");
 });
 
 test("brings a remembered Learning sub-tab into view on narrow screens", async () => {
@@ -1000,7 +1000,7 @@ test("shows authoritative proof gates separately from the next Challenger evalua
   await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByText("Minimum 80 met · 4 more usable outcomes until the next challenger")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Show road to influence" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show entry’s road to influence" }));
   expect(screen.getByText("2 / 2 proof gates")).toBeInTheDocument();
   expect(screen.getByText("Current executable coverage")).toBeInTheDocument();
   expect(screen.getByText(/next evaluation timing is separate/i)).toBeInTheDocument();
@@ -1095,6 +1095,12 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
     availability_fraction: 0.9375,
     mean_uplift: 0.03,
     uplift_lower_bound: 0.012,
+    candidate_model_family: "linear" as const,
+    candidate_recipe_version: "linear-v1",
+    champion_model_family: "linear" as const,
+    champion_recipe_version: "linear-v1",
+    previous_champion_model_family: "linear" as const,
+    resolution: "The contender proved the required safe advantage and replaced the saved Champion.",
   };
   const skillSnapshot = {
     ...snapshot,
@@ -1110,7 +1116,33 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
         manipulation: manipulationSkill.active_version!,
       },
       skills,
+      nonlinear_entry: {
+        state: "collecting" as const,
+        eligible_training_count: 181,
+        minimum_training_samples: 250,
+        required_linear_improvement_fraction: 0.02,
+        latest_artifact: null,
+        entry_only: true as const,
+      },
+      champion_records: [{
+        skill: "sizing" as const,
+        champion_version: championEvent.champion_version,
+        champion_codename: "Violet Balancer",
+        champion_generation: 2,
+        model_family: "linear" as const,
+        recipe_version: "linear-v1",
+        crowned_at: championEvent.occurred_at,
+        retained_count: 4,
+        inconclusive_count: 1,
+        recorded_battle_count: 5,
+        active: false,
+        influence_state: "shadow" as const,
+        history_complete: true,
+      }],
       champion_journey: [championEvent],
+      champion_journey_total: 1,
+      champion_journey_next_cursor: null,
+      champion_journey_cohort_key: "balanced-current-cohort",
       challenger_common_forward_minimum: 30,
     },
   } satisfies Snapshot;
@@ -1130,14 +1162,144 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("18 / 30 shared outcomes");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Nonlinear XGBoost");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("1 queued");
+  expect(screen.getByText("Nonlinear contender")).toBeInTheDocument();
+  expect(screen.getByText("181 / 250 training rows")).toBeInTheDocument();
+  expect(screen.getByRole("progressbar", { name: "XGBoost Entry training eligibility" })).toHaveAttribute("aria-valuenow", "181");
+  expect(screen.getByRole("region", { name: "Reigning Champions" })).toHaveTextContent("Champion v2 · Violet Balancer");
+  expect(screen.getByRole("region", { name: "Reigning Champions" })).toHaveTextContent("4 crown retentions · 1 inconclusive");
   const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
   expect(journeyToggle).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("A Champion means safer forward proof, never guaranteed profit.")).not.toBeInTheDocument();
   fireEvent.click(journeyToggle);
-  expect(screen.getAllByText("New Champion earned").length).toBeGreaterThanOrEqual(1);
-  expect(screen.getByText(/Champion v2 · Violet Balancer · New Champion earned/)).toBeInTheDocument();
+  expect(screen.getByText("Violet Balancer replaced Quiet Steward")).toBeInTheDocument();
   expect(screen.getByText(/30 shared outcomes · \+1\.2% conservative edge/)).toBeInTheDocument();
   expect(screen.getByText(/never guaranteed profit/)).toBeInTheDocument();
+  const viewBattle = screen.getByRole("button", { name: "View battle" });
+  fireEvent.click(viewBattle);
+  const battle = screen.getByRole("dialog", { name: "New Champion earned" });
+  expect(battle).toHaveTextContent("Violet Balancer replaced Quiet Steward");
+  expect(battle).toHaveTextContent("30");
+  expect(battle).toHaveTextContent("93.8%");
+  expect(battle).toHaveTextContent("The contender proved the required safe advantage");
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "New Champion earned" })).not.toBeInTheDocument();
+  await waitFor(() => expect(viewBattle).toHaveFocus());
+
+  const proofToggle = screen.getByRole("button", { name: "Show entry’s road to influence" });
+  expect(proofToggle).toHaveTextContent("Entry ·");
+  fireEvent.click(proofToggle);
+  expect(screen.getByText("Entry is the Challenger’s foundation.")).toBeInTheDocument();
+});
+
+test("loads older Champion battles without duplicating the bounded initial history", async () => {
+  const now = new Date();
+  const first = {
+    event_id: "champion-event-newest",
+    occurred_at: now.toISOString(),
+    skill: "exit" as const,
+    kind: "defended" as const,
+    candidate_version: "exit-contender-two",
+    candidate_codename: "Quiet Navigator",
+    previous_champion_version: "exit-champion-one",
+    previous_champion_codename: "Clear Harbormaster",
+    champion_version: "exit-champion-one",
+    champion_codename: "Clear Harbormaster",
+    champion_generation: 1,
+    common_observed_count: 32,
+    common_usable_count: 30,
+    availability_fraction: 0.9375,
+    mean_uplift: 0,
+    uplift_lower_bound: 0,
+    resolution: "The contender did not prove the safe advantage required for replacement.",
+  };
+  const older = {
+    ...first,
+    event_id: "champion-event-first",
+    occurred_at: new Date(now.getTime() - 60_000).toISOString(),
+    kind: "first_champion" as const,
+    candidate_version: "exit-champion-one",
+    candidate_codename: "Clear Harbormaster",
+    previous_champion_version: null,
+    previous_champion_codename: null,
+    common_observed_count: 0,
+    common_usable_count: 0,
+    availability_fraction: 0,
+    mean_uplift: null,
+    uplift_lower_bound: null,
+  };
+  const historySnapshot = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      champion_journey: [first],
+      champion_journey_total: 2,
+      champion_journey_next_cursor: first.event_id,
+      champion_journey_cohort_key: "history-pagination-cohort",
+    },
+  } satisfies Snapshot;
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/learning/champion-journey")) {
+      return { ok: true, json: async () => ({ events: [older], total: 2, next_cursor: null }) };
+    }
+    return { ok: true, json: async () => historySnapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show champion journey" }));
+  expect(screen.getByText("Clear Harbormaster retained the crown against Quiet Navigator")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Load older battles" }));
+
+  expect(await screen.findByText("Clear Harbormaster was crowned")).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "View battle" })).toHaveLength(2);
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/v1/learning/champion-journey?limit=8&cursor=champion-event-newest",
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+});
+
+test("distinguishes different battle artifacts that share a friendly codename", async () => {
+  const collisionEvent = {
+    event_id: "champion-event-codename-collision",
+    occurred_at: new Date().toISOString(),
+    skill: "exit" as const,
+    kind: "defended" as const,
+    candidate_version: "exit-contender-collision",
+    candidate_codename: "Clear Harbormaster",
+    previous_champion_version: "exit-champion-collision",
+    previous_champion_codename: "Clear Harbormaster",
+    champion_version: "exit-champion-collision",
+    champion_codename: "Clear Harbormaster",
+    champion_generation: 1,
+    common_observed_count: 30,
+    common_usable_count: 30,
+    availability_fraction: 1,
+    mean_uplift: 0,
+    uplift_lower_bound: 0,
+  };
+  const collisionSnapshot = {
+    ...snapshot,
+    learning: {
+      ...snapshot.learning,
+      champion_journey: [collisionEvent],
+      champion_journey_total: 1,
+      champion_journey_next_cursor: null,
+      champion_journey_cohort_key: "codename-collision-cohort",
+    },
+  } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => collisionSnapshot }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show champion journey" }));
+  expect(screen.getByText(
+    "Clear Harbormaster (saved Champion) retained the crown against Clear Harbormaster (contender)",
+  )).toBeInTheDocument();
 });
 
 test("does not invent Champion history for a pre-existing saved Champion", async () => {
@@ -1694,6 +1856,68 @@ test("shows ranked realized results with a link back to entry evidence", async (
   expect(screen.getByText("5m buy ratio 41% · 1m momentum -4.0%")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Take profit" }).closest(".leaderboard-outcome")).not.toBeNull();
   expect(screen.getByText("0.00003 SOL fees")).toHaveClass("leaderboard-mobile-fee");
+});
+
+test("keeps impossible legacy timing visible for audit without ranking its profit", async () => {
+  const now = new Date().toISOString();
+  const fetchMock = vi.fn().mockImplementation(async (input: string) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      const recent = input.includes("sort=recent");
+      return {
+        ok: true,
+        json: async () => ({
+          sort: recent ? "recent" : "profit",
+          available_rows: recent ? 1 : 0,
+          summary: { closed_trades: 0, open_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0, invalid_results: 1, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null, total_fees_minor: 0, quote_currency: "USDC", quote_decimals: 6 },
+          rows: recent ? [{
+            mint: "legacy-impossible", symbol: "OLD", status: "closed", pnl_minor: 30_460_000, last_known_pnl_minor: 30_460_000,
+            return_fraction: 1.56, fees_minor: 480_000, opened_at: now, closed_at: now, hold_seconds: null,
+            audit_status: "invalid", audit_reason: "sell predates its paper position", exit_reason: "take_profit", exit_assessment: null,
+            peak_return_fraction: 1.89, peak_capture_fraction: null, entry_risk_mode: "balanced", entry_decision_id: null,
+            mark_is_stale: false, market_status: "closed", mark_is_executable: true, quote_currency: "USDC", quote_decimals: 6,
+          }] : [],
+        }),
+      };
+    }
+    return { ok: true, json: async () => snapshot };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  expect(await screen.findByText("Legacy result not counted")).toBeInTheDocument();
+  expect(screen.queryByText("OLD")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Latest" }));
+  expect(await screen.findByText("OLD")).toBeInTheDocument();
+  expect(screen.getByText("Not counted")).toBeInTheDocument();
+  expect(screen.getByText("sell predates its paper position")).toBeInTheDocument();
+  expect(screen.getByText("Execution audit")).toBeInTheDocument();
+});
+
+test("audit-pauses a quarantined current season without hiding its preserved figures", async () => {
+  const quarantined: Snapshot = {
+    ...snapshot,
+    running: false,
+    paper_execution_audit: {
+      status: "quarantined",
+      issues: [{
+        fill_id: "bad-fill",
+        order_id: "bad-order",
+        mint: "bad-mint",
+        side: "sell",
+        reason: "sell predates its paper position",
+      }],
+    },
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => quarantined }));
+  render(<App />);
+
+  expect(await screen.findByText("Paper engine audit-paused")).toBeInTheDocument();
+  expect(screen.getByText("Current season preserved but not trusted")).toBeInTheDocument();
+  expect(screen.getByText(/1 impossible execution record was detected/)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Audit hold" })).toBeDisabled();
+  expect(screen.getByText("Paper equity")).toBeInTheDocument();
 });
 
 test("labels capped current-season trade views and explains where open positions appear", async () => {

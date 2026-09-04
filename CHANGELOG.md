@@ -6,6 +6,33 @@ would require a deliberate V2 release.
 
 ## Unreleased
 
+## 1.10.1 - 2026-09-04
+
+- Make the Challenger view easier to follow without changing model authority: Entry now shows its
+  exact-cohort XGBoost eligibility and current state, Road to influence is explicitly identified as
+  Entry proof, and detailed disclosures still begin collapsed.
+- Add honest per-skill Champion reign records plus a bounded, paginated battle history. Recent
+  rows identify both Champion and contender, while accessible battle details expose the shared
+  forward sample, coverage, mean edge, conservative floor, model families and recorded resolution.
+  Crown retentions are labelled as failed replacement proof—not guaranteed wins—and suspended
+  Champions remain visibly distinct from inactive Shadow Champions.
+
+- Preserve per-mint causality even when the bounded priority queue lets a held-position event pass
+  older candidate traffic. Lower-slot, same-slot reorder and clock-regression events can no longer
+  mutate features, paper fills, exits, learning or AI outcomes; verified PumpSwap routes also ignore
+  late bonding-curve trades.
+- Make every new fill independently reproducible with its exact reserve timestamp, event,
+  signature, slot, source, route, quote mint, fee and reserve values. Database commits reject fills
+  before their order, configured latency or paper position, while marks remain monotonic.
+- Detect impossible legacy paper chronology on upgrade without rewriting history. The affected
+  season stops safely, cannot auto-roll, rank, compare or qualify learning, and remains visible in
+  Latest as **Not counted** until the user starts a clean season; Arena labels that preserved state
+  explicitly instead of offering a resume control.
+- Keep long-running public-feed memory bounded by pruning causal and decision caches with expired
+  candidate features, while queued and saved Local AI outcomes remain protected until resolved.
+- Start the `challenger-features-v5` / `learner-v6` authority cohort so evidence collected before
+  strict causal execution stays preserved but cannot silently qualify a current Champion.
+
 ## 1.10.0 - 2026-09-03
 
 - Add a fixed, single-thread CPU XGBoost Entry contender beside the native Linear learner. It is

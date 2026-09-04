@@ -30,6 +30,7 @@ from .models import (
     OperationalIncident,
     PaperOrder,
     Position,
+    Side,
 )
 
 SCHEMA_VERSION = 13
@@ -2430,7 +2431,7 @@ class Database:
     ) -> None:
         """Atomically persist every durable effect of one filled paper buy."""
         rows = self._validated_ledger_entries(entries)
-        self._validate_fill_commit(order, fill)
+        self._validate_fill_commit(order, fill, position=position)
         now = fill.filled_at.isoformat()
         with self._lock, self._conn:
             self._require_pending_order(order.order_id)
@@ -2460,7 +2461,7 @@ class Database:
     ) -> None:
         """Atomically persist every durable effect of one filled paper sell."""
         rows = self._validated_ledger_entries(entries)
-        self._validate_fill_commit(order, fill)
+        self._validate_fill_commit(order, fill, position=position)
         now = fill.filled_at.isoformat()
         with self._lock, self._conn:
             self._require_pending_order(order.order_id)
@@ -2510,9 +2511,45 @@ class Database:
         )
 
     @staticmethod
-    def _validate_fill_commit(order: PaperOrder, fill: FillReceipt) -> None:
-        if order.order_id != fill.order_id or order.status.value != "filled":
+    def _validate_fill_commit(
+        order: PaperOrder,
+        fill: FillReceipt,
+        *,
+        position: Position | None = None,
+    ) -> None:
+        if (
+            order.order_id != fill.order_id
+            or order.mint != fill.mint
+            or order.side != fill.side
+            or order.status.value != "filled"
+        ):
             raise ValueError("fill commit requires its matching filled order")
+        if order.fill_after < order.created_at:
+            raise ValueError("paper order latency boundary cannot predate creation")
+        if order.filled_at is None or order.filled_at != fill.filled_at:
+            raise ValueError("filled order and receipt must share one execution time")
+        if fill.filled_at < order.created_at or fill.filled_at < order.fill_after:
+            raise ValueError("fill cannot predate its order or configured latency")
+        if fill.reserve_snapshot is not None:
+            if fill.reserve_snapshot.observed_at > fill.filled_at:
+                raise ValueError("fill cannot use a reserve observation from the future")
+            if fill.reserve_snapshot.venue != fill.venue:
+                raise ValueError("fill venue must match its reserve snapshot")
+        if position is not None:
+            if position.mint != fill.mint:
+                raise ValueError("fill position does not match its mint")
+            if fill.side == Side.BUY and (
+                position.entry_fill_id != fill.fill_id or position.opened_at != fill.filled_at
+            ):
+                raise ValueError("buy fill must create its matching paper position")
+            if fill.side == Side.SELL:
+                if fill.filled_at < position.opened_at:
+                    raise ValueError("sell fill cannot predate its paper position")
+                if (
+                    fill.position_opened_at is not None
+                    and fill.position_opened_at != position.opened_at
+                ):
+                    raise ValueError("sell receipt must reference its paper position boundary")
 
     def _require_pending_order(self, order_id: str) -> None:
         row = self._conn.execute(

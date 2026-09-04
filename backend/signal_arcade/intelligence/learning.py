@@ -85,10 +85,12 @@ MAX_COMPLETED_OBSERVATIONS = 5_000
 MAX_MODEL_VERSIONS = 1_000
 MAX_CLOCK_CHECKPOINTS_PER_TICK = 20
 LEARNING_EVENT_CRITICAL_LEAD_SECONDS = 15
-LEARNER_VERSION_PREFIX = "learner-v5-"
+LEARNER_VERSION_PREFIX = "learner-v6-"
 SKILL_ARTIFACT_VERSION_PREFIX = "challenger-skill-v2-"
 CHALLENGER_SKILL_SCHEMA_VERSION = "challenger-skill-v2"
-FEATURE_SCHEMA_VERSION = "challenger-features-v4"
+# v5 begins a clean authority cohort after per-mint causal ordering became a hard runtime
+# invariant. Earlier evidence stays readable but cannot qualify a policy under stronger timing.
+FEATURE_SCHEMA_VERSION = "challenger-features-v5"
 LEARNING_EVIDENCE_SCHEMA_VERSION = "learning-evidence-v2"
 LINEAR_IMPLEMENTATION_VERSION = "native-ridge-v1"
 LINEAR_RECIPE_VERSION = "linear-v1"
@@ -1817,6 +1819,13 @@ class LearningEngine:
             ),
         )
         skill_statuses = self.skill_statuses()
+        journey_page = self.champion_journey_page(limit=8)
+        journey_cohort_key = _challenger_cohort_key(
+            self.current_risk_mode,
+            self.configuration_fingerprint(),
+            self.baseline_version(),
+            FEATURE_SCHEMA_VERSION,
+        )
         evidence_lanes = self.evidence_lane_status()
         return {
             "mode": self.mode.value,
@@ -1862,7 +1871,12 @@ class LearningEngine:
             "consent_granted": self.consent_granted,
             "active_skill_versions": dict(self.active_skill_versions),
             "skills": skill_statuses,
-            "champion_journey": self.champion_journey(),
+            "nonlinear_entry": self.nonlinear_entry_status(),
+            "champion_records": self.champion_records(),
+            "champion_journey": journey_page["events"],
+            "champion_journey_total": journey_page["total"],
+            "champion_journey_next_cursor": journey_page["next_cursor"],
+            "champion_journey_cohort_key": journey_cohort_key,
             "evidence_lanes": evidence_lanes,
             "baseline_scorecard": self.baseline_scorecard(),
             "evidence_contract": {
@@ -2219,43 +2233,249 @@ class LearningEngine:
             )
         return statuses
 
-    def champion_journey(self) -> list[dict[str, Any]]:
-        """Return recent Champion milestones for only the exact active cohort."""
+    def _current_champion_events(
+        self,
+    ) -> list[tuple[ChallengerChampionEvent, int | None]]:
+        """Return every durable Champion milestone for only the exact active cohort."""
 
-        events = [
-            (event, generation)
-            for skill in (
-                ChallengerSkill.ENTRY,
-                ChallengerSkill.MANIPULATION,
-                ChallengerSkill.SIZING,
-                ChallengerSkill.EXIT,
+        return sorted(
+            [
+                (event, generation)
+                for skill in (
+                    ChallengerSkill.ENTRY,
+                    ChallengerSkill.MANIPULATION,
+                    ChallengerSkill.SIZING,
+                    ChallengerSkill.EXIT,
+                )
+                if (state := self._current_skill_state(skill)) is not None
+                for event, generation in _champion_event_generations(state)
+            ],
+            key=lambda item: (item[0].occurred_at, item[0].event_id),
+            reverse=True,
+        )
+
+    def _champion_event_view(
+        self,
+        event: ChallengerChampionEvent,
+        generation: int | None,
+    ) -> dict[str, Any]:
+        candidate = self.skill_artifacts.get(event.candidate_version)
+        champion = self.skill_artifacts.get(event.champion_version)
+        previous = (
+            self.skill_artifacts.get(event.previous_champion_version)
+            if event.previous_champion_version is not None
+            else None
+        )
+        resolution = {
+            "first_champion": (
+                "The first policy for this skill passed its independent proof and "
+                "established the saved Champion."
+            ),
+            "promoted": (
+                "The contender proved the required safe advantage on shared forward "
+                "outcomes and replaced the saved Champion."
+            ),
+            "defended": (
+                "The contender did not prove the safe advantage required for replacement, "
+                "so the saved Champion retained the crown."
+            ),
+            "inconclusive": (
+                "The battle completed without enough trustworthy advantage to replace "
+                "the saved Champion."
+            ),
+        }[event.kind]
+        return {
+            **event.model_dump(mode="json"),
+            "champion_generation": generation,
+            "candidate_codename": _challenger_codename(
+                event.candidate_version,
+                event.skill,
+            ),
+            "previous_champion_codename": (
+                _challenger_codename(event.previous_champion_version, event.skill)
+                if event.previous_champion_version is not None
+                else None
+            ),
+            "champion_codename": _challenger_codename(
+                event.champion_version,
+                event.skill,
+            ),
+            "candidate_model_family": candidate.model_family.value if candidate else None,
+            "candidate_recipe_version": candidate.recipe_version if candidate else None,
+            "champion_model_family": champion.model_family.value if champion else None,
+            "champion_recipe_version": champion.recipe_version if champion else None,
+            "previous_champion_model_family": previous.model_family.value if previous else None,
+            "resolution": resolution,
+        }
+
+    def champion_journey_page(
+        self,
+        *,
+        limit: int,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Page immutable battle history without shipping an unbounded dashboard payload."""
+
+        bounded_limit = max(1, min(50, limit))
+        events = self._current_champion_events()
+        start = 0
+        if cursor is not None:
+            try:
+                start = next(
+                    index + 1 for index, (event, _) in enumerate(events) if event.event_id == cursor
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    "Champion journey cursor is no longer in this learning cohort"
+                ) from exc
+        selected = events[start : start + bounded_limit]
+        has_more = start + len(selected) < len(events)
+        return {
+            "events": [
+                self._champion_event_view(event, generation) for event, generation in selected
+            ],
+            "total": len(events),
+            "next_cursor": selected[-1][0].event_id if selected and has_more else None,
+        }
+
+    def champion_journey(self) -> list[dict[str, Any]]:
+        """Return a compatibility-sized recent view of the exact active cohort."""
+
+        return cast(
+            list[dict[str, Any]],
+            self.champion_journey_page(limit=RECENT_CHAMPION_JOURNEY_EVENTS)["events"],
+        )
+
+    def champion_records(self) -> list[dict[str, Any]]:
+        """Describe each reigning Champion from complete durable cohort history."""
+
+        records: list[dict[str, Any]] = []
+        for skill in (
+            ChallengerSkill.ENTRY,
+            ChallengerSkill.MANIPULATION,
+            ChallengerSkill.SIZING,
+            ChallengerSkill.EXIT,
+        ):
+            state = self._current_skill_state(skill)
+            if state is None or state.champion_version is None:
+                continue
+            champion_version = state.champion_version
+            artifact = self.skill_artifacts.get(champion_version)
+            events = sorted(state.champion_journey, key=lambda item: item.occurred_at)
+            crown_event = next(
+                (
+                    event
+                    for event in events
+                    if event.champion_version == champion_version
+                    and event.kind in {"first_champion", "promoted"}
+                ),
+                None,
             )
-            if (state := self._current_skill_state(skill)) is not None
-            for event, generation in _champion_event_generations(state)
+            retained = sum(
+                event.kind == "defended" and event.champion_version == champion_version
+                for event in events
+            )
+            inconclusive = sum(
+                event.kind == "inconclusive" and event.champion_version == champion_version
+                for event in events
+            )
+            records.append(
+                {
+                    "skill": skill.value,
+                    "champion_version": champion_version,
+                    "champion_codename": _challenger_codename(champion_version, skill),
+                    "champion_generation": _champion_generation(state),
+                    "model_family": artifact.model_family.value if artifact else None,
+                    "recipe_version": artifact.recipe_version if artifact else None,
+                    "crowned_at": crown_event.occurred_at.isoformat() if crown_event else None,
+                    "retained_count": retained,
+                    "inconclusive_count": inconclusive,
+                    "recorded_battle_count": retained + inconclusive,
+                    "active": (
+                        state.active_version == champion_version
+                        and state.suspended_version != champion_version
+                    ),
+                    "influence_state": (
+                        "suspended"
+                        if state.suspended_version == champion_version
+                        else ("active" if state.active_version == champion_version else "shadow")
+                    ),
+                    "history_complete": crown_event is not None,
+                }
+            )
+        return records
+
+    def nonlinear_entry_status(self) -> dict[str, Any]:
+        """Expose XGBoost eligibility honestly without implying promotion progress."""
+
+        state = self._current_skill_state(ChallengerSkill.ENTRY)
+        current_entry_artifacts = sorted(
+            (
+                artifact
+                for artifact in self.skill_artifacts.values()
+                if artifact.skill == ChallengerSkill.ENTRY
+                and artifact.risk_mode == self.current_risk_mode
+                and artifact.configuration_fingerprint == self.configuration_fingerprint()
+                and artifact.baseline_version == self.baseline_version()
+                and artifact.feature_schema_version == FEATURE_SCHEMA_VERSION
+            ),
+            key=lambda artifact: (artifact.created_at, artifact.version),
+        )
+        latest_linear = next(
+            (
+                artifact
+                for artifact in reversed(current_entry_artifacts)
+                if artifact.model_family == StatisticalModelFamily.LINEAR
+            ),
+            None,
+        )
+        nonlinear_artifacts = [
+            artifact
+            for artifact in current_entry_artifacts
+            if artifact.model_family == StatisticalModelFamily.XGBOOST
         ]
-        recent = sorted(events, key=lambda item: item[0].occurred_at, reverse=True)[
-            :RECENT_CHAMPION_JOURNEY_EVENTS
-        ]
-        return [
-            {
-                **event.model_dump(mode="json"),
-                "champion_generation": generation,
-                "candidate_codename": _challenger_codename(
-                    event.candidate_version,
-                    event.skill,
-                ),
-                "previous_champion_codename": (
-                    _challenger_codename(event.previous_champion_version, event.skill)
-                    if event.previous_champion_version is not None
-                    else None
-                ),
-                "champion_codename": _challenger_codename(
-                    event.champion_version,
-                    event.skill,
-                ),
-            }
-            for event, generation in recent
-        ]
+        latest_nonlinear = nonlinear_artifacts[-1] if nonlinear_artifacts else None
+        eligible_training_count = latest_linear.training_count if latest_linear is not None else 0
+        status = "collecting"
+        if latest_nonlinear is not None:
+            eligible_training_count = max(
+                eligible_training_count,
+                latest_nonlinear.training_count,
+            )
+            if state is not None and state.suspended_version == latest_nonlinear.version:
+                status = "suspended"
+            elif state is not None and state.active_version == latest_nonlinear.version:
+                status = "active"
+            elif state is not None and state.champion_version == latest_nonlinear.version:
+                status = "champion"
+            elif state is not None and state.testing_version == latest_nonlinear.version:
+                status = "testing"
+            elif state is not None and latest_nonlinear.version in state.pending_versions:
+                status = "queued"
+            elif (
+                latest_linear is not None and latest_linear.created_at > latest_nonlinear.created_at
+            ):
+                status = (
+                    "eligible"
+                    if eligible_training_count >= XGBOOST_MINIMUM_TRAINING_SAMPLES
+                    else "collecting"
+                )
+            elif state is not None and latest_nonlinear.version in state.rejected_versions:
+                status = "linear_retained"
+            elif latest_nonlinear.qualified:
+                status = "qualified"
+            else:
+                status = "proof_not_met"
+        elif eligible_training_count >= XGBOOST_MINIMUM_TRAINING_SAMPLES:
+            status = "eligible"
+        return {
+            "state": status,
+            "eligible_training_count": eligible_training_count,
+            "minimum_training_samples": XGBOOST_MINIMUM_TRAINING_SAMPLES,
+            "required_linear_improvement_fraction": NONLINEAR_COMPLEXITY_MARGIN,
+            "latest_artifact": _skill_artifact_summary(latest_nonlinear),
+            "entry_only": True,
+        }
 
     def horizon_performance(self) -> list[dict[str, Any]]:
         """Compare executable horizons while conservatively penalizing unavailable exits."""

@@ -92,6 +92,10 @@ class TokenState:
     last_reserve_at: datetime | None = None
     last_reserve_slot: int = 0
     reserve_source: str = ""
+    # Exact provenance for the reserve state used by paper execution. These fields are kept in
+    # memory and copied into immutable fill receipts; raw trade rows may later be pruned.
+    last_reserve_event_id: str | None = None
+    last_reserve_signature: str | None = None
     virtual_token_reserves: int = 0
     virtual_quote_reserves: int = 0
     real_token_reserves: int = 0
@@ -111,6 +115,14 @@ class TokenState:
 
     def apply(self, event: MarketEvent) -> None:
         payload = event.payload
+        # The live orchestrator rejects queue-order and slot regressions before this method. A
+        # monotonic effective timestamp is still required for direct integrations and for the
+        # rare case where a host clock is corrected backwards while slots continue forwards.
+        effective_at = (
+            max(self.last_event_at, event.received_at)
+            if self.last_event_at is not None
+            else event.received_at
+        )
         reserve_observed = any(
             _number(payload, key) > 0
             for key in (
@@ -135,7 +147,7 @@ class TokenState:
             )
         )
         if event.kind != EventKind.MARKET:
-            self.last_event_at = event.received_at
+            self.last_event_at = effective_at
             self.last_event_id = event.event_id
         self.last_slot = max(self.last_slot, event.slot or 0)
         self.sources.add(event.source)
@@ -188,7 +200,7 @@ class TokenState:
             self.created_at = (
                 datetime.fromtimestamp(timestamp, UTC)
                 if timestamp > 1_500_000_000
-                else event.received_at
+                else effective_at
             )
             self.token_total_supply = _number(
                 payload, "token_total_supply", "tokenTotalSupply", default=self.token_total_supply
@@ -200,6 +212,7 @@ class TokenState:
             "sellevent",
             "createpoolevent",
         }
+        route_regression = self.venue == "pump_swap" and self.route_verified and not is_amm
         if is_amm:
             self.venue = "pump_swap"
             pool = _value(payload, "pool")
@@ -260,9 +273,9 @@ class TokenState:
             )
         )
         observed_fee_bps = sum(_number(payload, *keys) for keys in fee_keys)
-        if 0 < observed_fee_bps <= 5_000:
+        if not route_regression and 0 < observed_fee_bps <= 5_000:
             self.fee_bps = observed_fee_bps
-        if not is_amm:
+        if not is_amm and not route_regression:
             self.virtual_token_reserves = _number(
                 payload,
                 "virtual_token_reserves",
@@ -295,22 +308,34 @@ class TokenState:
                 )
                 if real_quote >= 0:
                     self.real_quote_reserves = real_quote
-        self.real_token_reserves = _number(
-            payload,
-            "real_token_reserves",
-            "realTokenReserves",
-            default=self.real_token_reserves,
-        )
+        if not route_regression:
+            self.real_token_reserves = _number(
+                payload,
+                "real_token_reserves",
+                "realTokenReserves",
+                default=self.real_token_reserves,
+            )
         if self.initial_real_token_reserves == 0 and self.real_token_reserves > 0:
             self.initial_real_token_reserves = self.real_token_reserves
-        if reserve_observed and self.virtual_token_reserves > 0 and self.virtual_quote_reserves > 0:
-            self.last_reserve_at = event.received_at
+        if (
+            not route_regression
+            and reserve_observed
+            and self.virtual_token_reserves > 0
+            and self.virtual_quote_reserves > 0
+        ):
+            self.last_reserve_at = (
+                max(self.last_reserve_at, effective_at)
+                if self.last_reserve_at is not None
+                else effective_at
+            )
             self.last_reserve_slot = max(self.last_reserve_slot, event.slot or 0)
             self.reserve_source = event.source
-        if event.kind == EventKind.TRADE:
-            self._apply_trade(event)
+            self.last_reserve_event_id = event.event_id
+            self.last_reserve_signature = event.signature
+        if event.kind == EventKind.TRADE and not route_regression:
+            self._apply_trade(event, effective_at=effective_at)
 
-    def _apply_trade(self, event: MarketEvent) -> None:
+    def _apply_trade(self, event: MarketEvent, *, effective_at: datetime) -> None:
         payload = event.payload
         event_name = str(payload.get("event_name") or "").lower()
         is_buy = _value(payload, "is_buy", "isBuy")
@@ -338,7 +363,7 @@ class TokenState:
             self.last_evicted_trade = self.trades[0]
         self.trades.append(
             TradeObservation(
-                received_at=event.received_at,
+                received_at=effective_at,
                 slot=event.slot or 0,
                 side=side,
                 user=str(_value(payload, "user", default="unknown")),
@@ -377,6 +402,16 @@ class FeatureEngine:
             if state is None:
                 state = TokenState(mint=mint)
                 self.tokens[mint] = state
+            event_is_amm = "pAMMBay6" in event.source or str(
+                event.payload.get("event_name", "")
+            ).lower() in {"buyevent", "sellevent", "createpoolevent"}
+            if (
+                event.kind == EventKind.TRADE
+                and state.venue == "pump_swap"
+                and state.route_verified
+                and not event_is_amm
+            ):
+                return state
             state.apply(event)
             return state
 

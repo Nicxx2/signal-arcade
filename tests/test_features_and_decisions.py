@@ -733,6 +733,58 @@ def test_non_trade_amm_state_updates_reserves_without_refreshing_trade_freshness
     assert state.last_event_at == now
 
 
+def test_verified_pumpswap_state_ignores_late_bonding_curve_trade() -> None:
+    now = datetime.now(UTC)
+    mint = "Mint111111111111111111111111111111111111111"
+    pool = "Pool111111111111111111111111111111111111111"
+    engine = FeatureEngine()
+    amm = event(
+        "e700",
+        EventKind.TRADE,
+        now,
+        {
+            "event_name": "BuyEvent",
+            "pool": pool,
+            "pool_base_token_reserves": 1_000_000,
+            "pool_quote_token_reserves": 2_000_000,
+            "token_amount": 10,
+            "quote_amount": 20,
+        },
+    ).model_copy(update={"source": "solana:pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"})
+    state = engine.apply(amm)
+    assert state is not None
+    assert engine.confirm_pumpswap_route(
+        mint,
+        pool_address=pool,
+        quote_mint="So11111111111111111111111111111111111111112",
+    )
+    reserve_before = (state.virtual_token_reserves, state.virtual_quote_reserves)
+    event_before = state.last_event_id
+    trades_before = len(state.trades)
+
+    engine.apply(
+        event(
+            "e701",
+            EventKind.TRADE,
+            now + timedelta(seconds=1),
+            {
+                "is_buy": False,
+                "virtual_token_reserves": 9_000_000,
+                "virtual_sol_reserves": 90_000_000,
+                "real_token_reserves": 9_000_000,
+                "token_amount": 500,
+                "quote_amount": 500,
+            },
+        )
+    )
+
+    assert state.venue == "pump_swap"
+    assert state.route_verified is True
+    assert (state.virtual_token_reserves, state.virtual_quote_reserves) == reserve_before
+    assert state.last_event_id == event_before
+    assert len(state.trades) == trades_before
+
+
 def test_decision_progresses_from_watch_to_evaluated() -> None:
     start = datetime.now(UTC) - timedelta(seconds=30)
     engine = FeatureEngine()

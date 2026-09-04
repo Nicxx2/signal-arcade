@@ -228,6 +228,12 @@ class AiDecisionLab:
 
         return bool(self.pending_outcomes.get(mint))
 
+    @property
+    def tracked_mints(self) -> set[str]:
+        """Mints whose queued or saved AI work must survive candidate pruning."""
+
+        return set(self.queued_mints) | set(self.pending_outcomes)
+
     def selected_model_provenance(self) -> tuple[str, str]:
         """Return the exact optional model identity used by durable advisory artifacts."""
 

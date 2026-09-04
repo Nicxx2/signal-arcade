@@ -719,6 +719,8 @@ def test_champion_journey_is_durable_idempotent_and_recent_view_is_cohort_isolat
         evidence_ended_at=now,
     )
     state = next(iter(learner.skill_states.values()))
+    original_champion = state.champion_version
+    assert original_champion is not None
     for index in range(14):
         learner._append_champion_event(  # noqa: SLF001
             state,
@@ -751,6 +753,31 @@ def test_champion_journey_is_durable_idempotent_and_recent_view_is_cohort_isolat
     assert all(event["champion_codename"] for event in recent_view)
     assert all(event["candidate_codename"] for event in recent_view)
     assert {event["champion_generation"] for event in recent_view} == {1}
+    assert all(event["resolution"] for event in recent_view)
+
+    first_page = learner.champion_journey_page(limit=5)
+    assert first_page["total"] == 15
+    assert len(first_page["events"]) == 5
+    assert first_page["next_cursor"] == first_page["events"][-1]["event_id"]
+    second_page = learner.champion_journey_page(
+        limit=5,
+        cursor=first_page["next_cursor"],
+    )
+    assert len(second_page["events"]) == 5
+    assert {event["event_id"] for event in first_page["events"]}.isdisjoint(
+        event["event_id"] for event in second_page["events"]
+    )
+    with pytest.raises(ValueError, match="no longer in this learning cohort"):
+        learner.champion_journey_page(limit=5, cursor="unknown-event")
+
+    record = learner.champion_records()[0]
+    assert record["champion_version"] == original_champion
+    assert record["champion_generation"] == 1
+    assert record["retained_count"] == 14
+    assert record["inconclusive_count"] == 0
+    assert record["recorded_battle_count"] == 14
+    assert record["influence_state"] == "shadow"
+    assert record["history_complete"] is True
 
     learner.current_risk_mode = RiskMode.SAFE
     assert learner.champion_journey() == []
@@ -761,9 +788,111 @@ def test_champion_journey_is_durable_idempotent_and_recent_view_is_cohort_isolat
         configuration_fingerprint=lambda: configuration,
     )
     restarted_state = next(iter(restarted.skill_states.values()))
+    restarted_state.active_version = original_champion
+    restarted_state.suspended_version = original_champion
+    suspended_record = restarted.champion_records()[0]
+    assert suspended_record["influence_state"] == "suspended"
+    assert suspended_record["active"] is False
     assert [event.event_id for event in restarted_state.champion_journey] == retained_ids
     assert len(restarted_state.champion_journey) == 15
     assert restarted.champion_journey() == recent_view
+    database.close()
+
+
+def test_nonlinear_entry_status_is_exact_cohort_eligibility_not_promotion_progress(
+    settings,
+) -> None:  # type: ignore[no-untyped-def]
+    database = Database(settings.database_path)
+    configuration = "nonlinear-status-config"
+    learner = LearningEngine(
+        database,
+        settings,
+        configuration_fingerprint=lambda: configuration,
+    )
+    stale_linear = ChallengerSkillArtifact(
+        version="challenger-skill-v2-entry-stale-linear-status",
+        skill=ChallengerSkill.ENTRY,
+        model_family=StatisticalModelFamily.LINEAR,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=PREVIOUS_BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        training_count=999,
+        qualified=True,
+    )
+    learner.skill_artifacts[stale_linear.version] = stale_linear
+    assert learner.nonlinear_entry_status() == {
+        "state": "collecting",
+        "eligible_training_count": 0,
+        "minimum_training_samples": 250,
+        "required_linear_improvement_fraction": 0.02,
+        "latest_artifact": None,
+        "entry_only": True,
+    }
+
+    linear = ChallengerSkillArtifact(
+        version="challenger-skill-v2-entry-linear-status",
+        skill=ChallengerSkill.ENTRY,
+        model_family=StatisticalModelFamily.LINEAR,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        training_count=250,
+        qualified=True,
+    )
+    learner.skill_artifacts[linear.version] = linear
+    assert learner.nonlinear_entry_status()["state"] == "eligible"
+
+    version = "challenger-skill-v2-entry-xgboost-status"
+    nonlinear = ChallengerSkillArtifact(
+        version=version,
+        skill=ChallengerSkill.ENTRY,
+        model_family=StatisticalModelFamily.XGBOOST,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        training_count=250,
+        qualified=False,
+    )
+    cohort_key = _challenger_cohort_key(
+        RiskMode.BALANCED,
+        configuration,
+        BASELINE_VERSION,
+        FEATURE_SCHEMA_VERSION,
+    )
+    assert cohort_key is not None
+    learner.skill_artifacts[version] = nonlinear
+    learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)] = ChallengerSkillState(
+        cohort_key=cohort_key,
+        skill=ChallengerSkill.ENTRY,
+        risk_mode=RiskMode.BALANCED,
+        configuration_fingerprint=configuration,
+        baseline_version=BASELINE_VERSION,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        latest_candidate_version=version,
+    )
+    status = learner.nonlinear_entry_status()
+    assert status["state"] == "proof_not_met"
+    assert status["latest_artifact"]["model_family"] == "xgboost"
+
+    newer_linear = linear.model_copy(
+        update={
+            "version": "challenger-skill-v2-entry-new-linear-status",
+            "created_at": nonlinear.created_at + timedelta(seconds=1),
+            "training_count": 275,
+        }
+    )
+    learner.skill_artifacts[newer_linear.version] = newer_linear
+    refreshed_status = learner.nonlinear_entry_status()
+    assert refreshed_status["state"] == "eligible"
+    assert refreshed_status["eligible_training_count"] == 275
+
+    learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)].champion_version = version
+    assert learner.nonlinear_entry_status()["state"] == "champion"
+    learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)].suspended_version = version
+    assert learner.nonlinear_entry_status()["state"] == "suspended"
     database.close()
 
 
