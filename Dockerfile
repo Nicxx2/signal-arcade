@@ -7,7 +7,7 @@ RUN pnpm install --frozen-lockfile
 COPY frontend frontend
 RUN pnpm --filter signal-arcade-web build
 
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 ARG SIGNAL_ARCADE_VERSION=1.10.3
 LABEL org.opencontainers.image.title="Signal Arcade" \
       org.opencontainers.image.description="A local-first Solana paper-trading and learning lab" \
