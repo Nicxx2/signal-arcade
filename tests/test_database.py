@@ -89,6 +89,75 @@ def test_health_check_does_not_wait_for_active_dashboard_reader(tmp_path: Path) 
         database.close()
 
 
+@pytest.mark.parametrize(
+    ("error_code", "expected"),
+    [
+        (sqlite3.SQLITE_BUSY, True),
+        (sqlite3.SQLITE_BUSY_SNAPSHOT, True),
+        (sqlite3.SQLITE_LOCKED, True),
+        (sqlite3.SQLITE_IOERR, False),
+        (sqlite3.SQLITE_CORRUPT, False),
+    ],
+)
+def test_health_check_distinguishes_contention_from_storage_failure(
+    tmp_path: Path,
+    error_code: int,
+    expected: bool,
+) -> None:
+    database = Database(tmp_path / f"health-{error_code}.sqlite3")
+    real_reader = database._reader_conn  # noqa: SLF001
+
+    class FailedReader:
+        @staticmethod
+        def execute(_query: str) -> None:
+            error = sqlite3.OperationalError("simulated health failure")
+            error.sqlite_errorcode = error_code
+            raise error
+
+    database._reader_conn = FailedReader()  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        assert database.health_check() is expected
+    finally:
+        database._reader_conn = real_reader  # noqa: SLF001
+        database.close()
+
+
+def test_storage_capacity_stats_do_not_scan_application_tables(tmp_path: Path) -> None:
+    database = Database(tmp_path / "capacity.sqlite3")
+    statements: list[str] = []
+    database._conn.set_trace_callback(statements.append)  # noqa: SLF001
+    try:
+        stats = database.storage_capacity_stats()
+    finally:
+        database._conn.set_trace_callback(None)  # noqa: SLF001
+        database.close()
+
+    assert stats["database_bytes"] >= stats["live_bytes"]
+    assert stats["total_disk_bytes"] >= stats["database_bytes"]
+    assert not any("COUNT(" in statement.upper() for statement in statements)
+
+
+def test_storage_capacity_stats_tolerate_wal_checkpoint_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "capacity-wal-race.sqlite3")
+    real_stat = Path.stat
+
+    def checkpoint_race(path: Path, *args: object, **kwargs: object) -> object:
+        if str(path).endswith("-wal"):
+            raise FileNotFoundError(path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", checkpoint_race)
+    try:
+        stats = database.storage_capacity_stats()
+    finally:
+        database.close()
+
+    assert stats["wal_bytes"] == 0
+    assert stats["total_disk_bytes"] == stats["database_bytes"]
+
+
 def test_read_connection_does_not_wait_for_maintenance_writer_lock(tmp_path: Path) -> None:
     database = Database(tmp_path / "wal-reader.sqlite3")
     database.set_setting("example", {"ready": True})
@@ -863,6 +932,22 @@ def test_history_pruning_is_bounded_per_maintenance_pass(tmp_path: Path) -> None
     database.close()
 
 
+def test_equity_pruning_is_bounded_per_maintenance_pass(tmp_path: Path) -> None:
+    database = Database(tmp_path / "bounded-equity-prune.sqlite3")
+    for value in range(5):
+        database.record_equity(value, value)
+
+    removed = database.prune_history(
+        datetime.now(UTC) - timedelta(days=1),
+        max_equity_points=1,
+        max_rows_per_category=2,
+    )
+
+    assert removed["equity_points"] == 2
+    assert len(database.equity_history(limit=10)) == 3
+    database.close()
+
+
 def test_storage_maintenance_never_prunes_season_scorecards(tmp_path: Path) -> None:
     database = Database(tmp_path / "season-retention.sqlite3")
     database.initialize_portfolio("season-one", 1_000_000_000, "SOL")
@@ -927,6 +1012,53 @@ def test_storage_budget_stops_between_committed_chunks_for_upgrade(tmp_path: Pat
 
     assert result["raw_trades"] == 0
     assert len(database.recent_events()) == 20
+    database.close()
+
+
+def test_storage_budget_fast_path_avoids_exact_row_counts(tmp_path: Path) -> None:
+    database = Database(tmp_path / "budget-fast-path.sqlite3")
+    statements: list[str] = []
+    database._conn.set_trace_callback(statements.append)  # noqa: SLF001
+    try:
+        result = database.enforce_storage_budget(1024**3)
+    finally:
+        database._conn.set_trace_callback(None)  # noqa: SLF001
+        database.close()
+
+    assert result["raw_trades"] == 0
+    assert result["work_remaining"] == 0
+    assert not any("COUNT(" in statement.upper() for statement in statements)
+
+
+def test_storage_budget_preserves_newest_rows_without_full_counts(tmp_path: Path) -> None:
+    database = Database(tmp_path / "budget-preserve.sqlite3")
+    now = datetime.now(UTC)
+    for index in range(10):
+        database.append_event(
+            MarketEvent(
+                event_id=f"trade-{index:02d}",
+                source="test",
+                kind=EventKind.TRADE,
+                mint="Mint111111111111111111111111111111111111111",
+                received_at=now + timedelta(seconds=index),
+            )
+        )
+
+    result = database.enforce_storage_budget(
+        1,
+        preserve_recent_events=3,
+        preserve_recent_non_entry_decisions=0,
+        max_rows_per_pass=20,
+        max_rows_per_chunk=2,
+        max_duration_seconds=5,
+    )
+
+    assert result["raw_trades"] == 7
+    assert [event.event_id for event in database.recent_events()] == [
+        "trade-07",
+        "trade-08",
+        "trade-09",
+    ]
     database.close()
 
 

@@ -75,6 +75,10 @@ waits through a fresh continuity window rather than learning from or trading on 
 Operational status reports processed, transient, saved, capacity-shed and expired candidate events
 as distinct counters; transient processing is never presented as lost data, and expiry is not
 mislabelled as queue shedding.
+Queued priority is recalculated immediately before expiry and handling. A candidate that became a
+pending order, held position or due learning outcome while waiting therefore gains protection even
+inside one worker batch. A mint already completed for the season leaves the queue only after its
+position, orders, Challenger checkpoints and Local AI outcomes are all terminal.
 Priority never becomes market time: a per-mint cursor uses Solana slot first and observed enqueue
 order within the same or slot-less stream, rejecting regressions before they can reach features,
 paper execution, learning or AI. Restart recovery unions tracked and recent raw events, deduplicates
@@ -104,6 +108,14 @@ explanations without stopping market processing, the baseline strategy, exits, o
 
 Health requests use a constant-time SQLite liveness query. Full integrity scans are explicit
 maintenance operations, never part of Docker health polling or normal UI snapshots.
+Routine storage maintenance uses page and WAL metadata rather than exact journal-wide counts. Raw
+events, non-entry decisions, equity samples, resolved AI audits and resolved incidents retire in
+small committed transactions. Work yields when the market path is busy, but receives one bounded
+chunk after sustained deferral so retention cannot starve on a continuous public stream. A
+thread-safe signal lets a newly protected event stop budget cleanup between transactions, and safe
+upgrade preparation waits only for the current bounded transaction. If immutable fills, ledger
+entries, seasons or learning proof alone exceed the configured target, they remain intact and the
+storage status says the target cannot be met by safe cleanup.
 
 SQLite is the source of truth. The bankroll currency, engine state, pending orders, open
 positions, and PumpSwap pool mappings recover on restart. Stopping cancels pending orders without

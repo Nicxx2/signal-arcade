@@ -3147,6 +3147,16 @@ function StorageManager({ snapshot, refresh, busy, setBusy, reportIssue, resolve
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const usedFraction = Math.min(1, storage.live_bytes / Math.max(1, storage.max_database_bytes));
+  const cleanup = storage.maintenance;
+  const cleanupCopy = cleanup?.active
+    ? "Background cleanup is working in a small bounded chunk."
+    : cleanup?.deferred_reason
+      ? "Background cleanup is waiting for quieter market traffic."
+      : cleanup?.budget_state === "retained_evidence_above_target"
+        ? "Protected trading and learning records exceed this target and were kept."
+      : cleanup?.last_completed_at
+        ? `Background cleanup ready · last pass ${duration(cleanup.last_duration_seconds)}.`
+        : "Background cleanup is ready and will yield to market traffic.";
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     const limit = Number(maxGb);
@@ -3174,6 +3184,7 @@ function StorageManager({ snapshot, refresh, busy, setBusy, reportIssue, resolve
     <SectionHeader title="Storage budget" subtitle="Bound high-volume evidence without deleting trades, P/L, ledger entries, or learned models" />
     <div className="storage-meter"><span style={{ width: `${usedFraction * 100}%` }} /></div>
     <div className="storage-summary"><strong>{formatBytes(storage.live_bytes)} live data</strong><span>{formatBytes(storage.database_bytes)} allocated · {formatBytes(storage.reclaimable_bytes)} reusable</span></div>
+    <p className="storage-maintenance-state"><HardDrive size={13} />{cleanupCopy}</p>
     <form className="storage-form" onSubmit={save}><label>Maximum database<input type="number" min="0.5" max="100" step="0.5" value={maxGb} onChange={(event) => { setMaxGb(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>GB</span></label><label>Raw event history<input type="number" min="1" max="720" step="1" value={retention} onChange={(event) => { setRetention(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>hours</span></label><button className={`button${saved ? " saved" : ""}`} type="submit" disabled={saving || busy} aria-live="polite">{saving ? <span className="mini-loader" /> : saved ? <Check size={15} /> : <Save size={15} />}{saving ? "Saving…" : saved ? "Saved" : "Save"}</button></form>
     {saved && <p className="storage-saved" role="status"><Check size={13} />Policy saved. Cleanup continues safely in the background.</p>}
     <p className="storage-note"><HardDrive size={14} />SQLite reuses freed pages, so an older file may stay physically large without continuing to grow. Docker text logs are separately rotated and capped at about 30 MB by the included Compose files.</p>

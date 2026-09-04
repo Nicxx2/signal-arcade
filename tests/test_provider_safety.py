@@ -554,6 +554,7 @@ def test_snapshot_cache_stays_available_during_active_storage_maintenance(
         second = await orchestrator.snapshot_view()
         assert second["snapshot_generated_at"] == first["snapshot_generated_at"]
         assert second["snapshot_age_seconds"] >= first["snapshot_age_seconds"]
+        assert second["storage"]["maintenance"]["active"] is True
         await orchestrator.http.close()
 
     asyncio.run(exercise())
@@ -583,6 +584,172 @@ def test_storage_policy_save_defers_expensive_cleanup(
     assert orchestrator.database.get_setting("raw_trade_retention_hours") == 12
     assert orchestrator._storage_maintenance_requested is True  # noqa: SLF001
     asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_storage_maintenance_defers_for_market_work_but_cannot_starve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    now = datetime.now(UTC)
+    orchestrator._event_batches_in_flight = 1  # noqa: SLF001 - simulate active market work
+    calls: list[str] = []
+
+    def prune_history(*_args: object, **_kwargs: object) -> dict[str, int]:
+        calls.append("history")
+        return {"raw_trades": 0, "non_entry_decisions": 0, "equity_points": 0}
+
+    monkeypatch.setattr(orchestrator.database, "prune_history", prune_history)
+
+    async def exercise() -> None:
+        await orchestrator._run_storage_maintenance(now)  # noqa: SLF001
+        assert calls == []
+        assert orchestrator._storage_maintenance_requested is True  # noqa: SLF001
+        assert (  # noqa: SLF001
+            orchestrator._storage_maintenance_deferred_reason == "protecting_market_throughput"
+        )
+
+        orchestrator._storage_maintenance_requested = False  # noqa: SLF001
+        orchestrator._storage_maintenance_deferred_since = now - timedelta(minutes=6)  # noqa: SLF001
+        await orchestrator._run_storage_maintenance(now)  # noqa: SLF001
+        assert calls == ["history"]
+        assert orchestrator._storage_maintenance_requested is True  # noqa: SLF001
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+    orchestrator.database.close()
+
+
+def test_routine_storage_maintenance_uses_fast_capacity_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    # A historical lag sample must not postpone cleanup after the queue has fully drained.
+    orchestrator.last_processing_lag_seconds = 30
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        orchestrator.database,
+        "prune_history",
+        lambda *_args, **_kwargs: {
+            "raw_trades": 0,
+            "non_entry_decisions": 0,
+            "equity_points": 0,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator.database,
+        "enforce_storage_budget",
+        lambda *_args, **_kwargs: {
+            "raw_trades": 0,
+            "non_entry_decisions": 0,
+            "live_bytes": 1,
+            "reclaimable_bytes": 0,
+            "work_remaining": 0,
+        },
+    )
+    monkeypatch.setattr(orchestrator.database, "prune_incidents", lambda: 0)
+    monkeypatch.setattr(orchestrator.database, "prune_ai_assessments", lambda: 0)
+
+    def capacity() -> dict[str, int]:
+        calls.append("capacity")
+        return {
+            "database_bytes": 2,
+            "live_bytes": 1,
+            "reclaimable_bytes": 1,
+            "wal_bytes": 0,
+            "total_disk_bytes": 2,
+        }
+
+    def unexpected_exact_counts(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("routine maintenance must not scan exact table counts")
+
+    monkeypatch.setattr(orchestrator.database, "storage_capacity_stats", capacity)
+    monkeypatch.setattr(orchestrator.database, "storage_stats", unexpected_exact_counts)
+
+    async def exercise() -> None:
+        await orchestrator._run_storage_maintenance(datetime.now(UTC))  # noqa: SLF001
+        assert calls == ["capacity", "capacity"]
+        assert orchestrator.storage_maintenance_status()["last_completed_at"] is not None
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+    orchestrator.database.close()
+
+
+def test_full_equity_prune_chunk_requests_bounded_follow_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    monkeypatch.setattr(
+        orchestrator.database,
+        "prune_history",
+        lambda *_args, **_kwargs: {
+            "raw_trades": 0,
+            "non_entry_decisions": 0,
+            "equity_points": 1_000,
+        },
+    )
+
+    async def exercise() -> None:
+        await orchestrator._run_storage_maintenance(datetime.now(UTC))  # noqa: SLF001
+        assert orchestrator._storage_maintenance_requested is True  # noqa: SLF001
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+    orchestrator.database.close()
+
+
+def test_storage_budget_never_deletes_protected_proof_to_meet_a_small_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
+    orchestrator.storage_max_bytes = 100
+    orchestrator._storage_snapshot["live_bytes"] = 95  # noqa: SLF001
+
+    monkeypatch.setattr(
+        orchestrator.database,
+        "prune_history",
+        lambda *_args, **_kwargs: {
+            "raw_trades": 0,
+            "non_entry_decisions": 0,
+            "equity_points": 0,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator.database,
+        "enforce_storage_budget",
+        lambda *_args, **_kwargs: {
+            "raw_trades": 0,
+            "non_entry_decisions": 0,
+            "live_bytes": 95,
+            "reclaimable_bytes": 0,
+            "work_remaining": 0,
+        },
+    )
+    monkeypatch.setattr(orchestrator.database, "prune_incidents", lambda: 0)
+    monkeypatch.setattr(orchestrator.database, "prune_ai_assessments", lambda: 0)
+    monkeypatch.setattr(
+        orchestrator.database,
+        "storage_capacity_stats",
+        lambda: {
+            "database_bytes": 95,
+            "live_bytes": 95,
+            "reclaimable_bytes": 0,
+            "wal_bytes": 0,
+            "total_disk_bytes": 95,
+        },
+    )
+
+    async def exercise() -> None:
+        await orchestrator._run_storage_maintenance(datetime.now(UTC))  # noqa: SLF001
+        assert (
+            orchestrator.storage_maintenance_status()["budget_state"]
+            == "retained_evidence_above_target"
+        )
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
     orchestrator.database.close()
 
 
@@ -1453,6 +1620,7 @@ def test_full_queue_backpressures_held_events_instead_of_dropping_them(tmp_path:
         waiting = asyncio.create_task(orchestrator.enqueue_event(critical))
         await asyncio.sleep(0)
         assert waiting.done() is False
+        assert orchestrator._storage_market_yield_requested.is_set()  # noqa: SLF001
         first = orchestrator.event_queue.get_nowait()
         assert first[2].event_id == low.event_id
         orchestrator.event_queue.task_done()
@@ -1645,6 +1813,135 @@ def test_worker_fast_forwards_expired_candidate_ticks_but_not_protected_events(
     assert orchestrator.event_pipeline_status()["shed_candidate_events"] == 0
     assert mint in orchestrator._integrity_mint_gap_at  # noqa: SLF001
     assert orchestrator._expired_candidate_event(0, expired, now) is False  # noqa: SLF001
+    orchestrator.database.close()
+
+
+def test_worker_reclassifies_candidate_that_becomes_protected_while_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path,
+        demo_mode=True,
+        stale_market_seconds=5,
+        event_batch_wait_ms=1,
+        _env_file=None,
+    )
+    orchestrator = Orchestrator(settings)
+    orchestrator.running = True
+    now = datetime.now(UTC)
+    mint = "newly-protected"
+    orchestrator.features.tokens[mint] = TokenState(mint=mint, last_event_at=now)
+    event = MarketEvent(
+        event_id="newly-protected-trade",
+        source="test",
+        kind=EventKind.TRADE,
+        mint=mint,
+        received_at=now - timedelta(seconds=30),
+        payload={"is_buy": True},
+    )
+    protected = False
+    handled: list[str] = []
+
+    monkeypatch.setattr(orchestrator, "_critical_event", lambda _event: protected)
+
+    async def record_handled(
+        handled_event: MarketEvent,
+        *,
+        sequence: int | None = None,
+    ) -> bool:
+        assert sequence is not None
+        handled.append(handled_event.event_id)
+        return True
+
+    monkeypatch.setattr(orchestrator, "_handle_persisted_event", record_handled)
+
+    async def exercise() -> None:
+        nonlocal protected
+        await orchestrator.enqueue_event(event)
+        protected = True
+        worker = asyncio.create_task(orchestrator._event_worker_loop())  # noqa: SLF001
+        await asyncio.wait_for(orchestrator.event_queue.join(), timeout=2)
+        orchestrator.stop_event.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+
+    assert handled == [event.event_id]
+    assert orchestrator.expired_candidate_events == 0
+    assert orchestrator.critical_events_processed == 1
+    assert [saved.event_id for saved in orchestrator.database.recent_events()] == [event.event_id]
+    orchestrator.database.close()
+
+
+def test_worker_rechecks_protection_after_an_earlier_event_in_the_same_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path,
+        demo_mode=True,
+        stale_market_seconds=5,
+        event_batch_wait_ms=1,
+        _env_file=None,
+    )
+    orchestrator = Orchestrator(settings)
+    orchestrator.running = True
+    now = datetime.now(UTC)
+    mint = "same-batch-protection"
+    orchestrator.features.tokens[mint] = TokenState(mint=mint, last_event_at=now)
+    first = MarketEvent(
+        event_id="creates-protection",
+        source="test",
+        kind=EventKind.TRADE,
+        mint=mint,
+        received_at=now,
+        payload={"is_buy": True},
+    )
+    second = first.model_copy(
+        update={
+            "event_id": "uses-new-protection",
+            "received_at": now - timedelta(seconds=30),
+        }
+    )
+    protected = False
+    handled: list[str] = []
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_critical_event",
+        lambda event: protected and event.event_id == second.event_id,
+    )
+
+    async def transition(
+        event: MarketEvent,
+        *,
+        sequence: int | None = None,
+    ) -> bool:
+        nonlocal protected
+        assert sequence is not None
+        handled.append(event.event_id)
+        if event.event_id == first.event_id:
+            protected = True
+        return True
+
+    monkeypatch.setattr(orchestrator, "_handle_persisted_event", transition)
+
+    async def exercise() -> None:
+        await orchestrator.enqueue_event(first)
+        await orchestrator.enqueue_event(second)
+        worker = asyncio.create_task(orchestrator._event_worker_loop())  # noqa: SLF001
+        await asyncio.wait_for(orchestrator.event_queue.join(), timeout=2)
+        orchestrator.stop_event.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await orchestrator.http.close()
+
+    asyncio.run(exercise())
+
+    assert handled == [first.event_id, second.event_id]
+    assert orchestrator.expired_candidate_events == 0
+    assert [saved.event_id for saved in orchestrator.database.recent_events()] == [second.event_id]
     orchestrator.database.close()
 
 
@@ -2270,6 +2567,34 @@ def test_paused_engine_sheds_untracked_candidate_trades(tmp_path: Path) -> None:
     )
 
     assert orchestrator.running is False
+    assert orchestrator._ignore_untracked_trade(trade) is True  # noqa: SLF001
+
+    asyncio.run(orchestrator.http.close())
+    orchestrator.database.close()
+
+
+def test_terminal_traded_mint_is_ignored_after_all_outcome_work_finishes(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
+    orchestrator = Orchestrator(settings)
+    orchestrator.running = True
+    mint = "terminal-traded-mint"
+    orchestrator.features.tokens[mint] = TokenState(
+        mint=mint,
+        last_event_at=datetime.now(UTC),
+    )
+    orchestrator.broker.traded_mints.add(mint)
+    trade = MarketEvent(
+        event_id="terminal-trade",
+        source="test",
+        kind=EventKind.TRADE,
+        mint=mint,
+        received_at=datetime.now(UTC),
+        payload={"is_buy": True},
+    )
+
+    orchestrator.ai_lab.queued_mints.add(mint)
+    assert orchestrator._ignore_untracked_trade(trade) is False  # noqa: SLF001
+    orchestrator.ai_lab.queued_mints.clear()
     assert orchestrator._ignore_untracked_trade(trade) is True  # noqa: SLF001
 
     asyncio.run(orchestrator.http.close())

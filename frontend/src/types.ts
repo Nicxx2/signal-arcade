@@ -849,6 +849,18 @@ export interface StorageStatus {
   max_database_bytes: number;
   raw_trade_retention_hours: number;
   maintenance_interval_seconds: number;
+  maintenance?: {
+    active: boolean;
+    requested: boolean;
+    budget_state: "within_budget" | "cleanup_needed" | "retained_evidence_above_target";
+    deferred_reason: string | null;
+    deferred_since: string | null;
+    last_started_at: string | null;
+    last_completed_at: string | null;
+    last_duration_seconds: number;
+    last_phase_seconds: Record<string, number>;
+    last_removed: Record<string, number>;
+  };
   model_storage_included: false;
 }
 
@@ -1095,6 +1107,7 @@ export interface Snapshot {
     persisted: number;
     ephemeral: number;
     critical_processed: number;
+    retired_candidate_events?: number;
     dropped: number;
     shed_candidate_events?: number;
     expired_candidate_events?: number;
@@ -1104,6 +1117,8 @@ export interface Snapshot {
     last_processed_at: string | null;
     last_source_event_at: string | null;
     processing_lag_seconds: number;
+    critical_processing_lag_seconds?: number;
+    last_critical_processed_at?: string | null;
     recent_windows?: Record<
       "5m" | "1h",
       {

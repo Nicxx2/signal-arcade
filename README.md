@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.10.2
+# 🧠 Signal Arcade v1.10.3
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach can observe the same saved outcomes without slowing or controlling the
 trading path. No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.10.2-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.10.3-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -87,7 +87,7 @@ it never replaces a Champion or trades directly.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.10.2 |
+| Player | What it does | Influence in v1.10.3 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | One explicit consent activates a qualified Entry champion; later skills can join only after independent forward proof and remain monitored |
@@ -126,6 +126,8 @@ it never replaces a Champion or trades directly.
 - 📊 **Honest throughput status** — Processed, transient, saved, capacity-shed and expired events
   are shown separately, so high-volume in-memory work is not mistaken for lost market data. A
   per-token causal cursor prevents priority scheduling from reversing execution or learning time.
+  Storage cleanup runs in small committed chunks, yields to protected market work and avoids
+  routine full-journal counts, preventing maintenance from becoming a five-minute traffic spike.
 - 🔌 **Keyless and local by default** — Public Solana RPC and DEX Screener work without accounts;
   guided or custom providers and the private Ollama companion are optional. Helius Economy can
   reserve the key for paced HTTP safety lookups while retaining the default live stream.
@@ -150,7 +152,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.10.2
+    image: nicxx2/signal-arcade:1.10.3
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -255,15 +257,17 @@ rather than treating update downtime as market evidence. If preparation cannot f
 normal operation and reports the reason. Users who deliberately prefer a rolling tag can use
 `nicxx2/signal-arcade:latest` instead.
 
-Upgrading from v1.9.2, v1.10.0 or v1.10.1 to v1.10.2 preserves the existing bankroll, open
+Upgrading from v1.9.2 or any earlier v1.10 release to v1.10.3 preserves the existing bankroll, open
 positions, pending-order accounting, seasons, settings, evidence and Champion history in the
 same data volume. The Baseline stays on v1.5, so an in-progress season keeps its trading policy.
 Earlier Challenger artifacts remain preserved for audit but cannot silently gain
 `challenger-features-v5` authority; the upgraded Challenger safely collects causally ordered
 evidence in Shadow until a current Champion earns every qualification and common-forward gate.
-The v1.10.2 reliability patch resets no learning cohort and requires no new paper season: it orders
-restart recovery by Solana slot, fences an accepted held-position account snapshot against older
-queued rows, and preserves the exact RPC reserve provenance used by a fill.
+The v1.10.2 chronology fix and v1.10.3 performance patch reset no learning cohort and require no
+new paper season. Restart recovery remains ordered by Solana slot, accepted held-position account
+snapshots still fence older queued rows, and every fill keeps its exact RPC reserve provenance.
+Routine storage cleanup now uses bounded transactions and fast page-capacity checks; it never
+deletes fills, ledger entries, seasons or learning proof merely to satisfy a configured target.
 If the upgrade finds an impossible timestamp in the retained current-season fills, it preserves
 and labels that season,
 stops the paper engine, excludes the result from ranking and learning, and asks for a clean new

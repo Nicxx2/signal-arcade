@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solana-signal-arcade"
-version = "1.10.2"
+version = "1.10.3"
 description = "A self-hosted Solana paper-trading lab that explains every decision."
 readme = "README.md"
 requires-python = ">=3.12"

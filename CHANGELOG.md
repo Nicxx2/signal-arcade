@@ -6,6 +6,23 @@ would require a deliberate V2 release.
 
 ## Unreleased
 
+## 1.10.3 - 2026-09-04
+
+- Replace the five-minute full-table storage scan with fast SQLite page/WAL capacity checks and
+  small committed cleanup chunks. Routine work yields to market traffic, receives one bounded
+  chance after sustained deferral so retention cannot starve, and remains interruptible by safe
+  upgrade preparation.
+- Reclassify every queued event against current broker and learning state before expiry or
+  persistence, including protection gained earlier in the same batch. Once a season has fully
+  finished with a mint and all saved Challenger/AI outcomes are resolved, later trades for that
+  mint no longer consume candidate capacity.
+- Distinguish transient SQLite BUSY/LOCKED contention from corruption and I/O failure, expose
+  protected-event lag plus bounded maintenance timings, and show whether cleanup is working,
+  yielding, ready or unable to meet a target without deleting immutable proof.
+- Bound equity, AI-assessment and incident retention writes as well as raw trades and decisions.
+  Baseline v1.5, feature values, paper execution, learning cohorts, Champion gates and Local AI
+  authority are unchanged; no new season or learning reset is required.
+
 ## 1.10.2 - 2026-09-04
 
 - Make held-position RPC observations causal with the live event stream: reserve time is assigned

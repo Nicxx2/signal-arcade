@@ -706,8 +706,17 @@ class Database:
             return True
         try:
             result = self._reader_conn.execute("SELECT 1").fetchone()[0]
-        except sqlite3.Error:
-            return False
+        except sqlite3.Error as exc:
+            # A short WAL lock collision means SQLite is alive but temporarily busy. Treat only
+            # BUSY/LOCKED as liveness here; corruption, disk-full and I/O failures must continue
+            # to fail the probe. Sustained contention remains visible through the separate
+            # queue, lag, storage-maintenance and worker diagnostics.
+            code = getattr(exc, "sqlite_errorcode", None)
+            primary_code = code & 0xFF if isinstance(code, int) else None
+            return primary_code in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }
         finally:
             self._reader_lock.release()
         return bool(result == 1)
@@ -753,10 +762,12 @@ class Database:
                     (non_entry_decision_before.isoformat(), max_rows_per_category),
                 ).rowcount
             equity = self._conn.execute(
-                """DELETE FROM equity_points WHERE id NOT IN (
-                       SELECT id FROM equity_points ORDER BY id DESC LIMIT ?
+                """DELETE FROM equity_points WHERE id IN (
+                       SELECT id FROM equity_points WHERE id NOT IN (
+                           SELECT id FROM equity_points ORDER BY id DESC LIMIT ?
+                       ) ORDER BY id ASC LIMIT ?
                    )""",
-                (max_equity_points,),
+                (max_equity_points, max_rows_per_category),
             ).rowcount
         self._invalidate_storage_cache()
         return {
@@ -772,6 +783,8 @@ class Database:
         preserve_recent_events: int = 20_000,
         preserve_recent_non_entry_decisions: int = 5_000,
         max_rows_per_pass: int = 250_000,
+        max_rows_per_chunk: int = 1_000,
+        max_duration_seconds: float = 2.0,
         stop_requested: Callable[[], bool] | None = None,
     ) -> dict[str, int]:
         """Free reusable SQLite pages before the configured live-data budget is crossed.
@@ -785,25 +798,32 @@ class Database:
             raise ValueError("max database bytes must be positive")
         if max_rows_per_pass < 1:
             raise ValueError("max rows per pass must be positive")
+        if max_rows_per_chunk < 1:
+            raise ValueError("max rows per chunk must be positive")
+        if max_duration_seconds <= 0:
+            raise ValueError("max duration seconds must be positive")
+        if preserve_recent_events < 0 or preserve_recent_non_entry_decisions < 0:
+            raise ValueError("preserved row counts cannot be negative")
         target = int(max_database_bytes * 0.90)
         removed_events = 0
         removed_decisions = 0
+        usage = self._page_usage()
+        if usage["live_bytes"] <= target:
+            # This is the normal path. Exact COUNT(*) queries over a multi-million-row event
+            # journal are unnecessary when live pages are already inside the budget.
+            return {
+                "raw_trades": 0,
+                "non_entry_decisions": 0,
+                "live_bytes": usage["live_bytes"],
+                "reclaimable_bytes": usage["reclaimable_bytes"],
+                "work_remaining": 0,
+            }
         # Keep individual write locks short while allowing one five-minute pass to retire a
         # genuinely busy legacy backlog. New untracked candidate ticks are no longer durable.
-        chunk_size = 5_000
-        with self._lock:
-            event_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) FROM market_events WHERE kind='trade'"
-                ).fetchone()[0]
-            )
-            decision_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) FROM decisions WHERE action!='enter'"
-                ).fetchone()[0]
-            )
-        removable_events = max(0, event_count - preserve_recent_events)
-        removable_decisions = max(0, decision_count - preserve_recent_non_entry_decisions)
+        chunk_size = min(max_rows_per_chunk, max_rows_per_pass)
+        deadline = time.monotonic() + max_duration_seconds
+        removable_events = True
+        removable_decisions = True
         chunks = 0
 
         while removed_events + removed_decisions < max_rows_per_pass:
@@ -812,32 +832,78 @@ class Database:
             # and prevents routine cleanup from delaying a container update for minutes.
             if stop_requested is not None and stop_requested():
                 break
+            if time.monotonic() >= deadline:
+                break
             if chunks % 5 == 0 and self._page_usage()["live_bytes"] <= target:
                 break
             remaining = max_rows_per_pass - removed_events - removed_decisions
             with self._lock, self._conn:
-                if removable_events > 0:
-                    deleted = self._conn.execute(
-                        """DELETE FROM market_events WHERE event_id IN (
-                               SELECT event_id FROM market_events WHERE kind='trade'
-                               ORDER BY received_at ASC LIMIT ?
-                           )""",
-                        (min(chunk_size, removable_events, remaining),),
-                    ).rowcount
+                if removable_events:
+                    cutoff = None
+                    if preserve_recent_events:
+                        cutoff = self._conn.execute(
+                            """SELECT received_at,event_id FROM market_events
+                               WHERE kind='trade'
+                               ORDER BY received_at DESC,event_id DESC LIMIT 1 OFFSET ?""",
+                            (preserve_recent_events - 1,),
+                        ).fetchone()
+                    if preserve_recent_events and cutoff is None:
+                        removable_events = False
+                        continue
+                    if cutoff is not None:
+                        query = """DELETE FROM market_events WHERE event_id IN (
+                            SELECT event_id FROM market_events WHERE kind='trade'
+                            AND (received_at<? OR (received_at=? AND event_id<?))
+                            ORDER BY received_at ASC,event_id ASC LIMIT ?)"""
+                        parameters: tuple[Any, ...] = (
+                            cutoff["received_at"],
+                            cutoff["received_at"],
+                            cutoff["event_id"],
+                            min(chunk_size, remaining),
+                        )
+                    else:
+                        query = """DELETE FROM market_events WHERE event_id IN (
+                            SELECT event_id FROM market_events WHERE kind='trade'
+                            ORDER BY received_at ASC,event_id ASC LIMIT ?)"""
+                        parameters = (min(chunk_size, remaining),)
+                    deleted = self._conn.execute(query, parameters).rowcount
                     removed = max(0, deleted)
                     removed_events += removed
-                    removable_events -= removed
-                elif removable_decisions > 0:
-                    deleted = self._conn.execute(
-                        """DELETE FROM decisions WHERE decision_id IN (
-                               SELECT decision_id FROM decisions WHERE action!='enter'
-                               ORDER BY created_at ASC LIMIT ?
-                           )""",
-                        (min(chunk_size, removable_decisions, remaining),),
-                    ).rowcount
+                    if removed < min(chunk_size, remaining):
+                        removable_events = False
+                elif removable_decisions:
+                    cutoff = None
+                    if preserve_recent_non_entry_decisions:
+                        cutoff = self._conn.execute(
+                            """SELECT created_at,decision_id FROM decisions
+                               WHERE action!='enter'
+                               ORDER BY created_at DESC,decision_id DESC LIMIT 1 OFFSET ?""",
+                            (preserve_recent_non_entry_decisions - 1,),
+                        ).fetchone()
+                    if preserve_recent_non_entry_decisions and cutoff is None:
+                        removable_decisions = False
+                        continue
+                    if cutoff is not None:
+                        query = """DELETE FROM decisions WHERE decision_id IN (
+                            SELECT decision_id FROM decisions WHERE action!='enter'
+                            AND (created_at<? OR (created_at=? AND decision_id<?))
+                            ORDER BY created_at ASC,decision_id ASC LIMIT ?)"""
+                        parameters = (
+                            cutoff["created_at"],
+                            cutoff["created_at"],
+                            cutoff["decision_id"],
+                            min(chunk_size, remaining),
+                        )
+                    else:
+                        query = """DELETE FROM decisions WHERE decision_id IN (
+                            SELECT decision_id FROM decisions WHERE action!='enter'
+                            ORDER BY created_at ASC,decision_id ASC LIMIT ?)"""
+                        parameters = (min(chunk_size, remaining),)
+                    deleted = self._conn.execute(query, parameters).rowcount
                     removed = max(0, deleted)
                     removed_decisions += removed
-                    removable_decisions -= removed
+                    if removed < min(chunk_size, remaining):
+                        removable_decisions = False
                 else:
                     break
             chunks += 1
@@ -852,6 +918,9 @@ class Database:
             "non_entry_decisions": removed_decisions,
             "live_bytes": usage["live_bytes"],
             "reclaimable_bytes": usage["reclaimable_bytes"],
+            "work_remaining": int(
+                usage["live_bytes"] > target and (removable_events or removable_decisions)
+            ),
         }
 
     def _page_usage(self) -> dict[str, int]:
@@ -866,6 +935,20 @@ class Database:
             "live_bytes": max(0, allocated - reclaimable),
             "reclaimable_bytes": reclaimable,
         }
+
+    def storage_capacity_stats(self) -> dict[str, int]:
+        """Return fast page/WAL capacity figures without scanning application tables."""
+
+        rows = self._page_usage()
+        wal_path = Path(str(self.path) + "-wal")
+        try:
+            rows["wal_bytes"] = wal_path.stat().st_size
+        except FileNotFoundError:
+            # SQLite may remove an empty WAL between path lookup and stat during shutdown or a
+            # checkpoint. Capacity remains valid and the next sample will observe any new WAL.
+            rows["wal_bytes"] = 0
+        rows["total_disk_bytes"] = rows["database_bytes"] + rows["wal_bytes"]
+        return rows
 
     def storage_stats(self, *, force: bool = False) -> dict[str, int]:
         now = time.monotonic()
@@ -898,10 +981,7 @@ class Database:
                 table: int(self._conn.execute(query).fetchone()[0])
                 for table, query in count_queries.items()
             }
-        rows.update(self._page_usage())
-        wal_path = Path(str(self.path) + "-wal")
-        rows["wal_bytes"] = wal_path.stat().st_size if wal_path.exists() else 0
-        rows["total_disk_bytes"] = rows["database_bytes"] + rows["wal_bytes"]
+        rows.update(self.storage_capacity_stats())
         with self._lock:
             # A writer may have committed after the counts were read. Return this point-in-time
             # view, but never cache it over that writer's invalidation for the next dashboard read.
@@ -1956,20 +2036,26 @@ class Database:
             ).fetchall()
         return [AiCriticAssessment.model_validate_json(row[0]) for row in rows]
 
-    def prune_ai_assessments(self, max_resolved: int = 5_000) -> int:
+    def prune_ai_assessments(
+        self,
+        max_resolved: int = 5_000,
+        max_rows: int = 1_000,
+    ) -> int:
         """Bound completed AI audits while never deleting an outcome still being measured."""
 
-        if max_resolved < 1:
-            raise ValueError("max_resolved must be positive")
+        if max_resolved < 1 or max_rows < 1:
+            raise ValueError("AI assessment retention limits must be positive")
         with self._lock, self._conn:
             removed = self._conn.execute(
-                """DELETE FROM ai_critic_assessments
-                   WHERE resolved_at IS NOT NULL AND assessment_id NOT IN (
+                """DELETE FROM ai_critic_assessments WHERE assessment_id IN (
                        SELECT assessment_id FROM ai_critic_assessments
-                       WHERE resolved_at IS NOT NULL
-                       ORDER BY created_at DESC LIMIT ?
+                       WHERE resolved_at IS NOT NULL AND assessment_id NOT IN (
+                           SELECT assessment_id FROM ai_critic_assessments
+                           WHERE resolved_at IS NOT NULL
+                           ORDER BY created_at DESC LIMIT ?
+                       ) ORDER BY created_at ASC LIMIT ?
                    )""",
-                (max_resolved,),
+                (max_resolved, max_rows),
             ).rowcount
         self._invalidate_storage_cache()
         return max(0, removed)
@@ -2314,15 +2400,17 @@ class Database:
             ).fetchall()
         return [OperationalIncident.model_validate_json(row[0]) for row in rows]
 
-    def prune_incidents(self, max_records: int = 2_000) -> int:
+    def prune_incidents(self, max_records: int = 2_000, max_rows: int = 1_000) -> int:
+        if max_records < 1 or max_rows < 1:
+            raise ValueError("incident retention limits must be positive")
         with self._lock, self._conn:
             removed = self._conn.execute(
                 """DELETE FROM operational_incidents WHERE incident_id IN (
                        SELECT incident_id FROM operational_incidents
                        WHERE resolved_at IS NOT NULL ORDER BY last_seen_at DESC
-                       LIMIT -1 OFFSET ?
+                       LIMIT ? OFFSET ?
                    )""",
-                (max_records,),
+                (max_rows, max_records),
             ).rowcount
         return max(0, removed)
 

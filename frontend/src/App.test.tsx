@@ -1608,6 +1608,7 @@ test("keeps core settings visible while secondary model and provider details sta
   expect(screen.getByText("Data health")).toBeInTheDocument();
   expect(screen.getByText("0 processed · 0 transient · 0 saved · 0 shed · 0 expired")).toBeInTheDocument();
   expect(screen.getByText("Storage budget")).toBeInTheDocument();
+  expect(screen.getByText("Background cleanup is ready and will yield to market traffic.")).toBeInTheDocument();
   expect(screen.getByText("Selected model")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Show local AI models" })).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByRole("button", { name: "Show data providers" })).toHaveAttribute("aria-expanded", "false");

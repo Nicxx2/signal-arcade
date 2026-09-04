@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event as ThreadEvent
 from threading import Lock
 from typing import Any
 
@@ -100,6 +101,12 @@ _CANDIDATE_VERIFICATION_RETRY_SECONDS = 60.0
 _CANDIDATE_PRIORITY_FRACTION = 0.75
 _UPGRADE_AI_SETTLE_SECONDS = 32.0
 _UPGRADE_STORAGE_SETTLE_SECONDS = 30.0
+_STORAGE_MAINTENANCE_INTERVAL_SECONDS = 5 * 60
+_STORAGE_MAINTENANCE_MAX_DEFERRAL_SECONDS = 5 * 60
+_STORAGE_MAINTENANCE_QUEUE_YIELD_FRACTION = 0.05
+_STORAGE_MAINTENANCE_CHUNK_ROWS = 1_000
+_STORAGE_BUDGET_PASS_ROWS = 5_000
+_STORAGE_BUDGET_PASS_SECONDS = 1.5
 PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS = 90
 _TERMINAL_PROBE_MIN_CONFIRMATIONS = 2
 _TERMINAL_PROBE_MAX_AGE_SECONDS = 180.0
@@ -379,6 +386,7 @@ class Orchestrator:
         self.events_persisted = 0
         self.events_ephemeral = 0
         self.critical_events_processed = 0
+        self.retired_candidate_events = 0
         self.events_dropped = 0
         self.expired_candidate_events = 0
         self.reordered_events = 0
@@ -387,6 +395,8 @@ class Orchestrator:
         self.last_event_processed_at: datetime | None = None
         self.last_source_event_at: datetime | None = None
         self.last_processing_lag_seconds = 0.0
+        self.last_critical_processing_lag_seconds = 0.0
+        self.last_critical_event_processed_at: datetime | None = None
         # One aggregate bucket per active wall-clock second keeps a genuine hour of recent
         # throughput evidence without retaining individual high-volume market events.
         self._pipeline_recent: deque[dict[str, Any]] = deque(maxlen=3_601)
@@ -480,6 +490,14 @@ class Orchestrator:
         self.last_maintenance_at: datetime | None = None
         self._storage_maintenance_requested = False
         self._storage_maintenance_active = False
+        self._storage_market_yield_requested = ThreadEvent()
+        self._storage_maintenance_deferred_since: datetime | None = None
+        self._storage_maintenance_deferred_reason: str | None = None
+        self._storage_maintenance_last_started_at: datetime | None = None
+        self._storage_maintenance_last_completed_at: datetime | None = None
+        self._storage_maintenance_last_duration_seconds = 0.0
+        self._storage_maintenance_last_phases: dict[str, float] = {}
+        self._storage_maintenance_last_removed: dict[str, int] = {}
         self.storage_max_bytes = int(self.database.get_setting("storage_max_bytes", 5 * 1024**3))
         self.raw_trade_retention_hours = int(
             self.database.get_setting(
@@ -488,6 +506,11 @@ class Orchestrator:
         )
         self.event_counts: defaultdict[str, int] = defaultdict(int)
         self._storage_snapshot = self._storage_health_view(self.database.storage_stats())
+        self._storage_budget_state = (
+            "cleanup_needed"
+            if int(self._storage_snapshot.get("live_bytes", 0)) > int(self.storage_max_bytes * 0.90)
+            else "within_budget"
+        )
         self._last_stream_reconnects = 0
         self._stream_incident_active = "solana_stream" in active_incident_scopes
         self._stream_interrupt_started_at: datetime | None = None
@@ -724,7 +747,7 @@ class Orchestrator:
         operationally_tracked = bool(
             mint in self.broker.positions
             or self.learning.has_pending_mint(mint)
-            or self.ai_lab.has_pending_outcome(mint)
+            or self._ai_tracks_mint(mint)
             or self.broker.has_pending_for(mint)
         )
         # While paused, future entry candidates cannot produce a trade. Retain only data needed
@@ -732,7 +755,28 @@ class Orchestrator:
         # busy public program stream from filling the queue while the user reviews or resets.
         if not self.running:
             return not operationally_tracked
+        if self._terminal_traded_event(event):
+            return True
         return mint not in self.features.tokens and not operationally_tracked
+
+    def _ai_tracks_mint(self, mint: str) -> bool:
+        """Check queued and saved Local AI work without allocating a union on the event path."""
+
+        return mint in self.ai_lab.queued_mints or self.ai_lab.has_pending_outcome(mint)
+
+    def _terminal_traded_event(self, event: MarketEvent) -> bool:
+        """Identify a queued trade that cannot affect this season or saved outcome work."""
+
+        if event.kind != EventKind.TRADE:
+            return False
+        mint = event.mint or ""
+        return bool(
+            mint in self.broker.traded_mints
+            and mint not in self.broker.positions
+            and not self.broker.has_pending_for(mint)
+            and not self.learning.has_pending_mint(mint)
+            and not self._ai_tracks_mint(mint)
+        )
 
     def _critical_event(self, event: MarketEvent) -> bool:
         return bool(
@@ -1312,12 +1356,17 @@ class Orchestrator:
         if self._ignore_untracked_trade(event):
             return
         priority = self._event_priority(event)
+        if priority == 0:
+            # Signal before a full-queue put can block, so storage yields between its current and
+            # next committed chunk even when this protected event is still awaiting capacity.
+            self._storage_market_yield_requested.set()
         self._event_sequence += 1
         queued = (priority, self._event_sequence, event)
         try:
             self.event_queue.put_nowait(queued)
             self.events_enqueued += 1
             self._record_pipeline_recent("enqueued")
+            self._refresh_storage_yield_signal(priority)
             return
         except asyncio.QueueFull:
             if priority == 0:
@@ -1326,6 +1375,7 @@ class Orchestrator:
                 await self.event_queue.put(queued)
                 self.events_enqueued += 1
                 self._record_pipeline_recent("enqueued")
+                self._refresh_storage_yield_signal(priority)
                 return
         self.events_dropped += 1
         dropped_at = datetime.now(UTC)
@@ -1338,7 +1388,10 @@ class Orchestrator:
                 "and due learning-checkpoint events use backpressure; any affected learning "
                 "mint is marked with a continuity gap."
             ),
-            metadata={"dropped_total": self.events_dropped},
+            metadata={
+                "dropped_total": self.events_dropped,
+                "storage_maintenance_active": self._storage_maintenance_active,
+            },
         )
 
     def _event_batch_wait_seconds(self) -> float:
@@ -1371,36 +1424,12 @@ class Orchestrator:
                     break
             try:
                 try:
-                    batch_now = datetime.now(UTC)
-                    expired_items: list[tuple[int, int, MarketEvent]] = []
                     working_batch: list[tuple[int, int, MarketEvent]] = []
-                    for item in batch:
-                        target = (
-                            expired_items
-                            if self._expired_candidate_event(item[0], item[2], batch_now)
-                            else working_batch
-                        )
-                        target.append(item)
-                    expired_count = len(expired_items)
-                    if expired_count:
-                        self.expired_candidate_events += expired_count
-                        self.events_dropped += expired_count
-                        self._record_pipeline_recent(
-                            "expired",
-                            observed_at=batch_now,
-                            count=expired_count,
-                        )
-                        for _priority, _sequence, expired_event in expired_items:
-                            self._note_integrity_mint_gap(expired_event.mint, batch_now)
-                        self._note_queue_pressure(
-                            batch_now,
-                            detail=(
-                                "Expired low-priority candidate events were skipped so current "
-                                "market evidence could catch up. Held-position, pending-order "
-                                "and due learning-checkpoint events remain protected."
-                            ),
-                            metadata={"expired_candidate_total": self.expired_candidate_events},
-                        )
+                    for _queued_priority, sequence, event in batch:
+                        if self._terminal_traded_event(event):
+                            self.retired_candidate_events += 1
+                            continue
+                        working_batch.append((self._event_priority(event), sequence, event))
                     durable_events = [
                         item[2] for item in working_batch if self._durable_event(item[2], item[0])
                     ]
@@ -1411,12 +1440,41 @@ class Orchestrator:
                         else set()
                     )
                     handled_ids: set[str] = set()
-                    for priority, sequence, event in working_batch:
+                    for _initial_priority, sequence, event in working_batch:
                         if event.event_id in handled_ids:
                             continue
                         handled_ids.add(event.event_id)
-                        durable = event.event_id in durable_ids
+                        if self._terminal_traded_event(event):
+                            self.retired_candidate_events += 1
+                            continue
                         effective_priority = self._event_priority(event)
+                        if self._expired_candidate_event(
+                            effective_priority,
+                            event,
+                            datetime.now(UTC),
+                        ):
+                            expired_at = datetime.now(UTC)
+                            self.expired_candidate_events += 1
+                            self.events_dropped += 1
+                            self._record_pipeline_recent("expired", observed_at=expired_at)
+                            self._note_integrity_mint_gap(event.mint, expired_at)
+                            self._note_queue_pressure(
+                                expired_at,
+                                detail=(
+                                    "Expired low-priority candidate events were skipped so "
+                                    "current market evidence could catch up. Held-position, "
+                                    "pending-order and due learning-checkpoint events remain "
+                                    "protected."
+                                ),
+                                metadata={
+                                    "expired_candidate_total": self.expired_candidate_events,
+                                    "storage_maintenance_active": (
+                                        self._storage_maintenance_active
+                                    ),
+                                },
+                            )
+                            continue
+                        durable = event.event_id in durable_ids
                         if not durable and self._durable_event(event, effective_priority):
                             # An event may have entered as an ordinary candidate and become the
                             # first executable tick after an order was submitted earlier in this
@@ -1439,7 +1497,7 @@ class Orchestrator:
                         if not handled:
                             continue
                         self.events_processed += 1
-                        if priority == 0 or effective_priority == 0:
+                        if effective_priority == 0:
                             self.critical_events_processed += 1
                         processed_at = datetime.now(UTC)
                         self.last_event_processed_at = processed_at
@@ -1447,6 +1505,11 @@ class Orchestrator:
                         self.last_processing_lag_seconds = max(
                             0.0, (processed_at - event.received_at).total_seconds()
                         )
+                        if effective_priority == 0:
+                            self.last_critical_event_processed_at = processed_at
+                            self.last_critical_processing_lag_seconds = (
+                                self.last_processing_lag_seconds
+                            )
                         self._record_pipeline_recent(
                             "processed",
                             observed_at=processed_at,
@@ -1484,6 +1547,7 @@ class Orchestrator:
                 for _ in batch:
                     self.event_queue.task_done()
                 self._event_batches_in_flight = max(0, self._event_batches_in_flight - 1)
+                self._refresh_storage_yield_signal()
             await self._update_queue_incident(datetime.now(UTC))
 
     async def handle_event(self, event: MarketEvent) -> None:
@@ -1965,7 +2029,8 @@ class Orchestrator:
         if (
             self._storage_maintenance_requested
             or self.last_maintenance_at is None
-            or (now - self.last_maintenance_at).total_seconds() >= 300
+            or (now - self.last_maintenance_at).total_seconds()
+            >= _STORAGE_MAINTENANCE_INTERVAL_SECONDS
         ):
             # Clear before awaiting. A settings update arriving during this pass sets it again,
             # guaranteeing another pass with the newest policy instead of losing the request.
@@ -2263,32 +2328,147 @@ class Orchestrator:
                     seconds=_CANDIDATE_VERIFICATION_RETRY_SECONDS
                 )
 
+    def _storage_market_path_busy(self) -> bool:
+        capacity = max(1, self.event_queue.maxsize)
+        depth = self.event_queue.qsize()
+        return bool(
+            depth / capacity >= _STORAGE_MAINTENANCE_QUEUE_YIELD_FRACTION
+            or self._event_batches_in_flight
+            or (depth > 0 and self.last_processing_lag_seconds >= 1)
+        )
+
+    def _refresh_storage_yield_signal(self, event_priority: int | None = None) -> None:
+        """Bridge event-loop pressure to the SQLite worker with a thread-safe flag."""
+
+        if event_priority == 0 or self._storage_market_path_busy():
+            self._storage_market_yield_requested.set()
+        elif self.event_queue.empty() and self._event_batches_in_flight == 0:
+            self._storage_market_yield_requested.clear()
+
     async def _run_storage_maintenance(self, now: datetime) -> None:
+        """Retire bounded history without creating a periodic market-processing cliff."""
+
+        started_monotonic = time.monotonic()
+        self._storage_maintenance_last_started_at = now
         self._storage_maintenance_active = True
+        phases: dict[str, float] = {}
+        removed = {
+            "raw_trades": 0,
+            "non_entry_decisions": 0,
+            "equity_points": 0,
+            "ai_assessments": 0,
+            "incidents": 0,
+        }
         try:
-            await asyncio.to_thread(
+            phase_started = time.monotonic()
+            capacity_before = await asyncio.to_thread(self.database.storage_capacity_stats)
+            phases["capacity_before_seconds"] = time.monotonic() - phase_started
+            self._storage_snapshot = self._storage_health_view(
+                {**self._storage_snapshot, **capacity_before}
+            )
+            live_bytes = int(capacity_before.get("live_bytes", 0))
+            storage_target = int(self.storage_max_bytes * 0.90)
+            urgent = live_bytes > storage_target
+            if live_bytes <= storage_target:
+                self._storage_budget_state = "within_budget"
+            elif self._storage_budget_state == "within_budget":
+                self._storage_budget_state = "cleanup_needed"
+            deferred_seconds = (
+                max(0.0, (now - self._storage_maintenance_deferred_since).total_seconds())
+                if self._storage_maintenance_deferred_since is not None
+                else 0.0
+            )
+            if (
+                self._storage_market_path_busy()
+                and not urgent
+                and deferred_seconds < _STORAGE_MAINTENANCE_MAX_DEFERRAL_SECONDS
+            ):
+                if self._storage_maintenance_deferred_since is None:
+                    self._storage_maintenance_deferred_since = now
+                self._storage_maintenance_deferred_reason = "protecting_market_throughput"
+                self._storage_maintenance_requested = True
+                return
+
+            # After a bounded deferral, one deliberately small transaction is allowed even on a
+            # continuous public stream. This prevents cleanup starvation without recreating the
+            # former multi-second maintenance burst.
+            self._storage_maintenance_deferred_since = None
+            self._storage_maintenance_deferred_reason = None
+            phase_started = time.monotonic()
+            history = await asyncio.to_thread(
                 self.database.prune_history,
                 now - timedelta(hours=self.raw_trade_retention_hours),
                 non_entry_decision_before=now - timedelta(hours=24),
-                max_rows_per_category=10_000,
+                max_rows_per_category=_STORAGE_MAINTENANCE_CHUNK_ROWS,
             )
-            await asyncio.to_thread(
-                self.database.enforce_storage_budget,
-                self.storage_max_bytes,
-                stop_requested=lambda: self._maintenance_requested,
+            phases["history_seconds"] = time.monotonic() - phase_started
+            for key in ("raw_trades", "non_entry_decisions", "equity_points"):
+                removed[key] = int(history.get(key, 0))
+            more_retention_work = any(
+                int(history.get(key, 0)) >= _STORAGE_MAINTENANCE_CHUNK_ROWS
+                for key in ("raw_trades", "non_entry_decisions", "equity_points")
             )
+
             if self._maintenance_requested:
                 return
-            await asyncio.to_thread(self.database.prune_incidents)
-            await asyncio.to_thread(self.database.prune_ai_assessments)
-            self._storage_snapshot = self._storage_health_view(
-                await asyncio.to_thread(
-                    self.database.storage_stats,
-                    force=True,
-                )
+            if self._storage_market_path_busy() and not urgent:
+                self._storage_maintenance_deferred_reason = "protecting_market_throughput"
+                self._storage_maintenance_requested = True
+                return
+
+            phase_started = time.monotonic()
+            self._refresh_storage_yield_signal()
+            budget = await asyncio.to_thread(
+                self.database.enforce_storage_budget,
+                self.storage_max_bytes,
+                max_rows_per_pass=_STORAGE_BUDGET_PASS_ROWS,
+                max_rows_per_chunk=_STORAGE_MAINTENANCE_CHUNK_ROWS,
+                max_duration_seconds=_STORAGE_BUDGET_PASS_SECONDS,
+                stop_requested=lambda: (
+                    self._maintenance_requested
+                    or (self._storage_market_yield_requested.is_set() and not urgent)
+                ),
             )
-            self.last_maintenance_at = now
+            phases["budget_seconds"] = time.monotonic() - phase_started
+            removed["raw_trades"] += int(budget.get("raw_trades", 0))
+            removed["non_entry_decisions"] += int(budget.get("non_entry_decisions", 0))
+
+            if self._maintenance_requested:
+                return
+            if not self._storage_market_path_busy():
+                phase_started = time.monotonic()
+                removed["incidents"] = await asyncio.to_thread(self.database.prune_incidents)
+                removed["ai_assessments"] = await asyncio.to_thread(
+                    self.database.prune_ai_assessments
+                )
+                phases["optional_history_seconds"] = time.monotonic() - phase_started
+            else:
+                self._storage_maintenance_deferred_reason = "protecting_market_throughput"
+
+            phase_started = time.monotonic()
+            capacity = await asyncio.to_thread(self.database.storage_capacity_stats)
+            phases["capacity_seconds"] = time.monotonic() - phase_started
+            self._storage_snapshot = self._storage_health_view(
+                {**self._storage_snapshot, **capacity}
+            )
+            budget_work_remaining = bool(int(budget.get("work_remaining", 0)))
+            if int(capacity.get("live_bytes", 0)) <= storage_target:
+                self._storage_budget_state = "within_budget"
+            elif budget_work_remaining or more_retention_work:
+                self._storage_budget_state = "cleanup_needed"
+            else:
+                # The configured target can be smaller than immutable fills, orders, seasons,
+                # ledger entries or learning proof. Report that honestly and never delete them.
+                self._storage_budget_state = "retained_evidence_above_target"
+            if more_retention_work or budget_work_remaining:
+                self._storage_maintenance_requested = True
+            completed_at = datetime.now(UTC)
+            self.last_maintenance_at = completed_at
+            self._storage_maintenance_last_completed_at = completed_at
         finally:
+            self._storage_maintenance_last_duration_seconds = time.monotonic() - started_monotonic
+            self._storage_maintenance_last_phases = phases
+            self._storage_maintenance_last_removed = removed
             self._storage_maintenance_active = False
 
     async def _verify_pumpswap_route(self, state: TokenState, now: datetime) -> bool:
@@ -4909,6 +5089,7 @@ class Orchestrator:
             "persisted": self.events_persisted,
             "ephemeral": self.events_ephemeral,
             "critical_processed": self.critical_events_processed,
+            "retired_candidate_events": self.retired_candidate_events,
             "dropped": self.events_dropped,
             "shed_candidate_events": max(
                 0,
@@ -4924,6 +5105,12 @@ class Orchestrator:
                 self.last_source_event_at.isoformat() if self.last_source_event_at else None
             ),
             "processing_lag_seconds": self.last_processing_lag_seconds,
+            "critical_processing_lag_seconds": self.last_critical_processing_lag_seconds,
+            "last_critical_processed_at": (
+                self.last_critical_event_processed_at.isoformat()
+                if self.last_critical_event_processed_at
+                else None
+            ),
             "recent_windows": self._recent_pipeline_windows(now),
             "learning_training": self.learning.training_status(),
             "degraded": bool(reasons),
@@ -4988,6 +5175,9 @@ class Orchestrator:
         # Overlay it so navigation and polling never hide a reset behind an otherwise valid cache.
         response["season_operation"] = self.season_operation_status()
         response["maintenance_operation"] = self.maintenance_operation_status()
+        storage = dict(response.get("storage") or {})
+        storage["maintenance"] = self.storage_maintenance_status()
+        response["storage"] = storage
         return response
 
     def invalidate_snapshot_cache(self) -> None:
@@ -5054,6 +5244,7 @@ class Orchestrator:
             "storage": {
                 **self._storage_snapshot,
                 **self.storage_policy(),
+                "maintenance": self.storage_maintenance_status(),
                 "model_storage_included": False,
             },
         }
@@ -5102,7 +5293,33 @@ class Orchestrator:
         return {
             "max_database_bytes": self.storage_max_bytes,
             "raw_trade_retention_hours": self.raw_trade_retention_hours,
-            "maintenance_interval_seconds": 300,
+            "maintenance_interval_seconds": _STORAGE_MAINTENANCE_INTERVAL_SECONDS,
+        }
+
+    def storage_maintenance_status(self) -> dict[str, Any]:
+        return {
+            "active": self._storage_maintenance_active,
+            "requested": self._storage_maintenance_requested,
+            "budget_state": self._storage_budget_state,
+            "deferred_reason": self._storage_maintenance_deferred_reason,
+            "deferred_since": (
+                self._storage_maintenance_deferred_since.isoformat()
+                if self._storage_maintenance_deferred_since
+                else None
+            ),
+            "last_started_at": (
+                self._storage_maintenance_last_started_at.isoformat()
+                if self._storage_maintenance_last_started_at
+                else None
+            ),
+            "last_completed_at": (
+                self._storage_maintenance_last_completed_at.isoformat()
+                if self._storage_maintenance_last_completed_at
+                else None
+            ),
+            "last_duration_seconds": self._storage_maintenance_last_duration_seconds,
+            "last_phase_seconds": dict(self._storage_maintenance_last_phases),
+            "last_removed": dict(self._storage_maintenance_last_removed),
         }
 
     @staticmethod
@@ -5129,7 +5346,7 @@ class Orchestrator:
         self,
         max_database_bytes: int,
         retention_hours: int,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         # Saving a policy is an interactive control-plane action. Persist it atomically and let
         # the recoverable maintenance worker perform expensive pruning; never make the browser
         # wait for a multi-gigabyte cleanup pass.
@@ -5142,8 +5359,17 @@ class Orchestrator:
         )
         self.storage_max_bytes = max_database_bytes
         self.raw_trade_retention_hours = retention_hours
+        self._storage_budget_state = (
+            "cleanup_needed"
+            if int(self._storage_snapshot.get("live_bytes", 0)) > int(max_database_bytes * 0.90)
+            else "within_budget"
+        )
         self._storage_maintenance_requested = True
-        return {**self._storage_snapshot, **self.storage_policy()}
+        return {
+            **self._storage_snapshot,
+            **self.storage_policy(),
+            "maintenance": self.storage_maintenance_status(),
+        }
 
     async def leaderboard_view(self, sort: str = "profit", limit: int = 100) -> dict[str, Any]:
         """Share bounded Results work and never race an in-flight position mutation."""

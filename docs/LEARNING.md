@@ -88,6 +88,10 @@ active. A slow fit therefore cannot hold the event-state lock. Shutdown waits fo
 running fit to finish before closing SQLite; it does not abandon a thread still using the database.
 Immediate active-skill health checks and common-forward tournament updates remain on the outcome
 boundary and are not deferred.
+Database retention also yields to the market path and no longer performs routine full-journal row
+counts. Due checkpoint events are reclassified when handled, so protection gained while waiting in
+the queue is retained; maintenance performance cannot turn an incomplete sample into qualification
+evidence or make a Champion gate easier.
 Those safety and tournament decisions read the authoritative Policy-proof journal, not the
 one-per-mint Discovery index. A later actionable ENTER can therefore advance honest Champion proof
 even when an earlier PASS for the same mint has already completed. If both lanes exist for that
