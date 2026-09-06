@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useReducer } from "react";
 
-export type IssueScope = "server" | "dashboard" | "database" | "risk" | "learning" | "ai" | "explanation" | "mode" | "reset" | "setup" | "engine" | "providers" | "storage" | "leaderboard" | "maintenance";
+export type IssueScope = "server" | "dashboard" | "database" | "market" | "risk" | "learning" | "ai" | "explanation" | "mode" | "reset" | "setup" | "engine" | "providers" | "storage" | "leaderboard" | "maintenance";
 
 export interface SystemIssue {
   id: string;
@@ -33,6 +33,21 @@ export const INITIAL_SYSTEM_STATUS: SystemStatusState = {
 };
 
 const MAX_HISTORY = 20;
+
+export function marketHealthDetail(reasons: readonly string[] | undefined): string {
+  const descriptions: Record<string, string> = {
+    queue_near_capacity: "The market event queue is nearly full.",
+    processing_lag: "Market events are being processed late.",
+    worker_recovering: "The market worker is recovering.",
+    recent_candidate_shedding: "Some candidate events were shed or expired recently.",
+    paper_execution_quarantined: "Some paper executions are quarantined for review.",
+  };
+  const fallback = "The engine reports degraded market processing.";
+  const details = Array.isArray(reasons)
+    ? [...new Set(reasons.map((reason) => Object.hasOwn(descriptions, reason) ? descriptions[reason] : fallback))].sort()
+    : [];
+  return `${details.length ? details.join(" ") : fallback} See Settings for market-processing details.`;
+}
 
 export function systemStatusReducer(
   state: SystemStatusState,

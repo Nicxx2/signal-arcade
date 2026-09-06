@@ -47,6 +47,12 @@ are pruned. Ollama model files remain in Ollama's separate store and never count
 - `intelligence/nonlinear.py`: one lazy-loaded, single-thread CPU XGBoost recipe with deterministic
   training, finite-input validation and portable JSON serialization. Linear remains the preferred
   family unless the nonlinear contender earns a material untouched-validation advantage.
+- `intelligence/training_job.py`: serialized immutable fit inputs and read-only artifact access;
+  object reconstruction and fitting run outside the event lock, with checked publication afterward.
+- `intelligence/reserve_refresh.py`: shared owner/PDA/mint/vault/fee validation for learning-only
+  reserve snapshots and held-position watchdog evidence. Learning never mutates the trading cache.
+- `event_queue.py` and `terminal_evidence.py`: finite admitted season boundaries and one shared
+  terminal-proof contract for the orchestrator and database accounting validator.
 - `paper/`: integer curve quotes, delayed orders, persistent adaptive exit assessments, receipts,
   positions, and accounting.
 - `ai_lab.py`: optional structured local-model critic, serialized catalog downloads, runtime

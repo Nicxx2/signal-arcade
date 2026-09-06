@@ -1,10 +1,15 @@
-import type { AiDecisionMode, AiLabStatus, AiModelDownload, ChallengerJourneyPage, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
+import type { AiDecisionMode, AiLabStatus, AiModelDownload, BattleReplayResponse, ChallengerJourneyPage, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
+
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) { super(message); this.name = "ApiError"; }
+}
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000): Promise<T> {
   const controller = new AbortController();
   let timedOut = false;
   const abortFromCaller = () => controller.abort();
   init?.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (init?.signal?.aborted) controller.abort();
   const timeout = window.setTimeout(() => {
     timedOut = true;
     controller.abort();
@@ -17,7 +22,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 15_000):
     });
     if (!response.ok) {
       const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-      throw new Error(body?.detail ?? `Request failed (${response.status})`);
+      throw new ApiError(body?.detail ?? `Request failed (${response.status})`, response.status);
     }
     return (await response.json()) as T;
   } catch (error) {
@@ -59,9 +64,12 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ mode }),
     }),
-  championJourney: (cursor?: string, signal?: AbortSignal) => request<ChallengerJourneyPage>(
-    `/api/v1/learning/champion-journey?limit=8${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+  championJourney: (cursor?: string, signal?: AbortSignal, limit = 8) => request<ChallengerJourneyPage>(
+    `/api/v1/learning/champion-journey?limit=${Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.trunc(limit))) : 8}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
     { signal },
+  ),
+  championReplay: (eventId: string, cohort: string, signal?: AbortSignal) => request<BattleReplayResponse>(
+    `/api/v1/learning/champion-replay?event_id=${encodeURIComponent(eventId)}&cohort_key=${encodeURIComponent(cohort)}`, { signal },
   ),
   aiLab: () => request<AiLabStatus>("/api/v1/ai-lab"),
   setAiMode: (mode: AiDecisionMode) =>

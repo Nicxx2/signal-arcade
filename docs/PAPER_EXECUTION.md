@@ -224,6 +224,44 @@ score. Scores observed at different times are not guaranteed comparable, and aut
 would add another sell plus buy, price impact, fees, and churn. A future rotation strategy should
 only be introduced with out-of-sample evidence that its net uplift exceeds those costs.
 
+## Automatic season resolution in v1.10.4
+
+After the configured grace period has accumulated verified eligible time, an eligible automatic
+season gets one additional five-minute terminal-evidence deadline. The deadline belongs to the
+season and is persisted: more dormant holdings, repeated requests and restarts cannot each add
+another window. An outage does not become evidence, and the existing global-health gate still
+blocks rollover. If a holding revives, a pending order appears, Stop is selected, another profile
+operation owns the transition, or persistence fails, the engine rechecks those gates before acting.
+
+The watchdog uses fully validated current accounts. Missing accounts, decode failures, timeouts,
+unsupported routes, repeated slots and stale probes cannot confirm a worthless token. Two valid
+unavailable observations at distinct advancing slots within 180 seconds may confirm a terminal
+loss. Returning liquidity or a failed intervening probe breaks that chain. Confirmed losses are
+archived as write-offs without fabricated sells; they preserve complete and potentially comparable
+season accounting if the season satisfies the other comparison requirements.
+
+If inventory remains unknown when the additional window ends, the eligible season may archive
+as `incomplete_unknown` and begin a fresh bankroll. Its uncertainty and unresolved inventory remain
+visible, its aggregate result is non-comparable, and existing valid learning receipts survive.
+This prevents one unverifiable dormant token from imposing indefinite waiting while preserving the
+difference between a proven loss and missing evidence. The deadline cannot bypass active holdings,
+pending orders, Stop, unhealthy market data or a failed database transaction.
+
+Rollover captures a finite set of admitted market events. Those events, including critical producers
+waiting for capacity, finish before the boundary. Later arrivals park behind it and resume after the
+transaction. Completion is based on unfinished admitted events, not the largest sequence number
+or a requirement for the entire live stream to go quiet. Dashboard progress overlays cached page
+data and shows a warning when its observation is more than fifteen seconds old.
+
+Terminal policy `executable-boundary-v3` keeps these results separate from older comparison groups.
+The upgrade preserves historical policy labels and does not retrospectively improve old seasons.
+
+Manual resets and End now boundaries are excluded from performance comparisons even when their
+ledger accounting is complete. v1.10.5 normalizes earlier manual-reset eligibility in the read view,
+retaining `recorded_comparable` and the original scorecard. Automatic and safe finishes retain their
+existing complete/unknown accounting rules; verified terminal losses remain valid losses. The UI
+recognizes both v2 and v3 terminal policies but never merges their comparison groups.
+
 ## Not modeled completely
 
 MEV ordering, leader geography, RPC propagation gaps, compute-unit variability, account creation

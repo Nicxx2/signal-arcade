@@ -60,3 +60,20 @@ test("turns raw browser network failures into a useful message", () => {
     "The app server is temporarily unreachable. Signal Arcade will keep retrying quietly.",
   );
 });
+
+test("HTTP liveness does not resolve a market warning", () => {
+  const warning = systemStatusReducer(INITIAL_SYSTEM_STATUS, {
+    type: "report", scope: "market", title: "Market processing needs attention",
+    detail: "Market events are being processed late.", at: 1_000,
+  });
+  const responding = systemStatusReducer(warning, {
+    type: "resolve", scope: "server", serverHealthy: true, at: 2_000,
+  });
+  expect(responding.activeByScope.market).toBe(warning.activeByScope.market);
+  expect(responding.issues[0]?.resolvedAt).toBeNull();
+  const recovered = systemStatusReducer(responding, {
+    type: "resolve", scope: "market", at: 3_000,
+  });
+  expect(recovered.activeByScope.market).toBeUndefined();
+  expect(recovered.issues[0]?.resolvedAt).toBe(3_000);
+});

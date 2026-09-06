@@ -958,6 +958,13 @@ def test_champion_journey_records_a_real_common_forward_defence(settings) -> Non
     assert defence.candidate_version == contender
     assert defence.champion_version == original_champion
     assert defence.common_usable_count == 30
+    replay = database.champion_battle_replay(state.cohort_key, defence.event_id)
+    assert replay is not None and not replay["partial"]
+    assert replay["points"][0]["usable"] == 0
+    assert replay["points"][-1]["usable"] == 30
+    assert replay["points"][-1]["mean"] == defence.mean_uplift
+    founder = state.champion_journey[0]
+    assert database.champion_battle_replay(state.cohort_key, founder.event_id) is None
     database.close()
 
 
@@ -1019,6 +1026,10 @@ def test_champion_journey_closes_a_max_length_tie_as_inconclusive(settings) -> N
     assert tie.kind == "inconclusive"
     assert tie.common_usable_count == 120
     assert tie.uplift_lower_bound is not None and tie.uplift_lower_bound <= 0
+    replay = database.champion_battle_replay(state.cohort_key, tie.event_id)
+    assert replay is not None and replay["sampled"]
+    assert len(replay["points"]) == 32
+    assert replay["points"][-1]["mean"] == tie.mean_uplift
     database.close()
 
 

@@ -1,0 +1,35 @@
+{
+  "version": "1.10.5",
+  "appearance": "arc-forged-v1",
+  "choreography": "arc-motion-v2",
+  "recording": "battle-checkpoints-v1",
+  "three": "0.185.1",
+  "assets": [
+    {
+      "file": "ArenaDialog-BXdf5VBi.js",
+      "bytes": 36057,
+      "sha256": "8b80b612840e9d2b0f615e9b5baef74aafdcfa0c54137253697a944b4ca03fa9"
+    },
+    {
+      "file": "ArenaDialog-DFKL1Ly0.css",
+      "bytes": 18725,
+      "sha256": "2fe356f0d521023a1126726aac39f5620f76faffe0b4a8fd22b53febd773a286"
+    },
+    {
+      "file": "index-D0i3wDBs.js",
+      "bytes": 446314,
+      "sha256": "23c496d09a5d58d531211de4d697397f9ddce4602c8f0892c02c885462b9c195"
+    },
+    {
+      "file": "index-D9PqfJZp.css",
+      "bytes": 127899,
+      "sha256": "6eb0d5c080582961bb01947053d97a4a349b096a654a9fbb6ee0983f3320acb0"
+    },
+    {
+      "file": "scene-qWqpnUj5.js",
+      "bytes": 567890,
+      "sha256": "53edf747cd3ccb6d644e2d9c079386e13fe799d49402e6b4a4064712783623c9"
+    }
+  ],
+  "details": "arc-details-v1"
+}

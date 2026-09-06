@@ -6,6 +6,166 @@ would require a deliberate V2 release.
 
 ## Unreleased
 
+## 1.10.5 - 2026-09-04
+
+- Repair PumpSwap quote identity during fully validated reserve refresh and commit it atomically
+  with watchdog reserves. Migrated/restored holdings with a cached native-SOL marker recover
+  through fresh Pool/vault proof, including legacy states incorrectly marked verified. Keep
+  unsupported pools, stale responses, empty-liquidity rules and historical outcomes unchanged.
+
+- Refresh the README with dated live v1.10.5 desktop/mobile captures in a new screenshot folder,
+  preserving earlier versions. Add capture provenance and a read-only headless capture script.
+
+- Retain the Arena’s last measured advantage and first-Champion proof during delayed updates,
+  with an evidence timestamp and compact delay label. Pause live moves without blanking valid
+  evidence; keep missing estimates unknown and retain existing qualification and freshness gates.
+- Show fighter signatures on skill launchers, preserve selected profiles when model generations
+  change, and explain family chest marks separately from cosmetic armor and handheld shields.
+
+- Support verified Mayhem curve refresh using current mint supply for SDK-compatible sell fees;
+  retain owner, mint, route, slot, timestamp and token-extension checks. Save compact failure
+  evidence on unquotable checkpoints without inventing returns or rewriting historical outcomes.
+- Replace bulk decision deletion at season handover with an atomic journal rotation and bounded,
+  restart-recoverable cleanup. Add season-boundary timing to diagnostics; retain schema 14.
+- Give storage cleanup a separate paced worker and bounded count refresh with per-counter ages.
+  Yield routine cleanup during model fitting to keep learning ahead of retention catch-up.
+  Show measured raw-history backlog in Settings and rate-limit compact cleanup diagnostics.
+- Allow optional Coach research during healthy open positions and ordinary market batches;
+  cooperatively pause read/screening work under pressure, retaining complete cohorts and joining
+  cancelled workers. Pending execution, stale positions, imminent reviews and training take priority.
+
+- Copy complete training cohorts in immutable batches of up to 32 rows per input category and
+  yield between reconstruction batches. Preserve row order, Policy sizing trials, fit outputs
+  and authority checks; reject partial or malformed copies without publishing evidence.
+- Reuse one fresh portfolio valuation within each sizing calculation, preserving calculated
+  sizes and performing fresh submission/fill checks after cash, reservations or marks change.
+- Keep Local AI qualification history reads off the core reader lock; use additive chronological,
+  evidence-retention and trajectory indexes without changing schema-14 records or proof gates.
+- Adapt dashboard snapshot reuse to measured read cost and market/training pressure (5–12
+  seconds), retaining explicit invalidation, real timestamps and one fair refresh waiter.
+- Add bounded operation timings inside market batches to distinguish persistence, features,
+  checkpoint updates, broker work and candidate evaluation without recording market payloads.
+- Prevent periodic AI Coach history reads from holding the core database reader lock. Check
+  market/training pressure before reading, fetch through a detached read-only connection, sort
+  compact keys instead of full JSON records, and abandon interrupted reads without evaluating
+  partial evidence. Move candidate screening off the event loop and recheck pressure, research
+  permission and cohort identity before inference. Preserve observation contents, chronology,
+  proof thresholds, Shadow mode and the main database schema.
+
+- Add bounded local diagnostics history with a separate 512 MiB allowance, a dedicated I/O writer
+  thread, fixed queues, storage-pressure guards and authenticated paged exports from Settings.
+  Preserve build/configuration identities, non-overlapping event counts and latency histograms,
+  real fit and cleanup completions, compact skill proof and existing conservative equity samples.
+  Keep actual fit timings after readiness-only checks. Record gaps and partial/mixed intervals;
+  do not create missing history, use diagnostics for training or change qualification gates.
+
+- Include degraded market processing in the compact system status, using existing snapshot and
+  fallback health responses. Keep warnings through successful HTTP requests, missing status and
+  stale cached reports; clear them on confirmed recovery without treating historical drops as a
+  current fault. No extra polling or changes to trading, learning, storage or provider settings.
+
+- Remove the brief 2D fighter flash while a selected 3D Arena loads. Reuse the active renderer when
+  switching skills, replace and dispose only the old fighter resources, and remember Auto's last
+  measured tier in the local browser. Preserve explicit graphics choices, adaptive performance
+  safeguards, hidden-stage deferral, reduced motion, 2D fallback and disposal on close.
+- Separate Entry's latest Linear and XGBoost proof from current activation readiness. Bind saved
+  validation and policy measurements to each named artifact, preserve unknown historical values,
+  identify the actual activation subject, and explain the single Entry crown and separate consent.
+  Keep older-server diagnostics explicitly Linear. Add a read-only status report without changing
+  training, qualification, activation or trading rules. Clarify exact-zero battle retentions and
+  single-point uncertainty ranges without inventing an advantage or asserting identical policies.
+  Fall back safely for unsupported or incomplete proof-report envelopes in both the panel and
+  its summary, without treating an unknown report version as current Champion evidence.
+- Extend stable fighter identities with shared SVG/3D helmet, visor, shoulder, emblem and trim
+  details. Add family marks and branching XGBoost antennae without changing existing colours,
+  builds, crests or signatures. Give fighters repeatable strike, defence, pose and celebration
+  styles, bounded to the existing rig and clip durations. Preserve recorded results, unknowns,
+  first-Champion ceremonies, reduced motion, graphics fallback and resource cleanup. No learning,
+  trading, API, recording, dependency or server-configuration changes.
+- Show valid early comparison averages as preliminary, with evidence counts beside the fighters.
+  Build a bounded chart from already-shown replay checkpoints, preserve unknown gaps and exact ties,
+  and name the saved result near playback controls. Keep promotion gates, guarded fighter momentum,
+  trading logic, backend recordings and playback/resource budgets unchanged.
+- Distinguish candidates still qualifying from actual battle contenders, label previous battle
+  results as historical, and explain why a saved Champion can appear alone. Allow status labels
+  and card footers to wrap on small screens; learning and trading behaviour are unchanged.
+- Record up to 32 actual tournament checkpoints for historical comparison playback, preserving
+  exact values, immutable participants and the final result. Keep legacy recaps final-only and
+  label partial or sampled recordings. Synchronize the comparison bars and illustrative fighter
+  exchanges; support pause, scrubbing, reduced-motion stepping and responsive controls. Read
+  recordings on demand with cohort and result validation, cancellation and no polling. Store
+  optional records separately in existing transactions without changing qualification, scoring,
+  trading decisions or schema-14 compatibility.
+
+- Clarify Arena live advantages, exact ties, retained crowns and inconclusive results with named
+  explanations. Add a fixed-scale contender advantage bar with live uncertainty, separate shared
+  evidence and first-Champion check progress, and expandable comparison numbers. Keep missing,
+  stale or insufficient evidence neutral; never display win probabilities or manufacture a crown.
+  Preserve backend trading, training, qualification, provider calls and graphics resource budgets.
+- Accept UTF-8 Basic-auth passwords and reject incorrect Unicode credentials cleanly for HTTP and
+  WebSockets. Bound decoded XGBoost runtime objects to eight recently used models and evict archived
+  entries, preserving saved artifacts, model recipes and qualification rules.
+- Restore XGBoost's one-thread execution setting after loading portable model JSON; explicitly
+  bound training/prediction input conversion as well as fitting.
+- Following live review, skip no-op training before copying retained history and omit audit-only
+  fields from frozen fitting inputs, preserving Policy sizing trials and identical fitted outputs.
+  Expose preparation, reconstruction, fitting and publication timings separately.
+- Preserve a single dashboard refresh through browser timeouts/cancellation; shrink maintenance
+  transactions adaptively, interrupt overdue SQLite cleanup, and join workers before shutdown.
+  Invalidate storage caches inside committed cleanup transactions so yielding does not reacquire
+  a busy writer lock. Verify writer contention and recovery from a failed dashboard refresh.
+- Recognize v3 season accounting alongside v2 without merging generations; exclude elective reset
+  boundaries from comparisons while preserving their raw scorecards and historical eligibility.
+- Bind skill proof gates to the displayed contender, clarify Champion availability and local AI
+  roles, and timestamp retained API row counts separately from refreshed storage capacity.
+- Add an optional Champion Arena to the four Challenger skill cards and Champion Journey, with
+  stable original robot fighters, evidence-driven exchanges and explicitly labelled result recaps.
+  Show immutable identities, actual testing pairs, proof metrics and current influence separately.
+- Keep first-Champion, promotion, crown retention, inconclusive and interrupted comparisons distinct.
+  Freeze completed recaps across later snapshots; fence views and asynchronous history by cohort.
+  Pause live exchanges on stale or uncertain snapshot provenance without inventing outcomes.
+- Lazy-load a pinned Three.js renderer with original articulated geometry, one selected stage,
+  bounded motion, adaptive quality, reduced motion, complete 2D fallback and explicit GPU cleanup.
+  Add keyboard focus handling, responsive layouts and a session-wide limit on context-loss retries.
+- Pause stages clipped by scrolling, defer graphics initialisation while hidden and count only visible
+  loading time toward the timeout. Preserve early Skip commands, recover keyboard focus after a
+  control disappears and retain incomplete historical outcomes in 2D without a misleading ceremony.
+- Distinguish first-Champion qualification and coronation from completed battles. Add matching static
+  portraits to Reigning Champions, preserving retention counts and suspension labels without loading 3D.
+- Bound manually paged Champion history in memory, preserve access to older pages, handle obsolete
+  cursors and propagate cancellation before an already-aborted history request reaches fetch.
+- Preserve all v1.10.4 trading/learning rules, risk profiles, model generations, consent and schema 14.
+  No new Solana/AI calls or learning writes; graphics settings remain browser-local.
+- Update release metadata, usage/rollback guidance, dependency notices and validation evidence.
+
+## 1.10.4 - 2026-09-04
+
+- Bound automatic season resolution with one persisted five-minute unknown-inventory deadline
+  after the configured verified grace period, and drain a finite admitted event set before rollover.
+  Preserve Stop, pending-order, active-position, health and persistence gates; expose fresh progress.
+- Require complete, matching on-chain account validation and distinct advancing slots for terminal
+  probes. Failed refreshes remain unknown. Confirmed write-offs remain complete losses; unresolved
+  inventory remains non-comparable without discarding valid lessons.
+- Rotate cached checkpoints fairly between Policy and Discovery, and add an optional, disabled by
+  default background reserve worker with shared RPC quotas, bounded batches and immutable snapshots.
+  Validate mint, program ownership, PDAs, vault mapping, token state, current fee configuration,
+  timestamps and slots. Do not extend freshness or lower the 70% qualification requirement.
+- Score Exit tournaments on all required paired horizons and advance governance on secondary
+  checkpoints. Version this proof and suspend previously promoted Exit authority until requalified.
+- Freeze training inputs and publish only against matching authority/runtime context. Allow Coach
+  work with dormant inventory when the event pipeline is quiet; preserve its zero trading authority.
+- Commit each training publication as one transaction and expose its in-memory candidate state only
+  after commit. Failed writes and commits roll back and remain retryable across restart.
+- Discard parked events and fence already-dequeued batches when switching Mainnet/Demo; release
+  admitted batch accounting if collection is cancelled before processing starts.
+- Preserve original Decision Lab checkpoint fees and require fresh, funded executable exit routes;
+  use critic schema v5 for new qualification. Account for individually rounded protocol fees and
+  retained LP fees in validated sell quotes.
+- Migrate to schema 14 with indexed Champion events, bounded in-memory history, and archived
+  metadata for pruned heavy payloads while retaining protected authority/dependency artifacts.
+- Update release metadata, Compose refresh controls, upgrade/rollback guidance and verification notes.
+  The prospective portfolio experiment remains outside this release.
+
 ## 1.10.3 - 2026-09-04
 
 - Replace the five-minute full-table storage scan with fast SQLite page/WAL capacity checks and

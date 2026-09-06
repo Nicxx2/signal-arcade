@@ -92,6 +92,9 @@ class TokenState:
     last_reserve_at: datetime | None = None
     last_reserve_slot: int = 0
     reserve_source: str = ""
+    reserve_audit: dict[str, Any] | None = None
+    reserve_fee_components: tuple[int, ...] | None = None
+    reserve_lp_fee_bps: int = 0
     # Exact provenance for the reserve state used by paper execution. These fields are kept in
     # memory and copied into immutable fill receipts; raw trade rows may later be pruned.
     last_reserve_event_id: str | None = None
@@ -153,6 +156,10 @@ class TokenState:
         if event.kind != EventKind.MARKET:
             self.last_event_at = effective_at
             self.last_event_id = event.event_id
+        if reserve_observed:
+            self.reserve_audit = None
+            self.reserve_fee_components = None
+            self.reserve_lp_fee_bps = 0
         self.last_slot = max(self.last_slot, event.slot or 0)
         self.sources.add(event.source)
         curve = _value(payload, "bonding_curve", "bondingCurve")
@@ -565,6 +572,44 @@ class FeatureEngine:
             state.last_reserve_slot = slot
             state.reserve_source = "solana_rpc:position_watchdog"
             state.last_reserve_event_id = observation_id
+            state.last_reserve_signature = None
+            return True
+
+    def apply_validated_watchdog_snapshot(self, snapshot: TokenState) -> bool:
+        """Apply all validated reserve fields atomically, including verified empty routes."""
+        with self._lock:
+            state = self.tokens.get(snapshot.mint)
+            if (
+                state is None
+                or state.venue != snapshot.venue
+                or state.curve_address != snapshot.curve_address
+                or state.pool_address != snapshot.pool_address
+                or state.pool_base_token_account != snapshot.pool_base_token_account
+                or state.pool_quote_token_account != snapshot.pool_quote_token_account
+                or snapshot.last_reserve_slot < state.last_slot
+                or snapshot.last_reserve_slot <= state.last_reserve_slot
+                or snapshot.reserve_audit is None
+            ):
+                return False
+            for name in (
+                "virtual_token_reserves",
+                "virtual_quote_reserves",
+                "real_token_reserves",
+                "real_quote_reserves",
+                # Commit the account-verified quote together with its reserves and proof.
+                # This also repairs older snapshots that incorrectly verified a cached quote.
+                "quote_mint",
+                "route_verified",
+                "fee_bps",
+                "reserve_fee_components",
+                "reserve_lp_fee_bps",
+                "reserve_audit",
+                "last_reserve_at",
+                "last_reserve_slot",
+            ):
+                setattr(state, name, getattr(snapshot, name))
+            state.reserve_source = "solana_rpc:position_watchdog"
+            state.last_reserve_event_id = f"solana-rpc:{snapshot.last_reserve_slot}:{snapshot.mint}"
             state.last_reserve_signature = None
             return True
 

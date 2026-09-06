@@ -71,6 +71,8 @@ def quote_sell(
     fee_bps: int,
     network_fee_lamports: int,
     real_quote_reserves: int | None = None,
+    fee_components: tuple[int, ...] | None = None,
+    lp_fee_bps: int = 0,
 ) -> CurveQuote:
     """Quote a Pump-style constant-product sell with fees deducted from proceeds."""
     _validate_reserves(virtual_token_reserves, virtual_sol_reserves)
@@ -78,6 +80,15 @@ def quote_sell(
         raise ValueError("token amount must be positive")
     if not 0 <= fee_bps <= 10_000:
         raise ValueError("fee_bps outside supported range")
+    if (fee_components is None and lp_fee_bps != 0) or (
+        fee_components is not None
+        and (
+            any(not 0 <= part <= 10_000 for part in fee_components)
+            or sum(fee_components) != fee_bps
+            or lp_fee_bps not in (0, *fee_components)
+        )
+    ):
+        raise ValueError("fee components are inconsistent")
     invariant = virtual_token_reserves * virtual_sol_reserves
     next_token = virtual_token_reserves + token_units
     next_sol = ceil_div(invariant, next_token)
@@ -89,9 +100,10 @@ def quote_sell(
             raise ValueError("real quote reserves are invalid")
         # Virtual reserves shape Pump/PumpSwap pricing but are not spendable liquidity.
         # Never report or fill a paper exit that the exact quote vault cannot cover.
-        if gross > real_quote_reserves:
+        retained_lp_fee = ceil_div(gross * lp_fee_bps, 10_000)
+        if gross - retained_lp_fee > real_quote_reserves:
             raise ValueError("sell output exceeds real quote reserves")
-    protocol_fee = ceil_div(gross * fee_bps, 10_000)
+    protocol_fee = sum(ceil_div(gross * part, 10_000) for part in (fee_components or (fee_bps,)))
     wallet_received = gross - protocol_fee - network_fee_lamports
     if wallet_received <= 0:
         raise ValueError("fees exceed sell proceeds")

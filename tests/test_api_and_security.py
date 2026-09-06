@@ -336,7 +336,7 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         comparison_key = (
             f"SOL:bankroll:1000000000:profile:"
             f"{first_body['current_profile_fingerprint']}:"
-            "terminal:executable-boundary-v2"
+            "terminal:executable-boundary-v3"
         )
         assert first_body["current_comparison_key"] == comparison_key
         assert first_body["seasons"][0]["comparison_key"] == comparison_key
@@ -346,7 +346,7 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
                 "quote_currency": "SOL",
                 "quote_decimals": 9,
                 "starting_minor": 1_000_000_000,
-                "terminal_policy_version": "executable-boundary-v2",
+                "terminal_policy_version": "executable-boundary-v3",
                 "profile_provenance": "exact",
                 "profile_fingerprint": first_body["current_profile_fingerprint"],
                 "risk_mode": "balanced",
@@ -417,7 +417,7 @@ def test_season_scorecards_survive_reset_and_number_the_next_bankroll(settings) 
         assert mixed_currency["current_comparison_key"] == (
             f"USDC:bankroll:100000000:profile:"
             f"{mixed_currency['current_profile_fingerprint']}:"
-            "terminal:executable-boundary-v2"
+            "terminal:executable-boundary-v3"
         )
         assert [group["quote_currency"] for group in mixed_currency["comparison_groups"]] == [
             "SOL",

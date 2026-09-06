@@ -11,6 +11,7 @@ import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -22,9 +23,17 @@ from .ai_lab import AiDecisionLab, decision_evidence_payload
 from .coach import AiCoach
 from .config import Settings
 from .database import TERMINAL_POLICY_VERSION, Database
+from .diagnostics import DiagnosticsRecorder, artifact_summary, identity, number
+from .event_queue import SeasonEventQueue
 from .intelligence.decision import DecisionEngine, deterministic_explanation
 from .intelligence.features import FeatureEngine, TokenState
 from .intelligence.learning import FEATURE_SCHEMA_VERSION, LearningEngine
+from .intelligence.reserve_refresh import (
+    ReserveRefreshRejected,
+    reserve_addresses,
+    route_identity,
+    validated_learning_state,
+)
 from .models import (
     AiDecisionMode,
     DataValue,
@@ -45,6 +54,7 @@ from .models import (
     Side,
 )
 from .paper.broker import PaperBroker
+from .paper.curve_math import quote_sell
 from .provider_settings import (
     PROVIDER_PRESETS,
     ProviderConfiguration,
@@ -52,7 +62,7 @@ from .provider_settings import (
     endpoint_label,
 )
 from .providers.demo import DemoFeed
-from .providers.http import SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, HttpProviders
+from .providers.http import HttpProviders
 from .providers.solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, SolanaLogProvider
 from .quota import QuotaBroker
 from .redaction import redact_secrets
@@ -69,10 +79,12 @@ from .strategy import (
     SIZING_POLICY_VERSION,
     strategy_fingerprint_payload,
 )
+from .terminal_evidence import TERMINAL_PROBE_POLICY, valid_terminal_probe
 
 logger = logging.getLogger(__name__)
 
 _UI_SNAPSHOT_CACHE_SECONDS = 5.0
+_UI_SNAPSHOT_MAX_CACHE_SECONDS = 12.0
 _UI_SNAPSHOT_LOCK_WAIT_SECONDS = 0.75
 _UI_LEADERBOARD_CACHE_SECONDS = 5.0
 _UI_SEASONS_CACHE_SECONDS = 5.0
@@ -86,6 +98,7 @@ AUTO_NEW_SEASON_MAX_GRACE_SECONDS = 24 * 60 * 60
 AUTO_NEW_SEASON_DATA_INTERRUPTION_RESET_SECONDS = 5 * 60
 AUTO_NEW_SEASON_MAX_CONTINUITY_GAP_SECONDS = 15
 AUTO_NEW_SEASON_CLOCK_CHECKPOINT_SECONDS = 30
+AUTO_NEW_SEASON_TERMINAL_RESOLUTION_SECONDS = 5 * 60
 _STREAM_INCIDENT_GRACE_SECONDS = 15.0
 _QUEUE_INCIDENT_GRACE_SECONDS = 15.0
 _QUEUE_INCIDENT_QUIET_SECONDS = 10.0
@@ -104,9 +117,10 @@ _UPGRADE_STORAGE_SETTLE_SECONDS = 30.0
 _STORAGE_MAINTENANCE_INTERVAL_SECONDS = 5 * 60
 _STORAGE_MAINTENANCE_MAX_DEFERRAL_SECONDS = 5 * 60
 _STORAGE_MAINTENANCE_QUEUE_YIELD_FRACTION = 0.05
-_STORAGE_MAINTENANCE_CHUNK_ROWS = 1_000
+_STORAGE_MAINTENANCE_CHUNK_ROWS = 50
+_STORAGE_HISTORY_PASS_SECONDS = 0.05
 _STORAGE_BUDGET_PASS_ROWS = 5_000
-_STORAGE_BUDGET_PASS_SECONDS = 1.5
+_STORAGE_BUDGET_PASS_SECONDS = 0.05
 PROFILE_TRANSITION_MANUAL_SETTLEMENT_SECONDS = 90
 _TERMINAL_PROBE_MIN_CONFIRMATIONS = 2
 _TERMINAL_PROBE_MAX_AGE_SECONDS = 180.0
@@ -371,10 +385,9 @@ class Orchestrator:
         self.source_stop = asyncio.Event()
         self.tasks: set[asyncio.Task[Any]] = set()
         self.source_task: asyncio.Task[Any] | None = None
-        self.event_queue: asyncio.PriorityQueue[tuple[int, int, MarketEvent]] = (
-            asyncio.PriorityQueue(maxsize=settings.event_queue_max)
-        )
+        self.event_queue = SeasonEventQueue(maxsize=settings.event_queue_max)
         self._event_sequence = 0
+        self._source_event_boundary_sequence = 0
         # Priority protects held positions and due outcomes during public-stream bursts. Keep a
         # separate per-mint cursor so that this scheduling optimization can never reverse market
         # chronology for execution or learning.
@@ -399,8 +412,20 @@ class Orchestrator:
         self.last_critical_event_processed_at: datetime | None = None
         # One aggregate bucket per active wall-clock second keeps a genuine hour of recent
         # throughput evidence without retaining individual high-volume market events.
-        self._pipeline_recent: deque[dict[str, Any]] = deque(maxlen=3_601)
+        self._pipeline_recent: deque[dict[str, Any]] = deque(maxlen=4_096)
         self._pipeline_recent_lock = Lock()
+        self._pipeline_bucket_sequence = 0
+        self._pipeline_diagnostic_boundary = False
+        self.diagnostics = DiagnosticsRecorder(
+            settings.data_dir / "diagnostics",
+            enabled=settings.diagnostics_enabled,
+            can_write=lambda: (
+                not self._storage_market_yield_requested.is_set()
+                and not self._storage_maintenance_active
+                and not self._maintenance_requested
+                and self.learning._training_active is None
+            ),
+        )
         self._last_drop_at: datetime | None = None
         self._integrity_stream_gap_at: datetime | None = None
         self._integrity_mint_gap_at: OrderedDict[str, datetime] = OrderedDict()
@@ -420,6 +445,15 @@ class Orchestrator:
         self._enrichment_incident_active = "enrichment_worker" in active_incident_scopes
         self._heartbeat_incident_active = "heartbeat_worker" in active_incident_scopes
         self._learning_trainer_incident_active = "learning_trainer" in active_incident_scopes
+        self._learning_refresh_status: dict[str, Any] = {
+            "enabled": settings.learning_reserve_refresh_enabled,
+            "requests": 0,
+            "accepted_routes": 0,
+            "checkpoint_updates": 0,
+            "rejected": {},
+            "last_completed_at": None,
+            "state": "idle",
+        }
         self.service_running = False
         self.running = bool(self.database.get_setting("trading_enabled", False))
         self._paper_execution_issues = self.broker.chronology_issues()
@@ -450,6 +484,13 @@ class Orchestrator:
         self._auto_new_season_clock_saved_at = self._auto_new_season_last_observed_at
         last_rollover = self.database.get_setting("auto_new_season_last_rollover_at")
         self._auto_new_season_last_rollover_at = _stored_datetime(last_rollover)
+        resolution = self.database.get_setting("auto_new_season_terminal_resolution")
+        self._terminal_resolution = (
+            resolution
+            if isinstance(resolution, dict) and resolution.get("season_id") == self.broker.season_id
+            else None
+        )
+        self._auto_season_progress: dict[str, Any] | None = None
         stored_season_operation = self.database.get_setting("season_operation")
         recovering_profile_transition = bool(
             isinstance(stored_season_operation, dict)
@@ -498,6 +539,10 @@ class Orchestrator:
         self._storage_maintenance_last_duration_seconds = 0.0
         self._storage_maintenance_last_phases: dict[str, float] = {}
         self._storage_maintenance_last_removed: dict[str, int] = {}
+        self._storage_diagnostic_removed: defaultdict[str, int] = defaultdict(int)
+        self._storage_removed_total: defaultdict[str, int] = defaultdict(int)
+        self._storage_diagnostic_at = time.monotonic()
+        self._storage_maintenance_chunk_rows = _STORAGE_MAINTENANCE_CHUNK_ROWS
         self.storage_max_bytes = int(self.database.get_setting("storage_max_bytes", 5 * 1024**3))
         self.raw_trade_retention_hours = int(
             self.database.get_setting(
@@ -506,6 +551,16 @@ class Orchestrator:
         )
         self.event_counts: defaultdict[str, int] = defaultdict(int)
         self._storage_snapshot = self._storage_health_view(self.database.storage_stats())
+        self._storage_counts_at = datetime.now(UTC)
+        self._storage_count_timestamps = {
+            name: self._storage_counts_at.isoformat()
+            for name in self._storage_snapshot
+            if not name.endswith("bytes")
+            and name not in {"wal_database_fraction", "wal_pressure_state"}
+        }
+        self._storage_counts_checked_at = self._storage_counts_at
+        self._storage_optional_history_at: datetime | None = None
+        self._oldest_retained_trade_at: str | None = None
         self._storage_budget_state = (
             "cleanup_needed"
             if int(self._storage_snapshot.get("live_bytes", 0)) > int(self.storage_max_bytes * 0.90)
@@ -540,8 +595,9 @@ class Orchestrator:
         )
         self._maintenance_operation_task: asyncio.Task[Any] | None = None
         self._reconcile_interrupted_maintenance_operation()
-        self._ui_snapshot_refresh_lock = asyncio.Lock()
+        self._ui_snapshot_task: asyncio.Task[dict[str, Any]] | None = None
         self._ui_snapshot_cache: tuple[float, datetime, dict[str, Any]] | None = None
+        self._ui_snapshot_last_duration = 0.0
         self._ui_leaderboard_refresh_lock = asyncio.Lock()
         self._ui_leaderboard_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._ui_seasons_refresh_lock = asyncio.Lock()
@@ -642,11 +698,20 @@ class Orchestrator:
         self.stop_event.clear()
         await self.ai_lab.start()
         await self.coach.start()
+        await self.diagnostics.start(self.settings.frontend_dir)
+        self.tasks.add(asyncio.create_task(self._diagnostics_loop(), name="diagnostics"))
         self.tasks.add(asyncio.create_task(self._event_worker_loop(), name="event-worker"))
         await self._start_source()
         self.learning.request_current_training()
         self.tasks.add(asyncio.create_task(self._learning_trainer_loop(), name="learning-trainer"))
+        self.tasks.add(
+            asyncio.create_task(
+                self._learning_reserve_loop(),
+                name="learning-reserve-refresh",
+            )
+        )
         self.tasks.add(asyncio.create_task(self._enrichment_loop(), name="enrichment"))
+        self.tasks.add(asyncio.create_task(self._storage_loop(), name="storage-cleanup"))
         self.tasks.add(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
         self.tasks.add(
             asyncio.create_task(self._position_watchdog_loop(), name="position-watchdog")
@@ -675,6 +740,7 @@ class Orchestrator:
         self.source_task = None
         await self.coach.stop()
         await self.ai_lab.stop()
+        await self.diagnostics.stop()
         await self.http.close()
         self.database.close()
 
@@ -702,12 +768,8 @@ class Orchestrator:
             if self.source_task:
                 self.source_task.cancel()
                 await asyncio.gather(self.source_task, return_exceptions=True)
-            while True:
-                try:
-                    self.event_queue.get_nowait()
-                    self.event_queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
+            self._source_event_boundary_sequence = self._event_sequence
+            self.event_queue.discard_queued()
             self.demo_mode = enabled
             self.database.set_setting("demo_mode", enabled)
             if enabled and self.learning.mode == LearningMode.ACTIVE:
@@ -718,6 +780,9 @@ class Orchestrator:
             self.broker.reset()
             self._paper_execution_issues = []
             self._set_auto_new_season_eligible_since(None)
+            self._terminal_resolution = None
+            self.database.set_setting("auto_new_season_terminal_resolution", None)
+            self._position_route_probes.clear()
             self._ui_leaderboard_cache.clear()
             self._ui_seasons_cache = None
             self.features = FeatureEngine(stale_market_seconds=self.settings.stale_market_seconds)
@@ -1059,6 +1124,7 @@ class Orchestrator:
         observed_at: datetime | None = None,
         count: int = 1,
         lag_seconds: float | None = None,
+        critical: bool = False,
     ) -> None:
         """Record bounded per-second counters and a lag histogram for recent diagnostics."""
 
@@ -1069,10 +1135,17 @@ class Orchestrator:
         if kind not in {"enqueued", "processed", "shed", "expired", "reordered"}:
             raise ValueError(f"unknown pipeline metric: {kind}")
         with self._pipeline_recent_lock:
-            if not self._pipeline_recent or self._pipeline_recent[-1]["second"] != second:
+            if (
+                not self._pipeline_recent
+                or self._pipeline_recent[-1]["second"] != second
+                or self._pipeline_diagnostic_boundary
+            ):
+                self._pipeline_bucket_sequence += 1
+                self._pipeline_diagnostic_boundary = False
                 self._pipeline_recent.append(
                     {
                         "second": second,
+                        "serial": self._pipeline_bucket_sequence,
                         "enqueued": 0,
                         "processed": 0,
                         "shed": 0,
@@ -1080,6 +1153,11 @@ class Orchestrator:
                         "reordered": 0,
                         "lag_count": 0,
                         "lag_histogram": [0] * (len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1),
+                        "lag_max": 0.0,
+                        "queue_max": 0,
+                        "critical_count": 0,
+                        "critical_lag_max": 0.0,
+                        "critical_histogram": [0] * (len(_PIPELINE_LAG_BOUNDS_SECONDS) + 1),
                     }
                 )
             bucket = self._pipeline_recent[-1]
@@ -1097,6 +1175,12 @@ class Orchestrator:
             )
             bucket["lag_count"] += count
             bucket["lag_histogram"][index] += count
+            bucket["lag_max"] = max(bucket["lag_max"], lag)
+            bucket["queue_max"] = max(bucket["queue_max"], self.event_queue.qsize())
+            if critical:
+                bucket["critical_count"] += count
+                bucket["critical_lag_max"] = max(bucket["critical_lag_max"], lag)
+                bucket["critical_histogram"][index] += count
 
     @staticmethod
     def _pipeline_histogram_percentile(histogram: list[int], percentile: float) -> float:
@@ -1313,10 +1397,159 @@ class Orchestrator:
         return bool(
             not self._maintenance_requested
             and not self._storage_maintenance_active
-            and self.event_queue.empty()
+            and self.event_queue.qsize() == 0
             and self._event_batches_in_flight == 0
             and self.last_processing_lag_seconds < 1
         )
+
+    def _collect_diagnostics(self) -> None:
+        """Copy compact in-memory facts at the event boundary; never build a dashboard."""
+        recorder = self.diagnostics
+        with self._pipeline_recent_lock:
+            buckets = [
+                {
+                    **item,
+                    "lag_histogram": list(item["lag_histogram"]),
+                    "critical_histogram": list(item["critical_histogram"]),
+                }
+                for item in self._pipeline_recent
+                if item["serial"] >= recorder.cursor.serial
+            ]
+            # Close the current second for diagnostics. The next event creates a new bucket,
+            # preserving exact non-overlapping counts and maxima without another per-event path.
+            self._pipeline_diagnostic_boundary = True
+        pipeline, gap = recorder.cursor.take(buckets)
+        configuration = self._configuration_fingerprint()
+        latest: dict[tuple[str, str], Any] = {}
+        for artifact in self.learning.skill_artifacts.values():
+            if (
+                artifact.risk_mode != self.risk_mode
+                or artifact.configuration_fingerprint != configuration
+            ):
+                continue
+            key = (artifact.skill.value, artifact.model_family.value)
+            old = latest.get(key)
+            if old is None or artifact.created_at > old.created_at:
+                latest[key] = artifact
+        skills = [artifact_summary(artifact) for _, artifact in sorted(latest.items())[:6]]
+        states = [
+            state
+            for state in self.learning.skill_states.values()
+            if state.risk_mode == self.risk_mode
+            and state.configuration_fingerprint == configuration
+        ]
+        for summary in skills:
+            state = next((state for state in states if state.skill.value == summary["skill"]), None)
+            if state:
+                summary["champion"] = identity(state.champion_version)
+                summary["active"] = identity(state.active_version)
+                summary["testing"] = identity(state.testing_version)
+                summary["shared"] = state.common_forward_count
+        training = self.learning.training_status()
+        equity = self.broker.last_diagnostic_equity
+        equity = (
+            {**equity, "season": identity(equity["season"])}
+            if equity and equity["season"] == self.broker.season_id
+            else None
+        )
+        snapshot_age = (
+            time.monotonic() - self._ui_snapshot_cache[0]
+            if self._ui_snapshot_cache is not None
+            else None
+        )
+        context = {
+            "build": recorder.fingerprint,
+            "version": __version__,
+            "configuration": identity(configuration),
+            "season": identity(self.broker.season_id),
+            "risk": self.risk_mode.value,
+            "demo": self.demo_mode,
+            "learning_mode": self.learning.mode.value,
+            "profile": identity(self.broker.season_profile),
+            "scope": "sampled_at_interval_end",
+        }
+        recorder.collect(
+            pipeline=pipeline,
+            context=context,
+            skills=skills,
+            gap=gap,
+            gauges={
+                "queue": self.event_queue.qsize(),
+                "training_runs": training["runs"],
+                "paper_equity": equity,
+                "models_published": training["published_models"],
+                "ai_mode": self.ai_lab.mode.value,
+                "ai_queue": self.ai_lab.queue.qsize(),
+                "ai_queue_drops": self.ai_lab.shadow_queue_drops,
+                "ai_pending_tokens": len(self.ai_lab.pending_outcomes),
+                "coach_busy": self.coach.busy,
+                "coach_error": self.coach.last_error is not None,
+                "coach_context_outcomes": self.coach.context_outcomes_seen,
+                "coach_retained_reviews": len(self.coach.reviews),
+                "coach_retained_hypotheses": len(self.coach.hypotheses),
+                "training_discarded": training["discarded_stale_jobs"],
+                "training_errors": int(training["last_error"] is not None),
+                "outcomes_seen": self.learning.outcomes_seen,
+                "provider_reconnects": self.solana.reconnects,
+                "snapshot_age": number(snapshot_age),
+                "app_cpu_seconds": number(time.process_time()),
+                "database_bytes": self._storage_snapshot.get("database_bytes"),
+                "database_live_bytes": self._storage_snapshot.get("live_bytes"),
+                "storage_active": self._storage_maintenance_active,
+                "running": self.running,
+                "workers_healthy": all(self.background_task_status().values()),
+            },
+        )
+
+    async def _diagnostics_loop(self) -> None:
+        if not self.diagnostics.enabled:
+            return
+        due = time.monotonic() + 60
+        while not self.stop_event.is_set():
+            try:
+                busy = bool(
+                    self._maintenance_requested
+                    or self._storage_maintenance_active
+                    or self.event_queue.qsize() > 100
+                    or self.last_processing_lag_seconds >= 1
+                    or self.learning.training_status()["state"] == "running"
+                )
+                if time.monotonic() >= due and not busy:
+                    async with asyncio.timeout(0.05), self._event_lock:
+                        self._collect_diagnostics()
+                    due = time.monotonic() + 60
+                await self.diagnostics.flush_one(allowed=not busy)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Diagnostics can lose detail; it must never stop a core worker or affect proof.
+                self.diagnostics.dropped += 1
+                due = time.monotonic() + 60
+            await self._wait_for_stop(5)
+
+    def _record_training_diagnostics(self, job: Any, ran: bool, phase_started: float) -> None:
+        if not self.diagnostics.enabled:
+            return
+        try:
+            self.diagnostics.event(
+                {
+                    "kind": "training",
+                    "at": time.time(),
+                    "ran": ran,
+                    "phases": {key: number(value) for key, value in job.phase_seconds.items()},
+                    "publish_seconds": number(time.monotonic() - phase_started),
+                    "risk": job.key[0].value,
+                    "configuration": identity(job.key[1]),
+                }
+            )
+            if ran and job.workspace._training_output is not None:
+                for artifact, _, _ in job.workspace._training_output.artifacts[:6]:
+                    self.diagnostics.event(
+                        {"kind": "proof", "at": time.time(), **artifact_summary(artifact)}
+                    )
+        except Exception:
+            # Reporting must not turn a committed publication into an apparent training failure.
+            self.diagnostics.dropped += 1
 
     async def _learning_trainer_loop(self) -> None:
         """Run coalesced fitting off the event lock and yield whenever market work exists."""
@@ -1326,7 +1559,41 @@ class Orchestrator:
                 await self._wait_for_stop(1)
                 continue
             try:
-                ran = await asyncio.to_thread(self.learning.run_next_training)
+                async with self._event_lock:
+                    learner = self.learning
+                    phase_started = time.monotonic()
+                    job = await asyncio.to_thread(
+                        learner.prepare_next_training,
+                        (
+                            id(self.learning),
+                            self.demo_mode,
+                            self.broker.season_id,
+                            self.stop_event.is_set(),
+                        ),
+                    )
+                    self.diagnostics.observe_phase("training_prepare", phase_started)
+                if job is None:
+                    continue
+                fit_error = None
+                try:
+                    await asyncio.to_thread(learner.fit_training_job, job)
+                except Exception as exc:
+                    fit_error = exc
+                async with self._event_lock:
+                    phase_started = time.monotonic()
+                    ran = await asyncio.to_thread(
+                        learner.finish_training_job,
+                        job,
+                        runtime_context=(
+                            id(self.learning),
+                            self.demo_mode,
+                            self.broker.season_id,
+                            self.stop_event.is_set(),
+                        ),
+                        error=fit_error,
+                    )
+                    self.diagnostics.observe_phase("training_publish", phase_started)
+                    self._record_training_diagnostics(job, ran, phase_started)
                 if (
                     ran
                     and self._learning_trainer_incident_active
@@ -1337,6 +1604,9 @@ class Orchestrator:
                 raise
             except Exception as exc:
                 logger.exception("Background Challenger training recovered from an error")
+                self.diagnostics.event(
+                    {"kind": "training_error", "at": time.time(), "error_type": type(exc).__name__}
+                )
                 self._learning_trainer_incident_active = True
                 await self._record_incident_safe(
                     scope="learning_trainer",
@@ -1362,6 +1632,7 @@ class Orchestrator:
             self._storage_market_yield_requested.set()
         self._event_sequence += 1
         queued = (priority, self._event_sequence, event)
+        self.event_queue.admit(queued[1])
         try:
             self.event_queue.put_nowait(queued)
             self.events_enqueued += 1
@@ -1372,12 +1643,17 @@ class Orchestrator:
             if priority == 0:
                 # Held-position, pending-order, AI-outcome and due learning-checkpoint updates
                 # are never silently discarded. Backpressure is safer than fabricated continuity.
-                await self.event_queue.put(queued)
+                try:
+                    await self.event_queue.put(queued)
+                except asyncio.CancelledError:
+                    self.event_queue.forget(queued[1])
+                    raise
                 self.events_enqueued += 1
                 self._record_pipeline_recent("enqueued")
                 self._refresh_storage_yield_signal(priority)
                 return
         self.events_dropped += 1
+        self.event_queue.forget(queued[1])
         dropped_at = datetime.now(UTC)
         self._record_pipeline_recent("shed", observed_at=dropped_at)
         self._note_integrity_mint_gap(event.mint, dropped_at)
@@ -1403,26 +1679,29 @@ class Orchestrator:
 
     async def _event_worker_loop(self) -> None:
         while not self.stop_event.is_set():
+            if self.event_queue.boundary_ready():
+                await self._finish_season_boundary()
             try:
                 first = await asyncio.wait_for(self.event_queue.get(), timeout=1)
             except TimeoutError:
                 await self._update_queue_incident(datetime.now(UTC))
                 continue
             batch = [first]
+            batch_started = time.monotonic()
             self._event_batches_in_flight += 1
             # A short wait improves database batching when traffic is sparse. Once another event
             # is already queued, waiting adds pure lag and can amplify a public-stream burst.
             # Skipping only that artificial delay preserves priority order, every event, and all
             # held-position/outcome backpressure semantics while allowing the worker to catch up.
-            batch_wait_seconds = self._event_batch_wait_seconds()
-            if batch_wait_seconds:
-                await asyncio.sleep(batch_wait_seconds)
-            while len(batch) < self.settings.event_batch_size:
-                try:
-                    batch.append(self.event_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
             try:
+                batch_wait_seconds = self._event_batch_wait_seconds()
+                if batch_wait_seconds:
+                    await asyncio.sleep(batch_wait_seconds)
+                while len(batch) < self.settings.event_batch_size:
+                    try:
+                        batch.append(self.event_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
                 try:
                     working_batch: list[tuple[int, int, MarketEvent]] = []
                     for _queued_priority, sequence, event in batch:
@@ -1434,11 +1713,12 @@ class Orchestrator:
                         item[2] for item in working_batch if self._durable_event(item[2], item[0])
                     ]
                     durable_ids = {event.event_id for event in durable_events}
-                    inserted = (
-                        await asyncio.to_thread(self.database.append_events, durable_events)
-                        if durable_events
-                        else set()
-                    )
+                    with self.diagnostics.measure("event_persist"):
+                        inserted = (
+                            await asyncio.to_thread(self.database.append_events, durable_events)
+                            if durable_events
+                            else set()
+                        )
                     handled_ids: set[str] = set()
                     for _initial_priority, sequence, event in working_batch:
                         if event.event_id in handled_ids:
@@ -1479,10 +1759,11 @@ class Orchestrator:
                             # An event may have entered as an ordinary candidate and become the
                             # first executable tick after an order was submitted earlier in this
                             # batch. Persist it before any fill can reference it.
-                            durable = await asyncio.to_thread(
-                                self.database.append_event,
-                                event,
-                            )
+                            with self.diagnostics.measure("event_persist"):
+                                durable = await asyncio.to_thread(
+                                    self.database.append_event,
+                                    event,
+                                )
                             if not durable:
                                 continue
                         if durable:
@@ -1514,6 +1795,7 @@ class Orchestrator:
                             "processed",
                             observed_at=processed_at,
                             lag_seconds=self.last_processing_lag_seconds,
+                            critical=effective_priority == 0,
                         )
                     if self._event_worker_incident_active and await self._resolve_incidents_safe(
                         "market_event_worker"
@@ -1544,21 +1826,47 @@ class Orchestrator:
                         metadata={"batch_size": len(batch)},
                     )
             finally:
+                self.diagnostics.observe_phase("event_batch", batch_started)
                 for _ in batch:
                     self.event_queue.task_done()
                 self._event_batches_in_flight = max(0, self._event_batches_in_flight - 1)
                 self._refresh_storage_yield_signal()
             await self._update_queue_incident(datetime.now(UTC))
 
+    async def _finish_season_boundary(self) -> None:
+        """The worker owns the handover after every admitted event has completed."""
+        boundary_started = time.monotonic()
+        try:
+            async with self._event_lock:
+                now = datetime.now(UTC)
+                profile = await self._profile_transition_tick(now)
+                rollover = (
+                    None
+                    if self._profile_transition_active()
+                    else await asyncio.to_thread(self._auto_new_season_tick, now)
+                )
+            if profile is not None:
+                await self.bus.publish({"type": "paper_profile_transition_completed", **profile})
+            if rollover is not None:
+                await self.bus.publish({"type": "paper_season_rolled_over", **rollover})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Season boundary will retry without discarding queued evidence")
+        finally:
+            self.diagnostics.observe_phase("season_boundary", boundary_started)
+            self.event_queue.end_boundary()
+
     async def handle_event(self, event: MarketEvent) -> None:
         """Immediate deterministic path retained for tests and direct integrations."""
 
         if self._ignore_untracked_trade(event):
             return
+        self._event_sequence += 1
+        sequence = self._event_sequence
         inserted = await asyncio.to_thread(self.database.append_event, event)
         if inserted:
-            self._event_sequence += 1
-            await self._handle_persisted_event(event, sequence=self._event_sequence)
+            await self._handle_persisted_event(event, sequence=sequence)
 
     async def _handle_persisted_event(
         self,
@@ -1570,13 +1878,16 @@ class Orchestrator:
             if sequence is None:
                 self._event_sequence += 1
                 sequence = self._event_sequence
+            if sequence <= self._source_event_boundary_sequence:
+                return False
             if self._event_regresses_verified_route(event):
                 self.route_regression_events += 1
                 return False
             if not self._accept_event_order(event, sequence):
                 return False
             self.event_counts[event.kind.value] += 1
-            state = self.features.apply(event)
+            with self.diagnostics.measure("event_features"):
+                state = self.features.apply(event)
             if state is None:
                 return False
             observed_at = max(
@@ -1591,14 +1902,16 @@ class Orchestrator:
 
             is_trade = event.kind == EventKind.TRADE
             if is_trade and self.learning.has_pending_mint(state.mint):
-                await asyncio.to_thread(
-                    self.learning.observe_market,
-                    state,
-                    observed_at,
-                    live=not self.demo_mode,
-                )
+                with self.diagnostics.measure("event_learning"):
+                    await asyncio.to_thread(
+                        self.learning.observe_market,
+                        state,
+                        observed_at,
+                        live=not self.demo_mode,
+                    )
             if is_trade and self.ai_lab.has_pending_outcome(state.mint):
-                await asyncio.to_thread(self.ai_lab.observe_market, state, observed_at)
+                with self.diagnostics.measure("event_ai"):
+                    await asyncio.to_thread(self.ai_lab.observe_market, state, observed_at)
 
             broker_tracked = bool(
                 state.mint in self.broker.positions or self.broker.has_pending_for(state.mint)
@@ -1628,7 +1941,8 @@ class Orchestrator:
             # cooldown, while positions/pending orders still receive every executable update.
             if not broker_tracked and not should_evaluate:
                 return True
-            snapshot = self.features.snapshot(state.mint, observed_at)
+            with self.diagnostics.measure("event_features"):
+                snapshot = self.features.snapshot(state.mint, observed_at)
             if snapshot is None:
                 return True
             integrity_window_complete = self._integrity_learning_window_complete(
@@ -1663,17 +1977,18 @@ class Orchestrator:
                 datetime.now(UTC)
             )
             if (self.running or transition_exit_management) and is_trade and broker_tracked:
-                receipts = await asyncio.to_thread(
-                    self.broker.on_market_state,
-                    state=state,
-                    features=snapshot,
-                    event_kind=event.kind,
-                    source_event_id=event.event_id,
-                    now=observed_at,
-                    mode=self.risk_mode,
-                    sol_usd_price=sol_usd_price,
-                    soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
-                )
+                with self.diagnostics.measure("event_broker"):
+                    receipts = await asyncio.to_thread(
+                        self.broker.on_market_state,
+                        state=state,
+                        features=snapshot,
+                        event_kind=event.kind,
+                        source_event_id=event.event_id,
+                        now=observed_at,
+                        mode=self.risk_mode,
+                        sol_usd_price=sol_usd_price,
+                        soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
+                    )
             elif not self.running and is_trade and state.mint in self.broker.positions:
                 receipts = []
                 await asyncio.to_thread(
@@ -1701,17 +2016,18 @@ class Orchestrator:
             order = None
             if should_evaluate:
                 integrity_learning_eligible = integrity_window_complete
-                planned_size = await asyncio.to_thread(
-                    self.broker.planned_order_size_sol,
-                    self.risk_mode,
-                    sol_usd_price=sol_usd_price,
-                )
-                baseline_decision = await asyncio.to_thread(
-                    self._evaluate_baseline_with_size,
-                    snapshot,
-                    planned_size,
-                    sol_usd_price,
-                )
+                with self.diagnostics.measure("event_candidate"):
+                    planned_size = await asyncio.to_thread(
+                        self.broker.planned_order_size_sol,
+                        self.risk_mode,
+                        sol_usd_price=sol_usd_price,
+                    )
+                    baseline_decision = await asyncio.to_thread(
+                        self._evaluate_baseline_with_size,
+                        snapshot,
+                        planned_size,
+                        sol_usd_price,
+                    )
                 baseline_decision = baseline_decision.model_copy(
                     update={
                         "season_id": self.broker.season_id,
@@ -1736,13 +2052,14 @@ class Orchestrator:
                 if integrity_learning_eligible:
                     # Freeze the untouched Baseline and active-skill receipts before either the
                     # statistical Challenger or optional Local AI can alter this decision.
-                    await asyncio.to_thread(
-                        self.learning.register,
-                        baseline_decision,
-                        state,
-                        live=not self.demo_mode,
-                        evaluation_actionable=baseline_entry_actionable,
-                    )
+                    with self.diagnostics.measure("event_register"):
+                        await asyncio.to_thread(
+                            self.learning.register,
+                            baseline_decision,
+                            state,
+                            live=not self.demo_mode,
+                            evaluation_actionable=baseline_entry_actionable,
+                        )
                 decision = self.learning.assess(
                     baseline_decision,
                     live=not self.demo_mode and integrity_learning_eligible,
@@ -1768,11 +2085,12 @@ class Orchestrator:
                         }
                     )
                 if decision.action == DecisionAction.ENTER:
-                    order, blocker = await asyncio.to_thread(
-                        self.broker.submit_decision_with_reason,
-                        decision,
-                        sol_usd_price=sol_usd_price,
-                    )
+                    with self.diagnostics.measure("event_broker"):
+                        order, blocker = await asyncio.to_thread(
+                            self.broker.submit_decision_with_reason,
+                            decision,
+                            sol_usd_price=sol_usd_price,
+                        )
                     if order is not None:
                         self.learning.link_policy_order(decision.decision_id, order.order_id)
                     if blocker:
@@ -1783,7 +2101,8 @@ class Orchestrator:
                             }
                         )
                 if self._should_record_decision(decision):
-                    await asyncio.to_thread(self.database.save_decision, decision)
+                    with self.diagnostics.measure("event_decision_save"):
+                        await asyncio.to_thread(self.database.save_decision, decision)
                     self.last_recorded_decision[state.mint] = decision
                 if baseline_entry_actionable and integrity_learning_eligible:
                     self.ai_lab.enqueue_shadow(baseline_decision, state)
@@ -2026,16 +2345,6 @@ class Orchestrator:
                 for mint, value in self._route_retry_delay_seconds.items()
                 if mint in current_mints
             }
-        if (
-            self._storage_maintenance_requested
-            or self.last_maintenance_at is None
-            or (now - self.last_maintenance_at).total_seconds()
-            >= _STORAGE_MAINTENANCE_INTERVAL_SECONDS
-        ):
-            # Clear before awaiting. A settings update arriving during this pass sets it again,
-            # guaranteeing another pass with the newest policy instead of losing the request.
-            self._storage_maintenance_requested = False
-            await self._run_storage_maintenance(now)
         if self.demo_mode:
             return
         candidates = self._enrichment_candidates()
@@ -2333,9 +2642,38 @@ class Orchestrator:
         depth = self.event_queue.qsize()
         return bool(
             depth / capacity >= _STORAGE_MAINTENANCE_QUEUE_YIELD_FRACTION
-            or self._event_batches_in_flight
+            or self.event_queue.boundary is not None
+            or self.learning._training_active is not None
             or (depth > 0 and self.last_processing_lag_seconds >= 1)
         )
+
+    async def _storage_loop(self) -> None:
+        """Paced tiny transactions catch up independently of slow optional provider requests."""
+        await self._wait_for_stop(15)
+        while not self.stop_event.is_set():
+            now = datetime.now(UTC)
+            try:
+                if (
+                    not self._maintenance_requested
+                    and self.learning._training_active is None
+                    and (
+                        self._storage_maintenance_requested
+                        or self.last_maintenance_at is None
+                        or (now - self.last_maintenance_at).total_seconds()
+                        >= _STORAGE_MAINTENANCE_INTERVAL_SECONDS
+                    )
+                ):
+                    self._storage_maintenance_requested = False
+                    await self._run_storage_maintenance(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._storage_maintenance_requested = True
+                logger.exception("Bounded storage cleanup will retry")
+                await self._wait_for_stop(5)
+            # At most four passes/second, even when there is years of imported history.
+            # Each category owns the writer only for its bounded transaction, not this wait.
+            await self._wait_for_stop(0.25 if self._storage_maintenance_requested else 5)
 
     def _refresh_storage_yield_signal(self, event_priority: int | None = None) -> None:
         """Bridge event-loop pressure to the SQLite worker with a thread-safe flag."""
@@ -2346,6 +2684,18 @@ class Orchestrator:
             self._storage_market_yield_requested.clear()
 
     async def _run_storage_maintenance(self, now: datetime) -> None:
+        cancelled = ThreadEvent()
+        worker = asyncio.create_task(self._storage_maintenance_pass(now, cancelled))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # SQLite work already running in a thread cannot be cancelled by asyncio. Ask the
+            # bounded pass to yield and join it before shutdown is allowed to close the database.
+            cancelled.set()
+            await worker
+            raise
+
+    async def _storage_maintenance_pass(self, now: datetime, cancelled: ThreadEvent) -> None:
         """Retire bounded history without creating a periodic market-processing cliff."""
 
         started_monotonic = time.monotonic()
@@ -2354,6 +2704,7 @@ class Orchestrator:
         phases: dict[str, float] = {}
         removed = {
             "raw_trades": 0,
+            "retired_decisions": 0,
             "non_entry_decisions": 0,
             "equity_points": 0,
             "ai_assessments": 0,
@@ -2366,6 +2717,20 @@ class Orchestrator:
             self._storage_snapshot = self._storage_health_view(
                 {**self._storage_snapshot, **capacity_before}
             )
+            if (now - self._storage_counts_checked_at).total_seconds() >= 60:
+                counts = await asyncio.to_thread(self.database.bounded_storage_counts)
+                counted_at = datetime.now(UTC)
+                self._storage_snapshot.update(counts)
+                self._storage_count_timestamps.update(
+                    {name: counted_at.isoformat() for name in counts}
+                )
+                self._storage_counts_at = datetime.fromisoformat(
+                    min(self._storage_count_timestamps.values())
+                )
+                self._oldest_retained_trade_at = await asyncio.to_thread(
+                    self.database.oldest_retained_trade
+                )
+                self._storage_counts_checked_at = counted_at
             live_bytes = int(capacity_before.get("live_bytes", 0))
             storage_target = int(self.storage_max_bytes * 0.90)
             urgent = live_bytes > storage_target
@@ -2399,17 +2764,42 @@ class Orchestrator:
                 self.database.prune_history,
                 now - timedelta(hours=self.raw_trade_retention_hours),
                 non_entry_decision_before=now - timedelta(hours=24),
-                max_rows_per_category=_STORAGE_MAINTENANCE_CHUNK_ROWS,
+                max_rows_per_category=self._storage_maintenance_chunk_rows,
+                max_duration_seconds=_STORAGE_HISTORY_PASS_SECONDS,
+                stop_requested=lambda: self._maintenance_requested or cancelled.is_set(),
             )
             phases["history_seconds"] = time.monotonic() - phase_started
             for key in ("raw_trades", "non_entry_decisions", "equity_points"):
                 removed[key] = int(history.get(key, 0))
-            more_retention_work = any(
-                int(history.get(key, 0)) >= _STORAGE_MAINTENANCE_CHUNK_ROWS
+            more_retention_work = bool(history.get("work_remaining")) or any(
+                int(history.get(key, 0)) >= self._storage_maintenance_chunk_rows
                 for key in ("raw_trades", "non_entry_decisions", "equity_points")
             )
+            phase_started = time.monotonic()
+            retired = await asyncio.to_thread(
+                self.database.prune_retired_decisions,
+                max_rows=self._storage_maintenance_chunk_rows,
+                max_duration_seconds=_STORAGE_HISTORY_PASS_SECONDS,
+                stop_requested=lambda: self._maintenance_requested or cancelled.is_set(),
+            )
+            phases["retired_decisions_seconds"] = time.monotonic() - phase_started
+            removed["retired_decisions"] = retired["retired_decisions"]
+            more_retention_work = more_retention_work or bool(retired["work_remaining"])
+            # Slow disks and large legacy rows need smaller transactions. An interrupted query
+            # is rolled back, so shrink the next attempt rather than retrying the same large job.
+            if (
+                history.get("work_remaining")
+                or phases["history_seconds"] > _STORAGE_HISTORY_PASS_SECONDS
+            ):
+                self._storage_maintenance_chunk_rows = max(
+                    1, self._storage_maintenance_chunk_rows // 2
+                )
+            elif phases["history_seconds"] < _STORAGE_HISTORY_PASS_SECONDS / 2:
+                self._storage_maintenance_chunk_rows = min(
+                    _STORAGE_MAINTENANCE_CHUNK_ROWS, self._storage_maintenance_chunk_rows + 5
+                )
 
-            if self._maintenance_requested:
+            if self._maintenance_requested or cancelled.is_set():
                 return
             if self._storage_market_path_busy() and not urgent:
                 self._storage_maintenance_deferred_reason = "protecting_market_throughput"
@@ -2422,10 +2812,11 @@ class Orchestrator:
                 self.database.enforce_storage_budget,
                 self.storage_max_bytes,
                 max_rows_per_pass=_STORAGE_BUDGET_PASS_ROWS,
-                max_rows_per_chunk=_STORAGE_MAINTENANCE_CHUNK_ROWS,
+                max_rows_per_chunk=self._storage_maintenance_chunk_rows,
                 max_duration_seconds=_STORAGE_BUDGET_PASS_SECONDS,
                 stop_requested=lambda: (
                     self._maintenance_requested
+                    or cancelled.is_set()
                     or (self._storage_market_yield_requested.is_set() and not urgent)
                 ),
             )
@@ -2433,16 +2824,20 @@ class Orchestrator:
             removed["raw_trades"] += int(budget.get("raw_trades", 0))
             removed["non_entry_decisions"] += int(budget.get("non_entry_decisions", 0))
 
-            if self._maintenance_requested:
+            if self._maintenance_requested or cancelled.is_set():
                 return
-            if not self._storage_market_path_busy():
+            if not self._storage_market_path_busy() and (
+                self._storage_optional_history_at is None
+                or (now - self._storage_optional_history_at).total_seconds() >= 60
+            ):
                 phase_started = time.monotonic()
                 removed["incidents"] = await asyncio.to_thread(self.database.prune_incidents)
                 removed["ai_assessments"] = await asyncio.to_thread(
                     self.database.prune_ai_assessments
                 )
                 phases["optional_history_seconds"] = time.monotonic() - phase_started
-            else:
+                self._storage_optional_history_at = now
+            elif self._storage_market_path_busy():
                 self._storage_maintenance_deferred_reason = "protecting_market_throughput"
 
             phase_started = time.monotonic()
@@ -2470,6 +2865,21 @@ class Orchestrator:
             self._storage_maintenance_last_phases = phases
             self._storage_maintenance_last_removed = removed
             self._storage_maintenance_active = False
+            self.diagnostics.observe_phase("storage", started_monotonic)
+            for key, value in removed.items():
+                self._storage_diagnostic_removed[key] += value
+                self._storage_removed_total[key] += value
+            if "history_seconds" in phases and time.monotonic() - self._storage_diagnostic_at >= 60:
+                self.diagnostics.event(
+                    {
+                        "kind": "storage",
+                        "at": time.time(),
+                        "phases": {key: number(value) for key, value in phases.items()},
+                        "removed": dict(self._storage_diagnostic_removed),
+                    }
+                )
+                self._storage_diagnostic_removed.clear()
+                self._storage_diagnostic_at = time.monotonic()
 
     async def _verify_pumpswap_route(self, state: TokenState, now: datetime) -> bool:
         """Verify a held/pending PumpSwap pool from its program-owned on-chain account."""
@@ -2559,6 +2969,142 @@ class Orchestrator:
                 delay = min(_POSITION_WATCHDOG_MAX_SECONDS, max(5.0, delay * 2))
             await self._wait_for_stop(delay)
 
+    def _learning_reserve_can_run(self) -> bool:
+        return bool(
+            self.settings.learning_reserve_refresh_enabled
+            and not self.demo_mode
+            and not self._maintenance_requested
+            and not self._storage_maintenance_active
+            and not self.event_queue.boundary_active
+            and not self._has_pending_sell()
+            and self.event_queue.qsize() < max(1, self.settings.event_queue_max * 0.05)
+            and self.last_processing_lag_seconds < 1
+            and self._rollover_market_data_healthy(datetime.now(UTC))
+        )
+
+    async def _learning_reserve_loop(self) -> None:
+        """One bounded background batch; shared RPC quota/backoff protects market processing."""
+        while not self.stop_event.is_set():
+            try:
+                if self._learning_reserve_can_run():
+                    await self._learning_reserve_tick()
+                else:
+                    self._learning_refresh_status["state"] = (
+                        "yielding" if self.settings.learning_reserve_refresh_enabled else "disabled"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._learning_refresh_status["state"] = "retrying"
+                self._learning_refresh_status["last_error"] = type(exc).__name__
+                logger.warning("Learning reserve refresh will retry (%s)", type(exc).__name__)
+            await self._wait_for_stop(self.settings.learning_reserve_refresh_interval_seconds)
+
+    async def _learning_reserve_tick(self) -> None:
+        async with self._event_lock:
+            if not self._learning_reserve_can_run():
+                return
+            mints = await asyncio.to_thread(
+                self.learning.due_checkpoint_mints,
+                self.features.tokens,
+                datetime.now(UTC),
+                limit=self.settings.learning_reserve_refresh_batch_size,
+                fresh=False,
+            )
+            originals = {mint: self.features.tokens[mint] for mint in mints}
+            snapshots = {mint: replace(state) for mint, state in originals.items()}
+            learner = self.learning
+        selected: dict[str, TokenState] = {}
+        addresses: list[str] = []
+        for mint, state in snapshots.items():
+            try:
+                proposed = list(dict.fromkeys([*addresses, *reserve_addresses(state)]))
+                if len(proposed) <= 100:
+                    selected[mint] = state
+                    addresses = proposed
+            except (ValueError, TypeError):
+                self._learning_refresh_rejected("route_identity_unavailable")
+        if not selected:
+            return
+        self._learning_refresh_status["state"] = "fetching"
+        self._learning_refresh_status["requests"] += 1
+        requested_at = datetime.now(UTC)
+        async with asyncio.timeout(8):
+            result = await self.http.solana_multiple_accounts(
+                addresses,
+                # Validate each route against its own fence after the response. One corrupt
+                # future-slot target must not prevent every other route from being refreshed.
+                min_context_slot=min(
+                    max(state.last_slot, state.last_reserve_slot) for state in selected.values()
+                )
+                or None,
+                critical=False,
+            )
+        if result is None:
+            self._learning_refresh_rejected("provider_unavailable")
+            self._learning_refresh_status["state"] = "retrying"
+            return
+        async with self._event_lock:
+            if (
+                self.demo_mode
+                or self.learning is not learner
+                or not self._learning_reserve_can_run()
+            ):
+                self._learning_refresh_rejected("context_changed_or_market_pressure")
+                return
+            # Validation and learning persistence run under the same event boundary as cached
+            # checkpoints. The snapshots never enter FeatureEngine or the paper broker.
+            await asyncio.to_thread(
+                self._apply_learning_reserve_result,
+                selected,
+                originals,
+                result,
+                requested_at,
+            )
+        self._learning_refresh_status["state"] = "idle"
+        self._learning_refresh_status["last_completed_at"] = datetime.now(UTC).isoformat()
+
+    def _learning_refresh_rejected(self, reason: str) -> None:
+        counts = self._learning_refresh_status["rejected"]
+        counts[reason] = counts.get(reason, 0) + 1
+
+    def _apply_learning_reserve_result(
+        self,
+        selected: dict[str, TokenState],
+        originals: dict[str, TokenState],
+        result: dict[str, Any],
+        requested_at: datetime,
+    ) -> None:
+        now = datetime.now(UTC)
+        for mint, snapshot in selected.items():
+            current = self.features.tokens.get(mint)
+            if current is not originals[mint] or route_identity(current) != route_identity(
+                snapshot
+            ):
+                self._learning_refresh_rejected("route_changed_during_request")
+                continue
+            try:
+                refreshed = validated_learning_state(
+                    current,
+                    result,
+                    self.solana.decoder,
+                    requested_at=requested_at,
+                    observed_at=now,
+                )
+            except ReserveRefreshRejected as exc:
+                self._learning_refresh_rejected(str(exc))
+                continue
+            except (ValueError, TypeError, KeyError, OverflowError):
+                self._learning_refresh_rejected("malformed_snapshot")
+                continue
+            self._learning_refresh_status["accepted_routes"] += 1
+            self._learning_refresh_status["checkpoint_updates"] += self.learning.observe_market(
+                refreshed,
+                now,
+                live=True,
+                cached=True,
+            )
+
     def _position_watchdog_interval_seconds(self) -> float:
         quota = self.quota.snapshot().get("solana", {})
         try:
@@ -2596,7 +3142,8 @@ class Orchestrator:
             if state is None:
                 continue
             target_minimum_slot = max(state.last_slot, state.last_reserve_slot)
-            target = {
+            target: dict[str, Any] = {
+                "position_id": _position.position_id,
                 "mint": mint,
                 "venue": state.venue,
                 "curve_address": state.curve_address,
@@ -2615,6 +3162,12 @@ class Orchestrator:
                     addresses.append(state.pool_quote_token_account)
             else:
                 continue
+            try:
+                target["validation_addresses"] = reserve_addresses(state)
+            except (ValueError, TypeError):
+                # An unverified identity may be retried, but cannot produce an executable mark.
+                target["validation_addresses"] = []
+            addresses.extend(target["validation_addresses"])
             minimum_slot = (
                 target_minimum_slot
                 if minimum_slot is None
@@ -2646,6 +3199,7 @@ class Orchestrator:
             target_addresses = [
                 str(target.get(key) or "") for key in address_keys if target.get(key)
             ]
+            target_addresses.extend(target.get("validation_addresses", []))
             prospective = list(dict.fromkeys([*batch_addresses, *target_addresses]))
             if batch_targets and len(prospective) > _SOLANA_MULTIPLE_ACCOUNTS_LIMIT:
                 batches.append((batch_targets, batch_addresses, batch_minimum_slot or 0))
@@ -2671,31 +3225,42 @@ class Orchestrator:
         self,
         mint: str,
         *,
-        available: bool,
+        available: bool | None,
         observed_at: datetime,
         slot: int,
         market_status: str,
         blockers: list[str],
+        route_proof: dict[str, Any] | None = None,
+        position_id: str | None = None,
     ) -> None:
         """Keep restart-conservative proof for terminal inventory classification."""
 
         previous = self._position_route_probes.get(mint)
-        outcome = "available" if available else "unavailable"
-        same_outcome = bool(previous is not None and previous.get("outcome") == outcome)
+        outcome = "unknown" if available is None else "available" if available else "unavailable"
+        same_outcome = bool(
+            previous is not None
+            and previous.get("outcome") == outcome
+            and previous.get("position_id") == position_id
+            and (previous.get("route_proof") or {}).get("route_identity")
+            == (route_proof or {}).get("route_identity")
+        )
         previous_count = int(previous.get("consecutive") or 0) if previous else 0
         previous_first = previous.get("first_observed_at") if previous else None
         previous_observed_at = _stored_datetime(previous.get("observed_at")) if previous else None
         previous_first_at = _stored_datetime(previous_first) if previous_first else None
         duplicate_or_reordered = bool(
             same_outcome
+            and previous is not None
             and previous_observed_at is not None
-            and observed_at <= previous_observed_at
+            and (observed_at <= previous_observed_at or slot <= int(previous.get("slot") or 0))
         )
         continues_fresh_sequence = bool(
             same_outcome
+            and previous is not None
             and previous_observed_at is not None
             and previous_first_at is not None
             and observed_at > previous_observed_at
+            and slot > int(previous.get("slot") or 0)
             and (observed_at - previous_observed_at).total_seconds()
             <= _TERMINAL_PROBE_MAX_AGE_SECONDS
             and (observed_at - previous_first_at).total_seconds() <= _TERMINAL_PROBE_MAX_AGE_SECONDS
@@ -2707,8 +3272,11 @@ class Orchestrator:
         )
         self._position_route_probes[mint] = {
             "outcome": outcome,
+            "verified": available is not None,
             "consecutive": (
-                previous_count
+                0
+                if available is None
+                else previous_count
                 if duplicate_or_reordered
                 else previous_count + 1
                 if continues_fresh_sequence
@@ -2721,8 +3289,15 @@ class Orchestrator:
             ),
             "observed_at": recorded_at.isoformat(),
             "slot": max(int(previous.get("slot") or 0) if previous else 0, 0, slot),
+            "first_slot": (
+                previous.get("first_slot", slot)
+                if previous and (continues_fresh_sequence or duplicate_or_reordered)
+                else slot
+            ),
             "market_status": market_status,
             "blockers": list(blockers[:12]),
+            "position_id": position_id,
+            "route_proof": route_proof,
         }
 
     def _terminal_position_dispositions(
@@ -2747,6 +3322,14 @@ class Orchestrator:
             )
             confirmed_unavailable = bool(
                 globally_healthy
+                and valid_terminal_probe(
+                    {
+                        "policy": TERMINAL_PROBE_POLICY,
+                        "global_market_healthy": globally_healthy,
+                        "probe": probe,
+                    },
+                    now,
+                )
                 and position.market_status.value != "active"
                 and probe is not None
                 and probe.get("outcome") == "unavailable"
@@ -2764,7 +3347,7 @@ class Orchestrator:
                 dispositions[position.mint] = {
                     "terminal_disposition": "write_off",
                     "terminal_evidence": {
-                        "policy": "two-fresh-route-probes",
+                        "policy": TERMINAL_PROBE_POLICY,
                         "probe": dict(probe or {}),
                         "global_market_healthy": True,
                     },
@@ -2796,6 +3379,9 @@ class Orchestrator:
         receipts: list[FillReceipt] = []
         critical = self._has_pending_sell()
         for batch_targets, addresses, minimum_slot in batches:
+            requested_at = datetime.now(UTC)
+            for target in batch_targets:
+                target["requested_at"] = requested_at.isoformat()
             result = await self.http.solana_multiple_accounts(
                 addresses,
                 min_context_slot=minimum_slot or None,
@@ -2838,81 +3424,29 @@ class Orchestrator:
         refreshed: set[str] = set()
         for target in targets:
             mint = str(target["mint"])
-            if target["venue"] == "pump_curve":
-                curve_address = str(target["curve_address"])
-                account = accounts.get(curve_address)
-                if not isinstance(account, dict) or account.get("owner") != PUMP_PROGRAM:
-                    continue
-                values = self.solana.decode_pump_bonding_curve(account.get("raw", b""))
-                if values is not None and self.features.refresh_pump_curve(
-                    mint,
-                    curve_address=curve_address,
-                    values=values,
-                    slot=slot,
-                    at=now,
-                    observation_id=f"solana-rpc:{slot}:{mint}",
-                ):
-                    refreshed.add(mint)
-                continue
-
-            pool_address = str(target["pool_address"])
-            pool_account = accounts.get(pool_address)
-            if not isinstance(pool_account, dict) or pool_account.get("owner") != PUMP_AMM_PROGRAM:
-                continue
-            pool = self.solana.decode_pump_swap_pool(pool_account.get("raw", b""))
-            if not isinstance(pool, dict) or pool.get("base_mint") != mint:
-                continue
-            quote_mint = pool.get("quote_mint")
-            base_address = pool.get("pool_base_token_account")
-            quote_address = pool.get("pool_quote_token_account")
-            if not isinstance(quote_mint, str) or not 30 <= len(quote_mint) <= 50:
-                continue
-            if not isinstance(base_address, str) or not 30 <= len(base_address) <= 50:
-                continue
-            if not isinstance(quote_address, str) or not 30 <= len(quote_address) <= 50:
-                continue
-            if not self.features.confirm_pumpswap_route(
-                mint,
-                pool_address=pool_address,
-                quote_mint=quote_mint,
-                pool_base_token_account=base_address,
-                pool_quote_token_account=quote_address,
-            ):
-                continue
-            base_account = accounts.get(base_address)
-            quote_account = accounts.get(quote_address)
-            if not isinstance(base_account, dict) or not isinstance(quote_account, dict):
-                continue
-            if base_account.get("owner") not in {SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM}:
-                continue
-            if quote_account.get("owner") not in {SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM}:
-                continue
-            base = self.solana.decode_token_account(base_account.get("raw", b""))
-            quote = self.solana.decode_token_account(quote_account.get("raw", b""))
+            state = self.features.tokens.get(mint)
+            position = self.broker.positions.get(mint)
             if (
-                base is None
-                or quote is None
-                or base.get("mint") != mint
-                or quote.get("mint") != quote_mint
-                or base.get("authority") != pool_address
-                or quote.get("authority") != pool_address
+                state is None
+                or position is None
+                or (target.get("position_id") and target["position_id"] != position.position_id)
+                or state.venue != target.get("venue")
+                or state.curve_address != str(target.get("curve_address") or "")
+                or state.pool_address != str(target.get("pool_address") or "")
             ):
                 continue
-            virtual_quote = pool.get("virtual_quote_reserves")
-            if not isinstance(virtual_quote, int):
+            try:
+                reserve_snapshot = validated_learning_state(
+                    state,
+                    result,
+                    self.solana.decoder,
+                    requested_at=_stored_datetime(target.get("requested_at")) or now,
+                    observed_at=now,
+                    allow_empty=True,
+                )
+            except (ValueError, TypeError, KeyError, OverflowError):
                 continue
-            if self.features.refresh_pumpswap_reserves(
-                mint,
-                pool_address=pool_address,
-                base_token_account=base_address,
-                quote_token_account=quote_address,
-                base_amount=int(base["amount"]),
-                quote_amount=int(quote["amount"]),
-                virtual_quote_reserves=virtual_quote,
-                slot=slot,
-                at=now,
-                observation_id=f"solana-rpc:{slot}:{mint}",
-            ):
+            if self.features.apply_validated_watchdog_snapshot(reserve_snapshot):
                 refreshed.add(mint)
 
         receipts: list[FillReceipt] = []
@@ -2966,22 +3500,56 @@ class Orchestrator:
                 self._position_route_probes.pop(mint, None)
                 continue
             state = self.features.tokens.get(mint)
-            probe_at = max(
-                observed_at
-                for observed_at in (
-                    now,
-                    state.last_event_at if state else None,
-                    state.last_reserve_at if state else None,
-                )
-                if observed_at is not None
-            )
+            available: bool | None = None
+            blockers = list(position.mark_blockers)
+            if mint in refreshed and state is not None:
+                if (
+                    state.reserve_audit
+                    and state.reserve_audit.get("economic_state") == "empty_route"
+                ):
+                    available = False
+                    blockers = ["verified_empty_route"]
+                elif position.market_status.value == "active":
+                    available = True
+                elif (state.venue == "pump_swap" or not state.complete) and (
+                    state.real_quote_reserves is not None
+                ):
+                    # Remove external protocol fees, but retain the verified LP fee: it stays
+                    # in an AMM vault and reduces the liquidity required to execute the exit.
+                    # Missing conversion or an unsupported route must remain unknown.
+                    try:
+                        quote_sell(
+                            virtual_token_reserves=state.virtual_token_reserves,
+                            virtual_sol_reserves=state.virtual_quote_reserves,
+                            real_quote_reserves=state.real_quote_reserves,
+                            token_units=position.token_units,
+                            fee_bps=state.reserve_lp_fee_bps,
+                            fee_components=(state.reserve_lp_fee_bps,),
+                            lp_fee_bps=state.reserve_lp_fee_bps,
+                            network_fee_lamports=(
+                                self.settings.network_fee_lamports
+                                + self.settings.priority_fee_lamports
+                            ),
+                        )
+                    except ValueError as exc:
+                        if str(exc) in {
+                            "fees exceed sell proceeds",
+                            "quote produced no SOL output",
+                            "sell output exceeds real quote reserves",
+                        }:
+                            available = False
+                            blockers = [str(exc)]
+            if mint not in refreshed:
+                blockers = ["route_refresh_not_verified"]
             self._record_position_route_probe(
                 mint,
-                available=position.market_status.value == "active",
-                observed_at=probe_at,
+                available=available,
+                observed_at=now,
                 slot=slot,
                 market_status=position.market_status.value,
-                blockers=list(position.mark_blockers),
+                blockers=blockers,
+                position_id=position.position_id,
+                route_proof=state.reserve_audit if mint in refreshed and state else None,
             )
         return receipts, refreshed, slot
 
@@ -3011,6 +3579,7 @@ class Orchestrator:
                     # Do not reuse a timestamp captured before waiting behind the market/watchdog
                     # lock. It could otherwise predate a reserve snapshot accepted while waiting.
                     now = datetime.now(UTC)
+                    phase_started = time.monotonic()
                     receipts, expired, learning_updates, ai_updates = await asyncio.to_thread(
                         self._heartbeat_tick,
                         now,
@@ -3021,6 +3590,7 @@ class Orchestrator:
                         if self._profile_transition_active()
                         else await asyncio.to_thread(self._auto_new_season_tick, now)
                     )
+                    self.diagnostics.observe_phase("heartbeat", phase_started)
                 if receipts or expired or learning_updates or ai_updates:
                     await self.bus.publish(
                         {
@@ -3302,7 +3872,7 @@ class Orchestrator:
                     )
                     return None
 
-        if not self._rollover_pipeline_idle():
+        if not self._request_rollover_boundary():
             await self._update_profile_transition_progress(
                 operation_id,
                 stage="waiting_for_pipeline",
@@ -3478,6 +4048,7 @@ class Orchestrator:
                     "auto_new_season_eligible_since": None,
                     "auto_new_season_paused_since": None,
                     "auto_new_season_last_observed_at": None,
+                    "auto_new_season_terminal_resolution": None,
                 },
             )
             self.auto_new_season_enabled = enabled
@@ -3486,6 +4057,8 @@ class Orchestrator:
             self._auto_new_season_paused_since = None
             self._auto_new_season_last_observed_at = None
             self._auto_new_season_clock_saved_at = None
+            self._terminal_resolution = None
+            self._auto_season_progress = None
             portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
             return self.season_automation_status(portfolio)
 
@@ -3607,7 +4180,15 @@ class Orchestrator:
     def _rollover_pipeline_idle(self) -> bool:
         """Do not cross a season boundary ahead of evidence already being processed."""
 
-        return self.event_queue.qsize() == 0 and self._event_batches_in_flight == 0
+        return self._event_batches_in_flight == 0 and (
+            self.event_queue.qsize() == 0 or self.event_queue.boundary_ready()
+        )
+
+    def _request_rollover_boundary(self) -> bool:
+        if self._rollover_pipeline_idle():
+            return True
+        self.event_queue.begin_boundary(self._event_sequence)
+        return False
 
     def _rollover_market_data_healthy(self, now: datetime) -> bool:
         if self.demo_mode:
@@ -3769,8 +4350,8 @@ class Orchestrator:
             max(0.0, self.auto_new_season_grace_seconds - elapsed) if elapsed is not None else None
         )
         rollover_at = (
-            observed_at + timedelta(seconds=remaining)
-            if eligible and remaining is not None
+            eligible_since + timedelta(seconds=self.auto_new_season_grace_seconds)
+            if eligible and eligible_since is not None
             else None
         )
         exhaustion_mode = self._drawdown_halt_disabled()
@@ -3822,6 +4403,17 @@ class Orchestrator:
                     else "The guarded rollover is due and will be attempted automatically."
                 )
             )
+            _, waiting = self._terminal_position_dispositions(portfolio, observed_at)
+            if waiting:
+                deadline = _stored_datetime((self._terminal_resolution or {}).get("deadline"))
+                state = "waiting_for_terminal_evidence"
+                detail = (
+                    "Verifying dormant holdings; any still unknown at the resolution deadline "
+                    "will be archived honestly before the next paper season."
+                )
+                if deadline is not None and observed_at >= deadline:
+                    state = "due"
+                    detail = "Resolution time finished; preparing the next safe event boundary."
         return {
             "enabled": self.auto_new_season_enabled,
             "state": state,
@@ -3841,9 +4433,30 @@ class Orchestrator:
                 if self._auto_new_season_last_rollover_at
                 else None
             ),
+            "observed_at": observed_at.isoformat(),
+            "terminal_resolution": self._terminal_resolution,
+            "terminal_probes": {
+                mint: dict(probe) for mint, probe in self._position_route_probes.items()
+            },
+            "in_flight_batches": self._event_batches_in_flight,
+            "boundary_sequence": self.event_queue.boundary,
         }
 
     def _auto_new_season_tick(self, now: datetime) -> dict[str, str] | None:
+        try:
+            return self._perform_auto_new_season_tick(now)
+        finally:
+            with suppress(Exception):
+                self._auto_season_progress = self.season_automation_status(
+                    self.broker.snapshot(self.risk_mode, persist_peak=False),
+                    now,
+                )
+
+    def _perform_auto_new_season_tick(self, now: datetime) -> dict[str, str] | None:
+        if self._terminal_resolution and (
+            self._terminal_resolution.get("season_id") != self.broker.season_id
+        ):
+            self._terminal_resolution = None
         if self._maintenance_requested:
             return None
         portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
@@ -3853,13 +4466,41 @@ class Orchestrator:
                 self._pause_auto_new_season_clock(now)
                 return None
             self._set_auto_new_season_clock(None, None, None)
+            if self._terminal_resolution is not None:
+                self.database.set_setting("auto_new_season_terminal_resolution", None)
+                self._terminal_resolution = None
             return None
         self._resume_auto_new_season_clock(now)
         elapsed = self._auto_new_season_elapsed_seconds(now) or 0.0
         if elapsed < self.auto_new_season_grace_seconds:
             return None
-        if not self._rollover_pipeline_idle():
-            return None
+        saved_deadline = _stored_datetime((self._terminal_resolution or {}).get("deadline"))
+        if self._terminal_resolution is None or saved_deadline is None:
+            resolution = {
+                "season_id": self.broker.season_id,
+                "started_at": now.isoformat(),
+                "due_since": (
+                    (self._auto_new_season_eligible_since or now)
+                    + timedelta(seconds=self.auto_new_season_grace_seconds)
+                ).isoformat(),
+                "deadline": (
+                    now + timedelta(seconds=AUTO_NEW_SEASON_TERMINAL_RESOLUTION_SECONDS)
+                ).isoformat(),
+                "policy_version": TERMINAL_POLICY_VERSION,
+            }
+            self.database.set_setting("auto_new_season_terminal_resolution", resolution)
+            self._terminal_resolution = resolution
+        elif saved_deadline > now + timedelta(seconds=AUTO_NEW_SEASON_TERMINAL_RESOLUTION_SECONDS):
+            # A backward wall-clock correction or malformed future value cannot create hours
+            # of additional waiting. Only shorten a saved deadline, never extend it.
+            resolution = {
+                **self._terminal_resolution,
+                "deadline": (
+                    now + timedelta(seconds=AUTO_NEW_SEASON_TERMINAL_RESOLUTION_SECONDS)
+                ).isoformat(),
+            }
+            self.database.set_setting("auto_new_season_terminal_resolution", resolution)
+            self._terminal_resolution = resolution
 
         terminal_dispositions: dict[str, dict[str, Any]] = {}
         if portfolio.positions:
@@ -3868,9 +4509,18 @@ class Orchestrator:
                 now,
             )
             if waiting_for_probe:
-                # A completed grace period is not permission to invent a zero. Keep the clock
-                # due while the exact-account watchdog obtains independent route evidence.
-                return None
+                deadline = _stored_datetime(self._terminal_resolution.get("deadline"))
+                if deadline is None or now < deadline:
+                    return None
+                for mint in waiting_for_probe:
+                    terminal_dispositions[mint]["terminal_evidence"].update(
+                        {
+                            "reason": "terminal_resolution_timeout",
+                            "resolution": dict(self._terminal_resolution),
+                        }
+                    )
+        if not self._request_rollover_boundary():
+            return None
 
         terminal_reason = (
             "bankroll_exhausted" if self._drawdown_halt_disabled() else "auto_drawdown"
@@ -3905,6 +4555,7 @@ class Orchestrator:
         self._auto_new_season_last_observed_at = None
         self._auto_new_season_clock_saved_at = None
         self._auto_new_season_last_rollover_at = now
+        self._terminal_resolution = None
         self.started_at = now
         self.last_decision_at.clear()
         self.last_recorded_decision.clear()
@@ -5003,21 +5654,39 @@ class Orchestrator:
             "enrichment_worker": task_states.get("enrichment", False),
             "heartbeat_worker": task_states.get("heartbeat", False),
             "position_watchdog": task_states.get("position-watchdog", False),
+            "storage_cleanup": task_states.get("storage-cleanup", False),
             "market_source": self.source_task is not None and not self.source_task.done(),
         }
 
     def _coach_can_run(self) -> tuple[bool, str | None]:
-        """Reserve optional CPU reflection for genuinely quiet, position-free periods."""
+        """Dormant inventory does not block research; urgent execution still takes priority."""
 
         if self.demo_mode:
             return False, "demo_excluded"
-        if self.broker.positions or self.broker.pending:
+        if self.broker.pending:
             return False, "protecting_open_positions"
+        now = datetime.now(UTC)
+        for position in list(self.broker.positions.values()):
+            if position.market_status.value != "active":
+                continue
+            limits = self.broker._position_exit_limits(position, self.risk_mode)
+            if (
+                not position.mark_is_executable
+                or position.mark_is_stale
+                or position.last_marked_at is None
+                or (now - position.last_marked_at).total_seconds()
+                > self.settings.position_mark_stale_seconds
+                or (now - position.opened_at).total_seconds() >= limits.max_hold_seconds - 30
+            ):
+                return False, "protecting_open_positions"
         capacity = max(1, self.settings.event_queue_max)
         if (
             self.event_queue.qsize() / capacity >= 0.05
             or self.last_processing_lag_seconds >= 1
-            or self._event_batches_in_flight
+            or self.event_queue.boundary_active
+            or self._maintenance_requested
+            or self._storage_maintenance_active
+            or self.learning._training_active is not None
         ):
             return False, "protecting_market_throughput"
         return True, None
@@ -5113,55 +5782,76 @@ class Orchestrator:
             ),
             "recent_windows": self._recent_pipeline_windows(now),
             "learning_training": self.learning.training_status(),
+            "learning_reserve_refresh": dict(self._learning_refresh_status),
             "degraded": bool(reasons),
             "degraded_reasons": reasons,
         }
 
     async def snapshot_view(self) -> dict[str, Any]:
-        """Return a bounded shared dashboard view without letting browsers starve market work."""
+        """Coalesce browsers onto one fair refresh; a timeout never discards its lock waiter."""
 
         cached = self._ui_snapshot_cache
-        now_monotonic = time.monotonic()
-        if cached is not None and now_monotonic - cached[0] < _UI_SNAPSHOT_CACHE_SECONDS:
+        if cached is not None and time.monotonic() - cached[0] < self._snapshot_cache_seconds():
             return self._snapshot_cache_response(cached)
+
         if cached is not None and self._storage_maintenance_active:
             return self._snapshot_cache_response(cached)
-
-        # One browser performs the refresh. Other community/local tabs receive the last complete
-        # view immediately instead of multiplying SQLite reads and JSON work.
-        if self._ui_snapshot_refresh_lock.locked() and cached is not None:
+        task = self._ui_snapshot_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._refresh_snapshot(), name="dashboard-refresh")
+            self._ui_snapshot_task = task
+            self.tasks.add(task)
+            task.add_done_callback(self._snapshot_refresh_done)
+        if cached is None:
+            return await asyncio.shield(task)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), _UI_SNAPSHOT_LOCK_WAIT_SECONDS)
+        except TimeoutError:
+            # Keep the single FIFO waiter alive after returning the timestamped previous view.
+            # Repeated browser timeouts used to cancel it and indefinitely postpone fresh data.
             return self._snapshot_cache_response(cached)
 
-        async with self._ui_snapshot_refresh_lock:
-            cached = self._ui_snapshot_cache
-            now_monotonic = time.monotonic()
-            if cached is not None and now_monotonic - cached[0] < _UI_SNAPSHOT_CACHE_SECONDS:
-                return self._snapshot_cache_response(cached)
+    def _snapshot_cache_seconds(self) -> float:
+        """Keep expensive read views from repeatedly taking the market-processing boundary."""
+        pressure = (
+            self.event_queue.qsize() / max(1, self.settings.event_queue_max) >= 0.05
+            or self.last_processing_lag_seconds >= 1.0
+            or self.learning._training_active is not None
+        )
+        if pressure:
+            return _UI_SNAPSHOT_MAX_CACHE_SECONDS
+        # A completed view targets roughly one part calculation to nine parts reuse, bounded
+        # below the existing 15-second stale-view warning. Invalidation still uses -inf and
+        # therefore bypasses this delay; initial and already-queued refreshes stay fair.
+        return max(
+            _UI_SNAPSHOT_CACHE_SECONDS,
+            min(_UI_SNAPSHOT_MAX_CACHE_SECONDS, 9 * self._ui_snapshot_last_duration),
+        )
 
-            acquired = False
+    def _snapshot_refresh_done(self, task: asyncio.Task[dict[str, Any]]) -> None:
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Dashboard refresh failed: %s", task.exception())
+
+    async def _refresh_snapshot(self) -> dict[str, Any]:
+        async with self._event_lock:
+            phase_started = time.monotonic()
+            worker = asyncio.create_task(asyncio.to_thread(self.snapshot))
             try:
-                if cached is None:
-                    await self._event_lock.acquire()
-                    acquired = True
-                else:
-                    try:
-                        async with asyncio.timeout(_UI_SNAPSHOT_LOCK_WAIT_SECONDS):
-                            await self._event_lock.acquire()
-                            acquired = True
-                    except TimeoutError:
-                        # A long guarded-AI or broker operation must not make the web UI look dead.
-                        # The previous view is explicitly timestamped and the next refresh retries.
-                        return self._snapshot_cache_response(cached)
-                snapshot = await asyncio.to_thread(self.snapshot)
+                snapshot = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # to_thread keeps running after cancellation. Preserve its read boundary until
+                # it finishes, especially before shutdown closes SQLite or resumes mutations.
+                await worker
+                raise
             finally:
-                if acquired:
-                    self._event_lock.release()
-
-            generated_at = datetime.now(UTC)
-            snapshot["snapshot_generated_at"] = generated_at.isoformat()
-            cached = (time.monotonic(), generated_at, snapshot)
-            self._ui_snapshot_cache = cached
-            return self._snapshot_cache_response(cached)
+                self.diagnostics.observe_phase("snapshot", phase_started)
+                self._ui_snapshot_last_duration = max(0.0, time.monotonic() - phase_started)
+        generated_at = datetime.now(UTC)
+        snapshot["snapshot_generated_at"] = generated_at.isoformat()
+        cached = (time.monotonic(), generated_at, snapshot)
+        self._ui_snapshot_cache = cached
+        return self._snapshot_cache_response(cached)
 
     def _snapshot_cache_response(
         self,
@@ -5175,8 +5865,17 @@ class Orchestrator:
         # Overlay it so navigation and polling never hide a reset behind an otherwise valid cache.
         response["season_operation"] = self.season_operation_status()
         response["maintenance_operation"] = self.maintenance_operation_status()
+        if self._auto_season_progress is not None:
+            progress = dict(self._auto_season_progress)
+            progress_at = _stored_datetime(progress.get("observed_at"))
+            progress["age_seconds"] = (
+                max(0.0, (now - progress_at).total_seconds()) if progress_at else None
+            )
+            response["season_automation"] = progress
         storage = dict(response.get("storage") or {})
         storage["maintenance"] = self.storage_maintenance_status()
+        storage["row_counts_as_of"] = self._storage_counts_at.isoformat()
+        storage["row_count_timestamps"] = dict(self._storage_count_timestamps)
         response["storage"] = storage
         return response
 
@@ -5320,6 +6019,10 @@ class Orchestrator:
             "last_duration_seconds": self._storage_maintenance_last_duration_seconds,
             "last_phase_seconds": dict(self._storage_maintenance_last_phases),
             "last_removed": dict(self._storage_maintenance_last_removed),
+            "removed_since_start": dict(self._storage_removed_total),
+            "oldest_retained_trade_at": self._oldest_retained_trade_at,
+            "history_checked_at": self._storage_counts_checked_at.isoformat(),
+            "chunk_rows": self._storage_maintenance_chunk_rows,
         }
 
     @staticmethod

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from signal_arcade.config import Settings
 from signal_arcade.database import Database
+from signal_arcade.event_queue import SeasonEventQueue
 from signal_arcade.intelligence.decision import INTEGRITY_MIN_AGE_SECONDS
 from signal_arcade.intelligence.features import TokenState
 from signal_arcade.models import (
@@ -592,7 +593,8 @@ def test_storage_maintenance_defers_for_market_work_but_cannot_starve(
 ) -> None:
     orchestrator = Orchestrator(Settings(data_dir=tmp_path, demo_mode=True, _env_file=None))
     now = datetime.now(UTC)
-    orchestrator._event_batches_in_flight = 1  # noqa: SLF001 - simulate active market work
+    # Ordinary batches now permit small cleanup transactions; sustained queue pressure defers.
+    monkeypatch.setattr(orchestrator.event_queue, "qsize", lambda: 1000)
     calls: list[str] = []
 
     def prune_history(*_args: object, **_kwargs: object) -> dict[str, int]:
@@ -1314,8 +1316,19 @@ def test_quiet_held_curve_is_refreshed_without_faking_a_trade(
     orchestrator = Orchestrator(settings)
     now = datetime.now(UTC)
     observed = now - timedelta(minutes=2)
-    mint = "Mint".ljust(32, "1")
-    curve = "Curve".ljust(32, "1")
+    from test_v1104_refresh import anchor_account, route_fixture
+
+    fixture_state, fixture_result, _decoder, _fixture_now = route_fixture()
+    mint, curve = fixture_state.mint, fixture_state.curve_address
+    fixture_result["slot"] = 11
+    values = orchestrator.solana.decode_pump_bonding_curve(fixture_result["accounts"][curve]["raw"])
+    values.update(
+        virtual_token_reserves=900000000,
+        virtual_quote_reserves=3000000000,
+        real_token_reserves=700000000,
+        real_quote_reserves=3000000000,
+    )
+    fixture_result["accounts"][curve]["raw"] = anchor_account("pump", "BondingCurve", values)
     state = TokenState(
         mint=mint,
         symbol="QUIET",
@@ -1338,16 +1351,6 @@ def test_quiet_held_curve_is_refreshed_without_faking_a_trade(
         opened_at=observed,
         entry_fill_id="entry-fill",
     )
-    monkeypatch.setattr(
-        orchestrator.solana,
-        "decode_pump_bonding_curve",
-        lambda _raw: {
-            "virtual_token_reserves": 900_000_000,
-            "virtual_quote_reserves": 3_000_000_000,
-            "real_token_reserves": 700_000_000,
-            "complete": False,
-        },
-    )
 
     receipts, refreshed, slot = orchestrator._apply_position_watchdog_result(  # noqa: SLF001
         [
@@ -1360,12 +1363,7 @@ def test_quiet_held_curve_is_refreshed_without_faking_a_trade(
                 "pool_quote_token_account": "",
             }
         ],
-        {
-            "slot": 11,
-            "accounts": {
-                curve: {"owner": PUMP_PROGRAM, "raw": b"pinned-curve-account"},
-            },
-        },
+        fixture_result,
         now,
     )
 
@@ -1589,7 +1587,7 @@ def test_full_queue_backpressures_held_events_instead_of_dropping_them(tmp_path:
     settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
     orchestrator = Orchestrator(settings)
     orchestrator.running = True
-    orchestrator.event_queue = asyncio.PriorityQueue(maxsize=1)
+    orchestrator.event_queue = SeasonEventQueue(maxsize=1)
     now = datetime.now(UTC)
     candidate = "candidate"
     held = "held"
@@ -1639,7 +1637,7 @@ def test_full_queue_marks_only_the_dropped_candidate_integrity_window(tmp_path: 
     settings = Settings(data_dir=tmp_path, demo_mode=True, _env_file=None)
     orchestrator = Orchestrator(settings)
     orchestrator.running = True
-    orchestrator.event_queue = asyncio.PriorityQueue(maxsize=1)
+    orchestrator.event_queue = SeasonEventQueue(maxsize=1)
     now = datetime.now(UTC)
     queued_mint = "queued-candidate"
     dropped_mint = "dropped-candidate"
@@ -1722,7 +1720,7 @@ def test_recent_pipeline_windows_are_thread_safe_during_dashboard_reads(tmp_path
     def write_buckets() -> None:
         start.wait()
         try:
-            for index in range(4_000):
+            for index in range(5_000):
                 orchestrator._record_pipeline_recent(  # noqa: SLF001
                     "processed",
                     observed_at=now + timedelta(seconds=index),
@@ -1752,7 +1750,7 @@ def test_recent_pipeline_windows_are_thread_safe_during_dashboard_reads(tmp_path
     assert not writer.is_alive()
     assert not reader.is_alive()
     assert errors == []
-    assert len(orchestrator._pipeline_recent) <= 3_601  # noqa: SLF001
+    assert len(orchestrator._pipeline_recent) == 4_096  # noqa: SLF001
     orchestrator.database.close()
 
 
@@ -1955,7 +1953,7 @@ def test_candidate_scoring_cooldown_adapts_only_when_queue_pressure_is_extreme(
         _env_file=None,
     )
     orchestrator = Orchestrator(settings)
-    orchestrator.event_queue = asyncio.PriorityQueue(maxsize=10)
+    orchestrator.event_queue = SeasonEventQueue(maxsize=10)
     now = datetime.now(UTC)
     event = MarketEvent(
         event_id="pressure",
@@ -2377,8 +2375,19 @@ def test_watchdog_snapshot_fences_only_preexisting_same_or_lower_slot_rows(
     settings = Settings(data_dir=tmp_path, demo_mode=False, _env_file=None)
     orchestrator = Orchestrator(settings)
     requested_at = datetime.now(UTC) - timedelta(seconds=5)
-    mint = "Mint".ljust(32, "1")
-    curve = "Curve".ljust(32, "1")
+    from test_v1104_refresh import anchor_account, route_fixture
+
+    fixture_state, fixture_result, _decoder, _fixture_now = route_fixture()
+    mint, curve = fixture_state.mint, fixture_state.curve_address
+    fixture_result["slot"] = 11
+    values = orchestrator.solana.decode_pump_bonding_curve(fixture_result["accounts"][curve]["raw"])
+    values.update(
+        virtual_token_reserves=900000,
+        virtual_quote_reserves=3000000,
+        real_token_reserves=700000,
+        real_quote_reserves=3000000,
+    )
+    fixture_result["accounts"][curve]["raw"] = anchor_account("pump", "BondingCurve", values)
     state = TokenState(
         mint=mint,
         symbol="WATCH",
@@ -2440,24 +2449,11 @@ def test_watchdog_snapshot_fences_only_preexisting_same_or_lower_slot_rows(
     ) -> dict[str, object]:
         assert min_context_slot == 10
         assert critical is False
-        return {
-            "slot": 11,
-            "accounts": {
-                curve: {"owner": PUMP_PROGRAM, "raw": b"curve"},
-                invalid_curve: {"owner": "wrong-owner", "raw": b"curve"},
-            },
-        }
+        fixture_result["accounts"][invalid_curve] = {"owner": "wrong-owner", "raw": b"curve"}
+        return fixture_result
 
     monkeypatch.setattr(orchestrator.http, "solana_multiple_accounts", multiple_accounts)
-    monkeypatch.setattr(
-        orchestrator.solana,
-        "decode_pump_bonding_curve",
-        lambda _raw: {
-            "virtual_token_reserves": 900_000,
-            "virtual_quote_reserves": 3_000_000,
-            "real_token_reserves": 700_000,
-        },
-    )
+
     before_refresh = datetime.now(UTC)
     assert asyncio.run(orchestrator._position_watchdog_tick(requested_at)) == []  # noqa: SLF001
     assert state.last_reserve_at is not None and state.last_reserve_at >= before_refresh

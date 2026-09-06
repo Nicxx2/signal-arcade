@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .config import Settings
 from .database import Database
 from .intelligence.features import TokenState
+from .intelligence.learning import _checkpoint_route_missing_reason
 from .models import (
     RISK_LIMITS,
     AiCriticAssessment,
@@ -32,7 +33,7 @@ from .redaction import redact_secrets
 logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "ai-critic-v4"
-SCHEMA_VERSION = "ai-critic-schema-v4"
+SCHEMA_VERSION = "ai-critic-schema-v5"
 MINIMUM_RESOLVED_ASSESSMENTS = 200
 MINIMUM_VETO_OUTCOMES = 20
 MAX_GUARDED_P95_LATENCY_MS = 2_500
@@ -406,6 +407,7 @@ class AiDecisionLab:
             "token_units": outcome["token_units"],
             "entry_cost_lamports": outcome["entry_cost_lamports"],
             "fee_bps": outcome["fee_bps"],
+            "checkpoint_network_fee_lamports": outcome["checkpoint_network_fee_lamports"],
             "outcome_due_at": outcome["outcome_due_at"],
         }
         if result is None:
@@ -468,14 +470,30 @@ class AiDecisionLab:
                 )
             else:
                 try:
+                    route_reason = _checkpoint_route_missing_reason(
+                        state,
+                        now,
+                        stale_after_seconds=self.settings.stale_market_seconds,
+                        require_timestamp=True,
+                    )
+                    if route_reason is not None:
+                        # Keep an in-window attempt pending; a later current route may resolve it.
+                        continue
+                    if assessment.checkpoint_network_fee_lamports is None:
+                        raise ValueError("original checkpoint fee context unavailable")
                     exit_quote = quote_sell(
                         virtual_token_reserves=state.virtual_token_reserves,
                         virtual_sol_reserves=state.virtual_quote_reserves,
                         token_units=assessment.token_units,
-                        fee_bps=state.fee_bps or assessment.fee_bps,
-                        network_fee_lamports=(
-                            self.settings.network_fee_lamports + self.settings.priority_fee_lamports
+                        fee_bps=(
+                            state.fee_bps
+                            if state.reserve_fee_components is not None
+                            else state.fee_bps or assessment.fee_bps
                         ),
+                        fee_components=state.reserve_fee_components,
+                        lp_fee_bps=state.reserve_lp_fee_bps,
+                        real_quote_reserves=state.real_quote_reserves,
+                        network_fee_lamports=assessment.checkpoint_network_fee_lamports,
                     )
                     outcome_return = (
                         exit_quote.wallet_sol_lamports - assessment.entry_cost_lamports
@@ -492,6 +510,7 @@ class AiDecisionLab:
                     updated = assessment.model_copy(
                         update={
                             "outcome_net_return": outcome_return,
+                            "outcome_route_snapshot": state.reserve_audit,
                             "counterfactual_uplift": uplift,
                             "resolved_at": now,
                         }
@@ -536,7 +555,11 @@ class AiDecisionLab:
         state: TokenState,
     ) -> dict[str, int | datetime] | None:
         size_sol = decision.planned_order_size_sol or RISK_LIMITS[decision.risk_mode].order_size_sol
-        fee_bps = state.fee_bps or self.settings.pump_fee_bps
+        fee_bps = (
+            state.fee_bps
+            if state.reserve_fee_components is not None
+            else state.fee_bps or self.settings.pump_fee_bps
+        )
         try:
             entry = quote_buy(
                 virtual_token_reserves=state.virtual_token_reserves,
@@ -552,6 +575,9 @@ class AiDecisionLab:
             return None
         return {
             "token_units": entry.token_units,
+            "checkpoint_network_fee_lamports": (
+                self.settings.network_fee_lamports + self.settings.priority_fee_lamports
+            ),
             "entry_cost_lamports": entry.wallet_sol_lamports,
             "fee_bps": fee_bps,
             "outcome_due_at": decision.created_at + timedelta(seconds=PRIMARY_OUTCOME_SECONDS),

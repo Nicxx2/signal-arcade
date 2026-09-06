@@ -710,16 +710,21 @@ def test_context_change_during_inference_discards_the_result(tmp_path: Path) -> 
     now = datetime.now(UTC) - timedelta(hours=1)
     for index in range(30):
         database.save_learning_observation(_observation(index, now + timedelta(seconds=index)))
-    calls = 0
+    changed = False
 
     def context() -> tuple[RiskMode, str]:
-        nonlocal calls
-        calls += 1
-        return (RiskMode.BALANCED, "fp") if calls == 1 else (RiskMode.SAFE, "changed-fingerprint")
+        return (RiskMode.SAFE, "changed-fingerprint") if changed else (RiskMode.BALANCED, "fp")
+
+    class ContextChangingHttp(FakeCoachHttp):
+        async def ollama_structured(self, **kwargs):
+            nonlocal changed
+            result = await super().ollama_structured(**kwargs)
+            changed = True
+            return result
 
     coach = AiCoach(  # type: ignore[arg-type]
         database,
-        FakeCoachHttp(),
+        ContextChangingHttp(),
         enabled=lambda: True,
         context=context,
         outcomes_seen=lambda: 80,

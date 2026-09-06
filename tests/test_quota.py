@@ -79,9 +79,15 @@ def test_bucket_never_starts_with_a_full_minute_burst(tmp_path: Path) -> None:
     broker = QuotaBroker(database, [ProviderPlan("provider", requests_per_minute=300)])
 
     async def exercise() -> None:
-        for _ in range(10):
+        # Real disk latency must not refill the bucket while testing its initial capacity.
+        initial = broker._buckets["provider"].updated
+        with patch("signal_arcade.quota.time.monotonic", return_value=initial):
+            for _ in range(10):
+                assert await broker.acquire("provider")
+            assert not await broker.acquire("provider")
+        with patch("signal_arcade.quota.time.monotonic", return_value=initial + 0.21):
             assert await broker.acquire("provider")
-        assert not await broker.acquire("provider")
+            assert not await broker.acquire("provider")
 
     asyncio.run(exercise())
     database.close()

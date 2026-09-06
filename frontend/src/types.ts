@@ -351,7 +351,7 @@ export interface ReadinessGate {
   id: string;
   label: string;
   current: number | boolean | null;
-  target: number | boolean;
+  target: number | boolean | null;
   comparison: ">=" | "<=" | ">" | "=";
   state: "passed" | "collecting" | "not_met";
   unit: "count" | "fraction" | "number" | "boolean" | "milliseconds";
@@ -384,6 +384,8 @@ export interface ChallengerSkillStatus {
     parameters: Record<string, unknown>;
   } | null;
   testing_version: string | null;
+  gate_artifact_version?: string | null;
+  gate_subject?: "testing_candidate" | "latest_candidate";
   testing_candidate?: ChallengerSkillStatus["latest_candidate"];
   pending_versions?: string[];
   champion: ChallengerSkillStatus["latest_candidate"];
@@ -445,6 +447,20 @@ export interface ChallengerChampionRecord {
   history_complete: boolean;
 }
 
+export interface BattleReplayPoint {
+  sequence: number; at: string; observed: number; usable: number; coverage: number;
+  mean: number | null; lower: number | null; upper: number | null;
+}
+export interface BattleReplayTimeline {
+  version: "battle-checkpoints-v1"; cohort_key: string; skill: ChallengerSkillStatus["skill"];
+  candidate_version: string; champion_version: string;
+  minimum_samples: number; minimum_coverage: number; partial: boolean; sampled: boolean;
+  points: BattleReplayPoint[];
+}
+export interface BattleReplayResponse {
+  event_id: string; cohort_key: string; timeline: BattleReplayTimeline | null;
+}
+
 export interface ChallengerJourneyPage {
   events: ChallengerChampionEvent[];
   total: number;
@@ -458,6 +474,30 @@ export interface NonlinearEntryStatus {
   required_linear_improvement_fraction: number;
   latest_artifact: ChallengerSkillStatus["latest_candidate"];
   entry_only: true;
+}
+
+export interface EntryProofStatus {
+  version: "entry-proof-v1";
+  families: Array<{
+    family: "linear" | "xgboost";
+    artifact: ChallengerSkillStatus["latest_candidate"];
+    state: "collecting" | "proof_not_met" | "qualified" | "queued" | "testing" | "champion" | "active" | "suspended" | "previously_tested";
+    gates: ReadinessGate[];
+  }>;
+  activation: {
+    champion: EntryProofIdentity | null;
+    subject: EntryProofIdentity | null;
+    source: "skill_champion" | "legacy_linear" | null;
+    ready: boolean;
+    active: EntryProofIdentity | null;
+    consent_granted: boolean;
+    gates: ReadinessGate[];
+  };
+}
+export interface EntryProofIdentity {
+  version: string;
+  model_family: string;
+  codename: string;
 }
 
 export interface LearningStatus {
@@ -596,6 +636,7 @@ export interface LearningStatus {
   qualification_gates?: ReadinessGate[];
   qualification_passed?: number;
   qualification_total?: number;
+  entry_proof?: EntryProofStatus;
   lessons: Array<{
     feature: string;
     label: string;
@@ -826,6 +867,8 @@ export interface OperationalIncident {
 }
 
 export interface StorageStatus {
+  row_counts_as_of?: string;
+  row_count_timestamps?: Record<string, string>;
   market_events: number;
   decisions: number;
   paper_orders: number;
@@ -860,6 +903,9 @@ export interface StorageStatus {
     last_duration_seconds: number;
     last_phase_seconds: Record<string, number>;
     last_removed: Record<string, number>;
+    removed_since_start?: Record<string, number>;
+    oldest_retained_trade_at?: string | null;
+    history_checked_at?: string;
   };
   model_storage_included: false;
 }
@@ -1020,7 +1066,7 @@ export interface Seasons {
 
 export interface SeasonAutomation {
   enabled: boolean;
-  state: "off" | "maintenance" | "no_bankroll" | "engine_stopped" | "monitoring" | "pending_orders" | "managing_positions" | "waiting_for_data" | "operation_pending" | "confirming" | "countdown" | "paused" | "due";
+  state: "off" | "maintenance" | "no_bankroll" | "engine_stopped" | "monitoring" | "pending_orders" | "managing_positions" | "waiting_for_data" | "operation_pending" | "confirming" | "countdown" | "paused" | "due" | "waiting_for_terminal_evidence";
   detail: string;
   grace_seconds: number;
   eligible_since: string | null;
@@ -1029,6 +1075,11 @@ export interface SeasonAutomation {
   rollover_at: string | null;
   remaining_seconds: number | null;
   last_rollover_at: string | null;
+  observed_at?: string;
+  age_seconds?: number | null;
+  terminal_resolution?: { season_id: string; due_since: string; deadline: string; policy_version: string } | null;
+  in_flight_batches?: number;
+  boundary_sequence?: number | null;
 }
 
 export interface SeasonOperation {

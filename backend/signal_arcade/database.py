@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
+from .battle_replay import MAX_REPLAY_BYTES, valid_replay
 from .models import (
     AiCriticAssessment,
     ChallengerChampionEvent,
@@ -32,12 +35,18 @@ from .models import (
     Position,
     Side,
 )
+from .terminal_evidence import valid_terminal_probe
 
-SCHEMA_VERSION = 13
-TERMINAL_POLICY_VERSION = "executable-boundary-v2"
+SCHEMA_VERSION = 14
+TERMINAL_POLICY_VERSION = "executable-boundary-v3"
 CHALLENGER_JOURNEY_SETTING_PREFIX = "challenger_champion_journey_v1:"
 CHALLENGER_PENDING_SETTING_PREFIX = "challenger_pending_versions_v1:"
 MAX_STATISTICAL_MODEL_ARTIFACT_BYTES = 8 * 1024**2
+RECENT_CHAMPION_EVENTS_IN_MEMORY = 100
+
+
+class AdvisoryReadDeferred(Exception):
+    """Optional history work yielded; no partial cohort may be used as evidence."""
 
 
 class Database:
@@ -56,6 +65,7 @@ class Database:
         self._storage_cache: dict[str, int] | None = None
         self._storage_cache_at = 0.0
         self._storage_revision = 0
+        self._training_publication_active = False
         self._migrate()
         # WAL permits a reader to retain the last committed view while the maintenance writer
         # retires old rows.  Keeping UI/decision reads off the writer's in-process RLock prevents
@@ -339,7 +349,6 @@ class Database:
                         ON unresolved_paper_positions(season_id, recorded_at);
                     """
                 )
-                self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             else:
                 if version == 1:
                     self._conn.execute(
@@ -691,7 +700,222 @@ class Database:
                         """
                     )
                     version = 13
-                self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            # executescript above commits older migrations. Make the v14 journal import and
+            # version advance one explicit transaction, including when the old state is empty.
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._migrate_champion_journal()
+            # Additive access paths: existing schema-14 readers and rollback images remain
+            # compatible. Avoid sorting full AI JSON or visiting large evidence rows just to
+            # decide which terminal IDs exceed retention. Keep this in the migration transaction.
+            # Some legacy season-only imports omit optional advisory tables entirely.
+            optional_tables = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                    "('ai_critic_assessments','learning_evidence_episodes')"
+                )
+            }
+            if "ai_critic_assessments" in optional_tables:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ai_assessments_created "
+                    "ON ai_critic_assessments(created_at DESC)"
+                )
+            if "learning_evidence_episodes" in optional_tables:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_learning_evidence_retention "
+                    "ON learning_evidence_episodes(lane,created_at DESC,status,episode_id)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_learning_evidence_trajectory "
+                    "ON learning_evidence_episodes(lane,trajectory_key)"
+                )
+            self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _migrate_champion_journal(self) -> None:
+        # Optional spectator sidecar; schema 14 and legacy authority JSON stay rollback-compatible.
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS champion_battle_replays (
+            replay_key TEXT PRIMARY KEY, cohort_key TEXT NOT NULL, record_json TEXT NOT NULL)""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS challenger_champion_events (
+            event_id TEXT PRIMARY KEY, cohort_key TEXT NOT NULL, skill TEXT NOT NULL,
+            occurred_at TEXT NOT NULL, kind TEXT NOT NULL, champion_version TEXT NOT NULL,
+            generation INTEGER, record_json TEXT NOT NULL)""")
+        self._conn.execute("""CREATE INDEX IF NOT EXISTS idx_champion_events_page
+            ON challenger_champion_events(cohort_key, occurred_at DESC, event_id DESC)""")
+        self._conn.execute("""CREATE INDEX IF NOT EXISTS idx_champion_events_lineage
+            ON challenger_champion_events(cohort_key, skill, champion_version, kind)""")
+        self._conn.execute("""CREATE INDEX IF NOT EXISTS idx_champion_events_generation
+            ON challenger_champion_events(cohort_key, skill, generation DESC)""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS challenger_artifact_archive (
+            version TEXT PRIMARY KEY, archived_at TEXT NOT NULL, record_json TEXT NOT NULL)""")
+        # Import former sidecars once. A failure rolls back the records and removal together.
+        for row in self._conn.execute("SELECT record_json FROM challenger_skill_states").fetchall():
+            payload = json.loads(row[0])
+            state = ChallengerSkillState.model_validate(payload)
+            sidecar = self._conn.execute(
+                "SELECT value_json FROM settings WHERE key=?",
+                (self._challenger_journey_setting_key(state),),
+            ).fetchone()
+            events = json.loads(sidecar[0]) if sidecar else payload.get("champion_journey", [])
+            if events:
+                self._insert_champion_events(
+                    state.cohort_key,
+                    state.skill.value,
+                    [ChallengerChampionEvent.model_validate(event) for event in events],
+                )
+            if sidecar:
+                self._conn.execute(
+                    "DELETE FROM settings WHERE key=?",
+                    (self._challenger_journey_setting_key(state),),
+                )
+            if "champion_journey" in payload or "pending_versions" in payload:
+                self._conn.execute(
+                    "UPDATE challenger_skill_states SET record_json=? "
+                    "WHERE cohort_key=? AND skill=?",
+                    (
+                        state.model_dump_json(exclude={"champion_journey", "pending_versions"}),
+                        state.cohort_key,
+                        state.skill.value,
+                    ),
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO settings VALUES(?,?,?)",
+                    (
+                        self._challenger_pending_setting_key(state),
+                        json.dumps(state.pending_versions),
+                        state.updated_at.isoformat(),
+                    ),
+                )
+
+    def _insert_champion_events(
+        self,
+        cohort: str,
+        skill: str,
+        events: list[ChallengerChampionEvent],
+    ) -> None:
+        if not events:
+            return
+        pending: dict[str, tuple[ChallengerChampionEvent, str]] = {}
+        for offset in range(0, len(events), 100):
+            chunk = events[offset : offset + 100]
+            ids = [event.event_id for event in chunk]
+            existing = {
+                row[0]: tuple(row)[1:]
+                for row in self._conn.execute(
+                    "SELECT event_id,cohort_key,skill,record_json FROM challenger_champion_events "
+                    "WHERE event_id IN (SELECT value FROM json_each(?))",
+                    (json.dumps(ids),),
+                ).fetchall()
+            }
+            for event in chunk:
+                record = event.model_dump_json()
+                previous = existing.get(event.event_id)
+                if previous is not None and previous != (cohort, skill, record):
+                    raise ValueError("Champion event identity already contains different data")
+                if event.event_id in pending and pending[event.event_id][1] != record:
+                    raise ValueError("Champion event identity already contains different data")
+                if previous is None:
+                    pending[event.event_id] = (event, record)
+        if not pending:
+            return
+        generation = int(
+            self._conn.execute(
+                "SELECT COALESCE(MAX(generation),0) FROM challenger_champion_events "
+                "WHERE cohort_key=? AND skill=?",
+                (cohort, skill),
+            ).fetchone()[0]
+        )
+        for event, record in sorted(
+            pending.values(), key=lambda item: (item[0].occurred_at, item[0].event_id)
+        ):
+            if event.skill.value != skill:
+                raise ValueError("Champion event skill does not match its cohort")
+            if event.kind == "first_champion" and generation == 0:
+                generation = 1
+            elif event.kind == "promoted":
+                generation = max(1, generation + 1)
+            self._conn.execute(
+                "INSERT INTO challenger_champion_events VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    event.event_id,
+                    cohort,
+                    skill,
+                    event.occurred_at.isoformat(),
+                    event.kind,
+                    event.champion_version,
+                    generation or None,
+                    record,
+                ),
+            )
+
+    def champion_events_page(
+        self,
+        cohort: str | None,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        limit = max(1, min(100, limit))
+        with self._reader_lock:
+            params: list[Any] = [cohort]
+            boundary = ""
+            if cursor:
+                row = self._reader_conn.execute(
+                    "SELECT occurred_at,event_id FROM challenger_champion_events "
+                    "WHERE cohort_key=? AND event_id=?",
+                    (cohort, cursor),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("Champion journey cursor is no longer in this learning cohort")
+                boundary = " AND (occurred_at,event_id) < (?,?)"
+                params.extend(row)
+            rows = self._reader_conn.execute(
+                "SELECT record_json,generation FROM challenger_champion_events WHERE cohort_key=?"  # noqa: S608 - SQL fragments are constants
+                + boundary
+                + " ORDER BY occurred_at DESC,event_id DESC LIMIT ?",
+                [*params, limit + 1],
+            ).fetchall()
+            total = int(
+                self._reader_conn.execute(
+                    "SELECT COUNT(*) FROM challenger_champion_events WHERE cohort_key=?",
+                    (cohort,),
+                ).fetchone()[0]
+            )
+        selected = [
+            (ChallengerChampionEvent.model_validate_json(row[0]), row[1]) for row in rows[:limit]
+        ]
+        return {
+            "events": selected,
+            "total": total,
+            "next_cursor": selected[-1][0].event_id if len(rows) > limit else None,
+        }
+
+    def champion_record(self, state: ChallengerSkillState) -> dict[str, Any]:
+        with self._reader_lock:
+            rows = self._reader_conn.execute(
+                "SELECT kind,COUNT(*) AS count,MIN(occurred_at) AS first_at,MAX(generation) AS gen "
+                "FROM challenger_champion_events WHERE cohort_key=? AND skill=? "
+                "AND champion_version=? GROUP BY kind",
+                (state.cohort_key, state.skill.value, state.champion_version),
+            ).fetchall()
+        counts = {row["kind"]: row["count"] for row in rows}
+        crowns = [row["first_at"] for row in rows if row["kind"] in {"first_champion", "promoted"}]
+        return {
+            "champion_generation": max((row["gen"] or 0 for row in rows), default=0) or None,
+            "crowned_at": min(crowns) if crowns else None,
+            "retained_count": counts.get("defended", 0),
+            "inconclusive_count": counts.get("inconclusive", 0),
+            "recorded_battle_count": counts.get("defended", 0) + counts.get("inconclusive", 0),
+            "history_complete": bool(crowns),
+        }
+
+    def archived_challenger_artifact(self, version: str | None) -> dict[str, Any] | None:
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                "SELECT record_json,archived_at FROM challenger_artifact_archive WHERE version=?",
+                (version,),
+            ).fetchone()
+        return {**json.loads(row[0]), "archived_at": row[1]} if row else None
 
     def health_check(self) -> bool:
         """Cheap, non-blocking liveness probe.
@@ -734,6 +958,8 @@ class Database:
         non_entry_decision_before: datetime | None = None,
         max_equity_points: int = 20_000,
         max_rows_per_category: int = 1_000,
+        max_duration_seconds: float | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> dict[str, int]:
         """Bound high-volume samples while retaining fills, orders, and entry evidence.
 
@@ -742,39 +968,141 @@ class Database:
         """
         if max_rows_per_category < 1:
             raise ValueError("max rows per category must be positive")
-        with self._lock, self._conn:
-            trades = self._conn.execute(
+        if max_duration_seconds is not None and max_duration_seconds <= 0:
+            raise ValueError("max duration seconds must be positive")
+        deadline = (
+            time.monotonic() + max_duration_seconds if max_duration_seconds is not None else None
+        )
+        queries: list[tuple[str, str, tuple[Any, ...]]] = [
+            (
+                "raw_trades",
                 """DELETE FROM market_events WHERE event_id IN (
                        SELECT event_id FROM market_events
                        WHERE kind=? AND received_at<?
                        ORDER BY received_at ASC LIMIT ?
                    )""",
                 ("trade", raw_trade_before.isoformat(), max_rows_per_category),
-            ).rowcount
-            decisions = 0
-            if non_entry_decision_before is not None:
-                decisions = self._conn.execute(
+            )
+        ]
+        if non_entry_decision_before is not None:
+            queries.append(
+                (
+                    "non_entry_decisions",
                     """DELETE FROM decisions WHERE decision_id IN (
                            SELECT decision_id FROM decisions
                            WHERE action!='enter' AND created_at<?
                            ORDER BY created_at ASC LIMIT ?
                        )""",
                     (non_entry_decision_before.isoformat(), max_rows_per_category),
-                ).rowcount
-            equity = self._conn.execute(
+                )
+            )
+        queries.append(
+            (
+                "equity_points",
                 """DELETE FROM equity_points WHERE id IN (
                        SELECT id FROM equity_points WHERE id NOT IN (
                            SELECT id FROM equity_points ORDER BY id DESC LIMIT ?
                        ) ORDER BY id ASC LIMIT ?
                    )""",
                 (max_equity_points, max_rows_per_category),
-            ).rowcount
-        self._invalidate_storage_cache()
-        return {
-            "raw_trades": max(0, trades),
-            "non_entry_decisions": max(0, decisions),
-            "equity_points": max(0, equity),
-        }
+            )
+        )
+        removed = {"raw_trades": 0, "non_entry_decisions": 0, "equity_points": 0}
+        for category, query, parameters in queries:
+            count = self._retention_transaction(query, parameters, deadline, stop_requested)
+            if count is None:
+                removed["work_remaining"] = 1
+                break
+            removed[category] = count
+        return removed
+
+    def retired_decision_tables(self) -> list[str]:
+        """The SQLite catalog is the durable cleanup queue; no in-memory handover can lose it."""
+        with self._reader_lock:
+            names = self._reader_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name GLOB 'retired_decisions_*' ORDER BY rowid LIMIT 16"
+            ).fetchall()
+        return [row[0] for row in names if re.fullmatch(r"retired_decisions_[0-9a-f]{32}", row[0])]
+
+    def prune_retired_decisions(
+        self,
+        *,
+        max_rows: int = 50,
+        max_duration_seconds: float = 0.1,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, int]:
+        """Reclaim closed-season decisions in small transactions after the atomic handover."""
+        if max_rows < 1 or max_duration_seconds <= 0:
+            raise ValueError("cleanup bounds must be positive")
+        deadline = time.monotonic() + max_duration_seconds
+        tables = self.retired_decision_tables()
+        removed = 0
+        for table in tables:
+            count = self._retention_transaction(
+                f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT ?)",  # noqa: S608 - validated internal table name
+                (max_rows - removed,),
+                deadline,
+                stop_requested,
+            )
+            if count is None:
+                break
+            removed += count
+            if removed < max_rows:
+                # Retired tables are immutable. A short delete exhausted it; dropping the
+                # empty table/index cannot recreate the former multi-GB rollover transaction.
+                self._retention_transaction(
+                    f"DROP TABLE IF EXISTS {table}",
+                    (),
+                    deadline,
+                    stop_requested,  # noqa: S608
+                )
+            if removed >= max_rows or time.monotonic() >= deadline:
+                break
+        return {"retired_decisions": removed, "work_remaining": int(bool(tables))}
+
+    def _retention_transaction(
+        self,
+        query: str,
+        parameters: tuple[Any, ...],
+        deadline: float | None,
+        stop_requested: Callable[[], bool] | None,
+    ) -> int | None:
+        """Commit one small cleanup query, or roll it back before yielding to market work."""
+
+        def interrupted() -> bool:
+            return bool(
+                (deadline is not None and time.monotonic() >= deadline)
+                or (stop_requested is not None and stop_requested())
+            )
+
+        if interrupted():
+            return None
+        timeout = -1.0 if deadline is None else min(0.025, max(0.0, deadline - time.monotonic()))
+        if not self._lock.acquire(timeout=timeout):
+            return None
+        try:
+            if interrupted():
+                return None
+            if deadline is not None or stop_requested is not None:
+                self._conn.set_progress_handler(interrupted, 500)
+            try:
+                with self._conn:
+                    count = self._conn.execute(query, parameters).rowcount
+                if count > 0:
+                    # Already own the writer lock. Invalidating after releasing it would let
+                    # a busy trader make the supposedly bounded cleanup wait all over again.
+                    self._invalidate_storage_cache()
+                return max(0, count)
+            except sqlite3.OperationalError as exc:
+                if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                    return None
+                raise
+            finally:
+                # Never let a cleanup deadline interrupt the next trade's transaction.
+                self._conn.set_progress_handler(None, 0)
+        finally:
+            self._lock.release()
 
     def enforce_storage_budget(
         self,
@@ -837,81 +1165,57 @@ class Database:
             if chunks % 5 == 0 and self._page_usage()["live_bytes"] <= target:
                 break
             remaining = max_rows_per_pass - removed_events - removed_decisions
-            with self._lock, self._conn:
-                if removable_events:
-                    cutoff = None
-                    if preserve_recent_events:
-                        cutoff = self._conn.execute(
-                            """SELECT received_at,event_id FROM market_events
-                               WHERE kind='trade'
-                               ORDER BY received_at DESC,event_id DESC LIMIT 1 OFFSET ?""",
-                            (preserve_recent_events - 1,),
-                        ).fetchone()
-                    if preserve_recent_events and cutoff is None:
-                        removable_events = False
-                        continue
-                    if cutoff is not None:
-                        query = """DELETE FROM market_events WHERE event_id IN (
-                            SELECT event_id FROM market_events WHERE kind='trade'
-                            AND (received_at<? OR (received_at=? AND event_id<?))
-                            ORDER BY received_at ASC,event_id ASC LIMIT ?)"""
-                        parameters: tuple[Any, ...] = (
-                            cutoff["received_at"],
-                            cutoff["received_at"],
-                            cutoff["event_id"],
-                            min(chunk_size, remaining),
-                        )
-                    else:
-                        query = """DELETE FROM market_events WHERE event_id IN (
-                            SELECT event_id FROM market_events WHERE kind='trade'
-                            ORDER BY received_at ASC,event_id ASC LIMIT ?)"""
-                        parameters = (min(chunk_size, remaining),)
-                    deleted = self._conn.execute(query, parameters).rowcount
-                    removed = max(0, deleted)
-                    removed_events += removed
-                    if removed < min(chunk_size, remaining):
-                        removable_events = False
-                elif removable_decisions:
-                    cutoff = None
-                    if preserve_recent_non_entry_decisions:
-                        cutoff = self._conn.execute(
-                            """SELECT created_at,decision_id FROM decisions
-                               WHERE action!='enter'
-                               ORDER BY created_at DESC,decision_id DESC LIMIT 1 OFFSET ?""",
-                            (preserve_recent_non_entry_decisions - 1,),
-                        ).fetchone()
-                    if preserve_recent_non_entry_decisions and cutoff is None:
-                        removable_decisions = False
-                        continue
-                    if cutoff is not None:
-                        query = """DELETE FROM decisions WHERE decision_id IN (
-                            SELECT decision_id FROM decisions WHERE action!='enter'
-                            AND (created_at<? OR (created_at=? AND decision_id<?))
-                            ORDER BY created_at ASC,decision_id ASC LIMIT ?)"""
-                        parameters = (
-                            cutoff["created_at"],
-                            cutoff["created_at"],
-                            cutoff["decision_id"],
-                            min(chunk_size, remaining),
-                        )
-                    else:
-                        query = """DELETE FROM decisions WHERE decision_id IN (
-                            SELECT decision_id FROM decisions WHERE action!='enter'
-                            ORDER BY created_at ASC,decision_id ASC LIMIT ?)"""
-                        parameters = (min(chunk_size, remaining),)
-                    deleted = self._conn.execute(query, parameters).rowcount
-                    removed = max(0, deleted)
-                    removed_decisions += removed
-                    if removed < min(chunk_size, remaining):
-                        removable_decisions = False
-                else:
-                    break
+            if removable_events:
+                table, timestamp, identifier, predicate, preserved = (
+                    "market_events",
+                    "received_at",
+                    "event_id",
+                    "kind='trade'",
+                    preserve_recent_events,
+                )
+            elif removable_decisions:
+                table, timestamp, identifier, predicate, preserved = (
+                    "decisions",
+                    "created_at",
+                    "decision_id",
+                    "action!='enter'",
+                    preserve_recent_non_entry_decisions,
+                )
+            else:
+                break
+            # Identifiers are internal constants. Select the retention boundary inside the same
+            # statement as the delete, including deterministic handling of equal timestamps.
+            boundary = (
+                f"AND ({timestamp},{identifier}) < (SELECT {timestamp},{identifier} FROM {table} "  # noqa: S608 - internal identifiers only
+                f"WHERE {predicate} ORDER BY {timestamp} DESC,{identifier} DESC LIMIT 1 OFFSET ?)"
+                if preserved
+                else ""
+            )
+            query = (
+                f"DELETE FROM {table} WHERE {identifier} IN (SELECT {identifier} FROM {table} "  # noqa: S608 - internal identifiers only
+                f"WHERE {predicate} {boundary} ORDER BY {timestamp} ASC,{identifier} ASC LIMIT ?)"
+            )
+            parameters: tuple[Any, ...] = (
+                (preserved - 1, min(chunk_size, remaining))
+                if preserved
+                else (min(chunk_size, remaining),)
+            )
+            removed = self._retention_transaction(query, parameters, deadline, stop_requested)
+            if removed is None:
+                break
+            if removable_events:
+                removed_events += removed
+                if removed < min(chunk_size, remaining):
+                    removable_events = False
+            else:
+                removed_decisions += removed
+                if removed < min(chunk_size, remaining):
+                    removable_decisions = False
             chunks += 1
             # Give waiting event/heartbeat workers a fair chance to take the connection between
             # chunks; RLock acquisition is not guaranteed to be fair across threads.
             time.sleep(0.01)
 
-        self._invalidate_storage_cache()
         usage = self._page_usage()
         return {
             "raw_trades": removed_events,
@@ -924,10 +1228,10 @@ class Database:
         }
 
     def _page_usage(self) -> dict[str, int]:
-        with self._lock:
-            page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
-            page_count = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
-            free_pages = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+        with self._reader_lock:
+            page_size = int(self._reader_conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(self._reader_conn.execute("PRAGMA page_count").fetchone()[0])
+            free_pages = int(self._reader_conn.execute("PRAGMA freelist_count").fetchone()[0])
         allocated = page_size * page_count
         reclaimable = page_size * free_pages
         return {
@@ -971,6 +1275,8 @@ class Database:
             "challenger_skill_artifacts": "SELECT COUNT(*) FROM challenger_skill_artifacts",
             "statistical_model_artifacts": "SELECT COUNT(*) FROM statistical_model_artifacts",
             "challenger_skill_states": "SELECT COUNT(*) FROM challenger_skill_states",
+            "challenger_champion_events": "SELECT COUNT(*) FROM challenger_champion_events",
+            "challenger_artifact_archive": "SELECT COUNT(*) FROM challenger_artifact_archive",
             "ai_critic_assessments": "SELECT COUNT(*) FROM ai_critic_assessments",
             "coach_reviews": "SELECT COUNT(*) FROM coach_reviews",
             "coach_hypotheses": "SELECT COUNT(*) FROM coach_hypotheses",
@@ -989,6 +1295,61 @@ class Database:
                 self._storage_cache = dict(rows)
                 self._storage_cache_at = now
         return rows
+
+    def bounded_storage_counts(self, *, seconds: float = 0.05) -> dict[str, int]:
+        """Refresh what fits in a detached read budget; omitted counters keep their real age."""
+        deadline = time.monotonic() + seconds
+        connection = sqlite3.connect(
+            f"{self.path.absolute().as_uri()}?mode=ro", uri=True, timeout=0.01
+        )
+        counts: dict[str, int] = {}
+        tables = (
+            "decisions",
+            "paper_orders",
+            "fills",
+            "positions",
+            "equity_points",
+            "equity_rollups",
+            "paper_seasons",
+            "learning_observations",
+            "learning_evidence_episodes",
+            "learning_models",
+            "challenger_skill_artifacts",
+            "statistical_model_artifacts",
+            "challenger_skill_states",
+            "challenger_champion_events",
+            "challenger_artifact_archive",
+            "ai_critic_assessments",
+            "coach_reviews",
+            "coach_hypotheses",
+            "operational_incidents",
+            "market_events",
+        )
+        try:
+            connection.execute("PRAGMA cache_size=-1024")
+            connection.set_progress_handler(lambda: time.monotonic() >= deadline, 500)
+            for table in tables:
+                if time.monotonic() >= deadline:
+                    break
+                counts[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608 - fixed names
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) not in {
+                sqlite3.SQLITE_INTERRUPT,
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise
+        finally:
+            connection.close()
+        return counts
+
+    def oldest_retained_trade(self) -> str | None:
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                "SELECT received_at FROM market_events WHERE kind='trade' "
+                "ORDER BY received_at LIMIT 1"
+            ).fetchone()
+        return row[0] if row else None
 
     def _invalidate_storage_cache(self) -> None:
         with self._lock:
@@ -1258,7 +1619,12 @@ class Database:
             raw_profile = season.pop("profile_json", None)
             season["profile"] = json.loads(raw_profile) if raw_profile else None
             season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
-            season["comparable"] = bool(season.get("comparable", 1))
+            # Preserve the original scorecard; an elective stopping point is not a fair strategy
+            # comparison even if its ledger is complete. Older releases stored these as eligible.
+            season["recorded_comparable"] = bool(season.get("comparable", 1))
+            season["comparable"] = season["recorded_comparable"] and season.get(
+                "boundary_type"
+            ) not in {"reset", "end_now"}
             season["meaningful_activity"] = bool(season.get("meaningful_activity", 0))
             season["unresolved_inventory"] = unresolved_by_season.get(str(season["season_id"]), [])
             seasons.append(season)
@@ -1603,8 +1969,9 @@ class Database:
             for lane in ("policy", "execution"):
                 rows = self._conn.execute(
                     """SELECT episode_id FROM learning_evidence_episodes
+                       INDEXED BY idx_learning_evidence_retention
                        WHERE lane=? AND status IN (?,?,?)
-                       ORDER BY created_at DESC LIMIT -1 OFFSET ?""",
+                       ORDER BY created_at DESC,rowid DESC LIMIT -1 OFFSET ?""",
                     (lane, *terminal, max_complete_per_lane),
                 ).fetchall()
                 ids = [str(row[0]) for row in rows]
@@ -1618,7 +1985,7 @@ class Database:
         return removed
 
     def save_learning_model(self, model: LearningModel) -> None:
-        with self._lock, self._conn:
+        with self._lock, self._model_write_scope():
             self._conn.execute(
                 "INSERT OR IGNORE INTO learning_models VALUES(?,?,?,?)",
                 (
@@ -1674,7 +2041,7 @@ class Database:
     def save_challenger_artifact(self, artifact: ChallengerSkillArtifact) -> None:
         """Persist an immutable skill artifact; a version can never be overwritten."""
 
-        with self._lock, self._conn:
+        with self._lock, self._model_write_scope():
             existing = self._conn.execute(
                 "SELECT record_json FROM challenger_skill_artifacts WHERE version=?",
                 (artifact.version,),
@@ -1715,7 +2082,7 @@ class Database:
         if artifact.payload_digest != actual_digest:
             raise ValueError("statistical model payload digest does not match")
         record_json = artifact.model_dump_json()
-        with self._lock, self._conn:
+        with self._lock, self._model_write_scope():
             existing_artifact = self._conn.execute(
                 "SELECT record_json FROM challenger_skill_artifacts WHERE version=?",
                 (artifact.version,),
@@ -1848,7 +2215,31 @@ class Database:
         }
 
     def save_challenger_skill_state(self, state: ChallengerSkillState) -> None:
-        with self._lock, self._conn:
+        with self._lock, self._model_write_scope():
+            self._insert_champion_events(
+                state.cohort_key, state.skill.value, state.champion_journey
+            )
+            if state._battle_replay_dirty and state._battle_replay is not None:
+                replay_json = json.dumps(
+                    state._battle_replay, separators=(",", ":"), allow_nan=False
+                )
+                if len(replay_json.encode()) <= MAX_REPLAY_BYTES:
+                    self._conn.execute(
+                        "INSERT INTO champion_battle_replays VALUES(?,?,?) "
+                        "ON CONFLICT(replay_key) DO UPDATE SET record_json=excluded.record_json",
+                        (
+                            f"active:{state.cohort_key}:{state.skill.value}",
+                            state.cohort_key,
+                            replay_json,
+                        ),
+                    )
+            for event_id, replay in state._pending_battle_replays.items():
+                replay_json = json.dumps(replay, separators=(",", ":"), allow_nan=False)
+                if len(replay_json.encode()) <= MAX_REPLAY_BYTES:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO champion_battle_replays VALUES(?,?,?)",
+                        (f"event:{event_id}", state.cohort_key, replay_json),
+                    )
             self._conn.execute(
                 """INSERT INTO challenger_skill_states VALUES(?,?,?,?)
                    ON CONFLICT(cohort_key,skill) DO UPDATE SET
@@ -1857,67 +2248,129 @@ class Database:
                     state.cohort_key,
                     state.skill.value,
                     state.updated_at.isoformat(),
-                    # Keep the established state payload readable by pre-journey v11 builds.
-                    # The additive journal lives in a settings sidecar that those builds ignore.
                     state.model_dump_json(exclude={"champion_journey", "pending_versions"}),
                 ),
             )
             self._upsert_settings(
-                [
-                    (
-                        self._challenger_journey_setting_key(state),
-                        [event.model_dump(mode="json") for event in state.champion_journey],
-                    ),
-                    (self._challenger_pending_setting_key(state), state.pending_versions),
-                ],
+                [(self._challenger_pending_setting_key(state), state.pending_versions)],
                 state.updated_at.isoformat(),
             )
+        state._battle_replay_dirty = False
+        state._pending_battle_replays.clear()
+        state.champion_journey = state.champion_journey[-RECENT_CHAMPION_EVENTS_IN_MEMORY:]
         self._invalidate_storage_cache()
+
+    @contextmanager
+    def training_publication(self) -> Iterator[None]:
+        """Commit immutable training outputs and their pending skill enrollment together."""
+        with self._lock:
+            if self._training_publication_active or self._conn.in_transaction:
+                raise RuntimeError("training publication requires its own transaction")
+            self._training_publication_active = True
+            try:
+                with self._conn:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    yield
+            finally:
+                self._training_publication_active = False
+
+    @contextmanager
+    def _model_write_scope(self) -> Iterator[None]:
+        # Called only with the database writer lock held. Ordinary saves retain their original
+        # commit behavior; the four training writers defer commit during bundle publication.
+        if self._training_publication_active:
+            yield
+        else:
+            with self._conn:
+                yield
 
     def list_challenger_skill_states(self) -> list[ChallengerSkillState]:
         states: list[ChallengerSkillState] = []
-        normalize: list[ChallengerSkillState] = []
+        # Support imported development records as well as the startup schema migration.
+        with self._lock, self._conn:
+            self._migrate_champion_journal()
         with self._reader_lock:
             rows = self._reader_conn.execute(
                 "SELECT record_json FROM challenger_skill_states ORDER BY updated_at"
             ).fetchall()
             for row in rows:
-                payload = json.loads(row[0])
-                embedded_format = "champion_journey" in payload or "pending_versions" in payload
-                embedded_journey = payload.pop("champion_journey", [])
-                embedded_pending = payload.pop("pending_versions", [])
-                state = ChallengerSkillState.model_validate(payload)
-                sidecar = self._reader_conn.execute(
-                    "SELECT value_json FROM settings WHERE key=?",
-                    (self._challenger_journey_setting_key(state),),
-                ).fetchone()
-                journey_payload = (
-                    json.loads(sidecar["value_json"]) if sidecar is not None else embedded_journey
-                )
-                journey = [
-                    ChallengerChampionEvent.model_validate(event) for event in journey_payload
-                ]
-                pending_sidecar = self._reader_conn.execute(
+                state = ChallengerSkillState.model_validate_json(row[0])
+                journey_rows = self._reader_conn.execute(
+                    "SELECT record_json FROM challenger_champion_events "
+                    "WHERE cohort_key=? AND skill=? "
+                    "ORDER BY occurred_at DESC,event_id DESC LIMIT ?",
+                    (state.cohort_key, state.skill.value, RECENT_CHAMPION_EVENTS_IN_MEMORY),
+                ).fetchall()
+                pending_row = self._reader_conn.execute(
                     "SELECT value_json FROM settings WHERE key=?",
                     (self._challenger_pending_setting_key(state),),
                 ).fetchone()
-                pending_payload = (
-                    json.loads(pending_sidecar["value_json"])
-                    if pending_sidecar is not None
-                    else embedded_pending
+                pending = json.loads(pending_row[0]) if pending_row else []
+                replay_row = self._reader_conn.execute(
+                    "SELECT record_json FROM champion_battle_replays WHERE replay_key=? "
+                    "AND length(record_json)<=?",
+                    (f"active:{state.cohort_key}:{state.skill.value}", MAX_REPLAY_BYTES),
+                ).fetchone()
+                if replay_row:
+                    try:
+                        replay = json.loads(replay_row[0])
+                    except (ValueError, TypeError):
+                        replay = None
+                    if valid_replay(replay):
+                        replay["partial"] = True
+                        state._battle_replay = replay
+                        state._battle_replay_dirty = True
+                states.append(
+                    state.model_copy(
+                        update={
+                            "champion_journey": [
+                                ChallengerChampionEvent.model_validate_json(item[0])
+                                for item in reversed(journey_rows)
+                            ],
+                            "pending_versions": [item for item in pending if isinstance(item, str)],
+                        }
+                    )
                 )
-                pending = [str(version) for version in pending_payload if isinstance(version, str)]
-                hydrated = state.model_copy(
-                    update={"champion_journey": journey, "pending_versions": pending}
-                )
-                states.append(hydrated)
-                if embedded_format:
-                    normalize.append(hydrated)
-        # Normalize any short-lived embedded format written during development. This is atomic per
-        # state and leaves a strict, rollback-readable payload plus its durable sidecar.
-        for state in normalize:
-            self.save_challenger_skill_state(state)
         return states
+
+    def champion_battle_replay(self, cohort: str, event_id: str) -> dict[str, Any] | None:
+        """Read a bounded replay without reconstructing history from final aggregates."""
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                "SELECT r.record_json,e.record_json FROM challenger_champion_events e "
+                "JOIN champion_battle_replays r ON r.replay_key='event:'||e.event_id "
+                "AND r.cohort_key=e.cohort_key WHERE e.cohort_key=? AND e.event_id=? "
+                "AND length(r.record_json)<=?",
+                (cohort, event_id, MAX_REPLAY_BYTES),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            replay = json.loads(row[0])
+            event = ChallengerChampionEvent.model_validate_json(row[1])
+        except (ValueError, TypeError):
+            return None
+        if not valid_replay(replay) or event.kind == "first_champion":
+            return None
+        if (
+            replay.get("cohort_key") != cohort
+            or replay.get("skill") != event.skill.value
+            or replay.get("candidate_version") != event.candidate_version
+            or replay.get("champion_version") != event.previous_champion_version
+        ):
+            return None
+        last = replay["points"][-1]
+        if (
+            event.occurred_at.utcoffset() is None
+            or datetime.fromisoformat(last["at"]) > event.occurred_at
+            or last["observed"] != event.common_observed_count
+            or last["usable"] != event.common_usable_count
+            or last["coverage"] != event.availability_fraction
+            or last["mean"] != event.mean_uplift
+            or last["lower"] != event.uplift_lower_bound
+        ):
+            return None
+        return replay
 
     @staticmethod
     def _challenger_journey_setting_key(state: ChallengerSkillState) -> str:
@@ -1962,22 +2415,21 @@ class Database:
                         for version in json.loads(pending_sidecar["value_json"])
                         if isinstance(version, str)
                     )
-                sidecar = self._conn.execute(
-                    "SELECT value_json FROM settings WHERE key=?",
-                    (self._challenger_journey_setting_key(state),),
-                ).fetchone()
-                if sidecar is not None:
-                    for payload in json.loads(sidecar["value_json"]):
-                        event = ChallengerChampionEvent.model_validate(payload)
-                        protected.update(
-                            version
-                            for version in (
-                                event.candidate_version,
-                                event.previous_champion_version,
-                                event.champion_version,
-                            )
-                            if version
-                        )
+            # Preserve the dependency closure of current authority and active battles.
+            artifact_rows = self._conn.execute(
+                "SELECT version,record_json FROM challenger_skill_artifacts"
+            ).fetchall()
+            artifacts = {
+                row[0]: ChallengerSkillArtifact.model_validate_json(row[1]) for row in artifact_rows
+            }
+            todo = list(protected)
+            while todo:
+                artifact = artifacts.get(todo.pop())
+                if artifact is not None:
+                    for version in artifact.dependency_versions.values():
+                        if version not in protected:
+                            protected.add(version)
+                            todo.append(version)
             versions = [
                 str(row[0])
                 for row in self._conn.execute(
@@ -1990,6 +2442,16 @@ class Database:
                     break
                 keep.add(version)
             removed = [version for version in versions if version not in keep]
+            for version in removed:
+                artifact = artifacts[version]
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO challenger_artifact_archive VALUES(?,?,?)",
+                    (
+                        version,
+                        datetime.now().astimezone().isoformat(),
+                        artifact.model_dump_json(exclude={"parameters"}),
+                    ),
+                )
             self._conn.executemany(
                 "DELETE FROM challenger_skill_artifacts WHERE version=?",
                 ((version,) for version in removed),
@@ -2020,11 +2482,18 @@ class Database:
         self._invalidate_storage_cache()
 
     def list_ai_assessments(self, limit: int = 1_000) -> list[AiCriticAssessment]:
-        with self._reader_lock:
-            rows = self._reader_conn.execute(
+        # Optional qualification may read 5,000 records. Its read transaction must not own
+        # the lock used by ledger/risk/settings reads; the chronological index avoids a JSON sort.
+        connection = sqlite3.connect(
+            f"{self.path.absolute().as_uri()}?mode=ro", uri=True, timeout=0.25
+        )
+        try:
+            rows = connection.execute(
                 "SELECT record_json FROM ai_critic_assessments ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+        finally:
+            connection.close()
         return [AiCriticAssessment.model_validate_json(row[0]) for row in rows]
 
     def unresolved_ai_assessments(self, limit: int = 500) -> list[AiCriticAssessment]:
@@ -2169,15 +2638,75 @@ class Database:
         self._invalidate_storage_cache()
         return True
 
-    def recent_learning_observations(self, limit: int = 1_000) -> list[LearningObservation]:
+    def recent_learning_observations(
+        self,
+        limit: int = 1_000,
+        *,
+        should_yield: Callable[[], bool] | None = None,
+        pause: Callable[[], None] | None = None,
+    ) -> list[LearningObservation]:
         if limit < 1:
             return []
-        with self._reader_lock:
-            rows = self._reader_conn.execute(
-                "SELECT record_json FROM learning_observations ORDER BY created_at DESC LIMIT ?",
+        if should_yield is not None and should_yield():
+            raise AdvisoryReadDeferred
+        # Coach reads must never hold the core reader lock. Sort only small keys: sorting 5,000
+        # complete JSON records in SQLite's temporary table caused multi-second processing stalls.
+        connection = sqlite3.connect(
+            f"{self.path.absolute().as_uri()}?mode=ro", uri=True, timeout=0.05
+        )
+        deadline = time.monotonic() + 0.25
+
+        def interrupted() -> bool:
+            return should_yield is not None and (time.monotonic() >= deadline or should_yield())
+
+        selected: list[tuple[str, int, LearningObservation]] = []
+        try:
+            if pause is not None:
+                pause()
+                deadline = time.monotonic() + 0.25
+            connection.execute("PRAGMA cache_size=-1024")
+            connection.set_progress_handler(interrupted, 1000)
+            cursor = connection.execute(
+                """WITH recent AS MATERIALIZED (
+                       SELECT rowid AS rid,created_at FROM learning_observations
+                       ORDER BY created_at DESC,rowid ASC LIMIT ?
+                   ) SELECT recent.created_at,recent.rid,observations.record_json
+                     FROM recent CROSS JOIN learning_observations AS observations
+                     WHERE observations.rowid=recent.rid""",
                 (limit,),
-            ).fetchall()
-        return [LearningObservation.model_validate_json(row[0]) for row in reversed(rows)]
+            )
+            while True:
+                if pause is not None:
+                    # Pause outside SQLite's VM. Preserve this complete read snapshot and
+                    # reset the query budget after intentional waiting, not during a query.
+                    pause()
+                if should_yield is not None and should_yield():
+                    raise AdvisoryReadDeferred
+                deadline = time.monotonic() + 0.25
+                rows = cursor.fetchmany(25)
+                if not rows:
+                    break
+                for created_at, rowid, raw in rows:
+                    if should_yield is not None and should_yield():
+                        raise AdvisoryReadDeferred
+                    selected.append(
+                        (created_at, -rowid, LearningObservation.model_validate_json(raw))
+                    )
+            if should_yield is not None and should_yield():
+                raise AdvisoryReadDeferred
+        except sqlite3.OperationalError as exc:
+            if should_yield is not None and getattr(exc, "sqlite_errorcode", None) in {
+                sqlite3.SQLITE_INTERRUPT,
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise AdvisoryReadDeferred from exc
+            raise
+        finally:
+            connection.close()
+        # Restore chronological order in Python without copying large JSON through a SQL sort.
+        selected.sort(key=lambda row: (row[0], row[1]))
+        return [row[2] for row in selected]
 
     def prune_coach_history(
         self,
@@ -2908,6 +3437,7 @@ class Database:
                     ("auto_new_season_paused_since", None),
                     ("auto_new_season_last_observed_at", None),
                     ("auto_new_season_last_rollover_at", now),
+                    ("auto_new_season_terminal_resolution", None),
                     ("auto_new_season_last_from", str(previous_season_id)),
                     ("auto_new_season_last_to", next_season_id),
                     *(
@@ -2958,12 +3488,13 @@ class Database:
             else "complete"
         )
         result_quality = "unresolved" if unknown else "complete"
+        boundary_type = self._terminal_boundary_type(terminal_reason)
         comparison_eligible = bool(
             comparable
+            and boundary_type not in {"reset", "end_now"}
             and meaningful_activity
             and accounting_status in {"complete", "complete_with_writeoffs"}
         )
-        boundary_type = self._terminal_boundary_type(terminal_reason)
         write_off_entry_minor = sum(
             max(0, int(item.get("entry_cost_minor") or 0)) for item in write_offs
         )
@@ -3159,8 +3690,8 @@ class Database:
                 evidence_seconds = -1.0
                 evidence_age_seconds = -1.0
             valid_write_off = bool(
-                isinstance(evidence, dict)
-                and evidence.get("policy") == "two-fresh-route-probes"
+                valid_terminal_probe(evidence, boundary_at)
+                and isinstance(evidence, dict)
                 and evidence.get("global_market_healthy") is True
                 and probe_record.get("outcome") == "unavailable"
                 and confirmations >= 2
@@ -3172,6 +3703,24 @@ class Database:
                 raise ValueError("terminal paper write-off requires confirmed route evidence")
 
     def _clear_paper_tables(self) -> None:
+        # SQLite's Python context manager does not begin a transaction for DDL by itself.
+        # Reset of an uninitialized legacy portfolio may have no preceding archive UPDATE.
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN")
+        # A large decisions journal used to be deleted while all event processing waited
+        # for the season transaction. Rotate its identity atomically instead. Every reader
+        # still sees either the old current season or the exact empty successor. The retired
+        # table is reclaimed later, survives a crash, and is ignored by older schema-14 code.
+        if self._conn.execute("SELECT 1 FROM decisions LIMIT 1").fetchone() is not None:
+            suffix = uuid.uuid4().hex
+            self._conn.execute(f"ALTER TABLE decisions RENAME TO retired_decisions_{suffix}")  # noqa: S608
+            self._conn.execute(
+                "CREATE TABLE decisions (decision_id TEXT PRIMARY KEY, mint TEXT NOT NULL, "
+                "action TEXT NOT NULL, created_at TEXT NOT NULL, record_json TEXT NOT NULL)"
+            )
+            self._conn.execute(
+                f"CREATE INDEX idx_decisions_created_{suffix} ON decisions(created_at DESC)"  # noqa: S608
+            )
         for table in (
             "fills",
             "paper_orders",
@@ -3179,6 +3728,5 @@ class Database:
             "ledger_entries",
             "equity_points",
             "equity_rollups",
-            "decisions",
         ):
             self._conn.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed names only

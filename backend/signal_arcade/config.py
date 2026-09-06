@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     frontend_dir: Path | None = None
     log_level: str = "INFO"
     demo_mode: bool = False
+    diagnostics_enabled: bool = True
     admin_password: str | None = None
 
     solana_http: str = "https://api.mainnet-beta.solana.com"
@@ -48,6 +49,9 @@ class Settings(BaseSettings):
     event_queue_max: int = Field(default=10_000, ge=500, le=100_000)
     event_batch_size: int = Field(default=250, ge=10, le=2_000)
     event_batch_wait_ms: int = Field(default=25, ge=1, le=500)
+    learning_reserve_refresh_enabled: bool = False
+    learning_reserve_refresh_interval_seconds: int = Field(default=10, ge=10, le=300)
+    learning_reserve_refresh_batch_size: int = Field(default=20, ge=1, le=20)
 
     @field_validator("log_level")
     @classmethod

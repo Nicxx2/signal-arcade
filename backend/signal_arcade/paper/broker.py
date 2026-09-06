@@ -102,6 +102,7 @@ class PaperBroker:
     def __init__(self, database: Database, settings: Settings) -> None:
         self.database = database
         self.settings = settings
+        self.last_diagnostic_equity: dict[str, Any] | None = None
         self.initialized = bool(database.get_setting("portfolio_initialized", False))
         self.quote_currency = QuoteCurrency(
             database.get_setting("quote_currency", QuoteCurrency.SOL.value)
@@ -337,7 +338,16 @@ class PaperBroker:
         limits = self.risk_limits(mode)
         if not self.initialized or self.starting_lamports <= 0:
             return limits.order_size_sol
-        portfolio = self.snapshot(mode)
+        return self._planned_size_from_portfolio(limits, self.snapshot(mode), sol_usd_price)
+
+    def _planned_size_from_portfolio(
+        self,
+        limits: RiskLimits,
+        portfolio: PortfolioSnapshot,
+        sol_usd_price: float | None,
+    ) -> float:
+        if not self.initialized or self.starting_lamports <= 0:
+            return limits.order_size_sol
         realized_equity = max(
             1,
             self.starting_lamports + portfolio.realized_pnl_lamports,
@@ -373,10 +383,10 @@ class PaperBroker:
         """
 
         limits = self.risk_limits(decision.risk_mode)
-        base_size_sol = self.planned_order_size_sol(
-            decision.risk_mode,
-            sol_usd_price=sol_usd_price,
-        )
+        # One synchronous sizing calculation uses one current valuation. Do not retain it
+        # across calls: submission and fill gates still read the portfolio afresh.
+        portfolio = self.snapshot(decision.risk_mode)
+        base_size_sol = self._planned_size_from_portfolio(limits, portfolio, sol_usd_price)
         integrity = decision.integrity_assessment
         baseline_version = decision.model_version.split("+", maxsplit=1)[0]
         quality = _clamp_fraction(
@@ -427,6 +437,7 @@ class PaperBroker:
                 target_fraction,
                 sol_usd_price,
                 fallback=base_size_sol,
+                portfolio=portfolio,
             )
             desired_size_sol = max(base_size_sol, desired_size_sol)
             reasons.append("Clean, mature evidence allows bounded sizing from realized bankroll")
@@ -437,10 +448,11 @@ class PaperBroker:
             decision,
             desired_size_sol,
             sol_usd_price,
+            portfolio,
         )
         realized_bankroll = max(
             1,
-            self.starting_lamports + self.snapshot(decision.risk_mode).realized_pnl_lamports,
+            self.starting_lamports + portfolio.realized_pnl_lamports,
         )
         try:
             selected_account_minor = self._account_minor_from_sol(
@@ -468,10 +480,10 @@ class PaperBroker:
         sol_usd_price: float | None,
         *,
         fallback: float,
+        portfolio: PortfolioSnapshot,
     ) -> float:
         if not self.initialized or self.starting_lamports <= 0:
             return fallback
-        portfolio = self.snapshot()
         realized_bankroll = max(
             1,
             self.starting_lamports + portfolio.realized_pnl_lamports,
@@ -490,10 +502,10 @@ class PaperBroker:
         decision: Decision,
         desired_size_sol: float,
         sol_usd_price: float | None,
+        portfolio: PortfolioSnapshot,
     ) -> tuple[float, float, list[str]]:
         limits = self.risk_limits(decision.risk_mode)
         desired_lamports = max(1, int(desired_size_sol * LAMPORTS_PER_SOL))
-        portfolio = self.snapshot(decision.risk_mode)
         capacity_positions = self._capacity_positions(portfolio)
         pending_buys = [order for order in self.pending.values() if order.side == Side.BUY]
         exposure = sum(position.entry_cost_lamports for position in capacity_positions)
@@ -512,7 +524,7 @@ class PaperBroker:
                 0,
                 int(portfolio.equity_lamports * limits.max_exposure_fraction) - exposure,
             ),
-            "available_cash": max(0, self.cash_lamports - reserved_cash),
+            "available_cash": max(0, portfolio.cash_lamports - reserved_cash),
         }
         for name, account_minor in account_caps.items():
             try:
@@ -982,7 +994,11 @@ class PaperBroker:
         if now < order.created_at or now < order.fill_after:
             return None
         network = self.settings.network_fee_lamports + self.settings.priority_fee_lamports
-        fee_bps = state.fee_bps or self.settings.pump_fee_bps
+        fee_bps = (
+            state.fee_bps
+            if state.reserve_fee_components is not None
+            else state.fee_bps or self.settings.pump_fee_bps
+        )
         sell_position: Position | None = None
         try:
             if order.side == Side.BUY:
@@ -1007,6 +1023,8 @@ class PaperBroker:
                     fee_bps=fee_bps,
                     network_fee_lamports=network,
                     real_quote_reserves=state.real_quote_reserves,
+                    fee_components=state.reserve_fee_components,
+                    lp_fee_bps=state.reserve_lp_fee_bps,
                 )
         except ValueError as exc:
             self._fail_order(order, str(exc), now)
@@ -1333,7 +1351,11 @@ class PaperBroker:
             entry_cost_lamports=receipt.net_sol_lamports,
             entry_account_minor=receipt.account_net_minor,
             entry_price_impact_fraction=receipt.price_impact_fraction,
-            fee_bps=state.fee_bps or self.settings.pump_fee_bps,
+            fee_bps=(
+                state.fee_bps
+                if state.reserve_fee_components is not None
+                else state.fee_bps or self.settings.pump_fee_bps
+            ),
             venue=receipt.venue,
             quote_mint=state.quote_mint,
             entry_route_event_id=receipt.source_event_id,
@@ -1378,11 +1400,17 @@ class PaperBroker:
                 virtual_token_reserves=state.virtual_token_reserves,
                 virtual_sol_reserves=state.virtual_quote_reserves,
                 token_units=position.token_units,
-                fee_bps=state.fee_bps or self.settings.pump_fee_bps,
+                fee_bps=(
+                    state.fee_bps
+                    if state.reserve_fee_components is not None
+                    else state.fee_bps or self.settings.pump_fee_bps
+                ),
                 network_fee_lamports=(
                     self.settings.network_fee_lamports + self.settings.priority_fee_lamports
                 ),
                 real_quote_reserves=state.real_quote_reserves,
+                fee_components=state.reserve_fee_components,
+                lp_fee_bps=state.reserve_lp_fee_bps,
             )
             position.last_mark_lamports = self._account_minor_from_sol(
                 quote.wallet_sol_lamports, sol_usd_price, ROUND_FLOOR
@@ -1826,6 +1854,22 @@ class PaperBroker:
         portfolio = self.snapshot()
         self.database.record_equity(portfolio.equity_lamports, portfolio.cash_lamports)
         self._last_equity_recorded_at = now
+        # Reuse an equity sample already computed for the ledger; diagnostics never asks the
+        # broker to perform an extra valuation or database query.
+        self.last_diagnostic_equity = {
+            "at": now.timestamp(),
+            "season": self.season_id,
+            "currency": portfolio.quote_currency.value,
+            "decimals": portfolio.quote_decimals,
+            "starting_minor": portfolio.starting_lamports,
+            "cash_minor": portfolio.cash_lamports,
+            "equity_minor": portfolio.equity_lamports,
+            "realized_pnl_minor": portfolio.realized_pnl_lamports,
+            "unrealized_pnl_minor": portfolio.unrealized_pnl_lamports,
+            "excluded_positions": portfolio.excluded_position_count,
+            "open_positions": len(portfolio.positions),
+            "drawdown": portfolio.drawdown_fraction,
+        }
 
     def season_summary(self) -> dict[str, int | float]:
         """Return conservative, currency-safe metrics for the active paper season."""

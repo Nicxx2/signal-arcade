@@ -1,0 +1,37 @@
+{
+  "image": "sha256:cba8f1bf633115331320ddefb3e13df570fb088c20ea8aa225565138f2058f05",
+  "started_at": "2026-09-06T07:52:11.973Z",
+  "source": "Live local paper app on mainnet data",
+  "errors": [],
+  "failed_requests": [],
+  "mutations": [],
+  "captures": [
+    {
+      "file": "01-arena-overview.png",
+      "captured_at": "2026-09-06T07:52:14.069Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "sha256": "c2be6bd3d633e3ff5d783de9809f0f3c93ccc218cea207b93825e61801d15dd9"
+    },
+    {
+      "file": "08-replay-receipts.png",
+      "captured_at": "2026-09-06T07:52:15.493Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "sha256": "a3dd766d9ea17ffeb5ae0d1860dc5b1756323663f0cc2b86fc47ef0dec2164e2"
+    },
+    {
+      "file": "07-mobile-arena.png",
+      "captured_at": "2026-09-06T07:52:17.097Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "sha256": "2580df2cb993530365ab9908877ce07d8502a8742b745750a1af0aad7a6e480e"
+    }
+  ]
+}

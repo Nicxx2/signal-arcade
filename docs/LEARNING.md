@@ -6,6 +6,87 @@ profit, discover a permanent edge, or safely trade real money.
 
 ## What becomes a lesson
 
+### v1.10.5 live-review refinements
+
+Training checks its existing exact-cohort retraining threshold before freezing history. Reduced
+fitting inputs omit Discovery sizing trials and prior Challenger evaluation receipts; full Policy
+sizing trials remain, and original stored observations/receipts are untouched. Fitting and
+publication retain their chronological split, context fence, atomic commit and qualification rules.
+Worker diagnostics distinguish skipped jobs from published models and report each processing phase.
+
+Skill-card gates describe `testing_candidate` when present, otherwise `latest_candidate`; the API
+names that subject and artifact version. Champion availability, current activation and paired
+forward tournament proof are separate states. A saved Champion does not qualify every new contender.
+
+### v1.10.4 checkpoint and publication contract
+
+Cached checkpoint selection filters for fresh executable routes before consuming its processing
+budget. It rotates across eligible tokens, allocating three turns to Policy evidence for each
+Discovery turn when both lanes have work. A stale oldest Discovery token cannot monopolize every
+pass. Unknown and expired outcomes remain in the original qualification denominator.
+
+The optional `learning_reserve_refresh_enabled` worker starts disabled. When enabled, it requests
+one batch no more frequently than every ten seconds, with at most twenty routes and one hundred
+unique accounts. It shares the configured provider quota and backoff, yields during maintenance,
+season boundaries, pending sells, queue pressure and market lag, and times out each attempt after
+eight seconds. Provider-unavailable, unsupported or malformed responses remain unknown. A target
+with an implausible future slot cannot poison the slot requirement for the other targets.
+
+Snapshots must validate current mint safety, program owners, curve/pool PDAs, native-SOL quote
+mapping, initialized unfrozen vaults, token-program extensions, fee configuration, slot fences and
+request/observation times. Fee recipes are pinned to the reviewed Pump SDK 1.36.0 and PumpSwap SDK
+1.19.0 semantics. Unknown layout extensions are rejected. v1.10.5 also supports verified Mayhem
+bonding curves: their fee tier uses current mint supply from the same validated account batch;
+ordinary curves retain the SDK's fixed billion-token supply. The learning copy is
+separate from the live feature cache and paper broker. Checkpoints record account hashes, slot,
+reserves, fees and their observation time; the worker cannot fill a past horizon retroactively.
+
+The original network/priority fee budget is frozen for each new observation and Decision Lab
+assessment. Validated sell quotes round fee components individually and account for LP fees
+retained in an AMM vault. A fresh account with insufficient executable liquidity is still an unknown
+learning outcome, not an invented zero-price trade. The held-position watchdog can separately use
+repeated, fully verified empty-route observations as terminal-accounting evidence.
+
+Exit tournaments use all required paired horizons, including evidence lacking the five-minute
+checkpoint. Secondary checkpoints update governance without forcing an unnecessary model fit.
+`paired-skill-outcomes-v2` distinguishes the corrected proof; older Exit promotions are suspended
+until qualified under it. Decision Lab schema v5 prevents older, weaker outcome semantics from
+silently qualifying new guarded authority.
+
+Training runs against private copied inputs and an artifact reader. Fitting cannot publish models
+or mutate live skill state. Publication rechecks configuration, risk, learning mode, consent,
+Champion dependencies, learner identity, demo state, season and shutdown state. A failed, changed
+or over-120-second job publishes no result and queues a current retry. The elapsed limit rejects
+late output; it does not forcibly interrupt native fitting. Existing row, round and CPU bounds
+remain necessary. Coach can study while holdings are dormant or healthy and executable. Pending
+orders, stale/unexecutable active holdings, imminent reviews, training and market pressure still
+take priority. Its detached read/screening workers can pause between batches and resume the same
+complete cohort within a 30-second deadline; interrupted work supplies no partial proof.
+
+Models, skill artifacts (including nonlinear payloads) and pending skill enrollment commit in one
+SQLite transaction. The live candidate view changes only after that commit. An interrupted write
+or failed commit leaves the previous generation intact and the fit retryable, including after
+restart. Tournaments begin only after all candidate records have been committed.
+
+### History, storage and rollout
+
+Schema 14 imports embedded/sidecar Champion events into an indexed journal transactionally. UI
+pages are bounded and each live skill retains only its latest 100 events in memory. Generation
+and defence counts come from the journal, so paging does not rewrite a Champion's history.
+Heavy artifacts use the existing retention cap while preserving active, testing, pending and
+required dependency versions. Protected versions may exceed the target; authority is never deleted
+to meet an arbitrary disk limit. Pruned versions retain hashes and audit metadata, but an archived
+payload cannot be replayed from its hash alone. Storage targets still require operational monitoring.
+
+Start the optional reserve worker in Shadow and compare recovered outcomes, unknown reasons,
+checkpoint deadlines, provider quota use and event lag across both lanes and venues. Its runtime
+status is included under the event pipeline's learning reserve refresh diagnostics. A 48–72 hour
+soak and later common-forward economic evidence are rollout validation, not results established by
+unit tests. Keep the 70% coverage gate and current activation consent. The separately versioned
+prospective portfolio experiment from the improvement plan is not included in this release.
+
+### Evidence lanes
+
 Learning has three deliberately separate evidence lanes:
 
 - **Discovery** keeps at most one eligible ENTER or PASS observation per mint. It finds broad

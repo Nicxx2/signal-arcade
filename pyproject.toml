@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solana-signal-arcade"
-version = "1.10.3"
+version = "1.10.5"
 description = "A self-hosted Solana paper-trading lab that explains every decision."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,6 +15,7 @@ dependencies = [
   "httpx==0.28.1",
   "pydantic==2.13.4",
   "pydantic-settings==2.15.0",
+  "solders==0.29.0",
   "uvicorn[standard]==0.52.4",
   "websockets==15.0.1",
   "xgboost-cpu==3.4.1",

@@ -1,3 +1,4 @@
+import { DiagnosticsHistory } from "./DiagnosticsHistory";
 import {
   Activity,
   AlertTriangle,
@@ -31,12 +32,18 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "./api";
+import { api, ApiError } from "./api";
+import { ArenaProvider, ArenaSkillButton, ArenaRecapButton } from "./championArena/ArenaEntry";
+import { ChampionRecordPortrait } from "./championArena/FighterPortrait";
+import { contextFor } from "./championArena/model";
+import { HISTORY_WINDOW, mergeHistoryWindow } from "./championArena/history";
 import { copyText } from "./clipboard";
+import EntryProof from "./EntryProof";
+import { entryProofSummary } from "./entryProofModel";
 import { latestDecisionsByMint, organizeDecisions } from "./decisionView";
 import { buildEquityJourney, unchangedEquitySeconds } from "./equityJourney";
 import { StatusPanel } from "./StatusPanel";
-import { friendlyError, useSystemStatus } from "./systemStatus";
+import { friendlyError, marketHealthDetail, useSystemStatus } from "./systemStatus";
 import type { IssueScope } from "./systemStatus";
 import type {
   Decision,
@@ -113,6 +120,12 @@ function autoSeasonStatusChip(
   automation: SeasonAutomation,
   configuredHours: number,
 ): { label: string; ariaLabel: string } {
+  if ((automation.age_seconds ?? 0) > 15) {
+    return { label: "Status delayed", ariaLabel: "Automatic season status: last reported progress is delayed" };
+  }
+  if (automation.state === "waiting_for_terminal_evidence") {
+    return { label: "Verifying", ariaLabel: "Automatic season status: verifying dormant holdings for at most five additional minutes" };
+  }
   const remaining = finiteNonNegativeSeconds(automation.remaining_seconds);
   const verified = finiteNonNegativeSeconds(automation.verified_seconds);
   const grace = finiteNonNegativeSeconds(automation.grace_seconds) ?? configuredHours * 3_600;
@@ -532,6 +545,14 @@ export default function App() {
     });
   }, []);
 
+  const updateMarketStatus = useCallback((health: { degraded?: boolean; degraded_reasons?: string[] } | undefined) => {
+    if (health?.degraded === true) {
+      reportIssue("market", "Market processing needs attention", new Error(marketHealthDetail(health.degraded_reasons)));
+    } else if (health?.degraded === false) {
+      resolveIssue("market");
+    }
+  }, [reportIssue, resolveIssue]);
+
   const refresh = useCallback((): Promise<void> => {
     if (refreshInFlight.current) return refreshInFlight.current;
     const request = (async () => {
@@ -561,6 +582,9 @@ export default function App() {
           );
         } else {
           resolveIssue("dashboard");
+          // Only a fresh, explicit market report can confirm recovery. HTTP liveness alone
+          // must not clear this warning, nor should missing or stale cached status.
+          updateMarketStatus(next.event_pipeline);
         }
         if (next.database_ok) {
           resolveIssue("database");
@@ -575,6 +599,7 @@ export default function App() {
         if (expectedRestart) return;
         try {
           const health = await api.health();
+          updateMarketStatus(health);
           if (health.service_running && health.database_ok) {
             resolveIssue("server", true);
             reportIssue(
@@ -595,7 +620,7 @@ export default function App() {
       if (refreshInFlight.current === request) refreshInFlight.current = null;
     });
     return request;
-  }, [expectedRestart, reportIssue, resolveIssue]);
+  }, [expectedRestart, reportIssue, resolveIssue, updateMarketStatus]);
 
   useEffect(() => {
     if (!expectedRestart) return;
@@ -1236,7 +1261,7 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
           <div className="guardrail"><ShieldCheck size={17} /><span>Structural safety and stale-data gates always remain active.</span></div>
           <div className={`auto-season-control ${snapshot.season_automation.enabled ? "enabled" : ""}`}>
             <RotateCcw size={16} />
-            <div><strong>Auto new season <em>{snapshot.season_automation.enabled ? "On" : "Off"}</em></strong><small>{snapshot.season_automation.enabled ? snapshot.season_automation.detail : snapshot.season_profile?.drawdown_policy.kind === "disabled" ? `Wait ${autoSeasonHours}h after genuine bankroll exhaustion; recoverable holdings and unknown data always defer rollover.` : `Wait ${autoSeasonHours}h after a guarded pause with no active holdings; healthy data is always required.`}</small></div>
+            <div><strong>Auto new season <em>{snapshot.season_automation.enabled ? "On" : "Off"}</em></strong><small>{snapshot.season_automation.enabled ? snapshot.season_automation.detail : snapshot.season_profile?.drawdown_policy.kind === "disabled" ? `Wait ${autoSeasonHours}h after genuine bankroll exhaustion. Dormant holdings get bounded verification; healthy market data is required.` : `Wait ${autoSeasonHours}h after a guarded pause with no active holdings; healthy data is always required.`}</small></div>
             {!snapshot.season_automation.enabled ? <label className="auto-season-delay">Wait<select aria-label="Automatic season wait" value={autoSeasonHours} disabled={busy} onChange={(event) => void setSeasonAutomation(false, Number(event.target.value))}>{Array.from({ length: 24 }, (_, index) => index + 1).map((hours) => <option value={hours} key={hours}>{hours}h</option>)}</select></label> : <span className={`auto-season-delay-chip state-${snapshot.season_automation.state}`} aria-label={autoSeasonChip.ariaLabel} title={snapshot.season_automation.detail}>{autoSeasonChip.label}</span>}
             <button type="button" role="switch" aria-checked={snapshot.season_automation.enabled} aria-label={`${snapshot.season_automation.enabled ? "Disable" : "Enable"} automatic new seasons`} disabled={busy} onClick={() => void setSeasonAutomation(!snapshot.season_automation.enabled, snapshot.season_automation.enabled ? undefined : autoSeasonHours)}><span /></button>
           </div>
@@ -1631,7 +1656,7 @@ function LearningDisclosure({ id, title: heading, subtitle, summary, children, o
 }
 
 function readinessValue(gate: ReadinessGate, value: number | boolean | null): string {
-  if (value === null) return "Collecting";
+  if (value === null || typeof value === "number" && !Number.isFinite(value)) return "Unknown";
   if (gate.unit === "boolean") return value ? "Ready" : "Not ready";
   if (typeof value !== "number") return String(value);
   if (gate.unit === "fraction") return percent(value);
@@ -1664,11 +1689,11 @@ const CHALLENGER_SKILL_LABELS: Record<ChallengerChampionEvent["skill"], string> 
   exit: "Exit timing",
 };
 
-function championEventTitle(event: ChallengerChampionEvent): string {
-  if (event.kind === "first_champion") return "First Champion qualified";
-  if (event.kind === "promoted") return "New Champion earned";
-  if (event.kind === "defended") return "Champion defended";
-  return "No safe winner yet";
+function lastChampionEventLabel(event: ChallengerChampionEvent): string {
+  if (event.kind === "first_champion") return "Last milestone: first Champion";
+  if (event.kind === "promoted") return "Last battle: new Champion";
+  if (event.kind === "defended") return "Last battle: Champion retained";
+  return "Last battle: inconclusive";
 }
 
 function championEventDetail(event: ChallengerChampionEvent): string {
@@ -1722,7 +1747,7 @@ function NonlinearEntryProgress({ status }: { status: NonNullable<Snapshot["lear
     <div className="nonlinear-entry-progress" role="progressbar" aria-label="XGBoost Entry training eligibility" aria-valuemin={0} aria-valuemax={minimum} aria-valuenow={shown}><span style={{ width: `${shown / minimum * 100}%` }} /></div>
     <details>
       <summary>How nonlinear Entry earns a place</summary>
-      <p>After enough exact-cohort training rows exist, XGBoost must materially beat Linear and then pass the same independent proof and Champion battle. Reaching the row threshold alone grants no influence.</p>
+      <p>After enough exact-cohort training rows exist, XGBoost must materially beat its paired Linear model and pass independent proof. Either family can earn the first Entry crown; once a Champion exists, replacements must also win the shared forward comparison. Reaching the row threshold alone grants no influence.</p>
       <small>Required validation improvement over Linear: {percent(status.required_linear_improvement_fraction)}.</small>
     </details>
   </div>;
@@ -1734,8 +1759,10 @@ function ReigningChampions({ records }: { records: ChallengerChampionRecord[] })
     <header><div><span>Current best proved</span><strong id="reigning-champions-title">Reigning Champions</strong></div><small>{records.length} / 4 skills crowned</small></header>
     <div>
       {records.map((record) => <article key={record.skill}>
-        <span>{CHALLENGER_SKILL_LABELS[record.skill]}</span>
-        <strong title={record.champion_version}>{record.champion_generation ? `Champion v${record.champion_generation} · ` : ""}{record.champion_codename}</strong>
+        <header className="reigning-champion-heading"><ChampionRecordPortrait record={record} /><div>
+          <span>{CHALLENGER_SKILL_LABELS[record.skill]}</span>
+          <strong title={record.champion_version}>{record.champion_generation ? `Champion v${record.champion_generation} · ` : ""}{record.champion_codename?.trim() || "Saved Champion"}</strong>
+        </div></header>
         <p><b>{record.retained_count}</b> crown {record.retained_count === 1 ? "retention" : "retentions"}{record.inconclusive_count ? ` · ${record.inconclusive_count} inconclusive` : ""}</p>
         <small>{modelFamilyLabel(record.model_family)} · {record.influence_state === "suspended" ? "Suspended safely" : record.active || record.influence_state === "active" ? "Active" : "Shadow"}{record.crowned_at ? ` · since ${shortDate(record.crowned_at)}` : " · recorded reign predates journey history"}</small>
       </article>)}
@@ -1790,7 +1817,7 @@ function ChampionBattleDialog({ event, onClose }: { event: ChallengerChampionEve
       }
       const first = focusable[0]!;
       const last = focusable[focusable.length - 1]!;
-      if (keyboardEvent.shiftKey && document.activeElement === first) {
+      if (keyboardEvent.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
         keyboardEvent.preventDefault();
         last.focus();
       } else if (!keyboardEvent.shiftKey && document.activeElement === last) {
@@ -1807,7 +1834,7 @@ function ChampionBattleDialog({ event, onClose }: { event: ChallengerChampionEve
   const firstChampion = event.kind === "first_champion";
   return <div className="champion-battle-backdrop" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}>
     <section ref={dialogRef} className="champion-battle-dialog" role="dialog" aria-modal="true" aria-labelledby="champion-battle-title" aria-describedby="champion-battle-resolution" tabIndex={-1}>
-      <header><div><span>{CHALLENGER_SKILL_LABELS[event.skill]} · {shortDateTime(event.occurred_at)}</span><strong id="champion-battle-title">{championBattleOutcome(event)}</strong></div><button type="button" onClick={onClose} aria-label="Close battle details"><X size={17} /></button></header>
+      <header><div><span>{CHALLENGER_SKILL_LABELS[event.skill]} · {shortDateTime(event.occurred_at)}</span><strong id="champion-battle-title">{championBattleOutcome(event)}</strong></div><button type="button" onClick={onClose} aria-label={firstChampion ? "Close qualification details" : "Close battle details"}><X size={17} /></button></header>
       <div className="champion-battle-body">
         <div className={`champion-battle-result event-${event.kind}`}><Trophy size={18} /><div><strong>{championBattleHeadline(event)}</strong><small>{event.champion_generation ? `Champion v${event.champion_generation}` : "Recorded Champion event"}</small></div></div>
         {!firstChampion && <div className="champion-battle-players">
@@ -1854,15 +1881,17 @@ function ChampionJourney({ initialEvents, total, nextCursor }: { initialEvents: 
     setLoadError(null);
     try {
       const page = await api.championJourney(cursor, controller.signal);
-      setSeenEvents((current) => {
-        const unique = new Map(current.map((event) => [event.event_id, event]));
-        page.events.forEach((event) => unique.set(event.event_id, event));
-        return [...unique.values()].sort((left, right) => Date.parse(right.occurred_at) - Date.parse(left.occurred_at));
-      });
+      if (controller.signal.aborted) return;
+      setSeenEvents((current) => mergeHistoryWindow(current, page.events));
       setHistoryTotal(page.total);
-      setLoadedCursor(page.next_cursor);
+      setLoadedCursor(page.next_cursor === cursor ? null : page.next_cursor);
     } catch (cause) {
-      if (!controller.signal.aborted) setLoadError(friendlyError(cause));
+      if (!controller.signal.aborted) {
+        if (cause instanceof ApiError && cause.status === 409) {
+          setSeenEvents(initialEvents); setLoadedCursor(undefined);
+          setLoadError("The proof context changed. History has returned to the latest available results.");
+        } else setLoadError(friendlyError(cause));
+      }
     } finally {
       if (requestController.current === controller) requestController.current = null;
       if (!controller.signal.aborted) setLoading(false);
@@ -1874,21 +1903,25 @@ function ChampionJourney({ initialEvents, total, nextCursor }: { initialEvents: 
   }, []);
   return <>
     {events.length > 0
-      ? <ol className="champion-journey-list" aria-label="Recent Challenger Champion battles">
+      ? <ol className="champion-journey-list" aria-label="Recent Challenger Champion events">
         {events.map((event) => <li key={event.event_id}>
           <span className={`champion-journey-icon event-${event.kind}`} aria-hidden="true">{event.kind === "promoted" || event.kind === "first_champion" ? <Trophy size={14} /> : <ShieldCheck size={14} />}</span>
           <span><small>{CHALLENGER_SKILL_LABELS[event.skill]} · {shortTime(event.occurred_at)}</small><strong title={event.champion_version}>{championBattleHeadline(event)}</strong><em>{championEventDetail(event)}</em></span>
-          <span className="champion-journey-actions"><time dateTime={event.occurred_at}>{shortDate(event.occurred_at)}</time><button type="button" onClick={(mouseEvent) => { lastTrigger.current = mouseEvent.currentTarget; setSelected(event); }}>View battle</button></span>
+          <span className="champion-journey-actions"><time dateTime={event.occurred_at}>{shortDate(event.occurred_at)}</time><button type="button" onClick={(mouseEvent) => { lastTrigger.current = mouseEvent.currentTarget; setSelected(event); }}>{event.kind === "first_champion" ? "View qualification" : "View battle"}</button><ArenaRecapButton event={event} /></span>
         </li>)}
       </ol>
-      : <EmptyState icon={<History size={22} />} title="No recorded Champion battles yet" copy="Existing Champions remain valid. Honest journey history begins with the next completed challenge; Signal Arcade does not invent past battles." />}
-    {(cursor || loadError) && <div className="champion-journey-more"><span>{events.length.toLocaleString()} of {displayTotal.toLocaleString()} recorded events</span>{cursor && <button className="button ghost" type="button" disabled={loading} onClick={() => void loadOlder()}>{loading ? "Loading…" : "Load older battles"}</button>}{loadError && <small role="status">{loadError}</small>}</div>}
+      : <EmptyState icon={<History size={22} />} title="No recorded Champion events yet" copy="Existing Champions remain valid. Journey history begins with the next qualification or completed comparison; Signal Arcade does not invent past events." />}
+    {(cursor || loadError || seenEvents.length >= HISTORY_WINDOW) && <div className="champion-journey-more"><span>{events.length.toLocaleString()} of {displayTotal.toLocaleString()} recorded events{seenEvents.length >= HISTORY_WINDOW ? " · latest results + older history window" : ""}</span>{cursor && <button className="button ghost" type="button" disabled={loading} onClick={() => void loadOlder()}>{loading ? "Loading…" : "Load older events"}</button>}{seenEvents.length >= HISTORY_WINDOW && <button className="button ghost" disabled={loading} onClick={() => { setSeenEvents(initialEvents); setLoadedCursor(undefined); setLoadError(null); }}>Back to latest</button>}{loadError && <small role="status">{loadError}</small>}</div>}
     <p className="champion-journey-note"><ShieldCheck size={13} />Season profit stays in Results. A Champion means safer forward proof, never guaranteed profit.</p>
     {selected && <ChampionBattleDialog event={selected} onClose={closeBattle} />}
   </>;
 }
 
-function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
+function LearningLab(props: React.ComponentProps<typeof LearningLabContents>) {
+  return <ArenaProvider key={contextFor(props.snapshot)} snapshot={props.snapshot}><LearningLabContents {...props} /></ArenaProvider>;
+}
+
+function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
   snapshot: Snapshot;
   setLearningMode: (mode: LearningMode) => Promise<void>;
   setAiMode: (mode: AiDecisionMode) => Promise<void>;
@@ -1938,10 +1971,6 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
   const canActivate = learning.activation_available && learning.collecting_from_current_source;
   const holdReview = learning.recommended_hold_seconds[snapshot.risk_mode];
   const timing = learning.hold_timing_validation[snapshot.risk_mode];
-  const challengerGates = learning.qualification_gates ?? [];
-  const challengerPassed = learning.qualification_passed
-    ?? challengerGates.filter((gate) => gate.state === "passed").length;
-  const challengerTotal = learning.qualification_total ?? challengerGates.length;
   const skillStatuses = learning.skills ?? [];
   const championJourney = learning.champion_journey ?? [];
   const championRecords = learning.champion_records ?? [];
@@ -2024,7 +2053,7 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
       </section>}
       <section className="learning-team-strip" aria-label="Learning team status">
         <button type="button" onClick={() => setActiveView("baseline")}><span>Fast Baseline</span><strong>{baselineState}</strong><small>Deterministic · {title(snapshot.risk_mode)} · safe fallback</small><em>Open Baseline <ChevronRight size={12} /></em></button>
-        <button type="button" onClick={() => setActiveView("challenger")}><span>Statistical Challenger</span><strong>{challengerState}</strong><small>{challengerTotal ? `${challengerPassed} / ${challengerTotal} proof gates` : "Server proof is collecting"}</small><em>Open Challenger <ChevronRight size={12} /></em></button>
+        <button type="button" onClick={() => setActiveView("challenger")}><span>Statistical Challenger</span><strong>{challengerState}</strong><small>{entryProofSummary(learning)}</small><em>Open Challenger <ChevronRight size={12} /></em></button>
         <button type="button" onClick={() => setActiveView("coach")}><span>Local AI Lab</span><strong>{snapshot.ai_lab.mode === "off" ? "Off" : "Shadow"} · {coachState}</strong><small>Coach + saved decision reviews · zero influence</small><em>Open AI Coach <ChevronRight size={12} /></em></button>
       </section>
       <div className="learning-overview-note"><ShieldCheck size={15} /><span><strong>The Baseline acts; the others must earn trust.</strong><small>Challenger and local AI evidence stays separate, measurable, bounded, and reversible.</small></span></div>
@@ -2080,15 +2109,15 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
           const candidate = skill.testing_candidate ?? skill.latest_candidate;
           const latestSkillEvent = championJourney.find((event) => event.skill === skill.skill);
           const waitingGate = skill.gates.find((gate) => gate.state !== "passed") ?? null;
-          const contenderState = skill.testing_version
-            ? "Testing"
-            : !candidate
-              ? "Collecting"
-              : candidate.version === skill.champion?.version
-                ? "Champion"
-                : candidate.qualified
-                  ? "Qualified"
-                  : "Building proof";
+          const candidateIsChampion = Boolean(candidate && candidate.version === skill.champion?.version);
+          const candidateRole = skill.testing_version ? "Contender" : candidateIsChampion ? "Champion" : "Candidate";
+          const candidateLabel = skill.testing_version
+            ? "Battle contender"
+            : candidateIsChampion
+              ? "Current Champion"
+              : candidate?.qualified
+                ? "Candidate · qualified"
+                : "Candidate · collecting proof";
           const tournamentAvailability = typeof skill.tournament.availability_fraction === "number"
             ? skill.tournament.availability_fraction
             : null;
@@ -2099,15 +2128,15 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
               ? `${percent(tournamentAvailability)} coverage · needs ${percent(minimumTournamentAvailability)}`
               : `${skill.common_forward_count} / ${commonForwardMinimum} shared outcomes`
             : latestSkillEvent
-              ? championEventTitle(latestSkillEvent)
+              ? lastChampionEventLabel(latestSkillEvent)
               : candidate
                 ? `${compact(candidate.sample_count)} outcomes`
                 : "Independent proof";
           return <article className={`card challenger-skill-card skill-${skill.state}`} key={skill.skill}>
-            <header><div><span>{skill.skill}</span><strong>{skill.label}</strong></div><b>{title(skill.state)}</b></header>
+            <header><div><span>{skill.skill}</span><strong>{skill.label}</strong></div><b>{skill.state === "qualified" ? "Champion available" : title(skill.state)}</b></header>
             <p>{skill.skill === "entry" ? "Selects among entries the Baseline already approved." : skill.skill === "manipulation" ? "Learns recurring adversarial flow patterns and may only veto." : skill.skill === "sizing" ? "Tests bounded 0.5x–2x sizes under the same executable route." : "May move the normal review earlier; hard exits never move."}</p>
             <div className="challenger-skill-facts">
-              <span><small>Contender</small><strong title={candidate?.version}>{candidate?.codename ?? contenderState}</strong>{candidate && <em>{modelFamilyLabel(candidate.model_family)}</em>}</span>
+              <span><small>{candidateLabel}</small><strong title={candidate?.version}>{candidate?.codename ?? (candidate ? "Unnamed candidate" : "No candidate yet")}</strong>{candidate && <em>{modelFamilyLabel(candidate.model_family)}</em>}</span>
               <span><small>Best proved</small><strong title={skill.champion?.version}>{skill.champion ? `${skill.champion_generation ? `Champion v${skill.champion_generation} · ` : ""}${skill.champion.codename ?? "Champion"}` : "None yet"}</strong>{skill.champion && <em>{modelFamilyLabel(skill.champion.model_family)}</em>}</span>
               <span><small>Influence</small><strong>{skill.active_version ? "Active" : skill.state === "suspended" ? "Suspended" : "Shadow"}</strong></span>
             </div>
@@ -2116,13 +2145,14 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
             {(candidate || skill.champion) && <details className="challenger-artifact-details">
               <summary>Artifact details</summary>
               <div>
-                {candidate && <span><small>Contender recipe</small><strong>{modelFamilyLabel(candidate.model_family)} · {candidate.recipe_version ?? "legacy recipe"}</strong></span>}
+                {candidate && <span><small>{candidateRole} recipe</small><strong>{modelFamilyLabel(candidate.model_family)} · {candidate.recipe_version ?? "legacy recipe"}</strong></span>}
                 {candidate && <span><small>Evidence split</small><strong>{compact(candidate.training_count)} train · {compact(candidate.validation_count)} validation</strong></span>}
                 {skill.champion && <span><small>Champion recipe</small><strong>{modelFamilyLabel(skill.champion.model_family)} · {skill.champion.recipe_version ?? "legacy recipe"}</strong></span>}
                 {candidate?.training_cutoff_at && <span><small>Frozen cutoff</small><strong>{shortDate(candidate.training_cutoff_at)}</strong></span>}
               </div>
             </details>}
-            <footer><span>{passed} / {skill.gates.length} skill gates</span><span>{battleProgress}{(skill.pending_versions?.length ?? 0) > 0 ? ` · ${skill.pending_versions!.length} queued` : ""}</span></footer>
+            <ArenaSkillButton skill={skill.skill} />
+            <footer><span title={skill.gate_artifact_version ?? candidate?.version}>{passed} / {skill.gates.length} {candidateRole === "Champion" ? "Champion" : candidateRole.toLowerCase()} gates</span><span>{battleProgress}{(skill.pending_versions?.length ?? 0) > 0 ? ` · ${skill.pending_versions!.length} queued` : ""}</span></footer>
           </article>;
         })}
       </section>}
@@ -2132,7 +2162,7 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
       <LearningDisclosure
         id="champion-journey-details"
         title="Champion journey"
-        subtitle="Recent recorded battles for this personality"
+        subtitle="Qualifications and comparisons for this personality"
         summary={championJourneyTotal ? `${championRecords.length} reigning · ${championJourneyTotal} events` : "Waiting for first Champion"}
         open={expandedSections.has("champion_journey")}
         onToggle={() => toggleSection("champion_journey")}
@@ -2142,14 +2172,13 @@ function LearningLab({ snapshot, setLearningMode, setAiMode, setCoachResearch, s
 
       <LearningDisclosure
         id="challenger-readiness-details"
-        title="Entry’s road to influence"
-        subtitle="Foundational activation proof from the engine"
-        summary={challengerTotal ? `Entry · ${challengerPassed} / ${challengerTotal} passed` : "Entry · collecting"}
+        title="Entry proof & activation"
+        subtitle="Linear and XGBoost · one Entry crown"
+        summary={entryProofSummary(learning)}
         open={expandedSections.has("challenger_proof")}
         onToggle={() => toggleSection("challenger_proof")}
       >
-        <p className="entry-influence-note"><ShieldCheck size={14} /><span><strong>Entry is the Challenger’s foundation.</strong> It may select or reject opportunities already approved by the Baseline, but it cannot invent trades. Manipulation, Sizing and Exit can join later only after their own independent proof.</span></p>
-        <ReadinessGates gates={challengerGates} emptyCopy="This running backend predates detailed proof gates; qualification remains safely server-controlled." />
+        <EntryProof learning={learning} renderGates={gates => <ReadinessGates gates={gates} emptyCopy="No detailed proof is recorded for this subject yet. Qualification remains server-controlled." />} />
       </LearningDisclosure>
 
       <LearningDisclosure
@@ -2751,7 +2780,7 @@ function SeasonsView({ reportIssue, resolveIssue }: {
     && selectedGroups.length > 1;
   const legacyHistory = !mixedHistory && (
     selectedComparison?.profile_provenance !== "exact"
-    || selectedComparison?.terminal_policy_version !== "executable-boundary-v2"
+    || !supportsSeasonAccounting(selectedComparison?.terminal_policy_version)
   );
   const comparisonClaimsHidden = mixedHistory || legacyHistory;
   const trend = mixedHistory
@@ -2779,7 +2808,7 @@ function SeasonsView({ reportIssue, resolveIssue }: {
     : null;
   return <>
     <section className="season-profile-filter card">
-      <div><span>Compare seasons</span><strong>{mixedHistory ? `${filteredCurrency ? `All ${filteredCurrency}` : "All seasons"} · mixed settings` : seasonComparisonGroupLabel(selectedComparison)}</strong><small>{mixedHistory ? "These scorecards remain visible, but bankroll, policy or boundary differences hide aggregate improvement claims." : legacyHistory ? "This retained history predates exact boundary accounting; comparison claims stay hidden." : "Every comparison statistic uses the same currency, starting bankroll, exact profile and terminal policy."}</small></div>
+      <div><span>Compare seasons</span><strong>{mixedHistory ? `${filteredCurrency ? `All ${filteredCurrency}` : "All seasons"} · mixed settings` : seasonComparisonGroupLabel(selectedComparison)}</strong><small>{mixedHistory ? "These scorecards remain visible, but bankroll, policy or boundary differences hide aggregate improvement claims." : legacyHistory ? "Exact boundary accounting is unavailable or unsupported for this history; comparison claims stay hidden." : "Every comparison statistic uses the same currency, starting bankroll, exact profile and terminal policy."}</small></div>
       <div className="season-comparison-control"><span id="season-comparison-control-label">Season comparison</span><button ref={comparisonPickerTriggerRef} type="button" className="season-comparison-trigger" aria-labelledby="season-comparison-control-label" aria-haspopup="dialog" aria-expanded={comparisonPickerOpen} onClick={() => setComparisonPickerOpen(true)}><span><strong>{selectedPickerOption?.label ?? "Choose comparison"}</strong><small>{selectedPickerOption?.detail ?? "Select retained season history"}</small></span><ChevronDown size={15} /></button></div>
       {comparisonPickerOpen && <div className="season-comparison-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeComparisonPicker(); }}><section ref={comparisonPickerDialogRef} className="season-comparison-dialog" role="dialog" aria-modal="true" aria-labelledby="season-comparison-title" aria-describedby="season-comparison-copy" tabIndex={-1}><header><div><strong id="season-comparison-title">Choose season comparison</strong><small id="season-comparison-copy">Exact strategy and accounting generations remain separate.</small></div><button type="button" aria-label="Close season comparison" onClick={closeComparisonPicker}><X size={16} /></button></header><div className="season-comparison-options">{comparisonPickerSections.map((section) => <section key={section.label} aria-label={section.label}><h3>{section.label}</h3><div role="radiogroup" aria-label={section.label}>{section.options.map((option) => <button type="button" role="radio" aria-checked={normalizedProfileFilter === option.value} className={normalizedProfileFilter === option.value ? "selected" : ""} key={option.value} onClick={() => { setProfileFilter(option.value); setHistoryLimit(20); closeComparisonPicker(); }}><span><strong>{option.label}</strong><small>{option.detail}</small></span>{normalizedProfileFilter === option.value && <Check size={16} />}</button>)}</div></section>)}</div></section></div>}
     </section>
@@ -3148,6 +3177,11 @@ function StorageManager({ snapshot, refresh, busy, setBusy, reportIssue, resolve
   const [saved, setSaved] = useState(false);
   const usedFraction = Math.min(1, storage.live_bytes / Math.max(1, storage.max_database_bytes));
   const cleanup = storage.maintenance;
+  const oldestTrade = cleanup?.oldest_retained_trade_at
+    ? Date.parse(cleanup.oldest_retained_trade_at) : NaN;
+  const historyAgeHours = Number.isFinite(oldestTrade)
+    ? Math.max(0, (Date.parse(snapshot.server_time) - oldestTrade) / 3_600_000) : null;
+  const historyBehind = historyAgeHours !== null && historyAgeHours > storage.raw_trade_retention_hours + 1;
   const cleanupCopy = cleanup?.active
     ? "Background cleanup is working in a small bounded chunk."
     : cleanup?.deferred_reason
@@ -3185,6 +3219,7 @@ function StorageManager({ snapshot, refresh, busy, setBusy, reportIssue, resolve
     <div className="storage-meter"><span style={{ width: `${usedFraction * 100}%` }} /></div>
     <div className="storage-summary"><strong>{formatBytes(storage.live_bytes)} live data</strong><span>{formatBytes(storage.database_bytes)} allocated · {formatBytes(storage.reclaimable_bytes)} reusable</span></div>
     <p className="storage-maintenance-state"><HardDrive size={13} />{cleanupCopy}</p>
+    {historyBehind && <p className="storage-note">History cleanup is catching up: oldest raw trade is {Math.floor(historyAgeHours ?? 0)} hours old; target {storage.raw_trade_retention_hours} hours. Trading and learning evidence remain protected.</p>}
     <form className="storage-form" onSubmit={save}><label>Maximum database<input type="number" min="0.5" max="100" step="0.5" value={maxGb} onChange={(event) => { setMaxGb(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>GB</span></label><label>Raw event history<input type="number" min="1" max="720" step="1" value={retention} onChange={(event) => { setRetention(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>hours</span></label><button className={`button${saved ? " saved" : ""}`} type="submit" disabled={saving || busy} aria-live="polite">{saving ? <span className="mini-loader" /> : saved ? <Check size={15} /> : <Save size={15} />}{saving ? "Saving…" : saved ? "Saved" : "Save"}</button></form>
     {saved && <p className="storage-saved" role="status"><Check size={13} />Policy saved. Cleanup continues safely in the background.</p>}
     <p className="storage-note"><HardDrive size={14} />SQLite reuses freed pages, so an older file may stay physically large without continuing to grow. Docker text logs are separately rotated and capped at about 30 MB by the included Compose files.</p>
@@ -3366,6 +3401,7 @@ function SettingsView({ snapshot, refresh, busy, setBusy, reportIssue, resolveIs
         <div className={`health-summary pipeline-summary ${snapshot.event_pipeline.degraded ? "unhealthy" : "healthy"}`}><span /><div><strong>Market processing {snapshot.event_pipeline.degraded ? snapshot.event_pipeline.degraded_reasons.map(humanize).join(", ") : "current"}</strong><small>{compact(snapshot.event_pipeline.processed)} processed · {compact(snapshot.event_pipeline.ephemeral)} transient · {compact(snapshot.event_pipeline.persisted)} saved · {compact(snapshot.event_pipeline.shed_candidate_events ?? Math.max(0, snapshot.event_pipeline.dropped - (snapshot.event_pipeline.expired_candidate_events ?? 0)))} shed · {compact(snapshot.event_pipeline.expired_candidate_events ?? 0)} expired</small></div></div>
       </article>
       <StorageManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
+      <DiagnosticsHistory />
       <AiModelManager snapshot={snapshot} refresh={refresh} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <ProviderManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <MaintenanceManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
@@ -3766,7 +3802,7 @@ function providerRole(name: string): string {
   if (name === "solana") return "Core on-chain stream + mint safety";
   if (name === "dexscreener") return "Secondary USD + liquidity context";
   if (name === "jupiter") return "Validation adapter; idle in V1";
-  if (name === "ollama") return "On-demand explanations only";
+  if (name === "ollama") return "Local AI reviews, Coach research and explanations";
   return "Optional adapter";
 }
 
@@ -4264,11 +4300,14 @@ function seasonComparisonBankrollLabel(
     : minorAmountInput(group.starting_minor, decimals);
   return includeCurrency ? `${group.quote_currency} ${amount}` : `${amount} ${group.quote_currency}`;
 }
+function supportsSeasonAccounting(version: string | undefined) {
+  return version === "executable-boundary-v2" || version === "executable-boundary-v3";
+}
 function seasonComparisonGroupContext(group: SeasonComparisonGroup) {
   const strategy = group.baseline_version
     ? group.baseline_version.replace("baseline-", "Baseline ")
     : "Legacy strategy";
-  const accounting = group.terminal_policy_version === "executable-boundary-v2"
+  const accounting = supportsSeasonAccounting(group.terminal_policy_version)
     ? "Modern accounting"
     : "Legacy accounting";
   const first = group.first_season_number;

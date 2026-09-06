@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 
 def utc_now() -> datetime:
@@ -295,6 +295,7 @@ class Decision(BaseModel):
 
 
 class LearningCheckpoint(BaseModel):
+    route_snapshot: dict[str, Any] | None = None
     horizon_seconds: int = Field(gt=0)
     observed_at: datetime
     net_return: float | None = Field(default=None, ge=-1, le=10)
@@ -338,6 +339,7 @@ class ChallengerSizeTrial(BaseModel):
 
 
 class LearningObservation(BaseModel):
+    checkpoint_network_fee_lamports: int | None = Field(default=None, ge=0)
     model_config = ConfigDict(extra="forbid")
 
     observation_id: str
@@ -388,6 +390,7 @@ class LearningObservation(BaseModel):
 
 
 class LearningEvidenceEpisode(BaseModel):
+    checkpoint_network_fee_lamports: int | None = Field(default=None, ge=0)
     """Self-contained, generation-bound evidence that survives paper-season cleanup.
 
     Discovery/ranking observations remain in ``LearningObservation`` for backward
@@ -565,6 +568,11 @@ class ChallengerSkillState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Optional spectator data lives in a separate table, outside authority/legacy JSON.
+    _battle_replay: dict[str, Any] | None = PrivateAttr(default=None)
+    _battle_replay_dirty: bool = PrivateAttr(default=False)
+    _pending_battle_replays: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
+
     cohort_key: str
     skill: ChallengerSkill
     risk_mode: RiskMode
@@ -589,6 +597,8 @@ class ChallengerSkillState(BaseModel):
 
 
 class AiCriticAssessment(BaseModel):
+    checkpoint_network_fee_lamports: int | None = Field(default=None, ge=0)
+    outcome_route_snapshot: dict[str, Any] | None = None
     """Immutable local-LLM recommendation plus its later paper counterfactual."""
 
     model_config = ConfigDict(extra="forbid")

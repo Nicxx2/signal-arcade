@@ -358,6 +358,7 @@ def test_ai_rejects_evidence_references_it_was_not_given(tmp_path: Path) -> None
                 "token_units": 1_000,
                 "entry_cost_lamports": 10_000,
                 "fee_bps": 125,
+                "checkpoint_network_fee_lamports": 30_000,
                 "outcome_due_at": now + timedelta(minutes=5),
             },
             applied=False,
@@ -415,6 +416,7 @@ def test_shadow_critic_deduplicates_a_token_until_the_queued_work_finishes(
         "token_units": 1_000,
         "entry_cost_lamports": 10_000,
         "fee_bps": 125,
+        "checkpoint_network_fee_lamports": 30_000,
         "outcome_due_at": now + timedelta(minutes=5),
     }
     lab._prepare_outcome = lambda _decision_value, _state: outcome  # type: ignore[method-assign]
@@ -448,6 +450,7 @@ def test_shadow_critic_drops_stale_burst_work_before_calling_ollama(tmp_path: Pa
         "token_units": 1_000,
         "entry_cost_lamports": 10_000,
         "fee_bps": 125,
+        "checkpoint_network_fee_lamports": 30_000,
         "outcome_due_at": old + timedelta(minutes=5),
     }
     lab._prepare_outcome = lambda _decision_value, _state: outcome  # type: ignore[method-assign]

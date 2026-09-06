@@ -57,7 +57,7 @@ def fit_xgboost(
         [0.5 ** ((len(rows) - 1 - index) / 500) for index in range(len(rows))],
         dtype=np.float32,
     )
-    matrix = xgb.DMatrix(features, label=targets, weight=weights)
+    matrix = xgb.DMatrix(features, label=targets, weight=weights, nthread=1)
     try:
         booster = xgb.train(
             dict(XGBOOST_PARAMETERS),
@@ -85,6 +85,9 @@ def load_xgboost(payload: bytes) -> Any:
         booster.load_model(bytearray(payload))
     except xgb.core.XGBoostError as exc:
         raise ValueError("invalid XGBoost payload") from exc
+    # Portable model JSON omits runtime thread settings. Reapply the execution budget
+    # after loading, including after a runtime-cache eviction or an app restart.
+    booster.set_param({"nthread": 1})
     return booster
 
 
@@ -106,7 +109,7 @@ def predict_xgboost(
         raise ValueError("XGBoost runtime is unavailable") from exc
 
     try:
-        predictions = booster.predict(xgb.DMatrix(np.asarray(rows, dtype=np.float32)))
+        predictions = booster.predict(xgb.DMatrix(np.asarray(rows, dtype=np.float32), nthread=1))
     except xgb.core.XGBoostError as exc:
         raise ValueError("XGBoost prediction failed") from exc
     values = [float(value) for value in predictions]

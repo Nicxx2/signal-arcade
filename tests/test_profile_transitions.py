@@ -472,7 +472,7 @@ def test_end_now_records_untradeable_inventory_without_fabricating_a_fill(settin
     assert retired["token_units"] == 123
     assert retired["entry_cost_minor"] == 1_000
     assert retired["terminal_disposition"] == "write_off"
-    assert retired["terminal_evidence"]["policy"] == "two-fresh-route-probes"
+    assert retired["terminal_evidence"]["policy"] == "validated-route-probes-v2"
     assert retired["was_executed"] is False
     assert orchestrator.database.list_fills() == []
     assert orchestrator.broker.positions == {}

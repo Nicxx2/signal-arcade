@@ -1,0 +1,887 @@
+{
+  "source": "@pump-fun/pump-sdk@1.36.0 getSellSolAmountFromTokenAmount",
+  "supply_source": "current mint account; curve tokenTotalSupply intentionally differs",
+  "tiers": [
+    {
+      "threshold": "0",
+      "protocol": "5",
+      "creator": "7"
+    },
+    {
+      "threshold": "60000000000",
+      "protocol": "93",
+      "creator": "30"
+    },
+    {
+      "threshold": "1000000000000",
+      "protocol": "6",
+      "creator": "8"
+    }
+  ],
+  "rows": [
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615383"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769229"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615383"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769229"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615384"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769230"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615384"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769230"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "998"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "997"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "989"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "986"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "998401598"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "997602397"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "989710289"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "986713286"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "230630769230"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "230446153845"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "228623076922"
+    },
+    {
+      "supply": "500000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "227930769229"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615383"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769229"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615383"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769229"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615384"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769230"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615384"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769230"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "998"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "997"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "998"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "997"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "998401598"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "997602397"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "998401598"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "997602397"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "230630769230"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "230446153845"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "230630769230"
+    },
+    {
+      "supply": "1000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "230446153845"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615383"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769229"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615383"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "29999999999",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769229"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "28"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "27"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "29955043"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "29934063"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "29691307"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "29601396"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "6919615384"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "6914769230"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "6858692307"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "30000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "6837923076"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "998"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "997"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "998"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "997"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "998401598"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "997602397"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "998401598"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "1000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "997602397"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": false,
+      "sdk_after_protocol_fee": "230630769230"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": false,
+      "creator": true,
+      "sdk_after_protocol_fee": "230446153845"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": false,
+      "sdk_after_protocol_fee": "230630769230"
+    },
+    {
+      "supply": "2000000000000000",
+      "quote": "1000000000000",
+      "amount": "300000000000000",
+      "mayhem": true,
+      "creator": true,
+      "sdk_after_protocol_fee": "230446153845"
+    }
+  ]
+}

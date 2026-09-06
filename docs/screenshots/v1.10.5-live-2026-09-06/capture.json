@@ -1,0 +1,256 @@
+{
+  "version": "1.10.5",
+  "started_at": "2026-09-06T07:23:43.565Z",
+  "source": "Live local paper-trading app on mainnet data",
+  "browser": "Headless Chrome",
+  "locale": "en-GB",
+  "timezone": "Europe/London",
+  "graphics": "Low",
+  "capture_policy": "Actual rendered UI; no synthetic responses, altered figures, hidden warnings or selected performance winners.",
+  "image": "sha256:b9e6f672631e223953ac9f2960ce8c1c9dc4844d85f1602c5e20d82ff81d5f0a",
+  "screenshots": [
+    {
+      "file": "01-arena-overview.png",
+      "caption": "Live paper Arena: equity, risk profile, positions and engine status.",
+      "captured_at": "2026-09-06T07:23:48.239Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 346052,
+      "sha256": "ec5dad76670eb6afc99d3d79d4e81995c2878b6e77dc547dfc20f26675a57e8f"
+    },
+    {
+      "file": "02-decision-board.png",
+      "caption": "Current decision board with real point-in-time evidence.",
+      "captured_at": "2026-09-06T07:23:49.841Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 170695,
+      "sha256": "ecf8b16888aee321b83b634b55697e36cb58563fbd48babf95d28f6f7fe25ee5"
+    },
+    {
+      "file": "03-season-progress.png",
+      "caption": "Default season comparison; no performance group was selected for a better result.",
+      "captured_at": "2026-09-06T07:23:51.646Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 324255,
+      "sha256": "df946ec32da89c96614b244b13e03617c7242f70e84fbcd45a1bda7a30f88c65"
+    },
+    {
+      "file": "04-learning-lab.png",
+      "caption": "Statistical Challenger collecting forward proof while the Baseline remains in control.",
+      "captured_at": "2026-09-06T07:23:54.025Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 340254,
+      "sha256": "c4c8d99e8341c6c24bc768ca59c254ddc0253f1edc0f814f0edcbfbcd0b02c48"
+    },
+    {
+      "file": "10-skill-progress.png",
+      "caption": "Entry, Manipulation, Sizing and Exit: current candidates, saved Champions and proof gates.",
+      "captured_at": "2026-09-06T07:23:55.030Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".challenger-skill-grid",
+      "width": 1180,
+      "height": 754,
+      "bytes": 299979,
+      "sha256": "30cf8eab963862bd0e0b83ee1e8606e5801f26498ad4d80c39ccf57dd77c1635"
+    },
+    {
+      "file": "12-reigning-champions.png",
+      "caption": "Current saved Champions with stable portraits and recorded crown retentions.",
+      "captured_at": "2026-09-06T07:23:55.897Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".reigning-champions",
+      "width": 1180,
+      "height": 225,
+      "bytes": 96723,
+      "sha256": "a90139e2ff90dd01c3c464af1fb6f892f6ab95f004ec0dd556b252866240c131"
+    },
+    {
+      "file": "11-champion-arena.png",
+      "caption": "A live Sizing comparison: measured advantage and uncertainty, not win probability.",
+      "captured_at": "2026-09-06T07:24:01.390Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1440
+      },
+      "selector": ".ca-dialog",
+      "width": 1040,
+      "height": 1310,
+      "bytes": 336484,
+      "sha256": "e775bb2f12d664682634e147c3e3e455e08fc26a92c8094b8a44862e776cce07"
+    },
+    {
+      "file": "14-mobile-battle.png",
+      "caption": "Mobile live battle, with the same fighters and measured evidence.",
+      "captured_at": "2026-09-06T07:24:02.568Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "selector": "viewport",
+      "width": 390,
+      "height": 1000,
+      "bytes": 159146,
+      "sha256": "3fcef4ce089e4a9cf51df187b414c9fe06077c927330d5da4f2eb8ce06cb5d16"
+    },
+    {
+      "file": "17-mobile-evidence.png",
+      "caption": "Mobile advantage readout with timestamp, uncertainty and sample requirements.",
+      "captured_at": "2026-09-06T07:24:03.442Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "selector": ".ca-readout",
+      "width": 360,
+      "height": 493,
+      "bytes": 90061,
+      "sha256": "216154e7a4b2485b1d9ccef19feaafbb7bd8e4545323dc15cad7f90c35af610c"
+    },
+    {
+      "file": "13-recorded-battle.png",
+      "caption": "A saved battle result replayed from the recorded comparison.",
+      "captured_at": "2026-09-06T07:24:06.701Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1440
+      },
+      "selector": ".ca-dialog",
+      "width": 1040,
+      "height": 1392,
+      "bytes": 346483,
+      "sha256": "0c1c09af9571faa9856a5c6603732952806812013de1cf6cb119fd29395ce609"
+    },
+    {
+      "file": "16-entry-profile.png",
+      "caption": "The current Entry model profile, with its family identity and real proof status.",
+      "captured_at": "2026-09-06T07:24:11.118Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1440
+      },
+      "selector": ".ca-dialog",
+      "width": 1040,
+      "height": 1114,
+      "bytes": 272341,
+      "sha256": "6f01358138699eb68044e99903c2f482ec4cbce610855d03664c9736cde27fa8"
+    },
+    {
+      "file": "09-ai-coach-room.png",
+      "caption": "Optional AI Coach research, separate from trading authority.",
+      "captured_at": "2026-09-06T07:24:12.800Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 271129,
+      "sha256": "6b83ae8e902079f6042e8aa08de73725160f170873399ae8d3bd87cc7b7ff626"
+    },
+    {
+      "file": "08-replay-receipts.png",
+      "caption": "Actual paper receipts and modeled trading friction.",
+      "captured_at": "2026-09-06T07:24:14.424Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 268458,
+      "sha256": "d6ea6837eb4a8dadd2e0f0ddaf7c6ad435426cf6e15630b95e2ebc11a048a451"
+    },
+    {
+      "file": "05-data-providers.png",
+      "caption": "Provider roles, budgets and current activity; no secret editor is opened.",
+      "captured_at": "2026-09-06T07:24:16.054Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".provider-manager",
+      "width": 1180,
+      "height": 422,
+      "bytes": 142536,
+      "sha256": "26ca98a8d2cf780c0e39cb0d0720d935058c0845353dd1518f6afd3b56be2b60"
+    },
+    {
+      "file": "06-local-ai.png",
+      "caption": "Installed local AI models and runtime information.",
+      "captured_at": "2026-09-06T07:24:17.008Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".ai-model-manager",
+      "width": 1180,
+      "height": 528,
+      "bytes": 164593,
+      "sha256": "575bb9ed078812799a5bb39cf28d8a011a13bf23f5dd77da3b938ab36ca6721a"
+    },
+    {
+      "file": "15-diagnostics-history.png",
+      "caption": "Separate bounded diagnostics history for reviewing long-term operation.",
+      "captured_at": "2026-09-06T07:27:14.310Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".diagnostics-card",
+      "width": 1180,
+      "height": 305,
+      "bytes": 106505,
+      "sha256": "570df8706dc860dcc9e209d4ef49363291054a849cdf0855b6fd222076673390"
+    },
+    {
+      "file": "07-mobile-arena.png",
+      "caption": "Live paper Arena on a 390-pixel mobile viewport.",
+      "captured_at": "2026-09-06T07:24:19.684Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "selector": "viewport",
+      "width": 390,
+      "height": 1000,
+      "bytes": 130614,
+      "sha256": "8abc4c2a564d508637511ac5fa61f115e5e220174819253efd2b65f710925cdf"
+    }
+  ],
+  "errors": [],
+  "failed_requests": [],
+  "mutations": [],
+  "completed_at": "2026-09-06T07:27:14.311Z",
+  "capture_notes": "Diagnostics card recaptured separately below the sticky header. All images are unedited browser screenshots."
+}

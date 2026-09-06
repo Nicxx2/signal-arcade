@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .database import Database
+from .database import AdvisoryReadDeferred, Database
 from .intelligence.learning import (
     COACH_ENTRY_RULES,
     COACH_MANIPULATION_COMBINATIONS,
@@ -61,6 +62,7 @@ COACH_Z_SCORE = 1.96
 COACH_MINIMUM_SAMPLES_PER_SEASON = 10
 COACH_MAXIMUM_FORWARD_OBSERVED = 180
 COACH_MAXIMUM_FORWARD_DAYS = 90
+COACH_OPTIONAL_WORK_SECONDS = 30
 
 _FEATURE_LABELS = {
     "buy_ratio": "low buy participation",
@@ -223,15 +225,72 @@ class AiCoach:
                 self.next_attempt_at = datetime.now(UTC) + timedelta(seconds=COACH_RETRY_SECONDS)
             await asyncio.sleep(COACH_MONITOR_SECONDS)
 
+    async def _optional_work(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Pause outside database transactions, retaining one bounded, complete input snapshot."""
+        cancelled = threading.Event()
+        context = self._context_provenance()
+        deadline = time.monotonic() + COACH_OPTIONAL_WORK_SECONDS
+
+        def should_stop() -> bool:
+            return cancelled.is_set() or not self.enabled()
+
+        def pause() -> None:
+            while True:
+                if should_stop() or time.monotonic() >= deadline:
+                    raise AdvisoryReadDeferred
+                if context != self._context_provenance():
+                    self.paused_reason = "context_changed"
+                    raise AdvisoryReadDeferred
+                allowed, reason = self.can_run()
+                if allowed:
+                    # Give the market worker a scheduling opportunity between small read/rule
+                    # batches; waiting does not change which observations are evaluated.
+                    time.sleep(0.001)
+                    return
+                self.paused_reason = reason or "protecting_market_work"
+                cancelled.wait(0.025)
+
+        if function == self.database.recent_learning_observations:
+            kwargs["should_yield"] = should_stop
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, pause=pause, **kwargs))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Join the detached reader/screener before shutdown can close its database.
+            await asyncio.gather(worker, return_exceptions=True)
+            raise
+        finally:
+            cancelled.set()
+
     async def tick(self) -> None:
+        try:
+            await self._tick()
+        except AdvisoryReadDeferred:
+            # An interrupted snapshot must never masquerade as an empty or smaller cohort.
+            if not self.enabled():
+                self.paused_reason = "ai_shadow_off"
+            elif self.paused_reason != "context_changed":
+                self.paused_reason = self.can_run()[1] or "protecting_market_work"
+
+    async def _tick(self) -> None:
         now = datetime.now(UTC)
         if not self.enabled():
             self.paused_reason = "ai_shadow_off"
             return
-        observations = await asyncio.to_thread(
-            self.database.recent_learning_observations,
-            COACH_OBSERVATION_WINDOW,
+        allowed, reason = self.can_run()
+        if not allowed:
+            self.paused_reason = reason or "protecting_market_work"
+            return
+        observations = await self._optional_work(
+            self.database.recent_learning_observations, COACH_OBSERVATION_WINDOW
         )
+        allowed, reason = self.can_run()
+        if not self.enabled() or not allowed:
+            self.paused_reason = (
+                "ai_shadow_off" if not self.enabled() else reason or "protecting_market_work"
+            )
+            return
         await asyncio.to_thread(self._refresh_hypotheses, now, observations)
         context = self._context_provenance()
         mode = context["risk_mode"]
@@ -281,7 +340,8 @@ class AiCoach:
                 for item in self.hypotheses
                 if self._matches_provenance(item, context)
             }
-            candidates = _build_candidates(
+            candidates = await self._optional_work(
+                _build_candidates,
                 observations,
                 mode,
                 fingerprint,
@@ -295,6 +355,15 @@ class AiCoach:
                 candidates,
                 [item for item in self.hypotheses if self._matches_provenance(item, context)],
             )
+            allowed, reason = self.can_run()
+            if not self.enabled() or not allowed:
+                self.paused_reason = (
+                    "ai_shadow_off" if not self.enabled() else reason or "protecting_market_work"
+                )
+                return
+            if context != self._context_provenance():
+                self.paused_reason = "context_changed"
+                return
             model_name, model_digest = self.model_provenance()
             if not candidates:
                 review = _review_without_candidate(
@@ -738,7 +807,10 @@ def _build_candidates(
     feature_schema_version: str = "challenger-features-v1",
     dependency_versions: dict[str, str] | None = None,
     baseline_hold_seconds: int | None = None,
+    pause: Callable[[], None] | None = None,
 ) -> list[_Candidate]:
+    if pause is not None:
+        pause()
     dependencies = dependency_versions or {}
     context_rows = [
         item
@@ -756,6 +828,8 @@ def _build_candidates(
     ]
     candidates: list[_Candidate] = []
     for feature, operator, threshold in COACH_ENTRY_RULES:
+        if pause is not None:
+            pause()
         entry_conditions = (
             CoachCondition(feature_name=feature, operator=operator, threshold=threshold),
         )
@@ -822,6 +896,8 @@ def _build_candidates(
         for pair in COACH_MANIPULATION_COMBINATIONS
     )
     for conditions in manipulation_rules:
+        if pause is not None:
+            pause()
         signature = _signature(
             CoachExperimentKind.MANIPULATION_VETO,
             mode,
@@ -868,6 +944,8 @@ def _build_candidates(
         )
 
     for multiplier in SIZING_MULTIPLIERS:
+        if pause is not None:
+            pause()
         if multiplier == 1.0:
             continue
         signature = _signature(
@@ -915,6 +993,8 @@ def _build_candidates(
 
     baseline_hold = baseline_hold_seconds or RISK_LIMITS[mode].max_hold_seconds
     for horizon in LEARNING_HORIZONS_SECONDS:
+        if pause is not None:
+            pause()
         if horizon >= baseline_hold:
             continue
         signature = _signature(

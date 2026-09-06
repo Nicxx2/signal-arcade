@@ -345,7 +345,7 @@ def test_v11_adds_multiskill_challenger_without_rewriting_legacy_learning(
     assert "champion_journey" not in raw_state
     assert (
         upgraded._conn.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM settings WHERE key LIKE 'challenger_champion_journey_v1:%'"
+            "SELECT COUNT(*) FROM challenger_champion_events"
         ).fetchone()[0]
         == 1
     )
@@ -426,7 +426,7 @@ def test_v13_adds_bounded_digest_verified_statistical_artifacts(tmp_path: Path) 
     assert loaded["payload"] == payload
     assert loaded["payload_digest"] == digest
     assert upgraded.storage_stats(force=True)["statistical_model_artifacts"] == 1
-    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 13  # noqa: SLF001
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION  # noqa: SLF001
 
     with pytest.raises(ValueError, match="digest"):
         upgraded.save_statistical_model_artifact(
@@ -533,7 +533,7 @@ def test_nonlinear_challenger_record_and_payload_commit_atomically(tmp_path: Pat
     database.close()
 
 
-def test_challenger_pruning_preserves_artifacts_referenced_by_durable_journey(
+def test_challenger_pruning_archives_old_payloads_and_preserves_journey_receipts(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "journey-pruning.sqlite3")
@@ -579,11 +579,12 @@ def test_challenger_pruning_preserves_artifacts_referenced_by_durable_journey(
     )
     database.save_challenger_skill_state(state)
 
-    assert database.prune_challenger_artifacts(1) == [disposable.version]
-    assert {item.version for item in database.list_challenger_artifacts()} == {
-        champion.version,
-        old_contender.version,
-    }
+    assert database.prune_challenger_artifacts(1) == [old_contender.version, disposable.version]
+    assert {item.version for item in database.list_challenger_artifacts()} == {champion.version}
+    archived = database.archived_challenger_artifact(old_contender.version)
+    assert archived is not None and archived["model_family"] == old_contender.model_family.value
+    assert "parameters" not in archived
+    assert database.champion_events_page(state.cohort_key)["total"] == 1
     database.close()
 
 
@@ -661,7 +662,7 @@ def test_reset_archives_the_season_before_starting_the_next_one(tmp_path: Path) 
     assert archived["net_pnl_minor"] == 120_000_000
     assert archived["wins"] == 3
     assert archived["accounting_status"] == "complete"
-    assert archived["comparable"] is True
+    assert archived["comparable"] is False
     assert database.ledger_balance("cash") == 0
 
     database.initialize_portfolio("season-two", 500_000_000, "SOL")
@@ -790,11 +791,13 @@ def unresolved_episode_inventory(
     }
     if disposition == "write_off":
         item["terminal_evidence"] = {
-            "policy": "two-fresh-route-probes",
+            "policy": "validated-route-probes-v2",
             "global_market_healthy": True,
             "probe": {
                 "outcome": "unavailable",
+                "verified": True,
                 "consecutive": 2,
+                "first_slot": 100,
                 "slot": 101,
                 "first_observed_at": (now - timedelta(seconds=2)).isoformat(),
                 "observed_at": (now - timedelta(seconds=1)).isoformat(),

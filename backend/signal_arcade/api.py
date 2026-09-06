@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import secrets
+import sqlite3
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -11,15 +14,18 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
+from starlette.types import Receive, Scope, Send
 
 from . import __version__
 from .config import Settings, load_settings
+from .diagnostics_store import LAG_BOUNDS, read_events, read_page
 from .models import (
     AiDecisionMode,
     LearningMode,
@@ -54,7 +60,7 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         if not _valid_basic_auth(request.headers.get("authorization"), self.password):
             return Response(
                 status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Signal Arcade"'},
+                headers={"WWW-Authenticate": 'Basic realm="Signal Arcade", charset="UTF-8"'},
             )
         return await call_next(request)
 
@@ -98,7 +104,9 @@ def _valid_basic_auth(header: str | None, password: str) -> bool:
         _, supplied = decoded.split(":", 1)
     except (ValueError, UnicodeDecodeError):
         return False
-    return secrets.compare_digest(supplied, password)
+    # compare_digest rejects non-ASCII str values. Compare the decoded UTF-8 bytes so
+    # international passwords work and invalid Unicode credentials return 401, not 500.
+    return secrets.compare_digest(supplied.encode("utf-8"), password.encode("utf-8"))
 
 
 class ModeRequest(BaseModel):
@@ -304,6 +312,117 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(SameOriginMiddleware)
     app.add_middleware(BasicAuthMiddleware, password=settings.admin_password)
 
+    diagnostic_exports = asyncio.Semaphore(2)
+
+    @app.get("/api/v1/diagnostics")
+    async def diagnostics_status() -> dict[str, Any]:
+        return orchestrator.diagnostics.status()
+
+    @app.get("/api/v1/diagnostics/export")
+    async def diagnostics_export() -> StreamingResponse:
+        if diagnostic_exports.locked():
+            raise HTTPException(429, "Two diagnostics exports are already running")
+        await diagnostic_exports.acquire()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                diagnostic_exports.release()
+
+        async def lines() -> AsyncIterator[str]:
+            before = time.time()
+            rows = 0
+            try:
+                yield (
+                    json.dumps(
+                        {
+                            "type": "metadata",
+                            "schema": 1,
+                            "exported_at": before,
+                            "status": orchestrator.diagnostics.status(),
+                            "histogram_upper_bounds_seconds": LAG_BOUNDS,
+                            "histogram_last_bucket": ">30 seconds",
+                            "gauges_and_skills": "last sample; never average these as hourly rates",
+                            "hour_grouping": (
+                                "interval completion hour; boundary flags preserve imprecision"
+                            ),
+                            "consistency": "paged reads; concurrent retention may remove old rows",
+                        }
+                    )
+                    + "\n"
+                )
+                for tier, label in ((0, "minute"), (1, "hour")):
+                    cursor = None
+                    while True:
+                        page = await asyncio.to_thread(
+                            read_page,
+                            orchestrator.diagnostics.directory,
+                            tier=tier,
+                            after=cursor,
+                            before=before,
+                        )
+                        if not page:
+                            break
+                        for item in page:
+                            yield (
+                                json.dumps({"type": label, **item["record"]}, allow_nan=False)
+                                + "\n"
+                            )
+                            rows += 1
+                        cursor = tuple(page[-1]["cursor"])
+                        await asyncio.sleep(0)
+                event_cursor = None
+                while True:
+                    page = await asyncio.to_thread(
+                        read_events,
+                        orchestrator.diagnostics.directory,
+                        after=event_cursor,
+                        before=before,
+                    )
+                    if not page:
+                        break
+                    for item in page:
+                        yield (
+                            json.dumps({"type": "event", **item["record"]}, allow_nan=False) + "\n"
+                        )
+                        rows += 1
+                    event_cursor = tuple(page[-1]["cursor"])
+                    await asyncio.sleep(0)
+                yield json.dumps({"type": "export_complete", "rows": rows}) + "\n"
+            except (sqlite3.Error, OSError, ValueError):
+                yield (
+                    json.dumps(
+                        {
+                            "type": "export_incomplete",
+                            "rows": rows,
+                            "reason": "diagnostics_read_unavailable",
+                        }
+                    )
+                    + "\n"
+                )
+            finally:
+                release()
+
+        class DiagnosticsExportResponse(StreamingResponse):
+            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                try:
+                    await super().__call__(scope, receive, send)
+                finally:
+                    # A send failure can precede generator startup and skip background tasks.
+                    release()
+
+        return DiagnosticsExportResponse(
+            lines(),
+            media_type="application/x-ndjson",
+            headers={
+                "Content-Disposition": 'attachment; filename="signal-arcade-diagnostics.ndjson"',
+                "Cache-Control": "no-store",
+            },
+            background=BackgroundTask(release),
+        )
+
     @app.get("/api/v1/health")
     async def health() -> dict[str, Any]:
         try:
@@ -349,6 +468,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             # A personality/configuration change legitimately invalidates an old page cursor.
             # Ask the browser to restart from its new cohort instead of mixing histories.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/learning/champion-replay")
+    async def champion_replay(
+        event_id: str = Query(min_length=1, max_length=180),
+        cohort_key: str = Query(min_length=1, max_length=180),
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                orchestrator.learning.champion_replay, event_id, cohort_key
+            )
+        except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.put("/api/v1/storage-settings", dependencies=[Depends(normal_operation)])

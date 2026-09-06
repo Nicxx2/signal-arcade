@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -7,10 +8,11 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from statistics import fmean, median
 from typing import Any, Literal, cast
 
+from ..battle_replay import freeze_replay, record_replay, start_replay
 from ..config import Settings
 from ..database import Database
 from ..models import (
@@ -54,6 +56,16 @@ from .nonlinear import (
     predict_xgboost,
     xgboost_payload_digest,
 )
+from .training_job import (
+    TRAINING_INPUTS as TRAINING_INPUTS,
+)
+from .training_job import (
+    TrainingJob,
+    TrainingOutput,
+    TrainingReader,
+    freeze_training_inputs,
+    thaw_training_inputs,
+)
 
 PRIMARY_HORIZON_SECONDS = 300
 LEARNING_HORIZONS_SECONDS = (60, PRIMARY_HORIZON_SECONDS, 600, 900, 1_200)
@@ -83,6 +95,7 @@ HOLD_TIMING_WINDOW_OBSERVATIONS = 1_000
 RETRAIN_SAMPLE_INTERVAL = 10
 MAX_COMPLETED_OBSERVATIONS = 5_000
 MAX_MODEL_VERSIONS = 1_000
+MAX_CACHED_NONLINEAR_MODELS = 8
 MAX_CLOCK_CHECKPOINTS_PER_TICK = 20
 LEARNING_EVENT_CRITICAL_LEAD_SECONDS = 15
 LEARNER_VERSION_PREFIX = "learner-v6-"
@@ -102,6 +115,7 @@ TOURNAMENT_MAXIMUM_COMMON_OBSERVED = math.ceil(
     TOURNAMENT_MAXIMUM_COMMON_OUTCOMES / TOURNAMENT_MINIMUM_AVAILABILITY
 )
 TOURNAMENT_Z_SCORE = 1.96
+TOURNAMENT_PROOF_VERSION = "paired-skill-outcomes-v2"
 MAX_PENDING_CHALLENGERS = 4
 NONLINEAR_COMPLEXITY_MARGIN = 0.02
 RECENT_CHAMPION_JOURNEY_EVENTS = 12
@@ -390,6 +404,35 @@ def _expired_checkpoint_reason(
     )
 
 
+def _failed_quote_checkpoint(
+    state: TokenState,
+    now: datetime,
+    horizon: int,
+    error: ValueError,
+    *,
+    missing_reason: str = "executable_exit_quote_unavailable",
+) -> LearningCheckpoint:
+    """Keep bounded failure evidence without claiming a price or changing qualification."""
+    observed = state.last_reserve_at or state.last_event_at
+    return LearningCheckpoint(
+        horizon_seconds=horizon,
+        observed_at=now,
+        missing_reason=missing_reason,
+        route_source=state.reserve_source or state.venue,
+        route_event_id=state.last_reserve_event_id or state.last_event_id,
+        reserve_observed_at=observed,
+        reserve_age_seconds=max(0.0, (now - observed).total_seconds()) if observed else None,
+        route_snapshot={
+            **(state.reserve_audit or {}),
+            "quote_failure_reason": str(error)[:160],
+            "virtual_token_reserves": state.virtual_token_reserves,
+            "virtual_quote_reserves": state.virtual_quote_reserves,
+            "real_quote_reserves": state.real_quote_reserves,
+            "fee_bps": state.fee_bps,
+        },
+    )
+
+
 class LearningEngine:
     """Local, versioned challenger trained only on forward live-paper outcomes."""
 
@@ -412,12 +455,20 @@ class LearningEngine:
         # market processing.
         self._training_request_lock = threading.Lock()
         self._training_requests: dict[tuple[RiskMode, str | None], datetime] = {}
+        self._checkpoint_served: dict[str, dict[str, int]] = {"cache": {}, "rpc": {}}
+        self._checkpoint_turn: dict[str, int] = {"cache": 0, "rpc": 0}
         self._training_active: tuple[RiskMode, str | None] | None = None
         self._training_last_started_at: datetime | None = None
         self._training_last_completed_at: datetime | None = None
         self._training_last_duration_seconds: float | None = None
         self._training_last_error: str | None = None
         self._training_runs = 0
+        self._training_skipped = 0
+        self._training_published_models = 0
+        self._training_last_phases: dict[str, float] = {}
+        self._training_last_fit: dict[str, Any] | None = None
+        self._training_output: TrainingOutput | None = None
+        self._training_discarded = 0
         try:
             self.current_risk_mode = RiskMode(
                 database.get_setting("risk_mode", RiskMode.BALANCED.value)
@@ -442,6 +493,17 @@ class LearningEngine:
             (state.cohort_key, state.skill): state
             for state in database.list_challenger_skill_states()
         }
+        for state in self.skill_states.values():
+            if (
+                state.skill == ChallengerSkill.EXIT
+                and state.champion_version
+                and state.last_tournament.get("result") == "promoted"
+                and state.last_tournament.get("proof_version") != TOURNAMENT_PROOF_VERSION
+            ):
+                state.suspended_version = state.champion_version
+                state.suspension_reason = "exit_comparison_proof_requires_requalification"
+                state.suspended_at = datetime.now(UTC)
+                database.save_challenger_skill_state(state)
         # Timing validation is read on every active market event. Recompute it only when
         # a checkpoint/prune changes the chronological evidence, keeping long runs cheap.
         self._timing_revision = 0
@@ -644,39 +706,235 @@ class LearningEngine:
         with self._training_request_lock:
             return bool(self._training_requests)
 
-    def run_next_training(self) -> bool:
-        """Run one coalesced job; callers place this method on a worker thread."""
+    def _training_authority_context(self) -> tuple[Any, ...]:
+        return (
+            self.current_risk_mode,
+            self.configuration_fingerprint(),
+            self.baseline_version(),
+            self.mode,
+            self.consent_granted,
+            tuple(sorted(self.active_skill_versions.items())),
+            tuple(
+                sorted(
+                    (
+                        state.cohort_key,
+                        state.skill.value,
+                        state.champion_version,
+                        state.testing_version,
+                        state.active_version,
+                        state.suspended_version,
+                    )
+                    for state in self.skill_states.values()
+                )
+            ),
+        )
 
+    def prepare_next_training(self, runtime_context: tuple[Any, ...] = ()) -> TrainingJob | None:
+        """Snapshot under the caller's event boundary; only fitting runs concurrently."""
+        preparation_started = time.monotonic()
         with self._training_request_lock:
             if self._training_active is not None or not self._training_requests:
-                return False
+                return None
             key = min(self._training_requests, key=self._training_requests.__getitem__)
             requested_at = self._training_requests.pop(key)
             self._training_active = key
             self._training_last_started_at = datetime.now(UTC)
             self._training_last_error = None
-        started = time.monotonic()
         try:
-            self._retrain_if_ready(
-                target_mode=key[0],
-                target_configuration=key[1],
+            latest = self._latest_model_for_context(*key)
+            if (
+                latest is not None
+                and self._new_outcomes_since_model(latest) < RETRAIN_SAMPLE_INTERVAL
+            ):
+                # Check the same readiness condition before serializing/rebuilding retained
+                # history. A new request arriving during this check stays in the queue. Safety
+                # and tournament observation still advance on their normal outcome boundary.
+                with self._training_request_lock:
+                    self._training_skipped += 1
+                    self._training_active = None
+                    self._training_last_completed_at = datetime.now(UTC)
+                    self._training_last_duration_seconds = time.monotonic() - preparation_started
+                    self._training_last_phases = {
+                        "readiness_seconds": time.monotonic() - preparation_started,
+                    }
+                return None
+            workspace = copy.copy(self)
+            # Serialize while the event boundary owns the inputs. Reconstructing thousands of
+            # nested Pydantic objects belongs to the fitting thread, not the market lock.
+            # Only the requested risk/configuration can contribute to this fit or its policy twin.
+            frozen_inputs = freeze_training_inputs(
+                (
+                    [
+                        item
+                        for item in self.observations.values()
+                        if (item.risk_mode, item.configuration_fingerprint) == key
+                    ],
+                    [
+                        item
+                        for item in self.evidence_episodes.values()
+                        if (item.risk_mode, item.configuration_fingerprint) == key
+                    ],
+                    self.models,
+                    list(self.skill_artifacts.values()),
+                    list(self.skill_states.values()),
+                ),
             )
+            workspace.observations = {}
+            workspace.evidence_episodes = {}
+            workspace._evidence_episode_ids_by_mint = {}
+            workspace.models = []
+            workspace.skill_artifacts = {}
+            workspace.skill_states = {}
+            for name in (
+                "settings",
+                "active_skill_versions",
+                "active_model",
+                "disabled_model_versions",
+                "context_outcome_counts",
+                "last_suspension",
+            ):
+                setattr(workspace, name, copy.deepcopy(getattr(self, name)))
+            configuration = self.configuration_fingerprint()
+            baseline = self.baseline_version()
+            workspace.configuration_fingerprint = lambda: configuration
+            workspace.baseline_version = lambda: baseline
+            workspace._timing_cache = {}
+            workspace._nonlinear_model_cache = {}
+            workspace.database = cast(Database, TrainingReader(self.database))
+            workspace._training_output = TrainingOutput()
+            return TrainingJob(
+                workspace,
+                key,
+                requested_at,
+                time.monotonic(),
+                self._training_authority_context(),
+                runtime_context,
+                frozen_inputs,
+                {"prepare_seconds": time.monotonic() - preparation_started},
+            )
+        except Exception:
+            with self._training_request_lock:
+                self._training_requests.setdefault(key, requested_at)
+                self._training_active = None
+            raise
+
+    @staticmethod
+    def fit_training_job(job: TrainingJob) -> None:
+        started = time.monotonic()
+        observations, episodes, models, artifacts, states = thaw_training_inputs(job.frozen_inputs)
+        workspace = job.workspace
+        workspace.observations = {item.mint: item for item in observations}
+        workspace.evidence_episodes = {item.episode_id: item for item in episodes}
+        for item in episodes:
+            workspace._evidence_episode_ids_by_mint.setdefault(item.mint, set()).add(
+                item.episode_id
+            )
+        workspace.models = models
+        workspace.skill_artifacts = {item.version: item for item in artifacts}
+        workspace.skill_states = {(item.cohort_key, item.skill): item for item in states}
+        job.phase_seconds["reconstruct_seconds"] = time.monotonic() - started
+        started = time.monotonic()
+        job.workspace._retrain_if_ready(target_mode=job.key[0], target_configuration=job.key[1])
+        job.phase_seconds["fit_seconds"] = time.monotonic() - started
+
+    def finish_training_job(
+        self,
+        job: TrainingJob,
+        *,
+        runtime_context: tuple[Any, ...] = (),
+        error: Exception | None = None,
+    ) -> bool:
+        """Publish prepared candidates against current state, never overwrite new outcomes."""
+        publication_started = time.monotonic()
+        try:
+            if error is not None:
+                raise error
+            if (
+                job.authority_context != self._training_authority_context()
+                or job.runtime_context != runtime_context
+                or time.monotonic() - job.started_monotonic > 120
+            ):
+                self._training_discarded += 1
+                self.request_current_training()
+                return False
+            output = job.workspace._training_output
+            assert output is not None
+            if not output.models and not output.artifacts:
+                # A changed eligibility window can still yield no fit. Do not take writer locks
+                # to prune unchanged history or count a no-op as a newly trained model.
+                self._training_skipped += 1
+                self._training_runs += 1
+                return True
+            affected = {(cohort, artifact.skill) for artifact, cohort, _ in output.artifacts}
+            publication = copy.copy(self)
+            publication.models = list(self.models)
+            publication.skill_artifacts = dict(self.skill_artifacts)
+            publication.skill_states = dict(self.skill_states)
+            for key in affected:
+                if key in self.skill_states:
+                    publication.skill_states[key] = self.skill_states[key].model_copy(deep=True)
+            with self.database.training_publication():
+                for model in output.models:
+                    self.database.save_learning_model(model)
+                    if not any(
+                        existing.version == model.version for existing in publication.models
+                    ):
+                        publication.models.append(model)
+                for artifact, cohort_key, payload in output.artifacts:
+                    publication._register_skill_artifact(
+                        artifact, cohort_key, payload=payload, defer_tournament=True
+                    )
+            # Even dashboard readers see only committed candidate state. The event boundary
+            # protects decisions while the successfully enrolled records become visible here.
+            self.models = publication.models
+            self.skill_artifacts = publication.skill_artifacts
+            self.skill_states = publication.skill_states
+            for key in sorted(affected, key=lambda item: (item[0], item[1].value)):
+                state = self.skill_states[key]
+                self._start_next_skill_tournament(state)
+                self.database.save_challenger_skill_state(state)
+            self._advance_entry_tournaments()
+            self._prune_model_history()
+            self._govern_active_model()
+            self._training_runs += 1
+            self._training_published_models += len(output.models)
+            return True
         except Exception as exc:
             with self._training_request_lock:
-                # Preserve the oldest request so a transient storage/runtime failure never loses
-                # a learning opportunity. The orchestrator provides the retry pacing.
-                self._training_requests.setdefault(key, requested_at)
+                self._training_requests.setdefault(job.key, job.requested_at)
                 self._training_last_error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            completed_at = datetime.now(UTC)
             with self._training_request_lock:
                 self._training_active = None
-                self._training_last_completed_at = completed_at
-                self._training_last_duration_seconds = max(0.0, time.monotonic() - started)
-        with self._training_request_lock:
-            self._training_runs += 1
-        return True
+                self._training_last_completed_at = datetime.now(UTC)
+                self._training_last_duration_seconds = max(
+                    0, time.monotonic() - job.started_monotonic
+                )
+                self._training_last_phases = {
+                    **job.phase_seconds,
+                    "publish_seconds": time.monotonic() - publication_started,
+                }
+                # Readiness-only checks must not erase the last actual fit/publication timing.
+                self._training_last_fit = {
+                    "completed_at": self._training_last_completed_at.isoformat(),
+                    "duration_seconds": self._training_last_duration_seconds,
+                    "phase_seconds": dict(self._training_last_phases),
+                    "failed": self._training_last_error is not None,
+                    "runs": self._training_runs,
+                    "published_models": self._training_published_models,
+                }
+
+    def run_next_training(self) -> bool:
+        """Synchronous integration helper. Live use separates snapshot, fit and publication."""
+        job = self.prepare_next_training()
+        if job is None:
+            return False
+        try:
+            self.fit_training_job(job)
+        except Exception as exc:
+            return self.finish_training_job(job, error=exc)
+        return self.finish_training_job(job)
 
     def training_status(self) -> dict[str, Any]:
         with self._training_request_lock:
@@ -702,6 +960,11 @@ class LearningEngine:
                 "last_duration_seconds": self._training_last_duration_seconds,
                 "last_error": self._training_last_error,
                 "runs": self._training_runs,
+                "skipped_not_due": self._training_skipped,
+                "published_models": self._training_published_models,
+                "last_phase_seconds": dict(self._training_last_phases),
+                "last_fit": self._training_last_fit,
+                "discarded_stale_jobs": self._training_discarded,
             }
 
     @property
@@ -847,6 +1110,9 @@ class LearningEngine:
             return False
 
         observation = LearningObservation(
+            checkpoint_network_fee_lamports=(
+                self.settings.network_fee_lamports + self.settings.priority_fee_lamports
+            ),
             observation_id="learning-" + decision.decision_id,
             decision_id=decision.decision_id,
             mint=decision.mint,
@@ -898,6 +1164,7 @@ class LearningEngine:
             and existing_policy is None
         ):
             episode = LearningEvidenceEpisode(
+                checkpoint_network_fee_lamports=observation.checkpoint_network_fee_lamports,
                 episode_id=f"policy-{trajectory_key}",
                 idempotency_key=f"policy:{trajectory_key}",
                 evidence_schema_version=LEARNING_EVIDENCE_SCHEMA_VERSION,
@@ -999,6 +1266,13 @@ class LearningEngine:
                 episode.order_id = order_id
                 return
 
+    def _checkpoint_network_fee(self, item: LearningObservation | LearningEvidenceEpisode) -> int:
+        if item.checkpoint_network_fee_lamports is not None:
+            return item.checkpoint_network_fee_lamports
+        if item.configuration_fingerprint != self.configuration_fingerprint():
+            raise ValueError("original checkpoint fee context unavailable")
+        return self.settings.network_fee_lamports + self.settings.priority_fee_lamports
+
     def observe_market(
         self,
         state: TokenState,
@@ -1016,7 +1290,10 @@ class LearningEngine:
         )
         observation = self.observations.get(state.mint)
         if observation is None or observation.status != LearningObservationStatus.PENDING:
-            self._advance_primary_outcomes(policy_primary_cohorts)
+            self._advance_primary_outcomes(
+                policy_primary_cohorts,
+                outcomes_changed=bool(policy_changed),
+            )
             if policy_completed:
                 self._prune_complete_history()
             return policy_changed
@@ -1053,10 +1330,14 @@ class LearningEngine:
                         virtual_token_reserves=state.virtual_token_reserves,
                         virtual_sol_reserves=state.virtual_quote_reserves,
                         token_units=observation.token_units,
-                        fee_bps=state.fee_bps or observation.fee_bps,
-                        network_fee_lamports=(
-                            self.settings.network_fee_lamports + self.settings.priority_fee_lamports
+                        fee_bps=(
+                            state.fee_bps
+                            if state.reserve_fee_components is not None
+                            else state.fee_bps or observation.fee_bps
                         ),
+                        fee_components=state.reserve_fee_components,
+                        lp_fee_bps=state.reserve_lp_fee_bps,
+                        network_fee_lamports=self._checkpoint_network_fee(observation),
                         real_quote_reserves=state.real_quote_reserves,
                     )
                     net_return = (
@@ -1067,8 +1348,9 @@ class LearningEngine:
                         observed_at=now,
                         net_return=max(-1.0, min(10.0, net_return)),
                         exit_value_lamports=exit_quote.wallet_sol_lamports,
+                        route_snapshot=state.reserve_audit,
                         route_source=state.reserve_source or state.venue,
-                        route_event_id=state.last_event_id,
+                        route_event_id=state.last_reserve_event_id or state.last_event_id,
                         reserve_observed_at=state.last_reserve_at or state.last_event_at or now,
                         reserve_age_seconds=max(
                             0.0,
@@ -1078,11 +1360,12 @@ class LearningEngine:
                         ),
                     )
                     primary_became_available = horizon == PRIMARY_HORIZON_SECONDS
-                except ValueError:
-                    observation.checkpoints[key] = LearningCheckpoint(
-                        horizon_seconds=horizon,
-                        observed_at=now,
-                        missing_reason="executable_exit_quote_unavailable",
+                except ValueError as exc:
+                    observation.checkpoints[key] = _failed_quote_checkpoint(
+                        state,
+                        now,
+                        horizon,
+                        exc,
                     )
                 self._observe_size_checkpoint(observation, state, horizon, now)
             primary_checkpoint_changed = (
@@ -1099,7 +1382,10 @@ class LearningEngine:
             if primary_became_available:
                 self._record_usable_outcome(observation)
             primary_cohorts.add((observation.risk_mode, observation.configuration_fingerprint))
-        self._advance_primary_outcomes(primary_cohorts)
+        self._advance_primary_outcomes(
+            primary_cohorts,
+            outcomes_changed=bool(changed or policy_changed),
+        )
         if observation.status == LearningObservationStatus.COMPLETE or policy_completed:
             self._prune_complete_history()
         return changed + policy_changed
@@ -1122,7 +1408,6 @@ class LearningEngine:
             stale_after_seconds=self.settings.stale_market_seconds,
             require_timestamp=cached,
         )
-        network_fee = self.settings.network_fee_lamports + self.settings.priority_fee_lamports
         for episode_id in self._evidence_episode_ids_by_mint.get(state.mint, ()):
             episode = self.evidence_episodes[episode_id]
             if (
@@ -1161,8 +1446,14 @@ class LearningEngine:
                             virtual_token_reserves=state.virtual_token_reserves,
                             virtual_sol_reserves=state.virtual_quote_reserves,
                             token_units=episode.token_units,
-                            fee_bps=state.fee_bps or episode.fee_bps,
-                            network_fee_lamports=network_fee,
+                            fee_bps=(
+                                state.fee_bps
+                                if state.reserve_fee_components is not None
+                                else state.fee_bps or episode.fee_bps
+                            ),
+                            fee_components=state.reserve_fee_components,
+                            lp_fee_bps=state.reserve_lp_fee_bps,
+                            network_fee_lamports=self._checkpoint_network_fee(episode),
                             real_quote_reserves=state.real_quote_reserves,
                         )
                         net_return = (
@@ -1173,8 +1464,9 @@ class LearningEngine:
                             observed_at=now,
                             net_return=max(-1.0, min(10.0, net_return)),
                             exit_value_lamports=exit_quote.wallet_sol_lamports,
+                            route_snapshot=state.reserve_audit,
                             route_source=state.reserve_source or state.venue,
-                            route_event_id=state.last_event_id,
+                            route_event_id=state.last_reserve_event_id or state.last_event_id,
                             reserve_observed_at=state.last_reserve_at or state.last_event_at or now,
                             reserve_age_seconds=max(
                                 0.0,
@@ -1183,11 +1475,12 @@ class LearningEngine:
                                 ).total_seconds(),
                             ),
                         )
-                    except ValueError:
-                        episode.checkpoints[key] = LearningCheckpoint(
-                            horizon_seconds=horizon,
-                            observed_at=now,
-                            missing_reason="executable_exit_quote_unavailable",
+                    except ValueError as exc:
+                        episode.checkpoints[key] = _failed_quote_checkpoint(
+                            state,
+                            now,
+                            horizon,
+                            exc,
                         )
                     self._observe_size_checkpoint(episode, state, horizon, now)
                 episode_changed = True
@@ -1207,10 +1500,12 @@ class LearningEngine:
     def _advance_primary_outcomes(
         self,
         cohorts: set[tuple[RiskMode, str | None]],
+        *,
+        outcomes_changed: bool = False,
     ) -> None:
         """Advance safety immediately and queue fitting for every newly resolved cohort."""
 
-        if not cohorts:
+        if not cohorts and not outcomes_changed:
             return
         # Forward health and suspension are inexpensive safety controls and remain on the
         # outcome boundary. Only coefficient fitting/publishing moves off the event path.
@@ -1234,7 +1529,6 @@ class LearningEngine:
         now: datetime,
     ) -> None:
         key = str(horizon)
-        network_fee = self.settings.network_fee_lamports + self.settings.priority_fee_lamports
         for trial in observation.size_trials.values():
             if key in trial.checkpoints:
                 continue
@@ -1254,8 +1548,14 @@ class LearningEngine:
                     virtual_token_reserves=state.virtual_token_reserves,
                     virtual_sol_reserves=state.virtual_quote_reserves,
                     token_units=trial.token_units,
-                    fee_bps=state.fee_bps or observation.fee_bps,
-                    network_fee_lamports=network_fee,
+                    fee_bps=(
+                        state.fee_bps
+                        if state.reserve_fee_components is not None
+                        else state.fee_bps or observation.fee_bps
+                    ),
+                    fee_components=state.reserve_fee_components,
+                    lp_fee_bps=state.reserve_lp_fee_bps,
+                    network_fee_lamports=self._checkpoint_network_fee(observation),
                     real_quote_reserves=state.real_quote_reserves,
                 )
                 net_return = (
@@ -1266,8 +1566,9 @@ class LearningEngine:
                     observed_at=now,
                     net_return=max(-1.0, min(10.0, net_return)),
                     exit_value_lamports=exit_quote.wallet_sol_lamports,
+                    route_snapshot=state.reserve_audit,
                     route_source=state.reserve_source or state.venue,
-                    route_event_id=state.last_event_id,
+                    route_event_id=state.last_reserve_event_id or state.last_event_id,
                     reserve_observed_at=state.last_reserve_at or state.last_event_at or now,
                     reserve_age_seconds=max(
                         0.0,
@@ -1276,10 +1577,12 @@ class LearningEngine:
                         ).total_seconds(),
                     ),
                 )
-            except ValueError:
-                trial.checkpoints[key] = LearningCheckpoint(
-                    horizon_seconds=horizon,
-                    observed_at=now,
+            except ValueError as exc:
+                trial.checkpoints[key] = _failed_quote_checkpoint(
+                    state,
+                    now,
+                    horizon,
+                    exc,
                     missing_reason="size_trial_exit_quote_unavailable",
                 )
 
@@ -1299,6 +1602,79 @@ class LearningEngine:
                     missing_reason=reason,
                 )
 
+    def due_checkpoint_mints(
+        self,
+        states: dict[str, TokenState],
+        now: datetime,
+        *,
+        limit: int,
+        fresh: bool,
+    ) -> list[str]:
+        """Bound acquisition fairly: three Policy turns, one Discovery turn, with rotation.
+
+        A mint shared by several trajectories is fetched once; each original clock still applies.
+        Cached work excludes stale routes before spending its budget. RPC work excludes fresh
+        routes. Failed attempts rotate behind unserved mints while all evidence stays enrolled.
+        """
+        lanes: dict[str, dict[str, datetime]] = {"policy": {}, "discovery": {}}
+        items = [
+            ("discovery", item.mint, item.created_at, item.checkpoints)
+            for item in self.observations.values()
+            if item.status == LearningObservationStatus.PENDING
+        ] + [
+            ("policy", item.mint, item.entry_at, item.checkpoints)
+            for item in self.evidence_episodes.values()
+            if item.lane == LearningEvidenceLane.POLICY
+            and item.status == LearningEvidenceStatus.PENDING
+        ]
+        for lane, mint, entered_at, checkpoints in items:
+            state = states.get(mint)
+            if state is None:
+                continue
+            is_fresh = (
+                _checkpoint_route_missing_reason(
+                    state,
+                    now,
+                    stale_after_seconds=self.settings.stale_market_seconds,
+                    require_timestamp=True,
+                )
+                is None
+            )
+            if is_fresh != fresh:
+                continue
+            for horizon in LEARNING_HORIZONS_SECONDS:
+                due_at = entered_at + timedelta(seconds=horizon)
+                if str(horizon) not in checkpoints and due_at <= now <= due_at + timedelta(
+                    seconds=CHECKPOINT_GRACE_SECONDS
+                ):
+                    lanes[lane][mint] = min(lanes[lane].get(mint, due_at), due_at)
+        for mint in lanes["policy"]:
+            lanes["discovery"].pop(mint, None)
+        channel = "cache" if fresh else "rpc"
+        served = self._checkpoint_served[channel]
+        pending = set(lanes["policy"]) | set(lanes["discovery"])
+        self._checkpoint_served[channel] = served = {
+            mint: value for mint, value in served.items() if mint in pending
+        }
+        queues = {
+            lane: sorted(mints, key=lambda mint: (served.get(mint, -1), mints[mint], mint))
+            for lane, mints in lanes.items()
+        }
+        selected: list[str] = []
+        while len(selected) < max(0, limit) and any(queues.values()):
+            turn = self._checkpoint_turn[channel]
+            preferred = "discovery" if turn % 4 == 3 else "policy"
+            lane = (
+                preferred
+                if queues[preferred]
+                else ("policy" if preferred == "discovery" else "discovery")
+            )
+            mint = queues[lane].pop(0)
+            selected.append(mint)
+            served[mint] = turn
+            self._checkpoint_turn[channel] = turn + 1
+        return selected
+
     def sample_due_checkpoints(
         self,
         states: dict[str, TokenState],
@@ -1307,73 +1683,17 @@ class LearningEngine:
         live: bool,
         max_observations: int = MAX_CLOCK_CHECKPOINTS_PER_TICK,
     ) -> int:
-        """Capture due outcomes from fresh cached routes without extra provider requests.
-
-        Work is bounded per heartbeat and ordered by the oldest due observation. A token receiving
-        no perfectly timed trade can therefore still produce an exact checkpoint, while stale or
-        unverifiable reserves remain missing rather than becoming fabricated P/L.
-        """
-
-        if not live or max_observations < 1:
+        if not live:
             return 0
-        due = sorted(
-            (
-                observation
-                for observation in self.observations.values()
-                if observation.status == LearningObservationStatus.PENDING
-                and any(
-                    str(horizon) not in observation.checkpoints
-                    and horizon
-                    <= max(0.0, (now - observation.created_at).total_seconds())
-                    <= horizon + CHECKPOINT_GRACE_SECONDS
-                    for horizon in LEARNING_HORIZONS_SECONDS
-                )
-            ),
-            key=lambda item: (
-                _checkpoint_route_missing_reason(
-                    states[item.mint],
-                    now,
-                    stale_after_seconds=self.settings.stale_market_seconds,
-                    require_timestamp=True,
-                )
-                is not None
-                if item.mint in states
-                else True,
-                item.created_at,
-            ),
-        )
-        changed = 0
-        sampled_mints: set[str] = set()
-        for observation in due[:max_observations]:
-            state = states.get(observation.mint)
-            if state is None:
-                continue
-            changed += self.observe_market(state, now, live=True, cached=True)
-            sampled_mints.add(observation.mint)
-        remaining = max(0, max_observations - len(sampled_mints))
-        if remaining:
-            policy_due = sorted(
-                {
-                    episode.mint: episode.entry_at
-                    for episode in self.evidence_episodes.values()
-                    if episode.lane == LearningEvidenceLane.POLICY
-                    and episode.status == LearningEvidenceStatus.PENDING
-                    and episode.mint not in sampled_mints
-                    and any(
-                        str(horizon) not in episode.checkpoints
-                        and horizon
-                        <= max(0.0, (now - episode.entry_at).total_seconds())
-                        <= horizon + CHECKPOINT_GRACE_SECONDS
-                        for horizon in LEARNING_HORIZONS_SECONDS
-                    )
-                }.items(),
-                key=lambda item: item[1],
+        return sum(
+            self.observe_market(states[mint], now, live=True, cached=True)
+            for mint in self.due_checkpoint_mints(
+                states,
+                now,
+                limit=max_observations,
+                fresh=True,
             )
-            for mint, _entry_at in policy_due[:remaining]:
-                state = states.get(mint)
-                if state is not None:
-                    changed += self.observe_market(state, now, live=True, cached=True)
-        return changed
+        )
 
     def expire_checkpoints(
         self,
@@ -1467,8 +1787,8 @@ class LearningEngine:
                 item_changed = True
             if item_changed:
                 self.database.save_learning_evidence_episode(episode)
-        if primary_changed:
-            self._advance_primary_outcomes(primary_cohorts)
+        if changed:
+            self._advance_primary_outcomes(primary_cohorts, outcomes_changed=True)
         if changed:
             self._prune_complete_history()
             self._invalidate_timing_validation()
@@ -1698,13 +2018,23 @@ class LearningEngine:
             }
         )
 
+    def _cache_nonlinear_model(self, version: str, model: Any | None) -> None:
+        # Only decoded runtime objects are evicted. Durable artifacts and Champion receipts
+        # keep their existing retention rules; a later use reloads and verifies the payload.
+        self._nonlinear_model_cache.pop(version, None)
+        self._nonlinear_model_cache[version] = model
+        while len(self._nonlinear_model_cache) > MAX_CACHED_NONLINEAR_MODELS:
+            self._nonlinear_model_cache.pop(next(iter(self._nonlinear_model_cache)))
+
     def _load_nonlinear_artifact(self, artifact: ChallengerSkillArtifact) -> Any | None:
         """Load a verified application-owned model, caching both success and failure."""
 
         if artifact.model_family != StatisticalModelFamily.XGBOOST:
             return None
         if artifact.version in self._nonlinear_model_cache:
-            return self._nonlinear_model_cache[artifact.version]
+            model = self._nonlinear_model_cache[artifact.version]
+            self._cache_nonlinear_model(artifact.version, model)
+            return model
         try:
             stored = self.database.load_statistical_model_artifact(artifact.version)
             if (
@@ -1719,7 +2049,7 @@ class LearningEngine:
                 model = load_xgboost(stored["payload"])
         except (TypeError, ValueError):
             model = None
-        self._nonlinear_model_cache[artifact.version] = model
+        self._cache_nonlinear_model(artifact.version, model)
         return model
 
     def _predict_artifact(
@@ -1900,6 +2230,11 @@ class LearningEngine:
             "qualification_gates": qualification_gates,
             "qualification_passed": sum(gate["state"] == "passed" for gate in qualification_gates),
             "qualification_total": len(qualification_gates),
+            "entry_proof": self.entry_proof_status(
+                qualification_gates,
+                activation_candidate=activation_candidate,
+                skill_activation_candidate=skill_activation_candidate,
+            ),
             "lessons": _lessons(latest),
             "guardrails": [
                 "Never trains on synthetic Demo Market data",
@@ -2173,6 +2508,7 @@ class LearningEngine:
             testing = (
                 self.skill_artifacts.get(state.testing_version or "") if state is not None else None
             )
+            gate_artifact = testing or latest
             active_version = self.active_skill_versions.get(skill.value)
             if (
                 state is not None
@@ -2220,7 +2556,9 @@ class LearningEngine:
                     "pending_versions": list(state.pending_versions) if state is not None else [],
                     "champion": _skill_artifact_summary(champion),
                     "champion_generation": (
-                        _champion_generation(state) if state is not None else None
+                        self.database.champion_record(state)["champion_generation"]
+                        if state is not None
+                        else None
                     ),
                     "active_version": active_version,
                     "common_forward_count": (
@@ -2228,44 +2566,30 @@ class LearningEngine:
                     ),
                     "tournament": dict(state.last_tournament) if state is not None else {},
                     "health": health,
-                    "gates": _skill_qualification_gates(skill, latest),
+                    "gates": _skill_qualification_gates(skill, gate_artifact),
+                    "gate_artifact_version": gate_artifact.version if gate_artifact else None,
+                    "gate_subject": "testing_candidate"
+                    if testing is not None
+                    else "latest_candidate",
                 }
             )
         return statuses
-
-    def _current_champion_events(
-        self,
-    ) -> list[tuple[ChallengerChampionEvent, int | None]]:
-        """Return every durable Champion milestone for only the exact active cohort."""
-
-        return sorted(
-            [
-                (event, generation)
-                for skill in (
-                    ChallengerSkill.ENTRY,
-                    ChallengerSkill.MANIPULATION,
-                    ChallengerSkill.SIZING,
-                    ChallengerSkill.EXIT,
-                )
-                if (state := self._current_skill_state(skill)) is not None
-                for event, generation in _champion_event_generations(state)
-            ],
-            key=lambda item: (item[0].occurred_at, item[0].event_id),
-            reverse=True,
-        )
 
     def _champion_event_view(
         self,
         event: ChallengerChampionEvent,
         generation: int | None,
     ) -> dict[str, Any]:
-        candidate = self.skill_artifacts.get(event.candidate_version)
-        champion = self.skill_artifacts.get(event.champion_version)
-        previous = (
-            self.skill_artifacts.get(event.previous_champion_version)
-            if event.previous_champion_version is not None
-            else None
-        )
+        def metadata(version: str | None) -> dict[str, Any]:
+            artifact = self.skill_artifacts.get(version or "")
+            if artifact is not None:
+                return {**artifact.model_dump(mode="json"), "payload_state": "retained"}
+            archived = self.database.archived_challenger_artifact(version)
+            return {**(archived or {}), "payload_state": "archived" if archived else "missing"}
+
+        candidate = metadata(event.candidate_version)
+        champion = metadata(event.champion_version)
+        previous = metadata(event.previous_champion_version)
         resolution = {
             "first_champion": (
                 "The first policy for this skill passed its independent proof and "
@@ -2300,11 +2624,13 @@ class LearningEngine:
                 event.champion_version,
                 event.skill,
             ),
-            "candidate_model_family": candidate.model_family.value if candidate else None,
-            "candidate_recipe_version": candidate.recipe_version if candidate else None,
-            "champion_model_family": champion.model_family.value if champion else None,
-            "champion_recipe_version": champion.recipe_version if champion else None,
-            "previous_champion_model_family": previous.model_family.value if previous else None,
+            "candidate_model_family": candidate.get("model_family"),
+            "candidate_recipe_version": candidate.get("recipe_version"),
+            "champion_model_family": champion.get("model_family"),
+            "champion_recipe_version": champion.get("recipe_version"),
+            "previous_champion_model_family": previous.get("model_family"),
+            "candidate_payload_state": candidate["payload_state"],
+            "champion_payload_state": champion["payload_state"],
             "resolution": resolution,
         }
 
@@ -2316,26 +2642,33 @@ class LearningEngine:
     ) -> dict[str, Any]:
         """Page immutable battle history without shipping an unbounded dashboard payload."""
 
-        bounded_limit = max(1, min(50, limit))
-        events = self._current_champion_events()
-        start = 0
-        if cursor is not None:
-            try:
-                start = next(
-                    index + 1 for index, (event, _) in enumerate(events) if event.event_id == cursor
-                )
-            except StopIteration as exc:
-                raise ValueError(
-                    "Champion journey cursor is no longer in this learning cohort"
-                ) from exc
-        selected = events[start : start + bounded_limit]
-        has_more = start + len(selected) < len(events)
+        cohort = _challenger_cohort_key(
+            self.current_risk_mode,
+            self.configuration_fingerprint(),
+            self.baseline_version(),
+            FEATURE_SCHEMA_VERSION,
+        )
+        page = self.database.champion_events_page(cohort, limit=min(50, limit), cursor=cursor)
         return {
+            **page,
             "events": [
-                self._champion_event_view(event, generation) for event, generation in selected
+                self._champion_event_view(event, generation) for event, generation in page["events"]
             ],
-            "total": len(events),
-            "next_cursor": selected[-1][0].event_id if selected and has_more else None,
+        }
+
+    def champion_replay(self, event_id: str, cohort: str) -> dict[str, Any]:
+        current = _challenger_cohort_key(
+            self.current_risk_mode,
+            self.configuration_fingerprint(),
+            self.baseline_version(),
+            FEATURE_SCHEMA_VERSION,
+        )
+        if cohort != current:
+            raise ValueError("The learning cohort changed; reopen the saved result.")
+        return {
+            "event_id": event_id,
+            "cohort_key": cohort,
+            "timeline": self.database.champion_battle_replay(cohort, event_id),
         }
 
     def champion_journey(self) -> list[dict[str, Any]]:
@@ -2361,36 +2694,16 @@ class LearningEngine:
                 continue
             champion_version = state.champion_version
             artifact = self.skill_artifacts.get(champion_version)
-            events = sorted(state.champion_journey, key=lambda item: item.occurred_at)
-            crown_event = next(
-                (
-                    event
-                    for event in events
-                    if event.champion_version == champion_version
-                    and event.kind in {"first_champion", "promoted"}
-                ),
-                None,
-            )
-            retained = sum(
-                event.kind == "defended" and event.champion_version == champion_version
-                for event in events
-            )
-            inconclusive = sum(
-                event.kind == "inconclusive" and event.champion_version == champion_version
-                for event in events
-            )
+            record = self.database.champion_record(state)
             records.append(
                 {
                     "skill": skill.value,
                     "champion_version": champion_version,
                     "champion_codename": _challenger_codename(champion_version, skill),
-                    "champion_generation": _champion_generation(state),
+                    "champion_generation": record["champion_generation"],
                     "model_family": artifact.model_family.value if artifact else None,
                     "recipe_version": artifact.recipe_version if artifact else None,
-                    "crowned_at": crown_event.occurred_at.isoformat() if crown_event else None,
-                    "retained_count": retained,
-                    "inconclusive_count": inconclusive,
-                    "recorded_battle_count": retained + inconclusive,
+                    **record,
                     "active": (
                         state.active_version == champion_version
                         and state.suspended_version != champion_version
@@ -2400,10 +2713,141 @@ class LearningEngine:
                         if state.suspended_version == champion_version
                         else ("active" if state.active_version == champion_version else "shadow")
                     ),
-                    "history_complete": crown_event is not None,
                 }
             )
         return records
+
+    def entry_proof_status(
+        self,
+        qualification_gates: list[dict[str, Any]],
+        *,
+        activation_candidate: LearningModel | None,
+        skill_activation_candidate: ChallengerSkillArtifact | None,
+    ) -> dict[str, Any]:
+        """Read-only, identity-bound explanations; never select, qualify or activate an artifact."""
+        state = self._current_skill_state(ChallengerSkill.ENTRY)
+        latest: dict[StatisticalModelFamily, ChallengerSkillArtifact] = {}
+        artifact: ChallengerSkillArtifact | None
+        configuration = self.configuration_fingerprint()
+        baseline = self.baseline_version()
+        for artifact in self.skill_artifacts.values():
+            if (
+                artifact.skill != ChallengerSkill.ENTRY
+                or artifact.model_family
+                not in {StatisticalModelFamily.LINEAR, StatisticalModelFamily.XGBOOST}
+                or artifact.risk_mode != self.current_risk_mode
+                or artifact.configuration_fingerprint != configuration
+                or artifact.baseline_version != baseline
+                or artifact.feature_schema_version != FEATURE_SCHEMA_VERSION
+            ):
+                continue
+            previous = latest.get(artifact.model_family)
+            if previous is None or (artifact.created_at, artifact.version) > (
+                previous.created_at,
+                previous.version,
+            ):
+                latest[artifact.model_family] = artifact
+
+        families = []
+        for family in (StatisticalModelFamily.LINEAR, StatisticalModelFamily.XGBOOST):
+            artifact = latest.get(family)
+            role = (
+                "collecting"
+                if artifact is None
+                else "qualified"
+                if artifact.qualified
+                else "proof_not_met"
+            )
+            if state is not None and artifact is not None:
+                if state.suspended_version == artifact.version:
+                    role = "suspended"
+                elif (
+                    self.active_skill_versions.get(ChallengerSkill.ENTRY.value) == artifact.version
+                ):
+                    role = "active"
+                elif state.champion_version == artifact.version:
+                    role = "champion"
+                elif state.testing_version == artifact.version:
+                    role = "testing"
+                elif artifact.version in state.pending_versions:
+                    role = "queued"
+                elif artifact.version in state.rejected_versions:
+                    role = "previously_tested"
+            # Early Linear artifacts did not copy this metric. Recover only from their exact
+            # source version in the same context, never from the newest unrelated Linear model.
+            source = (
+                next(
+                    (
+                        model
+                        for model in reversed(self.models)
+                        if artifact is not None
+                        and artifact.version
+                        == f"{SKILL_ARTIFACT_VERSION_PREFIX}entry-{model.version}"
+                        and model.risk_mode == artifact.risk_mode
+                        and model.configuration_fingerprint == artifact.configuration_fingerprint
+                    ),
+                    None,
+                )
+                if family == StatisticalModelFamily.LINEAR
+                else None
+            )
+            families.append(
+                {
+                    "family": family.value,
+                    "artifact": _skill_artifact_summary(artifact),
+                    "state": role,
+                    "gates": _entry_family_proof_gates(artifact, source=source),
+                }
+            )
+
+        champion = self.skill_artifacts.get(state.champion_version or "") if state else None
+        selected = skill_activation_candidate or activation_candidate
+        subject = selected or champion
+        active = (
+            self.skill_artifacts.get(self.active_skill_versions.get("entry", ""))
+            or self.active_model
+        )
+
+        def identity(item: ChallengerSkillArtifact | LearningModel | None) -> dict[str, Any] | None:
+            if item is None:
+                return None
+            return {
+                "version": item.version,
+                "model_family": item.model_family.value,
+                "codename": _challenger_codename(item.version, ChallengerSkill.ENTRY)
+                if isinstance(item, ChallengerSkillArtifact)
+                else "Legacy Linear model",
+            }
+
+        activation_gates = [
+            dict(gate)
+            for gate in qualification_gates
+            if gate["id"]
+            in {"current_outcome_availability", "current_observed_outcomes", "activation_ready"}
+        ]
+        for gate in activation_gates:
+            if gate["id"] == "activation_ready":
+                gate["detail"] = (
+                    "The engine checks the eligible Entry artifact, current context, coverage, "
+                    "loadability and suspension history. Consent is separate."
+                )
+        return {
+            "version": "entry-proof-v1",
+            "families": families,
+            "activation": {
+                "champion": identity(champion),
+                "subject": identity(subject),
+                "source": "skill_champion"
+                if isinstance(subject, ChallengerSkillArtifact)
+                else "legacy_linear"
+                if subject is not None
+                else None,
+                "ready": selected is not None,
+                "active": identity(active),
+                "consent_granted": self.consent_granted,
+                "gates": activation_gates,
+            },
+        }
 
     def nonlinear_entry_status(self) -> dict[str, Any]:
         """Expose XGBoost eligibility honestly without implying promotion progress."""
@@ -3211,7 +3655,7 @@ class LearningEngine:
             payload=payload,
             defer_tournament=True,
         )
-        self._nonlinear_model_cache[artifact.version] = booster
+        self._cache_nonlinear_model(artifact.version, booster)
         return artifact
 
     def _publish_manipulation_artifact(
@@ -3651,6 +4095,12 @@ class LearningEngine:
             raise ValueError("XGBoost challenger artifact requires its verified payload")
         if artifact.model_family != StatisticalModelFamily.XGBOOST and payload is not None:
             raise ValueError("inline challenger artifact cannot carry an external payload")
+        if self._training_output is not None:
+            self._training_output.artifacts.append(
+                (artifact.model_copy(deep=True), cohort_key, payload)
+            )
+            self.skill_artifacts[artifact.version] = artifact
+            return
         if payload is None:
             self.database.save_challenger_artifact(artifact)
         else:
@@ -3798,6 +4248,8 @@ class LearningEngine:
             "champion_version": state.champion_version,
             "common_usable_count": 0,
         }
+        start_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY)
+        record_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY)
 
     def seed_coach_candidate(
         self,
@@ -3934,6 +4386,8 @@ class LearningEngine:
         event_id = f"champion-event-{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
         if any(event.event_id == event_id for event in state.champion_journey):
             return
+        if kind != "first_champion":
+            freeze_replay(state, event_id)
         state.champion_journey = [
             *state.champion_journey,
             ChallengerChampionEvent(
@@ -4080,9 +4534,8 @@ class LearningEngine:
             champion_winner_vetoes = 0
             candidate_harm_count = 0
             for observation in usable:
-                outcome = observation.checkpoints[primary_key].net_return
-                if outcome is None:
-                    continue
+                primary = observation.checkpoints.get(primary_key)
+                outcome = primary.net_return if primary is not None else None
                 candidate_receipt = observation.challenger_evaluations[candidate_version]
                 champion_receipt = observation.challenger_evaluations[champion.version]
                 candidate_value = _tournament_policy_value(observation, candidate_receipt)
@@ -4091,10 +4544,14 @@ class LearningEngine:
                     continue
                 deltas.append(candidate_value - champion_value)
                 candidate_winner_vetoes += int(
-                    candidate_receipt.proposed_action == "veto" and outcome > 0
+                    candidate_receipt.proposed_action == "veto"
+                    and outcome is not None
+                    and outcome > 0
                 )
                 champion_winner_vetoes += int(
-                    champion_receipt.proposed_action == "veto" and outcome > 0
+                    champion_receipt.proposed_action == "veto"
+                    and outcome is not None
+                    and outcome > 0
                 )
                 candidate_harm_count += int(candidate_value < champion_value)
             mean_delta = fmean(deltas) if deltas else None
@@ -4142,6 +4599,7 @@ class LearningEngine:
             )
             state.last_tournament = {
                 "result": result,
+                "proof_version": TOURNAMENT_PROOF_VERSION,
                 "candidate_version": candidate_version,
                 "champion_version": champion.version,
                 "common_observed_count": observed_count,
@@ -4155,6 +4613,9 @@ class LearningEngine:
                 "candidate_harm_count": candidate_harm_count,
                 "maximum_common_observed": TOURNAMENT_MAXIMUM_COMMON_OBSERVED,
             }
+            record_replay(
+                state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY
+            )
             if promoted:
                 state.champion_version = candidate_version
                 state.testing_version = None
@@ -4858,7 +5319,8 @@ class LearningEngine:
         target_mode: RiskMode | None = None,
         target_configuration: str | None = None,
     ) -> None:
-        self._govern_active_model()
+        if self._training_output is None:
+            self._govern_active_model()
         all_rows = self._training_rows()
         self.outcomes_seen = max(self.outcomes_seen, len(all_rows))
         if not all_rows:
@@ -5050,7 +5512,10 @@ class LearningEngine:
             qualified=qualified,
         )
         self.models.append(model)
-        self.database.save_learning_model(model)
+        if self._training_output is None:
+            self.database.save_learning_model(model)
+        else:
+            self._training_output.models.append(model.model_copy(deep=True))
         feature_schemas = {observation.feature_schema_version for observation, _ in rows}
         current_authority_context = bool(
             target_mode == self.current_risk_mode
@@ -5085,7 +5550,7 @@ class LearningEngine:
                 if entry_cohort_key is not None
                 else None
             )
-            if entry_state is not None:
+            if entry_state is not None and self._training_output is None:
                 self._start_next_skill_tournament(entry_state)
                 entry_state.updated_at = datetime.now(UTC)
                 self.database.save_challenger_skill_state(entry_state)
@@ -5113,9 +5578,11 @@ class LearningEngine:
                 configuration_fingerprint=target_configuration,
                 baseline_version=baseline_version,
             )
-            self._advance_entry_tournaments()
-        self._prune_model_history()
-        self._govern_active_model()
+            if self._training_output is None:
+                self._advance_entry_tournaments()
+        if self._training_output is None:
+            self._prune_model_history()
+            self._govern_active_model()
 
     def context_outcomes_seen(
         self,
@@ -5197,16 +5664,6 @@ class LearningEngine:
                 )
                 if version
             )
-            for event in state.champion_journey:
-                protected_skill_versions.update(
-                    version
-                    for version in (
-                        event.candidate_version,
-                        event.previous_champion_version,
-                        event.champion_version,
-                    )
-                    if version
-                )
         skill_removed = set(
             self.database.prune_challenger_artifacts(
                 MAX_MODEL_VERSIONS,
@@ -5219,6 +5676,8 @@ class LearningEngine:
                 for version, artifact in self.skill_artifacts.items()
                 if version not in skill_removed
             }
+            for version in skill_removed:
+                self._nonlinear_model_cache.pop(version, None)
 
     def _invalidate_timing_validation(self) -> None:
         self._timing_revision += 1
@@ -6048,6 +6507,146 @@ def _skill_qualification_gates(
             "boolean",
         )
     )
+    return gates
+
+
+def _entry_family_proof_gates(
+    artifact: ChallengerSkillArtifact | None,
+    *,
+    source: LearningModel | None = None,
+) -> list[dict[str, Any]]:
+    """Explain saved family evidence. The stored qualified flag remains authoritative."""
+    if artifact is None:
+        return []
+    metrics = dict(artifact.metrics)
+    if (
+        artifact.model_family == StatisticalModelFamily.LINEAR
+        and "in_distribution_fraction" not in metrics
+        and source is not None
+        and artifact.version == f"{SKILL_ARTIFACT_VERSION_PREFIX}entry-{source.version}"
+        and source.risk_mode == artifact.risk_mode
+        and source.configuration_fingerprint == artifact.configuration_fingerprint
+    ):
+        metrics["in_distribution_fraction"] = source.validation_in_distribution_fraction
+
+    def number(name: str) -> float | None:
+        value = metrics.get(name)
+        return (
+            float(value)
+            if isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            else None
+        )
+
+    naive = number("naive_rmse")
+    baseline_rank = number("baseline_rank_fit")
+    specifications: list[tuple[str, str, float | None, str, str, str]] = [
+        (
+            "outcome_availability",
+            "Model outcome coverage",
+            ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+            ">=",
+            "fraction",
+            "Usable, fee-inclusive outcomes in this artifact's fitted cohort.",
+        ),
+        (
+            "validation_rmse",
+            "Validation error",
+            naive * (1 - ENTRY_MINIMUM_RMSE_RELATIVE_IMPROVEMENT) if naive is not None else None,
+            "<=",
+            "number",
+            "This artifact must improve on its untouched naive forecast by at least 2%.",
+        ),
+        (
+            "rank_fit",
+            "Forward rank fit",
+            max(0.10, baseline_rank + 0.03) if baseline_rank is not None else None,
+            ">=",
+            "number",
+            "Forward ranking must improve on the Baseline association.",
+        ),
+        (
+            "top_return",
+            "Top-group return",
+            ENTRY_MINIMUM_TOP_RETURN,
+            ">=",
+            "fraction",
+            "The highest-ranked untouched group must remain positive after costs.",
+        ),
+        (
+            "top_uplift",
+            "Top-group uplift",
+            ENTRY_MINIMUM_TOP_UPLIFT,
+            ">=",
+            "fraction",
+            "Improvement over the Baseline top group on the same held-out evidence.",
+        ),
+        (
+            "in_distribution_fraction",
+            "Familiar evidence",
+            ENTRY_MINIMUM_IN_DISTRIBUTION_FRACTION,
+            ">=",
+            "fraction",
+            "Validation evidence inside learned support. "
+            "Unrecorded historical values stay unknown.",
+        ),
+    ]
+    gates = []
+    for name, label, target, comparison, unit, detail in specifications:
+        current = number(name)
+        known = current is not None and target is not None
+        passed = (
+            current is not None
+            and target is not None
+            and (current <= target if comparison == "<=" else current >= target)
+        )
+        gates.append(
+            {
+                "id": f"entry_{name}",
+                "label": label,
+                "current": current,
+                "target": target,
+                "comparison": comparison,
+                "unit": unit,
+                "detail": detail,
+                "state": "passed" if passed else "not_met" if known else "collecting",
+            }
+        )
+    if artifact.model_family == StatisticalModelFamily.XGBOOST:
+        earned = metrics.get("complexity_earned")
+        current = earned if isinstance(earned, bool) else None
+        gates.append(
+            {
+                "id": "entry_complexity_earned",
+                "label": "Improvement over Linear",
+                "current": current,
+                "target": True,
+                "comparison": "=",
+                "unit": "boolean",
+                "state": "passed"
+                if current is True
+                else "not_met"
+                if current is False
+                else "collecting",
+                "detail": f"Saved validation check: at least {NONLINEAR_COMPLEXITY_MARGIN:.0%} "
+                "lower error than the paired Linear model. The latest unrelated Linear "
+                "generation is not substituted.",
+            }
+        )
+    # Reuse the existing policy check definitions, but do not coerce unknown/non-finite evidence.
+    for gate in _skill_qualification_gates(ChallengerSkill.ENTRY, artifact):
+        gate = dict(gate)
+        if gate["id"] != "entry_qualified":
+            raw = gate["current"]
+            if raw is not None and not math.isfinite(raw):
+                gate.update(current=None, state="collecting")
+        else:
+            gate["detail"] = (
+                "The saved engine qualification result for this exact artifact. "
+                "Passing individual displayed checks alone does not award a crown."
+            )
+        gates.append(gate)
     return gates
 
 

@@ -539,6 +539,16 @@ test.each([
     label: "Automatic season status: Due now",
   },
   {
+    name: "bounded dormant route verification",
+    update: { state: "waiting_for_terminal_evidence", remaining_seconds: 0 },
+    label: "Automatic season status: verifying dormant holdings for at most five additional minutes",
+  },
+  {
+    name: "delayed control progress without showing a false live countdown",
+    update: { state: "countdown", remaining_seconds: 60, age_seconds: 30 },
+    label: "Automatic season status: last reported progress is delayed",
+  },
+  {
     name: "a countdown whose remaining telemetry is temporarily unavailable",
     update: { state: "countdown", remaining_seconds: null, verified_seconds: 120 },
     label: "Automatic season status: Counting",
@@ -748,7 +758,7 @@ test("keeps detailed learning evidence tidy until requested", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   const evidenceToggle = screen.getByRole("button", { name: "Show learning evidence" });
-  const proofToggle = screen.getByRole("button", { name: "Show entry’s road to influence" });
+  const proofToggle = screen.getByRole("button", { name: "Show entry proof & activation" });
   const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
   expect(evidenceToggle).toHaveAttribute("aria-expanded", "false");
   expect(proofToggle).toHaveAttribute("aria-expanded", "false");
@@ -819,7 +829,7 @@ test("migrates the old Learning layout to a clean collapsed Overview", async () 
 
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByRole("button", { name: "Show learning evidence" })).toHaveAttribute("aria-expanded", "false");
-  expect(screen.getByRole("button", { name: "Show entry’s road to influence" })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: "Show entry proof & activation" })).toHaveAttribute("aria-expanded", "false");
 });
 
 test("brings a remembered Learning sub-tab into view on narrow screens", async () => {
@@ -1000,7 +1010,8 @@ test("shows authoritative proof gates separately from the next Challenger evalua
   await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByText("Minimum 80 met · 4 more usable outcomes until the next challenger")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Show entry’s road to influence" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show entry proof & activation" }));
+  fireEvent.click(screen.getByText("Legacy Linear diagnostics"));
   expect(screen.getByText("2 / 2 proof gates")).toBeInTheDocument();
   expect(screen.getByText("Current executable coverage")).toBeInTheDocument();
   expect(screen.getByText(/next evaluation timing is separate/i)).toBeInTheDocument();
@@ -1157,7 +1168,7 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Manipulation skill");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Sizing skill");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Exit skill");
-  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Contender");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Battle contender");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Best proved");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("18 / 30 shared outcomes");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Nonlinear XGBoost");
@@ -1167,6 +1178,7 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   expect(screen.getByRole("progressbar", { name: "XGBoost Entry training eligibility" })).toHaveAttribute("aria-valuenow", "181");
   expect(screen.getByRole("region", { name: "Reigning Champions" })).toHaveTextContent("Champion v2 · Violet Balancer");
   expect(screen.getByRole("region", { name: "Reigning Champions" })).toHaveTextContent("4 crown retentions · 1 inconclusive");
+  expect(screen.getByRole("region", { name: "Reigning Champions" }).querySelectorAll(".fighter-portrait")).toHaveLength(1);
   const journeyToggle = screen.getByRole("button", { name: "Show champion journey" });
   expect(journeyToggle).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("A Champion means safer forward proof, never guaranteed profit.")).not.toBeInTheDocument();
@@ -1185,10 +1197,10 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   expect(screen.queryByRole("dialog", { name: "New Champion earned" })).not.toBeInTheDocument();
   await waitFor(() => expect(viewBattle).toHaveFocus());
 
-  const proofToggle = screen.getByRole("button", { name: "Show entry’s road to influence" });
-  expect(proofToggle).toHaveTextContent("Entry ·");
+  const proofToggle = screen.getByRole("button", { name: "Show entry proof & activation" });
+  expect(proofToggle).toHaveTextContent("Linear and XGBoost · one Entry crown");
   fireEvent.click(proofToggle);
-  expect(screen.getByText("Entry is the Challenger’s foundation.")).toBeInTheDocument();
+  expect(screen.getByText(/not the XGBoost candidate’s checklist/)).toBeInTheDocument();
 });
 
 test("loads older Champion battles without duplicating the bounded initial history", async () => {
@@ -1226,6 +1238,7 @@ test("loads older Champion battles without duplicating the bounded initial histo
     availability_fraction: 0,
     mean_uplift: null,
     uplift_lower_bound: null,
+    resolution: "The first Champion passed its independent proof.",
   };
   const historySnapshot = {
     ...snapshot,
@@ -1251,10 +1264,21 @@ test("loads older Champion battles without duplicating the bounded initial histo
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   fireEvent.click(screen.getByRole("button", { name: "Show champion journey" }));
   expect(screen.getByText("Clear Harbormaster retained the crown against Quiet Navigator")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Load older battles" }));
+  fireEvent.click(screen.getByRole("button", { name: "Load older events" }));
 
   expect(await screen.findByText("Clear Harbormaster was crowned")).toBeInTheDocument();
-  expect(screen.getAllByRole("button", { name: "View battle" })).toHaveLength(2);
+  expect(screen.getAllByRole("button", { name: "View battle" })).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "View coronation" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "View qualification" }));
+  const qualification = screen.getByRole("dialog", { name: "First Champion crowned" });
+  expect(qualification).toHaveTextContent("after passing its independent proof");
+  expect(within(qualification).queryByText("VS")).not.toBeInTheDocument();
+  expect(within(qualification).queryByText("Shared outcomes")).not.toBeInTheDocument();
+  fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+  expect(within(qualification).getByText("Technical identities")).toHaveFocus();
+  fireEvent.keyDown(window, { key: "Tab" });
+  expect(screen.getByRole("button", { name: "Close qualification details" })).toHaveFocus();
+  fireEvent.click(screen.getByRole("button", { name: "Close qualification details" }));
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/v1/learning/champion-journey?limit=8&cursor=champion-event-newest",
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
@@ -1321,7 +1345,7 @@ test("does not invent Champion history for a pre-existing saved Champion", async
   expect(screen.getByText("Waiting for first Champion")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Show champion journey" }));
   expect(screen.getByText(/Existing Champions remain valid/)).toBeInTheDocument();
-  expect(screen.getByText(/does not invent past battles/)).toBeInTheDocument();
+  expect(screen.getByText(/does not invent past events/)).toBeInTheDocument();
 });
 
 test("explains low executable coverage while a Challenger battle is still open", async () => {
@@ -1622,6 +1646,26 @@ test("keeps core settings visible while secondary model and provider details sta
   fireEvent.click(screen.getByRole("button", { name: "Show data providers" }));
   expect(screen.getByRole("button", { name: "Manage" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Hide data providers" })).toHaveAttribute("aria-expanded", "true");
+});
+
+test.each(["2026-09-01T00:00:00Z", "invalid", undefined])("shows only measured raw history backlog (%s)", async (oldest) => {
+  const state: Snapshot = {
+    ...snapshot, server_time: "2026-09-06T00:00:00Z",
+    storage: { ...snapshot.storage, raw_trade_retention_hours: 24,
+      maintenance: { active: false, requested: true, budget_state: "within_budget",
+        deferred_reason: null, deferred_since: null, last_started_at: null, last_completed_at: null,
+        last_duration_seconds: 0, last_phase_seconds: {}, last_removed: {},
+        oldest_retained_trade_at: oldest } },
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => state }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  if (oldest?.startsWith("2026")) {
+    expect(screen.getByText(/oldest raw trade is 120 hours old; target 24 hours/)).toBeInTheDocument();
+  } else {
+    expect(screen.queryByText(/History cleanup is catching up:/)).not.toBeInTheDocument();
+  }
 });
 
 test("confirms upgrade preparation and blocks app controls while it settles", async () => {
@@ -2095,7 +2139,7 @@ test("filters every season view by exact profile and marks all-profile history a
   expect(screen.queryByText("Season 4")).not.toBeInTheDocument();
 });
 
-test("distinguishes matching season settings by strategy and accounting generation on mobile", async () => {
+test.each(["executable-boundary-v2", "executable-boundary-v3", "executable-boundary-v99"])("distinguishes season settings and accounting generation %s on mobile", async (currentAccounting) => {
   const now = new Date().toISOString();
   const customDrawdown = { kind: "custom" as const, custom_threshold_bps: 2_000 };
   const oldProfile = {
@@ -2155,11 +2199,11 @@ test("distinguishes matching season settings by strategy and accounting generati
     makeSeason(12, oldProfile, "legacy-v1", "legacy", "completed"),
     makeSeason(13, oldProfile, "legacy-v1", "legacy", "completed"),
     makeSeason(14, oldProfile, "executable-boundary-v2", "reset", "completed"),
-    makeSeason(15, currentProfile, "executable-boundary-v2", "open", "current"),
+    makeSeason(15, currentProfile, currentAccounting, "open", "current"),
   ];
   const oldLegacyKey = "USDC:bankroll:200000000:profile:balanced-custom-old:terminal:legacy-v1";
   const oldModernKey = "USDC:bankroll:200000000:profile:balanced-custom-old:terminal:executable-boundary-v2";
-  const currentKey = "USDC:bankroll:200000000:profile:balanced-custom-current:terminal:executable-boundary-v2";
+  const currentKey = `USDC:bankroll:200000000:profile:balanced-custom-current:terminal:${currentAccounting}`;
   const group = (
     comparisonKey: string,
     terminalPolicy: string,
@@ -2210,7 +2254,7 @@ test("distinguishes matching season settings by strategy and accounting generati
             quote_currency: "USDC",
             quote_decimals: 6,
             starting_minor: 200_000_000,
-            terminal_policy_version: "executable-boundary-v2",
+            terminal_policy_version: currentAccounting,
             profile_provenance: "exact",
             profile_fingerprint: currentProfile.profile_fingerprint,
             risk_mode: "balanced",
@@ -2232,6 +2276,11 @@ test("distinguishes matching season settings by strategy and accounting generati
   fireEvent.click(await screen.findByRole("button", { name: "Seasons" }));
 
   const trigger = await screen.findByRole("button", { name: "Season comparison" });
+  if (currentAccounting === "executable-boundary-v99") {
+    expect(screen.getByText(/Exact boundary accounting is unavailable or unsupported/)).toBeInTheDocument();
+  } else {
+    expect(screen.getByText(/Every comparison statistic uses the same currency/)).toBeInTheDocument();
+  }
   fireEvent.click(trigger);
   const picker = screen.getByRole("dialog", { name: "Choose season comparison" });
   expect(within(picker).getAllByRole("radio")).toHaveLength(5);
@@ -3708,6 +3757,63 @@ test("keeps the last screen and distinguishes a delayed dashboard from a healthy
   expect(screen.queryByText("App server unavailable")).not.toBeInTheDocument();
 });
 
+test("keeps degraded market processing visible until a fresh report confirms recovery", async () => {
+  let response: Snapshot = {
+    ...snapshot,
+    event_pipeline: { ...snapshot.event_pipeline, degraded: true, degraded_reasons: ["recent_candidate_shedding"] },
+  };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve({ ok: true, json: async () => response })));
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "System status: issue" }));
+  expect(screen.getByText("Market processing needs attention")).toBeInTheDocument();
+  expect(screen.getByText(/Some candidate events were shed or expired recently/)).toBeInTheDocument();
+
+  const refresh = async () => {
+    await act(async () => { fireEvent(document, new Event("visibilitychange")); });
+  };
+  await refresh(); // A successful HTTP response is not market recovery.
+  expect(screen.getByRole("button", { name: "System status: issue" })).toBeInTheDocument();
+  response = { ...snapshot, event_pipeline: undefined } as unknown as Snapshot;
+  await refresh(); // Missing status must not silently clear a known warning.
+  expect(screen.getByText("Market processing needs attention")).toBeInTheDocument();
+  response = { ...snapshot, snapshot_age_seconds: 30 };
+  await refresh(); // A cached healthy report is not current recovery evidence.
+  expect(screen.getByText("Dashboard view is catching up")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: /History/ }));
+  expect(within(screen.getByText("Market processing needs attention").closest("article")!).getByText("Current")).toBeInTheDocument();
+  response = { ...snapshot, event_pipeline: { ...snapshot.event_pipeline, dropped: 3308 } };
+  await refresh(); // Historical totals alone do not keep the warning active.
+  expect(screen.getByRole("button", { name: "System status: all good" })).toBeInTheDocument();
+  expect(within(screen.getByText("Market processing needs attention").closest("article")!).getByText("Resolved")).toBeInTheDocument();
+});
+
+test.each([{ reasons: [] }, { reasons: ["future_pipeline_reason"] }])("shows a useful warning when market reasons are unrecognized: $reasons", async ({ reasons }) => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({ ...snapshot, event_pipeline: { ...snapshot.event_pipeline, degraded: true, degraded_reasons: reasons } }),
+  }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "System status: issue" }));
+  expect(screen.getByText("Market processing needs attention")).toBeInTheDocument();
+  expect(screen.getByText(/The engine reports degraded market processing/)).toBeInTheDocument();
+});
+
+test("reports market degradation from health when the dashboard request fails", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string) => path.includes("/api/v1/health")
+    ? Promise.resolve({ ok: true, json: async () => ({
+      ok: true, service_running: true, database_ok: true,
+      degraded: true, degraded_reasons: ["processing_lag", "queue_near_capacity"],
+    }) })
+    : Promise.reject(new Error("snapshot timed out"))));
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "System status: issue" }));
+  fireEvent.click(screen.getByRole("tab", { name: /History/ }));
+  expect(screen.getByText("Dashboard refresh delayed")).toBeInTheDocument();
+  expect(screen.getByText("Market processing needs attention")).toBeInTheDocument();
+  expect(screen.getByText(/Market events are being processed late/)).toBeInTheDocument();
+  expect(screen.queryByText("App server unavailable")).not.toBeInTheDocument();
+});
+
 test("opens explanation feedback immediately while local AI is working", async () => {
   let finishExplanation!: (value: unknown) => void;
   const pendingExplanation = new Promise((resolve) => {
@@ -3953,4 +4059,25 @@ test("shows paused Coach research and keeps contribution revocation available", 
     "/api/v1/ai-lab/coach-contribution",
     expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: false }) }),
   ));
+});
+
+
+test("labels Champion availability separately from the named contender's gates", async () => {
+  const skill = challengerSkillStatus("sizing", "qualified");
+  skill.latest_candidate = { ...skill.latest_candidate!, version: "newest", codename: "New Contender", qualified: false };
+  skill.gate_artifact_version = "newest";
+  skill.gate_subject = "latest_candidate";
+  skill.gates = [{ ...skill.gates[0]!, current: 0.3, state: "not_met" }];
+  const data = { ...snapshot, learning: { ...snapshot.learning, skills: [skill] } } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => data }));
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  const card = screen.getByText("Sizing skill").closest("article")!;
+  expect(within(card).getByText("Champion available")).toBeInTheDocument();
+  expect(within(card).getByText("New Contender")).toBeInTheDocument();
+  expect(within(card).getByText("Candidate · collecting proof")).toBeInTheDocument();
+  expect(within(card).getByText("0 / 1 candidate gates")).toHaveAttribute("title", "newest");
+  expect(within(card).getByText("Waiting for evidence")).toBeInTheDocument();
 });
