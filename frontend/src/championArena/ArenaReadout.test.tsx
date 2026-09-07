@@ -45,7 +45,7 @@ test("positive average with an inconclusive interval stays too close to call", (
   expect(screen.getByText(/Too close to call a safe replacement/)).toBeInTheDocument();
   expect(screen.getByRole("img")).toHaveAccessibleName(/uncertainty range −0.2 pp to \+5.0 pp/);
   expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "30");
-  expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuetext", "35 of 30; evidence progress only");
+  expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuetext", "35 usable; minimum 30 met");
 });
 
 test.each([

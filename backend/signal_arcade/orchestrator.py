@@ -326,6 +326,7 @@ class Orchestrator:
             settings,
             select_model=self._select_ollama_model,
             configuration_fingerprint=self._configuration_fingerprint,
+            shadow_can_run=self._shadow_ai_can_run,
         )
         resources = Path(__file__).parent / "resources" / "idl"
         self.solana = SolanaLogProvider(
@@ -624,7 +625,7 @@ class Orchestrator:
             contribution_enabled=lambda: self.coach_contribution_enabled,
         )
         if self.demo_mode and self.learning.mode == LearningMode.ACTIVE:
-            self.learning.set_mode(LearningMode.SHADOW)
+            self.learning.set_mode(LearningMode.SHADOW, preserve_participation=True)
         self._rebuild_features()
 
     def _rebuild_features(self) -> None:
@@ -773,7 +774,7 @@ class Orchestrator:
             self.demo_mode = enabled
             self.database.set_setting("demo_mode", enabled)
             if enabled and self.learning.mode == LearningMode.ACTIVE:
-                self.learning.set_mode(LearningMode.SHADOW)
+                self.learning.set_mode(LearningMode.SHADOW, preserve_participation=True)
             self.running = False
             self.database.set_setting("trading_enabled", False)
             self.broker.cancel_pending_orders(datetime.now(UTC), "market_source_changed")
@@ -1402,6 +1403,22 @@ class Orchestrator:
             and self.last_processing_lag_seconds < 1
         )
 
+    def _exit_timing_arguments(self) -> dict[str, Any]:
+        seconds = self.learning.recommended_hold_seconds(self.risk_mode)
+        return {
+            "soft_hold_seconds": seconds,
+            "soft_hold_participant": self.learning.exit_timing_participant(self.risk_mode, seconds),
+        }
+
+    def _shadow_ai_can_run(self) -> bool:
+        """Optional CPU inference waits behind market work and the current model fit."""
+        return bool(
+            self._learning_training_can_run()
+            and self.learning._training_active is None
+            and not self._event_lock.locked()
+            and not self.http.ollama_generation_busy
+        )
+
     def _collect_diagnostics(self) -> None:
         """Copy compact in-memory facts at the event boundary; never build a dashboard."""
         recorder = self.diagnostics
@@ -1420,11 +1437,14 @@ class Orchestrator:
             self._pipeline_diagnostic_boundary = True
         pipeline, gap = recorder.cursor.take(buckets)
         configuration = self._configuration_fingerprint()
+        baseline = self.learning.baseline_version()
         latest: dict[tuple[str, str], Any] = {}
         for artifact in self.learning.skill_artifacts.values():
             if (
                 artifact.risk_mode != self.risk_mode
                 or artifact.configuration_fingerprint != configuration
+                or artifact.baseline_version != baseline
+                or artifact.feature_schema_version != FEATURE_SCHEMA_VERSION
             ):
                 continue
             key = (artifact.skill.value, artifact.model_family.value)
@@ -1437,12 +1457,16 @@ class Orchestrator:
             for state in self.learning.skill_states.values()
             if state.risk_mode == self.risk_mode
             and state.configuration_fingerprint == configuration
+            and state.baseline_version == baseline
+            and state.feature_schema_version == FEATURE_SCHEMA_VERSION
         ]
         for summary in skills:
+            # Old feature cohorts survive upgrades for audit. Match the same current
+            # cohort as the learning UI, and report authority from the runtime map.
+            summary["active"] = identity(self.learning.active_skill_versions.get(summary["skill"]))
             state = next((state for state in states if state.skill.value == summary["skill"]), None)
             if state:
                 summary["champion"] = identity(state.champion_version)
-                summary["active"] = identity(state.active_version)
                 summary["testing"] = identity(state.testing_version)
                 summary["shared"] = state.common_forward_count
         training = self.learning.training_status()
@@ -1558,6 +1582,7 @@ class Orchestrator:
             if not self.learning.has_pending_training() or not self._learning_training_can_run():
                 await self._wait_for_stop(1)
                 continue
+            job = None
             try:
                 async with self._event_lock:
                     learner = self.learning
@@ -1616,7 +1641,12 @@ class Orchestrator:
                     metadata=self.learning.training_status(),
                 )
                 await self._wait_for_stop(5)
-            else:
+            finally:
+                # A suspended coroutine otherwise holds the full private fit workspace until
+                # another job is prepared, increasing both idle memory and the next copy's peak.
+                job = None
+                fit_error = None
+            if not self.stop_event.is_set():
                 # Let a newly arrived market batch claim the CPU before another cohort starts.
                 await self._wait_for_stop(0.25)
 
@@ -1720,7 +1750,27 @@ class Orchestrator:
                             else set()
                         )
                     handled_ids: set[str] = set()
-                    for _initial_priority, sequence, event in working_batch:
+                    remaining = deque(working_batch)
+                    urgent_arrivals = 0
+                    while remaining:
+                        # Prefetching for persistence must not hide newly arrived position,
+                        # order, or due-checkpoint traffic behind hundreds of candidates.
+                        # Keep all dequeued receipts in batch until its final task_done calls;
+                        # this also preserves the finite season/shutdown admission boundary.
+                        if (
+                            urgent_arrivals < self.settings.event_batch_size
+                            and self._event_priority(remaining[0][2]) > 0
+                        ):
+                            try:
+                                urgent = self.event_queue.get_nowait_before(1)
+                            except asyncio.QueueEmpty:
+                                pass
+                            else:
+                                batch.append(urgent)
+                                working_batch.append(urgent)
+                                remaining.appendleft(urgent)
+                                urgent_arrivals += 1
+                        _initial_priority, sequence, event = remaining.popleft()
                         if event.event_id in handled_ids:
                             continue
                         handled_ids.add(event.event_id)
@@ -1987,7 +2037,7 @@ class Orchestrator:
                         now=observed_at,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
-                        soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
+                        **self._exit_timing_arguments(),
                     )
             elif not self.running and is_trade and state.mint in self.broker.positions:
                 receipts = []
@@ -2126,6 +2176,9 @@ class Orchestrator:
         if previous is None:
             return True
         if previous.action != decision.action or previous.blockers != decision.blockers:
+            return True
+        if previous.model_version != decision.model_version:
+            # Preserve first participation and replacements even when their verdict is unchanged.
             return True
         if abs(previous.score.composite - decision.score.composite) >= 5:
             return True
@@ -2295,7 +2348,9 @@ class Orchestrator:
                 delay = 5.0
             await self._wait_for_stop(delay)
 
-    async def _enrichment_tick(self, now: datetime) -> None:
+    def _prepare_enrichment(self, now: datetime) -> tuple[set[str], list[TokenState]]:
+        """Prune and select under the market boundary, before any provider I/O."""
+
         execution_mints = set(self.broker.positions)
         execution_mints.update(order.mint for order in self.broker.pending.values())
         keep_mints = set(execution_mints)
@@ -2345,9 +2400,15 @@ class Orchestrator:
                 for mint, value in self._route_retry_delay_seconds.items()
                 if mint in current_mints
             }
-        if self.demo_mode:
-            return
-        candidates = self._enrichment_candidates()
+        return execution_mints, [] if self.demo_mode else self._enrichment_candidates()
+
+    async def _enrichment_tick(self, now: datetime) -> None:
+        # Market and heartbeat work can mutate these collections in worker threads. Keep pending
+        # learning membership and pruning in one short boundary so new evidence is not pruned.
+        async with self._event_lock:
+            execution_mints, candidates = self._prepare_enrichment(now)
+            if self.demo_mode:
+                return
         # Resolve every held/pending exit route before optional metadata calls. One slow routine
         # provider must never delay the ability to value or exit another held position.
         for state in candidates:
@@ -2533,8 +2594,11 @@ class Orchestrator:
         now: datetime,
         execution_mints: set[str],
     ) -> None:
-        feature_engine = self.features
-        targets = self._candidate_verification_targets(now, execution_mints)
+        async with self._event_lock:
+            if self.demo_mode:
+                return
+            feature_engine = self.features
+            targets = self._candidate_verification_targets(now, execution_mints)
         for batch_targets, addresses, minimum_slot in self._candidate_verification_batches(targets):
             try:
                 result = await self.http.solana_multiple_accounts(
@@ -2673,7 +2737,13 @@ class Orchestrator:
                 await self._wait_for_stop(5)
             # At most four passes/second, even when there is years of imported history.
             # Each category owns the writer only for its bounded transaction, not this wait.
-            await self._wait_for_stop(0.25 if self._storage_maintenance_requested else 5)
+            if self._storage_maintenance_deferred_reason == "protecting_market_throughput":
+                # A deferred pass did little or no cleanup. Rechecking capacity four times a
+                # second competes with the very work it yielded to. Bounded deferral still
+                # permits cleanup on a continuously busy stream.
+                await self._wait_for_stop(2)
+            else:
+                await self._wait_for_stop(0.25 if self._storage_maintenance_requested else 5)
 
     def _refresh_storage_yield_signal(self, event_priority: int | None = None) -> None:
         """Bridge event-loop pressure to the SQLite worker with a thread-safe flag."""
@@ -3470,7 +3540,7 @@ class Orchestrator:
                     now=market_now,
                     mode=self.risk_mode,
                     sol_usd_price=sol_usd_price,
-                    soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
+                    **self._exit_timing_arguments(),
                 )
                 receipts.extend(
                     self.broker.process_due_orders(
@@ -3669,7 +3739,7 @@ class Orchestrator:
                         now=market_now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
-                        soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
+                        **self._exit_timing_arguments(),
                     )
                 receipts.extend(
                     self.broker.process_due_orders(
@@ -4893,6 +4963,15 @@ class Orchestrator:
             raise ValueError("switch to Solana Mainnet before activating a qualified learner")
         self.learning.set_mode(mode)
 
+    def set_champion_participation(self, enabled: bool) -> None:
+        if enabled and self.demo_mode:
+            raise ValueError("switch to Solana Mainnet before allowing champion support")
+        if enabled and self._paper_execution_issues:
+            raise ValueError(
+                "the current season must pass its execution audit before champion support"
+            )
+        self.learning.set_participation(enabled)
+
     def set_ai_decision_mode(self, mode: AiDecisionMode) -> None:
         if mode != AiDecisionMode.OFF and self.learning.mode == LearningMode.OFF:
             # The AI's five-minute counterfactual uses the same market observation lifecycle.
@@ -4905,8 +4984,8 @@ class Orchestrator:
     def set_coach_contribution_enabled(self, enabled: bool) -> None:
         if enabled and self.ai_lab.mode == AiDecisionMode.OFF:
             raise ValueError("enable Local AI Shadow before allowing Coach contributions")
-        if enabled and self.learning.mode == LearningMode.OFF:
-            self.learning.set_mode(LearningMode.SHADOW)
+        # This is advance permission, not a request to resume research or learning.
+        # Actual handoff still requires a proved idea in the current context.
         self.coach_contribution_enabled = bool(enabled)
         self.database.set_setting(
             "coach_contribution_enabled",
@@ -5589,7 +5668,7 @@ class Orchestrator:
                         now=now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
-                        soft_hold_seconds=self.learning.recommended_hold_seconds(self.risk_mode),
+                        **self._exit_timing_arguments(),
                     )
         except Exception as exc:
             self.running = False
@@ -5889,6 +5968,7 @@ class Orchestrator:
         provider_health = self.demo.health() if self.demo_mode else self.solana.health()
         tokens = self.features.list_snapshots(limit=30)
         portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
+        current_season = self.database.current_paper_season()
         return {
             "version": __version__,
             "running": self.running,
@@ -5915,6 +5995,14 @@ class Orchestrator:
             "events": dict(self.event_counts),
             "event_pipeline": self.event_pipeline_status(),
             "portfolio": portfolio.model_dump(mode="json"),
+            "season_context": {
+                "season_id": current_season["season_id"],
+                "season_number": current_season["season_number"],
+                "started_at": current_season["started_at"],
+                "peak_equity_minor": portfolio.peak_equity_lamports,
+            }
+            if current_season is not None and current_season["season_id"] == self.broker.season_id
+            else None,
             "season_automation": self.season_automation_status(portfolio, server_time),
             "season_operation": self.season_operation_status(),
             "maintenance_operation": self.maintenance_operation_status(),

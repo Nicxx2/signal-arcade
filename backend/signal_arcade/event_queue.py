@@ -98,6 +98,13 @@ class SeasonEventQueue(asyncio.PriorityQueue[QueuedEvent]):
         with self._boundary_lock:
             return not self._queue or bool(self._queue[0][0])
 
+    def get_nowait_before(self, priority: int) -> QueuedEvent:
+        """Take a more urgent arrival only if it belongs to the current season boundary."""
+        with self._boundary_lock:
+            if self.empty() or self._queue[0][1] >= priority:
+                raise asyncio.QueueEmpty
+            return self.get_nowait()
+
     def task_done(self) -> None:
         super().task_done()
         with self._boundary_lock:

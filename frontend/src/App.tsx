@@ -40,8 +40,10 @@ import { HISTORY_WINDOW, mergeHistoryWindow } from "./championArena/history";
 import { copyText } from "./clipboard";
 import EntryProof from "./EntryProof";
 import { entryProofSummary } from "./entryProofModel";
+import { challengerOverviewSummary } from "./learningSummary";
 import { latestDecisionsByMint, organizeDecisions } from "./decisionView";
-import { buildEquityJourney, unchangedEquitySeconds } from "./equityJourney";
+import { EquityChart } from "./EquityChart";
+import SeasonStrategy from "./SeasonStrategy";
 import { StatusPanel } from "./StatusPanel";
 import { friendlyError, marketHealthDetail, useSystemStatus } from "./systemStatus";
 import type { IssueScope } from "./systemStatus";
@@ -51,7 +53,6 @@ import type {
   DrawdownPolicy,
   ChallengerChampionEvent,
   ChallengerChampionRecord,
-  EquityPoint,
   FeatureSnapshot,
   Fill,
   LearningMode,
@@ -275,32 +276,34 @@ function learningMilestones(snapshot: Snapshot): LearningMilestone[] {
   if (latestVersion && learning.latest_model?.qualified && !learning.activation_available && learning.active_model_health.state !== "suspended") {
     milestones.push({
       id: `challenger-proof-${latestVersion}`,
-      title: "Challenger proof advanced",
+      title: "Entry model proof advanced",
       detail: "The fitted model passed its historical proof; current activation safety is still collecting.",
       tone: "info",
     });
   }
-  if (latestVersion && learning.activation_available && learning.mode !== "active") {
+  if (latestVersion && learning.activation_available && !learning.active_skill_versions?.entry && !learning.active_model) {
     milestones.push({
       id: `challenger-ready-${latestVersion}`,
-      title: "Qualified Challenger ready",
-      detail: "Every server-side proof and current coverage gate passed. It is waiting for your choice.",
+      title: "Entry activation proof ready",
+      detail: learning.mode === "off" ? "Learning and support are paused; saved proof remains."
+        : learning.auto_participation ? "Automatic support is allowed. The engine rechecks current proof before Entry joins."
+          : "Entry's activation checks passed. Automatic support is off until you enable it.",
       tone: "good",
     });
   }
   if (learning.mode === "active" && learning.active_model?.version) {
     milestones.push({
       id: `challenger-active-${learning.active_model.version}`,
-      title: "Qualified Challenger active",
-      detail: "Bounded learned protection is active while the Baseline remains the safe core and fallback.",
+      title: "Entry Champion support active",
+      detail: "Entry support filters Baseline-approved entries while every Baseline safety rule remains in force.",
       tone: "good",
     });
   }
   if (learning.active_model_health.state === "suspended") {
     milestones.push({
       id: `challenger-suspended-${learning.active_model_health.model_version ?? "unknown"}-${learning.active_model_health.suspended_at ?? "current"}`,
-      title: "Baseline safely regained control",
-      detail: "Later unseen evidence suspended the learner and returned it to Shadow.",
+      title: "Entry support returned to Shadow",
+      detail: "Later evidence suspended Entry support. Each other skill remains subject to its own safety checks.",
       tone: "warning",
     });
   }
@@ -317,9 +320,9 @@ function learningMilestones(snapshot: Snapshot): LearningMilestone[] {
           : `${skill.label} skill qualified`,
         detail: championEvent?.kind === "promoted"
           ? "A contender beat the saved Champion on shared forward outcomes. Influence remains separately gated."
-          : learning.consent_granted
-            ? "Its independent proof passed. Fresh combined evidence decides when it may join."
-            : "Its independent proof passed. It remains Shadow until you enable the Challenger once.",
+          : learning.mode === "off" ? "Its independent proof passed. Learning and support are paused."
+            : learning.auto_participation ? "Its independent proof passed. Fresh combined evidence decides when it may join."
+              : "Its independent proof passed. Automatic support is off; saved proof alone grants no influence.",
         tone: "good",
       });
     }
@@ -348,7 +351,7 @@ function learningMilestones(snapshot: Snapshot): LearningMilestone[] {
         milestones.push({
           id: `coach-contribution-handed-off-${hypothesis.hypothesis_id}`,
           title: "Coach idea entered a Challenger battle",
-          detail: "The proved idea is now a contender only. The saved Champion stays in control until fresh common outcomes prove an advantage.",
+          detail: "The proved idea is now a contender. Fresh Champion proof and separate activation checks must pass before it can support the Baseline.",
           tone: "good",
         });
         return;
@@ -825,6 +828,19 @@ export default function App() {
     }
   };
 
+  const setChampionParticipation = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      await api.setChampionParticipation(enabled);
+      resolveIssue("learning");
+      await refresh();
+    } catch (cause) {
+      reportIssue("learning", "Champion support permission was not changed", cause);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const setAiMode = async (mode: AiDecisionMode) => {
     setBusy(true);
     try {
@@ -841,11 +857,21 @@ export default function App() {
   const setCoachContribution = async (enabled: boolean) => {
     setBusy(true);
     try {
-      await api.setCoachContribution(enabled);
+      const confirmed = await api.setCoachContribution(enabled);
+      // Let any read started before the save finish before applying its confirmed permission.
+      // A later dashboard failure must not make a saved opt-in or revocation look undone.
+      await refreshInFlight.current;
+      if (typeof confirmed.contribution_enabled === "boolean") {
+        setSnapshot((current) => current ? {
+          ...current,
+          coach: { ...current.coach, contribution_enabled: confirmed.contribution_enabled },
+        } : current);
+      }
       resolveIssue("ai");
       await refresh();
     } catch (cause) {
-      reportIssue("ai", "AI Coach contribution permission was not changed", cause);
+      reportIssue("ai", "AI Coach contribution permission could not be confirmed", cause);
+      await refresh();
     } finally {
       setBusy(false);
     }
@@ -979,7 +1005,7 @@ export default function App() {
         ) : tab === "leaderboard" ? (
           <LeaderboardView explain={explain} reportIssue={reportIssue} resolveIssue={resolveIssue} />
         ) : tab === "learning" ? (
-          <LearningLab snapshot={snapshot} setLearningMode={setLearningMode} setAiMode={setAiMode} setCoachResearch={setCoachResearch} setCoachContribution={setCoachContribution} busy={controlsBusy} activeView={learningUi.activeView} setActiveView={setLearningView} expandedSections={learningUi.expandedSections} toggleSection={toggleLearningSection} milestones={milestones} hasUnseenMilestones={unseenMilestones.length > 0} />
+          <LearningLab snapshot={snapshot} setChampionParticipation={setChampionParticipation} setLearningMode={setLearningMode} setAiMode={setAiMode} setCoachResearch={setCoachResearch} setCoachContribution={setCoachContribution} busy={controlsBusy} activeView={learningUi.activeView} setActiveView={setLearningView} expandedSections={learningUi.expandedSections} toggleSection={toggleLearningSection} milestones={milestones} hasUnseenMilestones={unseenMilestones.length > 0} />
         ) : tab === "replay" ? (
           <Replay snapshot={snapshot} />
         ) : (
@@ -1231,9 +1257,10 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
       <section className="hero-grid">
         <article className="card equity-card">
           <div className="card-label">Paper equity</div>
+          {snapshot.season_context && <div className="season-context"><strong>Season {snapshot.season_context.season_number}</strong><span>{longDuration(Math.max(0, (Date.parse(snapshot.server_time) - Date.parse(snapshot.season_context.started_at)) / 1_000))} elapsed</span><time dateTime={snapshot.season_context.started_at} title={shortDateTime(snapshot.season_context.started_at)}>Since {shortDate(snapshot.season_context.started_at)}</time></div>}
           <div className="equity-value">{money(portfolio.equity_lamports, portfolio.quote_currency, portfolio.quote_decimals)}</div>
           <div className={`pnl-line ${totalPnl >= 0 ? "positive" : "negative"}`}>{signedMoney(totalPnl, portfolio.quote_currency, portfolio.quote_decimals)} <span>this season</span></div>
-          <EquityChart points={snapshot.equity_history} />
+          <EquityChart key={snapshot.season_context?.season_id ?? "current"} points={snapshot.equity_history} currency={portfolio.quote_currency} decimals={portfolio.quote_decimals} starting={portfolio.starting_lamports} peak={snapshot.season_context?.peak_equity_minor} />
           <div className="equity-meta">
             <span>{portfolio.reserved_cash_lamports ? "Available" : "Cash"} <strong>{money(portfolio.available_cash_lamports, portfolio.quote_currency, portfolio.quote_decimals)}</strong></span>
             {portfolio.reserved_cash_lamports > 0 && <span>Reserved <strong>{money(portfolio.reserved_cash_lamports, portfolio.quote_currency, portfolio.quote_decimals)}</strong></span>}
@@ -1310,7 +1337,7 @@ function Arena({ snapshot, totalPnl, setRisk, setSeasonAutomation, setupPortfoli
           />
           <div className="stack">
             {latestDecisionFeed.map((decision) => <DecisionRow key={decision.decision_id} decision={decision} explain={explain} loading={explainingId === decision.decision_id} />)}
-            {!snapshot.decisions.length && <EmptyState icon={<Activity size={22} />} title="Waiting for evidence" copy="Choose Demo Market in Settings if you want to explore without waiting for a live launch." />}
+            {!snapshot.decisions.length && <EmptyState icon={<Activity size={22} />} title="Waiting for evidence" copy="Choose Synthetic demo in Settings to explore without waiting for a live launch. Switching sources archives the current season." />}
           </div>
         </div>
       </section>
@@ -1921,9 +1948,10 @@ function LearningLab(props: React.ComponentProps<typeof LearningLabContents>) {
   return <ArenaProvider key={contextFor(props.snapshot)} snapshot={props.snapshot}><LearningLabContents {...props} /></ArenaProvider>;
 }
 
-function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
+function LearningLabContents({ snapshot, setChampionParticipation, setLearningMode, setAiMode, setCoachResearch, setCoachContribution, busy, activeView, setActiveView, expandedSections, toggleSection, milestones, hasUnseenMilestones }: {
   snapshot: Snapshot;
   setLearningMode: (mode: LearningMode) => Promise<void>;
+  setChampionParticipation: (enabled: boolean) => Promise<void>;
   setAiMode: (mode: AiDecisionMode) => Promise<void>;
   setCoachResearch: (enabled: boolean) => Promise<void>;
   setCoachContribution: (enabled: boolean) => Promise<void>;
@@ -1940,35 +1968,36 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
   const liveHealth = learning.active_model_health;
   const entryAvailability = learning.entry_outcome_availability;
   const challengerInterval = Math.max(1, learning.challenger_interval_outcomes);
-  const outcomesUntilChallenger = Math.max(
+  const outcomesUntilTraining = Math.max(
     0,
     Math.min(challengerInterval, learning.outcomes_until_next_training),
   );
-  const challengerProgress = challengerInterval - outcomesUntilChallenger;
+  const challengerProgress = challengerInterval - outcomesUntilTraining;
   const progress = latest
     ? challengerProgress / challengerInterval
     : Math.min(1, learning.usable_outcome_count / learning.minimum_training_samples);
-  const progressNow = latest ? challengerProgress : learning.usable_outcome_count;
+  const progressNow = latest ? challengerProgress : Math.min(learning.usable_outcome_count, learning.minimum_training_samples);
   const progressMax = latest ? challengerInterval : learning.minimum_training_samples;
   const progressLabel = latest
-    ? "Progress toward next challenger"
-    : "Progress toward first learning challenger";
-  const nextChallengerCopy = outcomesUntilChallenger === 0
-    ? "Next challenger is ready to fit"
-    : `${outcomesUntilChallenger} more usable outcome${outcomesUntilChallenger === 1 ? "" : "s"} until the next challenger`;
+    ? "Progress toward next training"
+    : "Progress toward first training";
+  const nextTrainingCopy = outcomesUntilTraining === 0
+    ? "Next training · outcome interval met"
+    : `Next training · ${outcomesUntilTraining} more usable outcome${outcomesUntilTraining === 1 ? "" : "s"}`;
   const normalStateCopy = {
-    paused: "Learning is paused. Existing lessons stay safely stored.",
+    paused: "Learning and Champion support are paused. Saved models and lessons are retained.",
     collecting: "Collecting independent forward outcomes before fitting anything.",
-    challenger_testing: "A challenger exists, but it has not beaten the baseline safely yet.",
-    ready: "A challenger passed forward checks and can be enabled when you choose.",
+    challenger_testing: "Skills are collecting and testing evidence for safe Baseline support. Each skill has its own activation checks.",
+    ready: learning.auto_participation
+      ? "Automatic support is allowed. Skills join when their current activation checks pass."
+      : "Entry has current activation proof. Enable automatic support to let qualified skills join.",
     active: "Qualified Challenger skills act only inside their separate safety gates.",
   }[learning.state];
   const stateCopy = liveHealth.state === "suspended"
-    ? "A previously active learner showed confident harm on later unseen outcomes, so the baseline automatically took control."
+    ? "Entry support returned to Shadow after its health checks failed. Each other skill is checked separately."
     : !learning.collecting_from_current_source && learning.mode !== "off"
       ? "Demo stays separate. Switch to Solana mainnet when you want to collect live-paper lessons."
       : normalStateCopy;
-  const canActivate = learning.activation_available && learning.collecting_from_current_source;
   const holdReview = learning.recommended_hold_seconds[snapshot.risk_mode];
   const timing = learning.hold_timing_validation[snapshot.risk_mode];
   const skillStatuses = learning.skills ?? [];
@@ -1983,14 +2012,14 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
   const baselinePolicy = baselineScorecard?.policy;
   const commonForwardMinimum = learning.challenger_common_forward_minimum ?? 30;
   const minimumTournamentAvailability = learning.challenger_minimum_availability ?? 0.70;
-  const activeSkillCount = Math.max(1, Object.keys(learning.active_skill_versions ?? {}).length);
+  const activeSkillCount = Math.max(learning.active_model ? 1 : 0, Object.keys(learning.active_skill_versions ?? {}).length);
   const baselineState = learning.mode === "active" ? "Core + bounded learner" : "In control";
-  const challengerState = liveHealth.state === "suspended"
-    ? "Suspended safely"
-    : learning.mode === "off"
-      ? "Off"
-      : learning.mode === "active"
-        ? "Active"
+  const challengerState = learning.mode === "off"
+    ? "Off"
+    : learning.mode === "active"
+      ? "Active"
+      : liveHealth.state === "suspended"
+        ? "Entry support paused"
         : title(learning.state);
   const coachState = snapshot.coach.mode === "off"
     ? snapshot.ai_lab.mode === "off" ? "Off" : "Paused"
@@ -2000,7 +2029,7 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
     { key: "baseline", label: "Baseline", summary: baselineState },
     { key: "challenger", label: "Challenger", summary: challengerState },
     { key: "coach", label: "AI Coach", summary: coachState },
-    { key: "reviews", label: "Shadow Reviews", summary: snapshot.ai_lab.mode === "off" ? "Off" : "Shadow" },
+    { key: "reviews", label: "Decision Reviews", summary: snapshot.ai_lab.mode === "guarded" ? "Legacy critic" : snapshot.ai_lab.mode === "off" ? "Off" : "Shadow" },
     { key: "safety", label: "Safety", summary: `${learning.guardrails.length} boundaries` },
   ];
   const learningTabListRef = useRef<HTMLDivElement>(null);
@@ -2053,8 +2082,8 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
       </section>}
       <section className="learning-team-strip" aria-label="Learning team status">
         <button type="button" onClick={() => setActiveView("baseline")}><span>Fast Baseline</span><strong>{baselineState}</strong><small>Deterministic · {title(snapshot.risk_mode)} · safe fallback</small><em>Open Baseline <ChevronRight size={12} /></em></button>
-        <button type="button" onClick={() => setActiveView("challenger")}><span>Statistical Challenger</span><strong>{challengerState}</strong><small>{entryProofSummary(learning)}</small><em>Open Challenger <ChevronRight size={12} /></em></button>
-        <button type="button" onClick={() => setActiveView("coach")}><span>Local AI Lab</span><strong>{snapshot.ai_lab.mode === "off" ? "Off" : "Shadow"} · {coachState}</strong><small>Coach + saved decision reviews · zero influence</small><em>Open AI Coach <ChevronRight size={12} /></em></button>
+        <button type="button" onClick={() => setActiveView("challenger")}><span>Statistical Challenger</span><strong>{challengerState}</strong><small>{challengerOverviewSummary(learning)}</small><em>Open Challenger <ChevronRight size={12} /></em></button>
+        <button type="button" onClick={() => setActiveView("coach")}><span>Local AI Lab</span><strong>{snapshot.ai_lab.mode === "guarded" ? "Legacy critic" : title(snapshot.ai_lab.mode)} · {coachState}</strong><small>{snapshot.ai_lab.mode === "guarded" ? "Entry vetoes allowed · Coach research stays separate" : "Coach + saved reviews · no direct trade influence"}</small><em>Open AI Coach <ChevronRight size={12} /></em></button>
       </section>
       <div className="learning-overview-note"><ShieldCheck size={15} /><span><strong>The Baseline acts; the others must earn trust.</strong><small>Challenger and local AI evidence stays separate, measurable, bounded, and reversible.</small></span></div>
     </>}
@@ -2062,7 +2091,7 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
     {activeView === "baseline" && <>
       <div className="learning-view-heading"><div><span>Fast Baseline</span><h2>The deterministic trader and permanent safe fallback</h2></div><strong>{baselineState} · {title(snapshot.risk_mode)}</strong></div>
       <article className="card baseline-overview">
-        <div><Gauge size={19} /><span><strong>Acts on fresh market evidence</strong><small>Scores entries and manages exits without waiting for local AI.</small></span></div>
+        <div><Gauge size={19} /><span><strong>Acts on fresh market evidence</strong><small>Scores entries and manages exits using fixed rules.</small></span></div>
         <div><ShieldCheck size={19} /><span><strong>Does not fit itself</strong><small>The Challenger studies measured outcomes separately; the Baseline stays predictable.</small></span></div>
         <div><RotateCcw size={19} /><span><strong>Always available as fallback</strong><small>If learned behavior becomes harmful or unverifiable, control returns here automatically.</small></span></div>
       </article>
@@ -2079,28 +2108,28 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
       {snapshot.demo_mode && learning.demo_excluded && <div className="learning-demo-note"><ShieldCheck size={17} /><div><strong>Demo experience stays separate</strong><p>Synthetic tokens can never train or activate the live learner.</p></div></div>}
 
       <div className="challenger-controls">
-        <div><strong>Challenger control</strong><small>The next evaluation is not an unlock. Every proof gate must pass independently.</small></div>
+        <div><strong>Automatic champion support</strong><small>Opt in once. Each skill may join when its own proof and the exact skill combination pass. Entry is not required for another skill to support the Baseline.</small></div>
         <div className="learning-controls">
+          <button className={`button ${learning.auto_participation ? "learning-primary" : "ghost"}`} role="switch" aria-checked={learning.auto_participation ?? false} aria-label="Automatic champion support" disabled={busy || (!learning.auto_participation && snapshot.demo_mode)} onClick={() => void setChampionParticipation(!learning.auto_participation)}><ShieldCheck size={15} />{learning.auto_participation ? "Support allowed" : "Allow when qualified"}</button>
           {learning.mode === "off"
-            ? <button className="button learning-primary" onClick={() => void setLearningMode("shadow")} disabled={busy}><Play size={15} /> Start Challenger Shadow</button>
-            : <button className="button ghost" onClick={() => void setLearningMode("off")} disabled={busy}><Pause size={15} /> Pause Challenger learning</button>}
-          {learning.mode === "active"
-            ? <button className="button learning-primary" onClick={() => void setLearningMode("shadow")} disabled={busy}><ShieldCheck size={15} /> Return Challenger to Shadow</button>
-            : <button className="button learning-primary" onClick={() => void setLearningMode("active")} disabled={busy || !canActivate} title={!learning.collecting_from_current_source ? "Switch to Solana mainnet before activation" : learning.activation_available ? "Use the newest qualified challenger" : "Every server-side proof and current coverage gate must pass first"}><TrendingUp size={15} /> Use qualified Challenger</button>}
+            ? <button className="button ghost" onClick={() => void setLearningMode("shadow")} disabled={busy}><Play size={15} /> Resume learning</button>
+            : <button className="button ghost" onClick={() => void setLearningMode("off")} disabled={busy}><Pause size={15} /> Pause learning &amp; support</button>}
+          {!learning.auto_participation && learning.mode === "active" && <button className="button ghost" onClick={() => void setLearningMode("shadow")} disabled={busy}>Stop current support</button>}
         </div>
       </div>
+      <p className="participation-note">{learning.mode === "off" ? "Learning and champion influence are paused. Saved models remain; already queued work may finish. Resume learning to continue." : learning.auto_participation ? activeSkillCount ? `${activeSkillCount} skill${activeSkillCount === 1 ? " is" : "s are"} supporting the Baseline. Others wait for proof. Harmful or unverifiable skills step out automatically; a newly proved replacement can join.` : "Permission is saved. The Baseline stays in control while Champions earn current activation proof." : learning.mode === "active" ? "Manually enabled support is active. Stop current support to return to Shadow, or opt into automatic qualification checks." : "Automatic support is off. Learning can continue in Shadow; saved Champions do not grant trading authority."} The Baseline's entry approval, executable routes, sizing limits and hard exits remain in force.</p>
 
       <section className="card learning-progress-card">
         <div><span className={`learning-state state-${learning.state}`} /> <strong>{title(learning.state)}</strong><small>{learning.mode === "active" ? `${activeSkillCount} bounded skill${activeSkillCount === 1 ? "" : "s"} active · ${duration(holdReview)} hold review` : `Baseline remains in control · ${duration(holdReview)} hold review`}</small></div>
-        <div className="learning-progress-copy"><strong>{latest ? `${learning.usable_outcome_count} usable` : `${learning.usable_outcome_count} / ${learning.minimum_training_samples}`}</strong><small>{latest ? `Minimum ${learning.minimum_training_samples} met · ${nextChallengerCopy}` : "usable five-minute outcomes before first training"}</small></div>
+        <div className="learning-progress-copy"><strong>{learning.usable_outcome_count} usable</strong><small>{learning.mode === "off" ? "Training paused · progress saved" : latest ? nextTrainingCopy : `First training · minimum ${learning.minimum_training_samples} ${learning.usable_outcome_count >= learning.minimum_training_samples ? "met" : "needed"}`}</small></div>
         <div className="learning-progress" role="progressbar" aria-label={progressLabel} aria-valuemin={0} aria-valuemax={progressMax} aria-valuenow={progressNow}><span style={{ width: `${progress * 100}%` }} /></div>
       </section>
 
       <section className="stats-grid learning-stats">
-        <Stat label="Tokens remembered" value={compact(learning.observation_count)} hint={`Newest ${compact(learning.model_window_observations)} train · ${compact(learning.retained_observation_limit)} retained`} />
-        <Stat label="Usable outcomes" value={compact(learning.usable_outcome_count)} hint="After entry, exit and fees" />
+        <Stat label="Tokens remembered" value={compact(learning.observation_count)} hint={`Training window: up to ${compact(learning.model_window_observations)} · Keeps ${compact(learning.retained_observation_limit)} completed + pending`} />
+        <Stat label="Usable outcomes" value={compact(learning.usable_outcome_count)} hint="Eligible five-minute outcomes after fees" />
         <Stat label="Still unfolding" value={compact(learning.pending_count)} hint="Measured at 1, 5, 10, 15 and 20 minutes" />
-        <Stat label="Unknown outcomes" value={compact(learning.unavailable_outcome_count)} hint="No fake P/L; unavailable exits reduce horizon utility" />
+        <Stat label="Unknown outcomes" value={compact(learning.unavailable_outcome_count)} hint="Five-minute outcome unavailable; never assumed zero" />
       </section>
 
       {skillStatuses.length > 0 && <section className="challenger-skill-grid" aria-label="Challenger skills">
@@ -2121,12 +2150,14 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
           const tournamentAvailability = typeof skill.tournament.availability_fraction === "number"
             ? skill.tournament.availability_fraction
             : null;
+          const supportProof = skill.support_proof?.artifact_version === skill.champion?.version
+            ? skill.support_proof : null;
           const battleProgress = skill.testing_version
             ? skill.common_forward_count >= commonForwardMinimum
               && tournamentAvailability !== null
               && tournamentAvailability < minimumTournamentAvailability
-              ? `${percent(tournamentAvailability)} coverage · needs ${percent(minimumTournamentAvailability)}`
-              : `${skill.common_forward_count} / ${commonForwardMinimum} shared outcomes`
+              ? `Battle: ${skill.common_forward_count} usable · ${percent(tournamentAvailability)} coverage (needs ${percent(minimumTournamentAvailability)})`
+              : `Battle: ${skill.common_forward_count} usable · Minimum ${commonForwardMinimum} ${skill.common_forward_count >= commonForwardMinimum ? "met" : "needed"}`
             : latestSkillEvent
               ? lastChampionEventLabel(latestSkillEvent)
               : candidate
@@ -2141,6 +2172,7 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
               <span><small>Influence</small><strong>{skill.active_version ? "Active" : skill.state === "suspended" ? "Suspended" : "Shadow"}</strong></span>
             </div>
             {skill.skill === "entry" && learning.nonlinear_entry && <NonlinearEntryProgress status={learning.nonlinear_entry} />}
+            {learning.auto_participation && skill.champion && !skill.active_version && skill.state !== "suspended" && <p className="challenger-waiting"><span>{learning.mode === "off" ? "Support paused" : "Waiting to support"}</span>{supportProof ? `${supportProof.usable_count} usable · Minimum ${commonForwardMinimum} ${supportProof.usable_count >= commonForwardMinimum ? "met" : "needed"} · ${supportProof.observed_count > 0 ? `${percent(supportProof.availability_fraction)} coverage` : "Coverage pending"}. Safe advantage and safety checks required.` : learning.mode === "off" ? "Permission is saved. Resume learning to continue support checks." : "Permission is saved. Current activation proof is checked as new outcomes arrive."}</p>}
             {!candidate?.qualified && waitingGate && <p className="challenger-waiting"><span>Waiting for evidence</span>{waitingGate.label} · {waitingGate.detail}</p>}
             {(candidate || skill.champion) && <details className="challenger-artifact-details">
               <summary>Artifact details</summary>
@@ -2149,6 +2181,7 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
                 {candidate && <span><small>Evidence split</small><strong>{compact(candidate.training_count)} train · {compact(candidate.validation_count)} validation</strong></span>}
                 {skill.champion && <span><small>Champion recipe</small><strong>{modelFamilyLabel(skill.champion.model_family)} · {skill.champion.recipe_version ?? "legacy recipe"}</strong></span>}
                 {candidate?.training_cutoff_at && <span><small>Frozen cutoff</small><strong>{shortDate(candidate.training_cutoff_at)}</strong></span>}
+                {supportProof && <span className="support-proof-details"><small>Champion support evidence</small><strong>{supportProof.usable_count} usable of {supportProof.observed_count} observed · {percent(minimumTournamentAvailability)} coverage required</strong></span>}
               </div>
             </details>}
             <ArenaSkillButton skill={skill.skill} />
@@ -2231,14 +2264,14 @@ function LearningLabContents({ snapshot, setLearningMode, setAiMode, setCoachRes
     </>}
 
     {activeView === "coach" && <>
-      <div className="learning-view-heading"><div><span>AI Coach</span><h2>Slow, asynchronous experiments that can never delay a trade</h2></div><strong>{snapshot.ai_lab.mode === "off" ? "Off" : `${coachState} · Shadow`}</strong></div>
+      <div className="learning-view-heading"><div><span>AI Coach</span><h2>Background experiments; market work has priority</h2></div><strong>{snapshot.ai_lab.mode === "off" ? "Off" : `${coachState} · Research only`}</strong></div>
       <div className="local-ai-boundary"><Bot size={17} /><div><strong>Research director, never a hidden trader</strong><small>The Coach studies saved outcomes. With your permission, a supported idea may enter a normal Challenger tournament; it can never bypass proof or act directly.</small></div></div>
       <CoachRoom snapshot={snapshot} setCoachResearch={setCoachResearch} setCoachContribution={setCoachContribution} busy={busy} expandedSections={expandedSections} toggleSection={toggleSection} />
     </>}
 
     {activeView === "reviews" && <>
-      <div className="learning-view-heading"><div><span>Shadow Decision Reviews</span><h2>Saved decision explanations and counterfactual evidence</h2></div><strong>{snapshot.ai_lab.mode === "off" ? "Off" : "Shadow · no influence"}</strong></div>
-      <div className="local-ai-boundary"><Bot size={17} /><div><strong>Completely off the live path</strong><small>Reviews use normalized saved evidence after decisions. They cannot create, resize, delay, or alter a trade.</small></div></div>
+      <div className="learning-view-heading"><div><span>Decision Reviews</span><h2>Saved decision explanations and counterfactual evidence</h2></div><strong>{snapshot.ai_lab.mode === "guarded" ? "Legacy critic · veto only" : snapshot.ai_lab.mode === "off" ? "Off" : "Shadow · no influence"}</strong></div>
+      <div className="local-ai-boundary"><Bot size={17} /><div><strong>{snapshot.ai_lab.mode === "guarded" ? "Legacy entry vetoes are enabled" : "Saved reviews stay off the decision path"}</strong><small>{snapshot.ai_lab.mode === "guarded" ? "Guarded mode may veto a Baseline-approved entry after its own proof checks. It cannot create entries, change sizes or bypass safety gates. Coach research remains separate." : "Shadow reviews use saved evidence after decisions. Trading does not wait for these reviews, and they cannot alter a trade."}</small></div></div>
       <AiDecisionLabCard snapshot={snapshot} setAiMode={setAiMode} busy={busy} />
     </>}
 
@@ -2295,13 +2328,19 @@ function CoachRoom({ snapshot, setCoachResearch, setCoachContribution, busy, exp
   const notebook = coach.recent_hypotheses.filter((item) => item.context_active);
   return <article className="card coach-card">
     <div className="coach-heading">
-      <SectionHeader title="AI Coach" subtitle="Slow, allowlisted experiments for the fast engine · Shadow-only" />
+      <SectionHeader title="AI Coach" subtitle="Bounded research ideas for future Challengers" />
       <div className="coach-heading-actions"><span className={`coach-state state-${coach.state}`}>{title(coach.state)}</span><button className="button subtle" disabled={busy || snapshot.ai_lab.mode === "off"} onClick={() => void setCoachResearch(!researchEnabled)}>{researchEnabled ? "Pause research" : "Start research"}</button></div>
     </div>
     <div className="coach-summary">
-      <div><span>Coach mode</span><strong>{coach.mode === "shadow" ? "Watching" : snapshot.ai_lab.mode === "off" ? "Off" : "Paused"}</strong><small>{snapshot.ai_lab.mode === "off" ? "No local model work" : coach.mode === "off" ? "Research can resume without losing evidence" : coach.worker_running ? "Background worker healthy" : "No AI coach calls"}</small></div>
-      <div><span>Influence</span><strong>Research only</strong><small>{contributionEnabled ? "Proved ideas may challenge · never act directly" : "Cannot change entries, exits, sizing or safety"}</small></div>
+      <div><span>Coach mode</span><strong>{coach.mode === "shadow" ? "Watching" : snapshot.ai_lab.mode === "off" ? "Off" : "Paused"}</strong><small>{snapshot.ai_lab.mode === "off" ? "Coach research is off" : coach.mode === "off" ? "Research can resume without losing evidence" : coach.worker_running ? "Background worker healthy" : "No AI coach calls"}</small></div>
+      <div><span>Direct influence</span><strong>None</strong><small>Tested policies can earn Champion support</small></div>
       <div><span>Next review</span><strong>{active ? "Forward test active" : coach.outcomes_until_review === 0 ? "When the engine is quiet" : `${coach.outcomes_until_review} outcomes`}</strong><small>{coach.outcomes_seen.toLocaleString()} fee-inclusive outcomes seen</small></div>
+    </div>
+    <div className="coach-contribution-control">
+      <div><strong>Automatic challengers</strong><small id="coach-contribution-description">{contributionEnabled
+        ? snapshot.ai_lab.mode === "off" ? "Permission saved. Local AI Off pauses new handoffs." : "Permission saved. Proved ideas enter Challenger battles automatically."
+        : snapshot.ai_lab.mode === "off" ? "Enable AI Shadow in Decision Reviews to allow future contributions." : "Allow now or later. Only proved ideas can enter Challenger battles."}</small></div>
+      <button className={`button ${contributionEnabled ? "ghost" : "learning-primary"}`} aria-pressed={contributionEnabled} aria-describedby="coach-contribution-description" disabled={busy || (!contributionEnabled && snapshot.ai_lab.mode === "off")} onClick={() => void setCoachContribution(!contributionEnabled)}>{contributionEnabled ? "Turn contribution off" : "Allow when ready"}</button>
     </div>
     <p className="coach-state-copy"><Bot size={15} />{stateCopy[coach.state]}</p>
     {lanes.length > 0 && <section className="coach-lane-grid" aria-label="AI Coach research lanes">
@@ -2318,11 +2357,11 @@ function CoachRoom({ snapshot, setCoachResearch, setCoachContribution, busy, exp
       </div>
       <div className="coach-proof-grid">
         <div><span>Historical screen</span><strong>{current.discovery_uplift_lower_bound === null ? "Unknown" : `${percentSigned(current.discovery_uplift_lower_bound)} floor`}</strong><small>{current.discovery_usable_count} usable · could only propose</small></div>
-        <div><span>New forward evidence</span><strong>{current.forward_mean_uplift === null ? "Collecting" : percentSigned(current.forward_mean_uplift)}</strong><small>{current.forward_usable_count} / {current.minimum_forward_samples} usable</small></div>
+        <div><span>New forward evidence</span><strong>{current.forward_mean_uplift === null ? "Collecting" : percentSigned(current.forward_mean_uplift)}</strong><small>{current.forward_usable_count} usable · Minimum {current.minimum_forward_samples} {current.forward_usable_count >= current.minimum_forward_samples ? "met" : "needed"}</small></div>
         <div><span>Outcome coverage</span><strong>{percent(current.forward_availability_fraction)}</strong><small>Needs {percent(current.minimum_availability_fraction)}</small></div>
-        <div><span>Independent seasons</span><strong>{current.forward_season_count} / {coach.minimum_forward_seasons}</strong><small>{coach.minimum_samples_per_season ?? 10}+ usable outcomes in each</small></div>
+        <div><span>Independent seasons</span><strong>{current.forward_season_count}</strong><small>Minimum {coach.minimum_forward_seasons} {current.forward_season_count >= coach.minimum_forward_seasons ? "met" : "needed"} · {coach.minimum_samples_per_season ?? 10}+ usable outcomes in each</small></div>
       </div>
-      <div className="coach-progress" role="progressbar" aria-label="Coach forward-test progress" aria-valuemin={0} aria-valuemax={current.minimum_forward_samples} aria-valuenow={current.forward_usable_count}><span style={{ width: `${progress * 100}%` }} /></div>
+      <div className="coach-progress" role="progressbar" aria-label="Coach forward-test progress" aria-valuemin={0} aria-valuemax={current.minimum_forward_samples} aria-valuenow={Math.min(current.forward_usable_count, current.minimum_forward_samples)} aria-valuetext={`${current.forward_usable_count} usable; minimum ${current.minimum_forward_samples} ${current.forward_usable_count >= current.minimum_forward_samples ? "met" : "needed"}`}><span style={{ width: `${progress * 100}%` }} /></div>
     </div> : <div className="coach-empty">
       <BrainCircuit size={21} />
       <div><strong>{latestReview?.selected_candidate_id === "none" ? "No experiment cleared screening yet" : "The coach is observing"}</strong><small>{latestReview?.summary || "It will review compact, normalized outcomes without placing work on the live decision path."}</small></div>
@@ -2339,11 +2378,12 @@ function CoachRoom({ snapshot, setCoachResearch, setCoachContribution, busy, exp
       </ol> : <EmptyState icon={<BrainCircuit size={22} />} title="The notebook is empty" copy="The Coach will record the first bounded study only after enough fee-inclusive evidence clears screening." />}
     </LearningDisclosure>
 
-    <LearningDisclosure id="coach-contribution" title="Road to contribution" subtitle="Coach proof first, then a completely new Challenger battle" summary={current?.contribution_state === "handed_off" ? "Contender handed off" : contributionEnabled ? "Permission on" : contributionReady ? "Permission available" : `${coachPassed} / ${coachTotal || 6} Coach gates`} open={expandedSections.has("coach_contribution")} onToggle={() => toggleSection("coach_contribution")}>
-      <div className="coach-contribution-path" aria-label="Coach contribution path"><span>Allowlisted idea</span><ChevronRight size={14} /><span>Coach forward proof</span><ChevronRight size={14} /><span>Challenger contender</span><ChevronRight size={14} /><span>Champion battle</span></div>
+    <LearningDisclosure id="coach-contribution" title="How Coach contributes" subtitle="Fresh proof, a Champion battle, then activation checks" summary={current?.contribution_state === "handed_off" ? "Contender handed off" : contributionReady ? "Idea proved" : `${coachPassed} / ${coachTotal || 6} Coach gates`} open={expandedSections.has("coach_contribution")} onToggle={() => toggleSection("coach_contribution")}>
+      <div className="coach-contribution-path" aria-label="Coach contribution path"><span>Bounded idea</span><ChevronRight size={14} /><span>Fresh proof</span><ChevronRight size={14} /><span>Champion battle</span><ChevronRight size={14} /><span>Eligible support</span></div>
+      <p className="coach-proof-note">Coach chooses from bounded rule templates for Entry, Manipulation, Sizing or Exit. An idea must pass fresh research proof before it can become a Challenger; it waits if that skill has no Champion yet.</p>
+      <p className="coach-proof-note">A winner still needs activation proof and separate Champion support permission. Decision Reviews stay advisory. Permission survives restarts without resuming paused research or learning; turning it off stops new handoffs, while existing contenders and Champions keep their normal rules.</p>
       {contributionCandidate && <p className="coach-contribution-candidate"><BrainCircuit size={14} /><span><strong>{CHALLENGER_SKILL_LABELS[contributionCandidate.skill]} idea ready</strong><small>{contributionCandidate.title}{contributionCandidate.state === "waiting_for_champion" ? " · waiting for that skill's first statistical Champion" : ""}</small></span></p>}
       <ReadinessGates gates={coachGates} emptyCopy="No Coach experiment is selected yet, so its independent forward proof has not started." />
-      <div className="coach-contribution-control"><div><strong>Allow proved Coach ideas to challenge</strong><small>Permission only hands a supported policy to the existing statistical tournament. It never enables direct AI trading.</small></div><button className={`button ${contributionEnabled ? "ghost" : "learning-primary"}`} disabled={busy || (!contributionEnabled && (snapshot.ai_lab.mode === "off" || !contributionReady))} onClick={() => void setCoachContribution(!contributionEnabled)}>{contributionEnabled ? "Turn contribution off" : "Allow contribution"}</button></div>
       {coachTotal > 0 && <p className="coach-proof-note"><ShieldCheck size={13} />{coachPassed} / {coachTotal} Coach proof gates passed. Challenger tournament evidence begins only after handoff.</p>}
     </LearningDisclosure>
 
@@ -2381,13 +2421,13 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
     copy: string;
     futureHint?: string;
   }> = [
-    { key: "off", mode: "off", label: "Off", copy: "No AI calls" },
-    { key: "shadow", mode: "shadow", label: "Shadow", copy: "Observes and tests without influence" },
+    { key: "off", mode: "off", label: "Off", copy: "Reviews & research paused" },
+    { key: "shadow", mode: "shadow", label: "Shadow", copy: "Reviews without direct trade influence" },
     {
       key: "qualified-coach",
       label: "Qualified Coach",
       copy: coachTotal ? `${coachPassed}/${coachTotal} Coach Shadow gates · future` : "Coach proof collecting · future",
-      futureHint: "Future update — Coach proof progress is shown above. This stage remains unavailable even after evidence passes, until its bounded influence path is implemented and validated.",
+      futureHint: "Direct Coach control remains unavailable. Supported research ideas may already enter a normal Challenger tournament when contribution permission is enabled; that separate path still requires every skill proof check.",
     },
     {
       key: "live-critic",
@@ -2397,10 +2437,10 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
     },
   ];
   const recent = lab.recent_assessments.slice(0, 5);
-  const displayedMode = lab.mode === "guarded" ? "Qualified Coach (legacy)" : title(lab.mode);
+  const displayedMode = lab.mode === "guarded" ? "Guarded critic (legacy)" : title(lab.mode);
   return <article className="card ai-lab-card">
     <div className="ai-lab-heading">
-      <SectionHeader title="Shadow Decision Reviews" subtitle="AI Decision Lab · reviews completed decisions only; Live Critic remains a future stage" />
+      <SectionHeader title="Decision Reviews" subtitle={lab.mode === "guarded" ? "Legacy Guarded critic · bounded entry vetoes enabled" : "AI Decision Lab · saved Shadow reviews; direct Coach control remains unavailable"} />
       <span className={`ai-mode-badge ${lab.mode}`}>{displayedMode}</span>
     </div>
     <div className="ai-mode-grid">
@@ -2430,11 +2470,11 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
     <div className="ai-lab-summary">
       <div><span>Selected model</span><strong>{lab.selected_model}</strong><small>{selectedCatalog?.installed ? `Installed reviewed model · ${runtimeLabel}` : selectedCatalog ? "Install it in Settings before Shadow can run" : "Legacy/custom explanation model · choose a reviewed model in Settings"}</small></div>
       <div><span>Shadow evidence</span><strong>{qualification.resolved} resolved</strong><small>{percent(qualification.valid_fraction)} valid · evidence alone never enables a future stage</small></div>
-      <div><span>Influence</span><strong>{lab.mode === "guarded" ? "Veto only" : "None"}</strong><small>AI can never create or resize an entry</small></div>
+      <div><span>Direct review influence</span><strong>{lab.mode === "guarded" ? "Veto only" : "None"}</strong><small>Coach research has a separate Challenger path</small></div>
     </div>
-    <p className="ai-lab-note"><ShieldCheck size={14} />Shadow is the only AI analysis stage available now. It observes normalized saved evidence without influencing trades; later stages stay locked until separately implemented and validated.</p>
+    <p className="ai-lab-note"><ShieldCheck size={14} />{lab.mode === "guarded" ? "This installation has legacy Guarded mode enabled. Choose Shadow to remove entry vetoes while keeping saved reviews. This screen does not enable legacy Guarded mode." : lab.mode === "off" ? "Automatic reviews and Coach research are paused. An explanation you request may still use the installed local model; it cannot change the saved decision." : "Shadow reviews have no direct trade influence. Coach research may propose a normal Challenger contender with separate permission; direct Coach control and the new Live Critic stage remain unavailable."}</p>
     <ReadinessGates gates={aiGates} emptyCopy="This running backend predates detailed AI Shadow evidence gates; later stages still remain unavailable." />
-    {aiTotal > 0 && <p className="ai-proof-note"><ShieldCheck size={13} />{aiPassed} / {aiTotal} Shadow evidence gates passed. Qualified Coach remains a future feature even when all are met; Live Critic has no readiness claim yet.</p>}
+    {aiTotal > 0 && <p className="ai-proof-note"><ShieldCheck size={13} />{aiPassed} / {aiTotal} Shadow evidence gates passed. These gates do not unlock direct Coach control or the new Live Critic stage.</p>}
     {recent.length > 0 && <div className="ai-assessment-list">
       {recent.map((assessment) => <div key={assessment.assessment_id}><span className={`ai-verdict ${assessment.valid ? assessment.verdict ?? "unknown" : "invalid"}`}>{assessment.valid ? title(assessment.verdict ?? "unknown") : aiFailureLabel(assessment.invalid_reason)}</span><div><strong title={tokenSymbolKnown(assessment.symbol) ? undefined : assessment.mint}>{tokenDisplayLabel(assessment.symbol, assessment.mint)}</strong><small>{assessment.valid ? assessment.summary || "Bounded assessment completed" : aiFailureDetail(assessment.invalid_reason)}</small></div><div><strong>{!assessment.valid ? "Ignored safely" : assessment.resolved_at ? assessment.counterfactual_uplift === null ? "No outcome" : `${percentSigned(assessment.counterfactual_uplift)} veto value` : "Measuring…"}</strong><small>{assessment.latency_ms.toLocaleString()} ms</small></div></div>)}
     </div>}
@@ -3030,6 +3070,7 @@ function SeasonRow({ season }: { season: PaperSeason }) {
     <span data-label="Trades"><strong>{season.closed_trades.toLocaleString()}</strong><small>{money(season.total_fees_minor, season.quote_currency, season.quote_decimals)} fees</small></span>
     <span data-label="Drawdown"><strong>{percent(season.ending_drawdown_fraction)}</strong><small>{season.open_positions ? `${season.open_positions} ${unresolved ? "unresolved at boundary" : `open at ${season.status === "current" ? "present" : "finish"}`}` : "No open positions"}</small></span>
     <span data-label="Duration"><strong>{longDuration(season.duration_seconds)}</strong><small>Started {shortDate(season.started_at)}</small></span>
+    <SeasonStrategy usage={season.strategy_usage} />
     {!!boundaryInventory.length && <details className="season-unresolved-detail">
       <summary>Review boundary inventory · {boundaryInventory.length}</summary>
       <div>{boundaryInventory.map((position) => <span key={position.position_id}>
@@ -3061,7 +3102,7 @@ function seasonTrend(completed: PaperSeason[]): { title: string; copy: string; t
   const tone = returnDelta > 0.001 ? "good" : returnDelta < -0.001 ? "bad" : "neutral";
   return {
     title: `Latest net return ${direction}`,
-    copy: `Season ${latest.season_number} finished at ${percentSigned(latest.net_return_fraction ?? 0)} versus ${percentSigned(previous.net_return_fraction ?? 0)} in Season ${previous.season_number}.${winDelta === null ? "" : ` Win rate moved ${percentSigned(winDelta)}.`}`,
+    copy: `Season ${latest.season_number} finished at ${percentSigned(latest.net_return_fraction ?? 0)} versus ${percentSigned(previous.net_return_fraction ?? 0)} in Season ${previous.season_number}.${winDelta === null ? "" : ` Win rate moved ${percentSigned(winDelta).replace("%", " percentage points")}.`}`,
     tone,
   };
 }
@@ -3151,7 +3192,7 @@ function Replay({ snapshot }: { snapshot: Snapshot }) {
       <Stat label="Average impact" value={averageImpact === null ? "—" : percent(averageImpact)} hint="Recorded price impact" />
       <Stat label="Median latency" value={medianLatency === null ? "—" : formatLatency(medianLatency)} hint="Order request to paper fill" />
     </section>
-    <article className="card replay-chart"><SectionHeader title="Equity history" subtitle={`Current season · ${snapshot.equity_history.length} recorded market checkpoints · ${currency} account`} /><EquityChart points={snapshot.equity_history} tall /></article>
+    <article className="card replay-chart"><SectionHeader title="Equity history" subtitle={`${snapshot.season_context ? `Season ${snapshot.season_context.season_number}` : "Current season"} · ${snapshot.equity_history.length} saved chart points · ${currency} account`} /><EquityChart key={snapshot.season_context?.season_id ?? "current"} points={snapshot.equity_history} currency={currency} decimals={snapshot.portfolio.quote_decimals} starting={snapshot.portfolio.starting_lamports} peak={snapshot.season_context?.peak_equity_minor} tall /></article>
     <SectionHeader title="Fill receipts" subtitle={receiptScope} />
     {fills.length === 30 && <p className="replay-scope-note"><History size={14} />Replay keeps the live dashboard responsive with the newest 30 receipts; Results summarizes the complete current season.</p>}
     <div className="fills-table" role="table" aria-label="Current-season paper fill receipts">
@@ -3966,68 +4007,6 @@ function FillRow({ fill }: { fill: Fill }) {
     <span role="cell" data-label="Fees" aria-label={`Fees ${feeCopy}`} className="fill-fees"><strong>{money(fees, fill.account_currency, fill.account_decimals)}</strong><small>{money(fill.account_protocol_fee_minor, fill.account_currency, fill.account_decimals)} protocol · {money(fill.account_network_fee_minor, fill.account_currency, fill.account_decimals)} network</small></span>
     <span role="cell" data-label="Impact" aria-label={`Impact ${percent(fill.price_impact_fraction)}`}><strong>{percent(fill.price_impact_fraction)}</strong></span>
     <span role="cell" data-label="Latency" aria-label={`Latency ${formatLatency(fill.latency_ms)}, ${Math.round(fill.latency_ms).toLocaleString()} milliseconds exact`}><strong>{formatLatency(fill.latency_ms)}</strong>{fill.latency_ms >= 1_000 && <small>{Math.round(fill.latency_ms).toLocaleString()}ms exact</small>}</span>
-  </div>;
-}
-
-function EquityChart({ points, tall = false }: { points: EquityPoint[]; tall?: boolean }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const [view, setView] = useState<"journey" | "time">("journey");
-  const journey = useMemo(() => buildEquityJourney(points), [points]);
-  const displayPoints = view === "journey" ? journey : points;
-  const unchangedSeconds = unchangedEquitySeconds(points);
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const draw = () => {
-      const rect = canvas.getBoundingClientRect();
-      const ratio = Math.min(devicePixelRatio, 2);
-      canvas.width = Math.max(1, rect.width * ratio);
-      canvas.height = Math.max(1, rect.height * ratio);
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.scale(ratio, ratio);
-      ctx.clearRect(0, 0, rect.width, rect.height);
-      const data = displayPoints.length ? displayPoints : [{ recorded_at: "", equity_lamports: 0, cash_lamports: 0 }];
-      const values = data.map((point) => point.equity_lamports);
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const flat = max === min;
-      const range = Math.max(1, max - min);
-      const pad = 8;
-      const timestamps = data.map((point) => Date.parse(point.recorded_at));
-      const firstTime = Math.min(...timestamps);
-      const lastTime = Math.max(...timestamps);
-      const useTime = view === "time" && timestamps.every(Number.isFinite) && lastTime > firstTime;
-      let coords = data.map((point, index) => ({
-        x: pad + (useTime ? (timestamps[index]! - firstTime) / (lastTime - firstTime) : index / Math.max(1, data.length - 1)) * (rect.width - pad * 2),
-        y: flat ? rect.height / 2 : pad + (1 - (point.equity_lamports - min) / range) * (rect.height - pad * 2),
-      }));
-      if (coords.length === 1) coords = [{ x: pad, y: coords[0]!.y }, { x: rect.width - pad, y: coords[0]!.y }];
-      const gradient = ctx.createLinearGradient(0, 0, 0, rect.height);
-      gradient.addColorStop(0, "rgba(98, 91, 255, .28)");
-      gradient.addColorStop(1, "rgba(98, 91, 255, 0)");
-      ctx.beginPath();
-      ctx.moveTo(coords[0]!.x, rect.height);
-      coords.forEach((point) => ctx.lineTo(point.x, point.y));
-      ctx.lineTo(coords.at(-1)!.x, rect.height);
-      ctx.closePath();
-      ctx.fillStyle = gradient;
-      ctx.fill();
-      ctx.beginPath();
-      coords.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
-      ctx.strokeStyle = "#7b74ff";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    };
-    draw();
-    const observer = new ResizeObserver(draw);
-    observer.observe(canvas);
-    return () => observer.disconnect();
-  }, [displayPoints, view]);
-  const plateau = unchangedSeconds >= 60 ? ` · unchanged for ${duration(unchangedSeconds)}` : "";
-  return <div className="equity-chart-shell">
-    <div className="equity-chart-toolbar"><small>{view === "journey" ? `${journey.length} meaningful equity moves · unchanged waits collapsed${plateau}` : "True elapsed-time spacing · unchanged waits preserved"}</small><div role="group" aria-label="Equity chart spacing"><button className={view === "journey" ? "active" : ""} aria-pressed={view === "journey"} title="Journey collapses repetitive unchanged checkpoints so the season's meaningful moves stay visible." onClick={() => setView("journey")}>Journey</button><button className={view === "time" ? "active" : ""} aria-pressed={view === "time"} title="Elapsed time preserves the real waiting time between recorded checkpoints." onClick={() => setView("time")}>Elapsed time</button></div></div>
-    <canvas ref={ref} className={`equity-chart ${tall ? "tall" : ""}`} role="img" aria-label={`Paper equity ${view === "journey" ? "season journey with unchanged checkpoints collapsed" : "history spaced by elapsed time"}. ${points.length} recorded checkpoints.`}>Paper equity history</canvas>
   </div>;
 }
 

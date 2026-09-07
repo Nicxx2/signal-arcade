@@ -147,9 +147,33 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
 .pnl-line span { color: var(--muted); font-weight: 400; font-size: 13px; }
 .positive, .good { color: var(--mint) !important; }
 .negative, .bad { color: var(--red) !important; }
-.equity-chart-shell { margin: 12px 0 3px; }.equity-chart-toolbar { min-height: 25px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }.equity-chart-toolbar > small { color: #6f7d93; font-size: 9px; line-height: 1.35; }.equity-chart-toolbar > div { flex: 0 0 auto; display: flex; padding: 2px; border-radius: 7px; background: #0d1422; }.equity-chart-toolbar button { border: 0; border-radius: 5px; padding: 4px 7px; color: #77849a; background: transparent; font-size: 8px; cursor: pointer; }.equity-chart-toolbar button.active { color: #dedbff; background: #252d48; }
+.equity-chart-shell { margin: 12px 0 3px; }.equity-chart-toolbar { min-height: 25px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }.equity-chart-toolbar > small { color: #6f7d93; font-size: 9px; line-height: 1.35; }.equity-chart-controls { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }.equity-chart-spacing { display: flex; padding: 2px; border-radius: 7px; background: #0d1422; }.equity-chart-toolbar button { border: 0; border-radius: 5px; padding: 4px 7px; color: #77849a; background: transparent; font-size: 8px; cursor: pointer; }.equity-chart-toolbar button.active { color: #dedbff; background: #252d48; }
+.equity-chart-toolbar .equity-chart-help-toggle { width: 44px; height: 44px; display: grid; place-items: center; color: #94a2b9; }
+.equity-chart-help-toggle:hover, .equity-chart-help-toggle[aria-expanded="true"] { color: #d6dbed; background: #252d48; }
+.equity-chart-help { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 4px 0 12px; color: #a1acc0; font-size: 11px; line-height: 1.6; }
+.equity-chart-help p { margin: 0; }.equity-chart-help p + p { margin-top: 7px; }
 .equity-chart { width: 100%; height: 115px; display: block; margin: 3px 0; }
 .equity-chart.tall { height: 260px; }
+.season-context, .equity-chart-facts { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline; color: #a1acc0; font-size: 11px; margin: 8px 0; }
+.season-context strong, .equity-chart-facts strong { color: #d6dbed; }
+.season-context time { color: #8899ae; }
+.equity-chart.interactive { height: 180px; touch-action: pan-y; cursor: crosshair; border-radius: 7px; }
+.equity-chart.interactive.tall { height: 260px; }
+.equity-chart.interactive:focus-visible, .equity-chart-toolbar button:focus-visible { outline: 2px solid #b6fff0; outline-offset: 3px; }
+.equity-chart-plot { display: grid; grid-template-columns: clamp(70px, 17%, 96px) minmax(0, 1fr); gap: 8px; margin-top: 8px; }
+.equity-chart-plot .equity-chart { min-width: 0; margin: 0; }
+.equity-chart-axis { position: relative; min-width: 0; color: #94a2ba; font-size: 10px; }
+.equity-chart-axis-label { position: absolute; width: 100%; transform: translateY(-50%); display: grid; gap: 3px; line-height: 1.35; overflow-wrap: anywhere; }
+.equity-chart-axis-label > span { color: #8c9bb1; font-size: 9px; }
+.equity-chart-axis-label strong { color: #c2d0e3; font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.equity-chart-axis-label.compact > strong + span { margin-top: 6px; }
+.equity-chart-dates { display: flex; justify-content: space-between; gap: 10px; color: #94a2ba; font-size: 10px; margin-top: 8px; }
+.equity-chart-dates span:last-child { text-align: right; }
+.equity-chart-inspection { min-height: 68px; display: flex; flex-direction: column; justify-content: center; gap: 4px; margin-top: 9px; border-top: 1px solid var(--line); font-size: 11px; overflow-wrap: anywhere; }
+.equity-chart-inspection strong { color: #c2d5e3; }.equity-chart-inspection strong span { font-weight: 400; }
+.equity-chart-inspection small { color: #94a2b9; font-size: 10px; line-height: 1.5; }
+.equity-chart-empty { min-height: 180px; display: grid; place-items: center; color: #94a2b9; }
+.participation-note { color: #a2b0c6; font-size: 12px; line-height: 1.65; margin: -5px 0 20px; }
 .equity-meta { border-top: 1px solid var(--line); padding-top: 14px; display: flex; flex-wrap: wrap; gap: 10px 28px; color: var(--muted); font-size: 12px; }
 .equity-meta strong { color: #e9ecf3; margin-left: 5px; }
 .risk-profile-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
@@ -392,6 +416,7 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
 .challenger-artifact-details > div { display: grid; gap: 6px; grid-template-columns: repeat(2,minmax(0,1fr)); padding-top: 8px; }
 .challenger-artifact-details span { min-width: 0; }
 .challenger-artifact-details small, .challenger-artifact-details strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.challenger-artifact-details .support-proof-details { grid-column: 1 / -1; }.challenger-artifact-details .support-proof-details strong { white-space: normal; line-height: 1.5; }
 .challenger-artifact-details small { color: #6f7c93; font-size: 7px; }.challenger-artifact-details strong { color: #bfc9da; font-size: 8px; margin-top: 2px; }
 .nonlinear-entry { margin-top: 10px; border: 1px solid rgba(77,163,255,.18); border-radius: 10px; padding: 9px 10px; background: rgba(77,163,255,.035); }
 .nonlinear-entry-heading, .nonlinear-entry-progress-copy { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -671,6 +696,22 @@ main { width: min(1180px, calc(100% - 40px)); margin: 46px auto 90px; }
 .season-table { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .season-row { display: grid; grid-template-columns: .75fr 1.2fr 1fr .8fr .75fr .85fr .8fr; gap: 13px; align-items: center; min-height: 76px; padding: 13px 15px; border-bottom: 1px solid var(--line); font-size: 10px; }
 .season-row:last-child { border-bottom: 0; }.season-row.current { background: rgba(47,211,165,.018); }.season-row.not-comparable { background: rgba(238,181,91,.018); }
+.season-strategy { grid-column: 1 / -1; min-width: 0; border-top: 1px solid var(--line); padding-top: 8px; }
+.season-strategy summary { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 9px; cursor: pointer; color: var(--muted); font-size: 10px; list-style: none; min-height: 32px; }
+.season-strategy summary::-webkit-details-marker { display: none; }
+.season-strategy summary strong { color: var(--text); font-size: 10px; }
+.season-strategy summary small { font-size: 10px; }
+.season-strategy summary em { font-style: normal; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 9px; }
+.season-strategy summary:focus-visible { outline: 2px solid var(--purple); outline-offset: 3px; border-radius: 5px; }
+.season-strategy-chevron { margin-left: auto; flex-shrink: 0; }
+.season-strategy[open] .season-strategy-chevron { transform: rotate(180deg); }
+.season-strategy-content { padding: 4px 4px 10px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.season-strategy-content p { margin: 8px 0; }
+.season-strategy-content ul { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 8px; padding: 0; list-style: none; }
+.season-strategy-content li { min-width: 0; background: rgba(98,91,255,.035); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+.season-strategy-content li strong, .season-strategy-content li span, .season-strategy-content li code { display: block; }
+.season-strategy-content li strong { color: var(--text); }
+.season-strategy-content li code { overflow-wrap: anywhere; font-size: 9px; margin-top: 5px; }
 .season-row > span { min-width: 0; }.season-row > span > strong, .season-row > span > small { display: block; }
 .season-row > span > small { color: var(--muted); margin-top: 4px; font-size: 9px; line-height: 1.35; }
 .season-history-more { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 54px; padding: 9px 15px; background: rgba(111,102,255,.025); }

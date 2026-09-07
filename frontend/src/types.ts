@@ -237,6 +237,10 @@ export interface EquityPoint {
   recorded_at: string;
   equity_lamports: number;
   cash_lamports: number;
+  kind?: "checkpoint" | "hourly_close";
+  period_end?: string;
+  high_equity_lamports?: number;
+  low_equity_lamports?: number;
 }
 
 export interface ProviderQuota {
@@ -359,6 +363,7 @@ export interface ReadinessGate {
 }
 
 export interface ChallengerSkillStatus {
+  support_proof?: { artifact_version: string; ready: boolean; usable_count: number; observed_count: number; availability_fraction: number; uplift_lower_bound: number | null } | null;
   skill: "entry" | "manipulation" | "sizing" | "exit";
   label: string;
   state: "collecting" | "collecting_proof" | "candidate_testing" | "qualified" | "active" | "suspended";
@@ -572,6 +577,7 @@ export interface LearningStatus {
   };
   activation_available: boolean;
   consent_granted?: boolean;
+  auto_participation?: boolean;
   active_skill_versions?: Partial<Record<"entry" | "manipulation" | "sizing" | "exit", string>>;
   skills?: ChallengerSkillStatus[];
   nonlinear_entry?: NonlinearEntryStatus;
@@ -957,7 +963,28 @@ export interface Leaderboard {
   };
 }
 
+export interface SeasonStrategyUsage {
+  status: "unknown" | "no_decisions" | "baseline" | "assisted" | "mixed";
+  complete_from_start: boolean;
+  tracking_started_at?: string;
+  baseline_observed?: boolean;
+  first_baseline_at?: string | null;
+  skills_observed?: ("entry" | "manipulation" | "sizing" | "exit")[];
+  ai_observed?: boolean;
+  champion_observed?: boolean;
+  unattributed_use?: boolean;
+  details_limited?: boolean;
+  participants: {
+    kind: "champion" | "learner" | "ai_critic";
+    skill: "entry" | "manipulation" | "sizing" | "exit" | "";
+    version: string;
+    name: string;
+    first_used_at: string;
+  }[];
+}
+
 export interface PaperSeason {
+  strategy_usage?: SeasonStrategyUsage;
   season_id: string;
   season_number: number;
   started_at: string;
@@ -1195,6 +1222,12 @@ export interface Snapshot {
   decisions: Decision[];
   fills: Fill[];
   equity_history: EquityPoint[];
+  season_context?: {
+    season_id: string;
+    season_number: number;
+    started_at: string;
+    peak_equity_minor: number;
+  } | null;
   quotas: Record<string, ProviderQuota>;
   provider_settings: ProviderSettings;
   learning: LearningStatus;

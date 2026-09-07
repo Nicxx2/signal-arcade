@@ -5,8 +5,8 @@ import { percentage, recordedDate } from "./model";
 
 import { SCALE, position, numeric, edgeText, battleReadout, nextCheckText } from "./readout";
 
-function Progress({ value, maximum, label }: { value: number; maximum: number; label: string }) {
-  return <div className="ca-progress" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={maximum} aria-valuenow={Math.min(value, maximum)} aria-valuetext={`${value} of ${maximum}; evidence progress only`}><span style={{ width: `${Math.min(1, Math.max(0, value / maximum)) * 100}%` }} /></div>;
+function Progress({ value, maximum, label, minimum = false }: { value: number; maximum: number; label: string; minimum?: boolean }) {
+  return <div className="ca-progress" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={maximum} aria-valuenow={Math.min(value, maximum)} aria-valuetext={minimum ? `${value} usable; minimum ${maximum} ${value >= maximum ? "met" : "needed"}` : `${value} of ${maximum}; evidence progress only`}><span style={{ width: `${Math.min(1, Math.max(0, value / maximum)) * 100}%` }} /></div>;
 }
 
 export default function ArenaReadout({ view, stale }: { view: ArenaView; stale: boolean }) {
@@ -28,7 +28,7 @@ export default function ArenaReadout({ view, stale }: { view: ArenaView; stale: 
       <p>{view.superseded ? "This profile belongs to an earlier model version. Its saved status is separate from the current generation." : first ? `${view.left?.name ?? "The recorded Champion"} earned the first crown through independent skill proof. No opponent was needed.` : training ? `${view.left?.name ?? "This contender"} must pass each required check. Progress can move backward as evidence changes.` : `${view.left?.name ?? "This Champion"} holds the saved crown. Permission to influence trading is separately gated.`}</p>
       {first && !view.left && <p>Champion identity unavailable</p>}
       {training && (!paused || view.superseded) && total > 0 && <div className="ca-proof-progress"><div><strong>{passed} / {total} checks passing</strong><span>{view.superseded ? "Saved evidence" : stale ? "Last received evidence" : "Current evidence"}</span></div><Progress value={passed} maximum={total} label="Independent checks passing" /><p>{next ? <>{view.superseded ? "Unmet check" : "Next check"}: <strong>{next.label}</strong>. {nextCheckText(next)}</> : "The displayed checks pass. A recorded qualification result is still required; a crown is not guaranteed."}</p></div>}
-      {training && ((paused && !view.superseded) || total === 0) && <p className="ca-readout-note">{paused && !view.superseded ? "Waiting for fresh learning evidence before showing current progress." : "Qualification checks are not available yet."}</p>}
+      {training && ((paused && !view.superseded) || total === 0) && <p className="ca-readout-note">{paused && !view.superseded ? "Current proof resumes when learning is running on this source and the skill is eligible." : "Qualification checks are not available yet."}</p>}
       {!training && <p className="ca-readout-note">{first ? `${recordedDate(view.event?.occurred_at)} · ` : ""}Saved status and permission to influence trading are separate.</p>}
     </section>;
   }
@@ -50,7 +50,7 @@ export default function ArenaReadout({ view, stale }: { view: ArenaView; stale: 
       <div className="ca-balance-scale" aria-hidden="true"><span>−5 pp</span><span>Level</span><span>+5 pp</span></div>
     </div>
     <p className="ca-balance-caption">{point === null ? historical ? "The saved comparison does not include enough information to position the marker." : "The marker appears when a valid measured average and uncertainty range are available." : <>{readout.preliminary ? "Preliminary average" : "Average edge"}: <strong>{edgeText(view.mean)}</strong>. {Math.abs(view.mean!) > SCALE && "Beyond the displayed ±5 pp scale. "}{range ? view.lower === view.upper ? "The recorded uncertainty range is a single point." : "The band shows uncertainty." : `Conservative estimate: ${edgeText(view.lower)}.`}{readout.preliminary && " Every qualification guard still applies."}</>}</p>
-    {countReady && <div className="ca-proof-progress"><div><strong>{view.usable} / {view.minimum} minimum shared outcomes</strong><span>{view.usable! >= view.minimum ? "Sample minimum reached" : `${view.minimum - view.usable!} more needed`}</span></div><Progress value={view.usable!} maximum={view.minimum} label="Shared outcome evidence" /><p>{numeric(view.coverage) ? `Usable coverage: ${percentage(view.coverage)} · required ${percentage(view.minimumCoverage)}. ` : "Usable coverage is unknown. "}Sample size, coverage and a safe advantage must all pass.</p></div>}
+    {countReady && <div className="ca-proof-progress"><div><strong>{view.usable} usable shared outcomes</strong><span>Minimum {view.minimum} {view.usable! >= view.minimum ? "met" : "needed"}</span></div><Progress value={view.usable!} maximum={view.minimum} label="Shared outcome evidence" minimum /><p>{numeric(view.coverage) ? `Usable coverage: ${percentage(view.coverage)} · required ${percentage(view.minimumCoverage)}. ` : "Usable coverage is unknown. "}Sample size, coverage and a safe advantage must all pass.</p></div>}
     <p className="ca-readout-note">{checkpoint ? "This checkpoint is past evidence, not a settled result. " : historical ? `${recordedDate(view.event?.occurred_at)} · The animation illustrates this saved result. ` : ""}Bars show evidence and measured advantage, never the probability of a win.</p>
   </section>;
 }

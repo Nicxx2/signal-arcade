@@ -737,6 +737,7 @@ class PaperBroker:
         mode: RiskMode,
         sol_usd_price: float | None = None,
         soft_hold_seconds: int | None = None,
+        soft_hold_participant: dict[str, str] | None = None,
     ) -> list[FillReceipt]:
         if event_kind != EventKind.TRADE:
             return []
@@ -753,6 +754,7 @@ class PaperBroker:
             now,
             mode,
             soft_hold_seconds=soft_hold_seconds,
+            soft_hold_participant=soft_hold_participant,
         )
         receipts.extend(
             self.process_due_orders(
@@ -853,6 +855,7 @@ class PaperBroker:
         mode: RiskMode,
         sol_usd_price: float | None = None,
         soft_hold_seconds: int | None = None,
+        soft_hold_participant: dict[str, str] | None = None,
     ) -> None:
         """Use the freshest retained state to restore risk management after resume."""
         # A clock tick must never turn an old reserve observation into a fresh mark.
@@ -868,6 +871,7 @@ class PaperBroker:
             now,
             mode,
             soft_hold_seconds=soft_hold_seconds,
+            soft_hold_participant=soft_hold_participant,
         )
 
     def cancel_pending_orders(self, now: datetime, reason: str = "paper_engine_stopped") -> int:
@@ -1471,6 +1475,7 @@ class PaperBroker:
         mode: RiskMode,
         *,
         soft_hold_seconds: int | None = None,
+        soft_hold_participant: dict[str, str] | None = None,
     ) -> None:
         position = self.positions.get(state.mint)
         if position is None or self.has_pending_for(state.mint, Side.SELL):
@@ -1490,6 +1495,12 @@ class PaperBroker:
             limits=limits,
             soft_hold_seconds=soft_hold_seconds,
             persistent_integrity_reason=integrity_exit_reason,
+        )
+        assessment.strategy_season_id = self.season_id
+        assessment.strategy_participant = (
+            soft_hold_participant
+            if assessment.soft_hold_seconds < limits.max_hold_seconds
+            else None
         )
         position.exit_assessment = assessment
         self.database.save_position(position)
@@ -1833,6 +1844,7 @@ class PaperBroker:
             excluded_position_count=len(excluded_positions),
             starting_lamports=self.starting_lamports,
             equity_lamports=equity,
+            peak_equity_lamports=peak,
             last_known_equity_lamports=max(0, cash + last_known_inventory_mark),
             realized_pnl_lamports=int(self.database.get_setting("realized_pnl_lamports", 0)),
             unrealized_pnl_lamports=unrealized,

@@ -110,7 +110,7 @@ def test_freezing_and_restart_preserve_result_and_isolate_next_pair(settings):
     assert database.champion_battle_replay(state.cohort_key, "older-event") is None
     assert loaded._pending_battle_replays == {}
     assert "battle_replay" not in loaded.model_dump_json()
-    assert database._conn.execute("PRAGMA user_version").fetchone()[0] == 14
+    assert database._conn.execute("PRAGMA user_version").fetchone()[0] == 15
     database.close()
 
 

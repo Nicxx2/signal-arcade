@@ -45,7 +45,7 @@ def test_season_rotation_does_not_delete_or_copy_the_large_journal(tmp_path):
         assert db._conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 2
         while db.retired_decision_tables():
             db.prune_retired_decisions(max_rows=100, max_duration_seconds=1)
-        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 15
         assert db.integrity_check()
     finally:
         db.close()

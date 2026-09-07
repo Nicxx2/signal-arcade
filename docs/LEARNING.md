@@ -6,6 +6,23 @@ profit, discover a permanent edge, or safely trade real money.
 
 ## What becomes a lesson
 
+### v1.10.6 independent support and performance
+
+Automatic Champion support can start with any independently qualified skill. Saved permission,
+current influence and candidate training are separate; each activation requires current composition
+proof and a durable receipt. The consent, dependency and rollback contract below applies on restart
+and when another skill joins. Existing sample, coverage, uncertainty and harm thresholds are unchanged.
+
+Native Manipulation and Sizing proof continues while a downstream Champion is active. The proof
+uses proposals and paired shadow outcomes frozen before downstream actions, and matches the exact
+prospective upstream versions. Joining still removes downstream authority until the new combination
+earns fresh proof. Automatic-support health starts from the current activation and its upstream
+composition; a reused Champion cannot inherit health from an earlier activation.
+
+Market-batch priority, native public-key decoding and bounded private training copies reduce repeated
+work while retaining chronological evidence, original durable receipts and publication checks.
+Diagnostics match the current Baseline and feature schema; diagnostics are never training evidence.
+
 ### v1.10.5 live-review refinements
 
 Training checks its existing exact-cohort retraining threshold before freezing history. Reduced
@@ -77,6 +94,10 @@ Heavy artifacts use the existing retention cap while preserving active, testing,
 required dependency versions. Protected versions may exceed the target; authority is never deleted
 to meet an arbitrary disk limit. Pruned versions retain hashes and audit metadata, but an archived
 payload cannot be replayed from its hash alone. Storage targets still require operational monitoring.
+
+v1.10.6's schema 15 adds a bounded per-season strategy-usage sidecar. It records actual
+applied participants without feeding those descriptive labels into training or proof. Existing
+season history remains unknown or partial; rollback requires the matching pre-upgrade data and image.
 
 Start the optional reserve worker in Shadow and compare recovered outcomes, unknown reasons,
 checkpoint deadlines, provider quota use and event lag across both lanes and venues. Its runtime
@@ -367,18 +388,32 @@ history safely. The state and sidecar are committed atomically.
 
 ## Consent, composition and rollback
 
-Active influence is unavailable until a qualified Entry champion exists. The user's one explicit
-activation grants consent to that exact Entry version. Manipulation, Sizing and Exit do not gain
-immediate control from that click. Each later skill must first collect at least 30 fresh common-
-forward outcomes beside the exact active upstream ensemble, retain at least 70% availability, show
-positive conservative incremental value and pass its harm guard. Only then can that exact version
-join automatically.
+Automatic Champion support is a separate, explicitly enabled preference, off by default. It can
+wait while no skill is ready. Entry keeps its existing activation gates; Linear or XGBoost can
+earn that crown. Manipulation, Sizing or Exit can also be the first active skill without Entry,
+but only after independent qualification and fresh proof against the Baseline alone. Later joins
+must match the exact prospective upstream versions and start after those versions joined. The
+native proof comparison may ignore downstream roles because the saved upstream proposals and
+paired shadow outcomes precede their actions. It cannot ignore an upstream mismatch, an already
+active version of the skill being tested, or an unknown role. Coach artifacts retain their exact
+full-ensemble context contract. The latest 60 resolved eligible cases must contain at least 30
+usable outcomes, at least 70% coverage,
+a positive conservative incremental advantage and the existing harm guard. A saved crown alone
+does not grant influence. The legacy manual Active API keeps its Entry-first contract and rejects
+manual activation while automatic support is enabled, so the two authority policies cannot mix.
+
+Each automatic activation stores a versioned receipt with its dependencies and proof. Restart
+validates that receipt before restoring authority; missing or inconsistent receipts fall back
+safely. New Sizing receipts freeze the actual integrity/capacity clamp. Exit alongside Sizing
+uses that bounded size at both compared horizons. Missing old clamp or size/horizon evidence is
+unknown and cannot qualify the combination. Training recipes and tournament results are unchanged.
 
 Composition changes are treated symmetrically. If a newly proved upstream skill joins after a
 downstream skill was already active, the downstream Champion and journey are preserved but its
 authority is removed until that exact new ensemble earns fresh incremental proof. Runtime
-assessment also rechecks the saved version, health state and full dependency map before every
-application, so inconsistent persisted state fails closed to the smaller proved ensemble.
+assessment checks the saved version and required dependencies before application. Automatic
+governance checks current health and the full activation receipt; restart validates that receipt
+before restoring authority. Invalid authority falls back to the smaller proved ensemble.
 
 Every eligible observation freezes the active skill versions and each skill's proposed action
 before the future outcome exists. Entries that cash, exposure, capacity or conversion gates would
@@ -387,12 +422,16 @@ not have placed. Each final decision also carries a per-skill audit receipt desc
 skill abstained, vetoed, changed size or shortened review.
 
 After 30 resolved cases, per-skill rolling health checks compare each active version with its
-bounded counterfactual. Pending horizons do not count as failures; resolved unavailable outcomes
+bounded counterfactual in the current activation and exact upstream composition. A downstream
+join does not reset an upstream skill's health; reactivation starts a new health window.
+Pending horizons do not count as failures; resolved unavailable outcomes
 do count against coverage. A harmful or insufficiently observable skill is suspended. Its
 downstream dependants are suspended as well because their proof assumed that upstream ensemble;
-unrelated upstream evidence and every immutable artifact remain intact. If Entry is suspended,
-influence returns to Shadow and the Baseline resumes sole control. A restart restores only exact
-healthy, dependency-compatible versions; it cannot silently substitute the newest artifact.
+unrelated upstream evidence and every immutable artifact remain intact. With automatic support,
+the preference stays enabled: a newly proved replacement or another independently qualified skill
+can join after the appropriate fresh proof. A suspended version cannot re-enable itself. Without
+automatic permission, the legacy Entry-first mode returns to Shadow when Entry is suspended.
+A restart cannot silently substitute the newest artifact.
 
 Changing risk personality or a decision-relevant Baseline/provider/fee configuration returns an
 active ensemble to Shadow and clears influence, while retaining the user's consent and all learning
@@ -406,16 +445,17 @@ only to restore the transparent baseline, never to take more risk.
 
 ## Modes and safety boundary
 
-- **Off** stops starting new learning observations. Already-started horizons may still resolve so
-  they are not falsified by a setting change.
+- **Off**, shown as **Pause learning & support**, stops new learning observations and removes
+  Champion influence. Saved models and automatic-support preference remain. Already-started
+  horizons and queued training may finish; resuming learning permits future qualification checks.
 - **Shadow** is the default. It records outcomes and shows what the latest challenger thinks, but
   never changes a paper decision.
-- **Active** is unavailable until a qualified Entry champion exists. It begins with the exact Entry
-  version the user approved. Independently proved Manipulation, Sizing and Exit champions may join
-  later under the composition gates above. Deterministic entry, fill-time route/integrity, cash,
+- **Active** means at least one proved skill has influence. Explicit automatic support can begin
+  with any independently qualified skill under the composition gates above; the legacy manual
+  activation API still requires Entry. Deterministic entry, fill-time route/integrity, cash,
   exposure, stop, structural exit, trailing and absolute-time controls always retain priority.
   Later unseen results monitor every active version and can automatically suspend only the unsafe
-  part—or restore Shadow when Entry itself is no longer trustworthy.
+  part, returning to Shadow when no approved skill remains.
 
 The learner cannot create an entry, exceed deterministic sizing capacity, weaken a permanent
 safety gate, extend past the absolute ceiling, fabricate an exit, or touch a wallet.
@@ -445,8 +485,12 @@ above one percentage point. Clearly harmful evidence may reject a study after 12
 A study that reaches 180 resolved observations or 90 days without enough support closes as
 inconclusive, including quiet cohorts that never reached 60 samples; it cannot collect forever.
 
-Support still grants no trading authority. Only after explicit user permission may a supported
-idea be handed to the matching Challenger skill. It waits until that skill already has a saved
+Support still grants no trading authority. The Coach card's **Allow when ready** control saves
+explicit permission in advance, even before an idea qualifies. The preference survives restart;
+it does not resume paused learning/research or enable automatic Champion support. With permission
+on, eligible supported ideas are handed to the matching Challenger skill automatically while
+Local AI is on. Turning contribution off stops new handoffs; already admitted contenders and
+Champions keep their normal proof and support rules. An idea waits until that skill has a saved
 statistical Champion, then enters the ordinary common-forward tournament as one immutable
 contender. It cannot create the first Champion, skip proof, replace a Champion directly, or act
 outside its exact dependencies. A context change retires the stale contender while preserving the

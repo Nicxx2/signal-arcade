@@ -11,9 +11,12 @@ export function supportedEntryProof(learning: LearningStatus): EntryProofStatus 
 
 export function entryProofSummary(learning: LearningStatus): string {
   if (!learning.collecting_from_current_source) return "Saved proof · source separate";
-  if (learning.mode === "active") return "Entry influence active";
+  const proof = supportedEntryProof(learning);
+  const entryActive = proof ? proof.activation.active
+    : learning.active_skill_versions?.entry || learning.active_model;
+  if (learning.mode === "active" && entryActive) return "Entry influence active";
   if (learning.mode === "off") return "Learning paused";
   if (learning.activation_available) return "Ready for activation";
-  return supportedEntryProof(learning)?.activation.champion || learning.skills?.some(s => s.skill === "entry" && s.champion)
+  return proof?.activation.champion || learning.skills?.some(s => s.skill === "entry" && s.champion)
     ? "Champion saved · activation gated" : "First Entry Champion pending";
 }

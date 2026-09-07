@@ -134,6 +134,11 @@ class LearningRequest(BaseModel):
     mode: LearningMode
 
 
+class ParticipationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+
+
 class AiDecisionModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -554,6 +559,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def set_learning(body: LearningRequest) -> dict[str, Any]:
         try:
             orchestrator.set_learning_mode(body.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        orchestrator.invalidate_snapshot_cache()
+        return orchestrator.learning.status(demo_mode=orchestrator.demo_mode)
+
+    @app.put("/api/v1/learning/participation", dependencies=[Depends(normal_operation)])
+    async def set_participation(body: ParticipationRequest) -> dict[str, Any]:
+        try:
+            orchestrator.set_champion_participation(body.enabled)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()

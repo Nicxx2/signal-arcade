@@ -734,14 +734,14 @@ test("keeps future AI influence stages visible but unavailable", async () => {
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  fireEvent.click(screen.getByRole("tab", { name: "Shadow Reviews" }));
-  expect(screen.getAllByText("Shadow Decision Reviews").length).toBeGreaterThan(1);
+  fireEvent.click(screen.getByRole("tab", { name: "Decision Reviews" }));
+  expect(screen.getAllByText("Decision Reviews").length).toBeGreaterThan(1);
   expect(screen.getByRole("button", { name: /Qualified Coach/ })).toBeDisabled();
   expect(screen.getByRole("button", { name: /Live Critic/ })).toBeDisabled();
-  expect(screen.getByRole("tooltip", { name: /Coach proof progress is shown above/ })).toBeInTheDocument();
+  expect(screen.getByRole("tooltip", { name: /Direct Coach control remains unavailable/ })).toBeInTheDocument();
   expect(screen.getByRole("tooltip", { name: /considered only after Qualified Coach proves useful/ })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /Live Critic/ })).toHaveTextContent("No readiness measure yet");
-  fireEvent.click(screen.getByRole("button", { name: /^ShadowObserves/ }));
+  fireEvent.click(screen.getByRole("button", { name: /^ShadowReviews without direct trade influence/ }));
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
     "/api/v1/ai-lab/mode",
@@ -903,7 +903,7 @@ test("synchronizes Learning layout preferences changed in another browser tab", 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
 
   await waitFor(() => expect(screen.getByRole("tab", { name: "AI Coach" })).toHaveAttribute("aria-selected", "true"));
-  expect(screen.getByText("Slow, allowlisted experiments for the fast engine · Shadow-only")).toBeInTheDocument();
+  expect(screen.getByText("Bounded research ideas for future Challengers")).toBeInTheDocument();
 });
 
 test("keeps a new milestone unread until the persisted Overview is actually visited", async () => {
@@ -930,11 +930,11 @@ test("keeps a new milestone unread until the persisted Overview is actually visi
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   expect(screen.getByRole("tab", { name: "Challenger" })).toHaveAttribute("aria-selected", "true");
-  expect(screen.queryByText("Qualified Challenger ready")).not.toBeInTheDocument();
+  expect(screen.queryByText("Entry activation proof ready")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
 
   fireEvent.click(screen.getByRole("tab", { name: /Overview/ }));
-  expect(screen.getByText("Qualified Challenger ready")).toBeInTheDocument();
+  expect(screen.getByText("Entry activation proof ready")).toBeInTheDocument();
   await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
 });
 
@@ -1006,10 +1006,10 @@ test("shows authoritative proof gates separately from the next Challenger evalua
 
   expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("Qualified Challenger ready")).toBeInTheDocument();
+  expect(screen.getByText("Entry activation proof ready")).toBeInTheDocument();
   await waitFor(() => expect(screen.getByRole("button", { name: "Learning" })).not.toHaveAttribute("title"));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
-  expect(screen.getByText("Minimum 80 met · 4 more usable outcomes until the next challenger")).toBeInTheDocument();
+  expect(screen.getByText("Next training · 4 more usable outcomes")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Show entry proof & activation" }));
   fireEvent.click(screen.getByText("Legacy Linear diagnostics"));
   expect(screen.getByText("2 / 2 proof gates")).toBeInTheDocument();
@@ -1065,8 +1065,8 @@ test("does not describe an already active Challenger as waiting to be enabled", 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("Qualified Challenger active")).toBeInTheDocument();
-  expect(screen.queryByText("Qualified Challenger ready")).not.toBeInTheDocument();
+  expect(screen.getByText("Entry Champion support active")).toBeInTheDocument();
+  expect(screen.queryByText("Entry activation proof ready")).not.toBeInTheDocument();
 });
 
 test("shows each Challenger skill and the exact bounded active ensemble", async () => {
@@ -1170,7 +1170,7 @@ test("shows each Challenger skill and the exact bounded active ensemble", async 
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Exit skill");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Battle contender");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Best proved");
-  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("18 / 30 shared outcomes");
+  expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Battle: 18 usable · Minimum 30 needed");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("Nonlinear XGBoost");
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent("1 queued");
   expect(screen.getByText("Nonlinear contender")).toBeInTheDocument();
@@ -1375,7 +1375,7 @@ test("explains low executable coverage while a Challenger battle is still open",
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByRole("region", { name: "Challenger skills" })).toHaveTextContent(
-    "60.0% coverage · needs 70.0%",
+    "Battle: 45 usable · 60.0% coverage (needs 70.0%)",
   );
 });
 
@@ -1460,8 +1460,11 @@ test("labels a persisted legacy guarded mode without unlocking future roadmap st
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  fireEvent.click(screen.getByRole("tab", { name: "Shadow Reviews" }));
-  expect(screen.getByText("Qualified Coach (legacy)")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: "Decision Reviews" }));
+  expect(screen.getByText("Guarded critic (legacy)")).toBeInTheDocument();
+  expect(screen.getByText("Legacy entry vetoes are enabled")).toBeInTheDocument();
+  expect(screen.queryByText("Shadow · no influence")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Live Critic/ })).toBeDisabled();
   expect(screen.getByRole("button", { name: /Qualified Coach/ })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: /^Off/ }));
 
@@ -1512,7 +1515,7 @@ test("shows bounded local AI failures as safely ignored instead of raw errors", 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  fireEvent.click(screen.getByRole("tab", { name: "Shadow Reviews" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Decision Reviews" }));
   expect(screen.getByText("Timed out")).toBeInTheDocument();
   expect(screen.getByText("Ignored safely")).toBeInTheDocument();
   expect(screen.getByText(/missed its bounded time budget/)).toBeInTheDocument();
@@ -3257,14 +3260,15 @@ test("shows learning progress without mixing demo outcomes", async () => {
   expect(screen.getByText(/Switch to Solana mainnet when you want to collect/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.getByText("Demo experience stays separate")).toBeInTheDocument();
-  expect(screen.getByText("0 / 80")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Use qualified Challenger" })).toBeDisabled();
+  expect(screen.getByText("0 usable")).toBeInTheDocument();
+  expect(screen.getByText("First training · minimum 80 needed")).toBeInTheDocument();
+  expect(screen.getByRole("switch", { name: "Automatic champion support" })).toBeDisabled();
 
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   expect(screen.getByText(/learned experience remain/)).toBeInTheDocument();
 });
 
-test("separates the training minimum from progress toward the next challenger", async () => {
+test("separates the training minimum from progress toward the next training", async () => {
   const challengerSnapshot: Snapshot = {
     ...snapshot,
     demo_mode: false,
@@ -3322,10 +3326,10 @@ test("separates the training minimum from progress toward the next challenger", 
   fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
   expect(screen.queryByText("Demo experience stays separate")).not.toBeInTheDocument();
   expect(screen.getByText("976 usable")).toBeInTheDocument();
-  expect(screen.getByText("Minimum 80 met · 1 more usable outcome until the next challenger")).toBeInTheDocument();
+  expect(screen.getByText("Next training · 1 more usable outcome")).toBeInTheDocument();
   expect(screen.queryByText("976 / 80")).not.toBeInTheDocument();
-  expect(screen.getByRole("progressbar", { name: "Progress toward next challenger" })).toHaveAttribute("aria-valuenow", "9");
-  expect(screen.getByRole("progressbar", { name: "Progress toward next challenger" })).toHaveAttribute("aria-valuemax", "10");
+  expect(screen.getByRole("progressbar", { name: "Progress toward next training" })).toHaveAttribute("aria-valuenow", "9");
+  expect(screen.getByRole("progressbar", { name: "Progress toward next training" })).toHaveAttribute("aria-valuemax", "10");
 });
 
 test("shows the risk rule that caused a sell fill", async () => {
@@ -3664,7 +3668,8 @@ test("falls back safely when Arena layout storage is unavailable", async () => {
 
 test("synchronizes Arena preferences changed in another browser tab", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
-  render(<App />);
+  // Finish mount effects before simulating an event from an already-open second tab.
+  await act(async () => { render(<App />); });
   expect(await screen.findByRole("button", { name: "Hide Market radar" })).toBeInTheDocument();
 
   window.localStorage.setItem(arenaLayoutKey, JSON.stringify({
@@ -3685,18 +3690,56 @@ test("explains that a stopped engine still lets the empty market radar observe",
   expect(await screen.findByText("Market observations continue while the paper engine is stopped; recent tokens will appear when enough evidence arrives.")).toBeInTheDocument();
 });
 
+test("champion support requires an explicit toggle and can wait before Entry is qualified", async () => {
+  const pending = { ...snapshot, demo_mode: false, learning: { ...snapshot.learning, auto_participation: false, activation_available: false } };
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => pending });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Challenger" }));
+  const toggle = screen.getByRole("switch", { name: "Automatic champion support" });
+  expect(toggle).not.toBeDisabled();
+  expect(toggle).toHaveAttribute("aria-checked", "false");
+  expect(fetchMock.mock.calls.some(([url]) => url === "/api/v1/learning/participation")).toBe(false);
+  fireEvent.click(toggle);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/learning/participation", expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: true }) })));
+  expect(screen.getByRole("button", { name: "Pause learning & support" })).toBeInTheDocument();
+});
+
+test.each([
+  { mode: "shadow", allowed: true, source: true, expected: "2 Champions saved · waiting for support proof" },
+  { mode: "active", allowed: true, source: true, expected: "1 skill supporting Baseline · 2 Champions saved" },
+  { mode: "off", allowed: true, source: true, expected: "Learning & support paused" },
+  { mode: "shadow", allowed: false, source: true, expected: "2 Champions saved · support off" },
+  { mode: "active", allowed: true, source: false, expected: "Saved proof · source separate" },
+] as const)("overview separates saved non-Entry champions from influence: $mode / $allowed / $source", async ({ mode, allowed, source, expected }) => {
+  const current = { ...snapshot, learning: { ...snapshot.learning,
+    mode, auto_participation: allowed, collecting_from_current_source: source,
+    active_model: null, activation_available: false,
+    active_skill_versions: { sizing: "challenger-skill-v1-sizing" },
+    skills: [challengerSkillStatus("entry", "collecting"), challengerSkillStatus("sizing", "qualified"), challengerSkillStatus("exit", "qualified")],
+  } } satisfies Snapshot;
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => current }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Learning" }));
+  const card = screen.getByRole("button", { name: /Statistical Challenger.*Open Challenger/ });
+  expect(card).toHaveTextContent(expected);
+  expect(card).not.toHaveTextContent("First Entry Champion pending");
+  expect(card).not.toHaveTextContent("Entry influence active");
+});
+
 test("explains the two Arena equity chart spacing modes", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
   render(<App />);
 
   const journey = await screen.findByRole("button", { name: "Journey" });
-  const elapsed = screen.getByRole("button", { name: "Elapsed time" });
-  expect(journey).toHaveAttribute("title", expect.stringContaining("collapses repetitive unchanged checkpoints"));
-  expect(elapsed).toHaveAttribute("title", expect.stringContaining("real waiting time"));
-  expect(screen.getByText(/unchanged waits collapsed/)).toBeInTheDocument();
+  const elapsed = screen.getByRole("button", { name: "Timeline" });
+  expect(journey).toHaveAttribute("aria-pressed", "true");
+  expect(elapsed).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getByText(/quiet periods collapsed/)).toBeInTheDocument();
 
   fireEvent.click(elapsed);
-  expect(screen.getByText("True elapsed-time spacing · unchanged waits preserved")).toBeInTheDocument();
+  expect(screen.getByText("Time spacing · quiet periods preserved")).toBeInTheDocument();
 });
 
 test("keeps connection failures in the compact status panel", async () => {
@@ -3937,9 +3980,9 @@ test("shows a forward-only AI coach experiment without implying trading influenc
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
   fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
-  const coachCard = screen.getByText("Slow, allowlisted experiments for the fast engine · Shadow-only").closest("article");
-  expect(coachCard).toHaveTextContent("InfluenceResearch only");
-  expect(coachCard).toHaveTextContent("24 / 60 usable");
+  const coachCard = screen.getByText("Bounded research ideas for future Challengers").closest("article");
+  expect(coachCard).toHaveTextContent("Direct influenceNone");
+  expect(coachCard).toHaveTextContent("24 usable · Minimum 60 needed");
   expect(screen.getByRole("region", { name: "AI Coach research lanes" })).toHaveTextContent("Manipulation");
   expect(screen.getByRole("button", { name: "Show research notebook" })).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByRole("progressbar", { name: "Coach forward-test progress" })).toHaveAttribute("aria-valuenow", "24");
@@ -4014,9 +4057,9 @@ test("announces a proved Coach idea and requires explicit tournament permission"
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Learning" })).toHaveAttribute("title", "New learning milestone");
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  fireEvent.click(screen.getByRole("button", { name: "Show road to contribution" }));
+  fireEvent.click(screen.getByRole("button", { name: "Show how coach contributes" }));
   expect(screen.getByLabelText("Coach contribution path")).toHaveTextContent("Champion battle");
-  const allow = screen.getByRole("button", { name: "Allow contribution" });
+  const allow = screen.getByRole("button", { name: "Allow when ready" });
   expect(allow).toBeEnabled();
   fireEvent.click(allow);
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
@@ -4025,10 +4068,10 @@ test("announces a proved Coach idea and requires explicit tournament permission"
   ));
 });
 
-test("shows paused Coach research and keeps contribution revocation available", async () => {
+test.each(["shadow", "off"] as const)("keeps Coach contribution revocation available with paused research and Local AI %s", async (aiMode) => {
   const paused = {
     ...snapshot,
-    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
+    ai_lab: { ...snapshot.ai_lab, mode: aiMode },
     coach: {
       ...snapshot.coach,
       mode: "off" as const,
@@ -4050,8 +4093,12 @@ test("shows paused Coach research and keeps contribution revocation available", 
 
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("Paused · Shadow")).toBeInTheDocument();
-  expect(screen.getByText("Research can resume without losing evidence")).toBeInTheDocument();
+  if (aiMode === "shadow") {
+    expect(screen.getByText("Paused · Research only")).toBeInTheDocument();
+    expect(screen.getByText("Research can resume without losing evidence")).toBeInTheDocument();
+  } else {
+    expect(screen.getByText("Permission saved. Local AI Off pauses new handoffs.")).toBeInTheDocument();
+  }
   const revoke = screen.getByRole("button", { name: "Turn contribution off" });
   expect(revoke).toBeEnabled();
   fireEvent.click(revoke);
@@ -4059,6 +4106,160 @@ test("shows paused Coach research and keeps contribution revocation available", 
     "/api/v1/ai-lab/coach-contribution",
     expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: false }) }),
   ));
+});
+
+test("allows advance Coach permission without a ready idea and keeps proof separate", async () => {
+  let data = {
+    ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
+    coach: { ...snapshot.coach, contribution_enabled: false, contribution_ready: false, recent_hypotheses: [] },
+  } satisfies Snapshot;
+  const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+    if (path === "/api/v1/ai-lab/coach-contribution" && init?.method === "PUT") {
+      data = { ...data, coach: { ...data.coach, contribution_enabled: JSON.parse(String(init.body)).enabled } };
+    }
+    return Promise.resolve({ ok: true, json: async () => data });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
+  const details = screen.getByRole("button", { name: "Show how coach contributes" });
+  expect(details).toHaveAttribute("aria-expanded", "false");
+  const allow = screen.getByRole("button", { name: "Allow when ready" });
+  expect(allow).toBeEnabled();
+  expect(allow).toHaveAttribute("aria-pressed", "false");
+  expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+  fireEvent.click(allow);
+  const revoke = await screen.findByRole("button", { name: "Turn contribution off" });
+  expect(revoke).toHaveAttribute("aria-pressed", "true");
+  expect(screen.queryByText("Idea proved")).not.toBeInTheDocument();
+  expect(screen.getByText("Permission saved. Proved ideas enter Challenger battles automatically.")).toBeInTheDocument();
+  fireEvent.click(details);
+  expect(screen.getByLabelText("Coach contribution path")).toHaveTextContent("Eligible support");
+  expect(screen.getByText(/separate Champion support permission/)).toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PUT")).toEqual([
+    ["/api/v1/ai-lab/coach-contribution", expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: true }) })],
+  ]);
+});
+
+test.each([
+  [false, false], [true, false], [false, true], [true, true],
+])("keeps confirmed Coach permission visible when refresh fails (previously %s, older read %s)", async (previous, olderRead) => {
+  const data = {
+    ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
+    coach: { ...snapshot.coach, contribution_enabled: previous, contribution_ready: false },
+  } satisfies Snapshot;
+  let saveRequested = false;
+  let snapshotReads = 0;
+  let finishOlderRead!: (value: unknown) => void;
+  const olderSnapshot = new Promise((resolve) => { finishOlderRead = resolve; });
+  let confirmSave!: (value: unknown) => void;
+  const saved = new Promise((resolve) => { confirmSave = resolve; });
+  const fetchMock = vi.fn().mockImplementation((path: string) => {
+    if (path === "/api/v1/ai-lab/coach-contribution") {
+      saveRequested = true;
+      return saved;
+    }
+    if (path === "/api/v1/snapshot") {
+      snapshotReads += 1;
+      if (olderRead && snapshotReads === 2) return olderSnapshot;
+      if (saveRequested) return Promise.reject(new Error("Snapshot temporarily unavailable"));
+    }
+    if (path === "/api/v1/health") return Promise.resolve({ ok: true, json: async () => ({ service_running: true, database_ok: true }) });
+    return Promise.resolve({ ok: true, json: async () => data });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
+  if (olderRead) {
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(snapshotReads).toBe(2));
+  }
+  const toggle = screen.getByRole("button", { name: previous ? "Turn contribution off" : "Allow when ready" });
+  fireEvent.click(toggle);
+  expect(toggle).toBeDisabled();
+  fireEvent.click(toggle);
+  expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/ai-lab/coach-contribution")).toHaveLength(1);
+  await act(async () => { confirmSave({ ok: true, json: async () => ({ ...data.coach, contribution_enabled: !previous }) }); });
+  if (olderRead) {
+    expect(toggle).toBeDisabled();
+    await act(async () => { finishOlderRead({ ok: true, json: async () => data }); });
+  }
+  const confirmed = await screen.findByRole("button", { name: previous ? "Allow when ready" : "Turn contribution off" });
+  expect(confirmed).toHaveAttribute("aria-pressed", String(!previous));
+  expect(confirmed).toBeEnabled();
+});
+
+test.each([
+  [false, false], [true, false], [false, true], [true, true],
+])("uses fresh Coach permission after saving (previously %s, response lost %s)", async (previous, responseLost) => {
+  const data = {
+    ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: "shadow" as const },
+    coach: { ...snapshot.coach, contribution_enabled: previous, contribution_ready: false },
+  } satisfies Snapshot;
+  let saved = false;
+  let freshRead = false;
+  // A fresh server read may confirm a lost save response, or another client's later change.
+  const serverValue = responseLost ? !previous : previous;
+  const fetchMock = vi.fn().mockImplementation((path: string) => {
+    if (path === "/api/v1/ai-lab/coach-contribution") {
+      saved = true;
+      return responseLost
+        ? Promise.reject(new Error("Connection closed after saving"))
+        : Promise.resolve({ ok: true, json: async () => ({ ...data.coach, contribution_enabled: !previous }) });
+    }
+    if (path === "/api/v1/snapshot" && saved) {
+      freshRead = true;
+      return Promise.resolve({ ok: true, json: async () => ({ ...data, coach: { ...data.coach, contribution_enabled: serverValue } }) });
+    }
+    return Promise.resolve({ ok: true, json: async () => data });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
+  fireEvent.click(screen.getByRole("button", { name: previous ? "Turn contribution off" : "Allow when ready" }));
+  await waitFor(() => {
+    expect(freshRead).toBe(true);
+    const toggle = screen.getByRole("button", { name: serverValue ? "Turn contribution off" : "Allow when ready" });
+    expect(toggle).toHaveAttribute("aria-pressed", String(serverValue));
+    expect(toggle).toBeEnabled();
+  });
+  expect(screen.queryByText("Idea proved")).not.toBeInTheDocument();
+});
+
+test.each(["ai_off", "request_failed"])("does not imply Coach permission was saved when %s", async (reason) => {
+  const data = {
+    ...snapshot,
+    ai_lab: { ...snapshot.ai_lab, mode: reason === "ai_off" ? "off" as const : "shadow" as const },
+    coach: { ...snapshot.coach, contribution_enabled: false, contribution_ready: false },
+  } satisfies Snapshot;
+  const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
+    path === "/api/v1/ai-lab/coach-contribution"
+      ? { ok: false, status: 409, json: async () => ({ detail: "Permission could not be saved" }) }
+      : { ok: true, json: async () => data },
+  ));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  fireEvent.click(screen.getByRole("tab", { name: "AI Coach" }));
+  const allow = screen.getByRole("button", { name: "Allow when ready" });
+  if (reason === "ai_off") {
+    expect(allow).toBeDisabled();
+    expect(screen.getByText("Enable AI Shadow in Decision Reviews to allow future contributions.")).toBeInTheDocument();
+  } else {
+    fireEvent.click(allow);
+    await waitFor(() => expect(allow).toBeEnabled());
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/ai-lab/coach-contribution", expect.objectContaining({ method: "PUT" }));
+  }
+  expect(allow).toHaveAttribute("aria-pressed", "false");
+  expect(screen.queryByRole("button", { name: "Turn contribution off" })).not.toBeInTheDocument();
 });
 
 

@@ -110,3 +110,29 @@ test("unsupported report versions cannot contribute a phantom Champion to the su
   value.entry_proof = { ...value.entry_proof!, version: "entry-proof-v2" } as unknown as LearningStatus["entry_proof"];
   expect(entryProofSummary(value)).toBe("First Entry Champion pending");
 });
+
+test.each(["sizing", "exit"] as const)("active %s cannot claim that Entry is influencing decisions", skill => {
+  const value = learning();
+  value.mode = "active";
+  value.auto_participation = true;
+  value.active_skill_versions = { [skill]: `${skill}-champion` };
+  value.activation_available = false;
+  value.entry_proof!.activation = { ...value.entry_proof!.activation, champion: null, subject: null, active: null, ready: false };
+  show(value);
+  expect(entryProofSummary(value)).toBe("First Entry Champion pending");
+  expect(screen.queryByText("Entry influence active")).toBeNull();
+  expect(screen.queryByText(/Influencing entries/)).toBeNull();
+  expect(screen.getByText(/Automatic support is allowed/)).toBeInTheDocument();
+  expect(screen.queryByText(/Consent has not been granted/)).toBeNull();
+  delete value.entry_proof;
+  expect(entryProofSummary(value)).toBe("First Entry Champion pending");
+});
+
+test("a confirmed active Entry remains distinct from another active skill", () => {
+  const value = learning();
+  value.mode = "active";
+  value.entry_proof!.activation.active = value.entry_proof!.activation.champion;
+  show(value);
+  expect(entryProofSummary(value)).toBe("Entry influence active");
+  expect(screen.getByText(/Influencing entries/)).toBeInTheDocument();
+});

@@ -4,7 +4,68 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
-## Unreleased
+## 1.10.6 - 2026-09-07
+
+- Coordinate candidate pruning and enrichment selection with in-flight market and learning updates.
+  Preserve newly pending evidence during concurrent updates and keep provider requests outside
+  the short shared boundary. Learning, qualification and trading rules are unchanged.
+- Explain the Coach's research-to-Challenger path and expose **Allow when ready** before proof
+  completes. Save advance contribution permission without resuming paused learning or research;
+  preserve all forward-proof, tournament, activation and Local AI Off guards. Keep confirmed
+  opt-ins and revocations visible if refreshing fails, and reconcile uncertain save responses
+  with fresh server state.
+- Keep native Manipulation and Sizing activation proof progressing when a downstream Champion
+  is already active. Match exact upstream versions using frozen bounded shadow comparisons;
+  require downstream skills to requalify after the join. Scope automatic-support health to the
+  current activation and upstream composition, preserving all sample, coverage and harm gates.
+- Match diagnostic skill summaries to the current Baseline and feature schema after upgrades,
+  and record active support from the runtime skill map. Preserve historical evidence without
+  mistaking an older cohort for the current Champion or changing learning/trading authority.
+- Let newly arriving position, order and due-checkpoint events interrupt prefetched candidate
+  batches, with bounded admission and unchanged persistence, duplicate and season-boundary guards.
+  Reduce stream-decoding CPU with the existing native public-key codec and avoid rebuilding the
+  same configuration fingerprint for every row in learning views. Preserve proof and risk rules.
+- Align battle and Coach sample-minimum labels, Entry activation milestones and paused proof
+  messages. Distinguish saved Shadow reviews, approved Coach research contributions and legacy
+  Guarded entry vetoes without exposing new trading controls or changing qualification rules.
+  Report season win-rate changes in percentage points and align Synthetic demo guidance.
+- Clarify training intervals, retained observations and Champion support counts. Label sample
+  minima separately from coverage, distinguish battle evidence from activation proof, and keep
+  the observed denominator under artifact details. Paused support stays explicitly labelled.
+- Summarize saved Champions and actual skill support across all skills in the Learning overview.
+  Keep Entry proof labels specific to Entry, including when another skill is active first.
+- Add explicit automatic Champion support permission. A non-Entry skill may be the first active
+  skill only after its own qualification and fresh Baseline/composition proof. Keep all existing
+  sample, coverage, uncertainty and harm thresholds. Persist activation receipts, validate them
+  on restart, and remove affected authority when dependencies change or health fails. Reject
+  legacy manual activation while automatic support is enabled, including while paused.
+- Freeze bounded Sizing decisions for participation proof. Exit/Sizing combinations require
+  executable evidence at that bounded size and both horizons; missing older receipts stay unknown.
+- Show the saved season number, elapsed duration, starting bankroll and season peak in Arena.
+  Add hover, touch and keyboard equity inspection in Arena and Replay, with Journey/Timeline
+  spacing. Label older hourly closes and exclude rollups overlapping recent exact checkpoints.
+  Keep observations with the same timestamp individually selectable across history refreshes.
+  Label scale high/low beside the chart in Arena and Replay, keep flat ranges readable, and
+  put chart guidance behind a compact help button. Keep the latest shown or selected values
+  visible, with hourly closes labelled when inspected.
+- Clarify pause/resume and automatic-support controls, distinguish permission from influence,
+  and stop describing a previous model fit as proof of the current training-row minimum.
+- Update release metadata and upgrade guidance for v1.10.6. Refresh the README with new
+  desktop/mobile captures from the running v1.10.6 app in a separate versioned screenshot folder,
+  preserving all earlier captures.
+- Add compact per-season strategy usage in Results, including applied Champion skills, legacy
+  learners and AI vetoes. Preserve first-use identities across restarts and season rollover;
+  distinguish mixed, partial, unknown and no-decision histories without inferring past influence.
+  Schema 15 adds a bounded usage sidecar; historical scores and learning gates are unchanged.
+- Trim in-memory trade buffers to the five-minute feature window while preserving its inclusive
+  boundary and capacity-loss evidence. Feature values and decision rules are unchanged.
+- Reduce private training copies by leaving bulky reserve audit payloads in the durable journal;
+  retain all fitting values, missing outcomes, timestamps and Policy sizing evidence. Release
+  serialized inputs after reconstruction and completed workspaces before the trainer waits.
+- Pace storage retries while market processing is busy, preserving bounded cleanup catch-up.
+- Defer optional Shadow AI assessments while market work, training or another generation is busy.
+  Recheck queue age, AI mode and maintenance before inference; expose the deferral reason.
+  Preserve inference deadlines, the 70% coverage requirement and all promotion/execution gates.
 
 ## 1.10.5 - 2026-09-04
 

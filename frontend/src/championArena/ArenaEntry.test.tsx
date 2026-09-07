@@ -53,7 +53,7 @@ test.each([
   render(<ArenaProvider snapshot={snapshot}><ArenaSkillButton skill="entry" /></ArenaProvider>);
   const trigger = screen.getByRole("button", { name: `Entry: ${action} in Champion Arena` });
   if (state === "suspended") {
-    fireEvent.click(trigger); await screen.findByText("Learning paused");
+    fireEvent.click(trigger); await screen.findByText("Proof paused");
     expect(document.querySelector(".ca-name-left")).toHaveTextContent("Suspended");
     expect(document.querySelector("canvas")).toBeNull();
   }

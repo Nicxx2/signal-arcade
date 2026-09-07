@@ -268,6 +268,8 @@ class ExitAssessment(BaseModel):
     soft_hold_seconds: int = Field(gt=0)
     hard_hold_seconds: int = Field(gt=0)
     evidence: list[str] = Field(default_factory=list)
+    strategy_season_id: str | None = None
+    strategy_participant: dict[str, str] | None = None
 
 
 class Decision(BaseModel):
@@ -585,6 +587,7 @@ class ChallengerSkillState(BaseModel):
     champion_version: str | None = None
     active_version: str | None = None
     active_dependencies: dict[str, str] = Field(default_factory=dict)
+    activation_proof: dict[str, Any] = Field(default_factory=dict)
     common_forward_count: int = Field(default=0, ge=0)
     joined_at: datetime | None = None
     suspended_version: str | None = None
@@ -987,6 +990,7 @@ class PortfolioSnapshot(BaseModel):
     excluded_position_count: int = Field(default=0, ge=0)
     starting_lamports: int
     equity_lamports: int
+    peak_equity_lamports: int = Field(default=0, ge=0)
     last_known_equity_lamports: int = Field(default=0, ge=0)
     realized_pnl_lamports: int
     unrealized_pnl_lamports: int

@@ -46,7 +46,7 @@ export function battleReadout(view: ArenaView, stale: boolean) {
   const countReady = (historical || live && numeric(view.minimum) && view.minimum > 0) && numeric(view.usable) && numeric(view.observed) && Number.isSafeInteger(view.usable) && Number.isSafeInteger(view.observed) && view.usable >= 0 && view.usable <= view.observed;
   const evidenceText = (delayed ? "Last update · " : "") + (countReady
     ? historical ? `${view.usable} usable · ${percentage(view.coverage)} coverage`
-      : `Evidence ${view.usable}/${view.minimum} usable · ${preliminary ? "preliminary" : "comparison open"}`
+      : `${view.usable} usable · ${preliminary ? "preliminary" : "comparison open"}`
     : historical ? "Recorded evidence unavailable" : "Evidence not available yet");
   const shortTitle = !plot ? historical ? "Average unavailable" : !live ? "Comparison paused" : "Average not available yet"
     : view.mean === 0 ? historical ? "Level result" : delayed ? "Level at last update" : "Level so far"
@@ -73,7 +73,7 @@ export function battleReadout(view: ArenaView, stale: boolean) {
     detail = "This pair is no longer testing. A saved result is needed before showing a winner.";
   } else if (!checkpoint && view.paused) {
     title = "Comparison paused";
-    detail = "The advantage display resumes when fresh learning evidence is available.";
+    detail = "Learning must be running on this source and the skill must be eligible for the comparison to resume.";
   } else if (!plot) {
     title = "Building the comparison";
     detail = "Usable shared outcomes and a valid estimate are needed to show the average difference. Missing values stay unknown.";

@@ -234,5 +234,5 @@ def test_failed_journal_migration_does_not_advance_schema_or_remove_sidecar(sett
         assert conn.execute("SELECT COUNT(*) FROM challenger_champion_events").fetchone()[0] == 0
         conn.execute("UPDATE settings SET value_json='[]' WHERE key=?", (key,))
     database = Database(settings.database_path)
-    assert database._conn.execute("PRAGMA user_version").fetchone()[0] == 14
+    assert database._conn.execute("PRAGMA user_version").fetchone()[0] == 15
     database.close()

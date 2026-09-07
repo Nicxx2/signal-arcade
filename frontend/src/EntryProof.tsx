@@ -24,7 +24,7 @@ export default function EntryProof({ learning, renderGates }: { learning: Learni
 
   const activation = proof.activation;
   return <div className="entry-proof-panel">
-    <p className="entry-influence-note"><ShieldCheck size={14} /><span><strong>One Entry crown. Two model families.</strong> Linear or XGBoost can earn the first crown through independent proof. Later contenders must prove an advantage against the saved Champion. Trading influence requires separate activation checks and consent.</span></p>
+    <p className="entry-influence-note"><ShieldCheck size={14} /><span><strong>One Entry crown. Two model families.</strong> Linear or XGBoost can earn the first crown through independent proof. Later contenders must prove an advantage against the saved Champion. Trading influence requires separate activation checks and consent. These checks apply only to Entry; other skills have their own activation proof.</span></p>
     <div className="entry-family-grid">
       {(["linear", "xgboost"] as const).map(family => {
         const report = proof.families.find(item => item.family === family);
@@ -51,7 +51,7 @@ export default function EntryProof({ learning, renderGates }: { learning: Learni
       {learning.mode === "active" && learning.collecting_from_current_source && activation.active && <p>Influencing entries: <strong title={activation.active.version}>{identityText(activation.active)}</strong></p>}
       {!learning.collecting_from_current_source && <p className="entry-proof-note">This source is separate from live-paper learning. Saved proof grants no influence here.</p>}
       {learning.mode === "off" && <p className="entry-proof-note">Learning is paused. Saved qualification is separate from the current mode.</p>}
-      <p className="entry-proof-note">{activation.consent_granted ? "Consent was previously granted. The current mode and engine approval still control influence." : "Consent has not been granted. A crown alone does not switch learning to Active."}</p>
+      <p className="entry-proof-note">{typeof learning.auto_participation === "boolean" ? learning.auto_participation ? "Automatic support is allowed. Entry joins only when learning is running and its current activation checks pass." : "Automatic support is off. A saved crown does not enable trading influence." : activation.consent_granted ? "Consent was previously granted. The current mode and engine approval still control influence." : "Consent has not been granted. A crown alone does not switch learning to Active."}</p>
       {renderGates(activation.gates)}
       <p className="entry-proof-note">Entry may select or reject Baseline-approved opportunities. Manipulation, Sizing and Exit join only after their own independent and combined proof.</p>
     </section>

@@ -46,11 +46,28 @@ def freeze_training_inputs(inputs: TrainingInputs) -> tuple[bytes, ...]:
                 states[offset : offset + TRAINING_COPY_CHUNK_ROWS],
             ),
             round_trip=True,
-            # These audit-only fields were already excluded by the monolithic serializer.
-            # Policy sizing trials remain complete inputs to fitting.
+            # Account hashes and decoded reserve audits stay in the durable evidence journal.
+            # Fitting consumes the recorded values, missing reasons and chronological times,
+            # never these bulky nested proofs. Keep all Policy sizing economics and checkpoints.
             exclude={
-                0: {"__all__": {"size_trials", "challenger_evaluations"}},
-                1: {"__all__": {"challenger_evaluations"}},
+                0: {
+                    "__all__": {
+                        "size_trials": True,
+                        "challenger_evaluations": True,
+                        "checkpoints": {"__all__": {"route_snapshot"}},
+                    }
+                },
+                1: {
+                    "__all__": {
+                        "challenger_evaluations": True,
+                        "checkpoints": {"__all__": {"route_snapshot"}},
+                        "size_trials": {
+                            "__all__": {
+                                "checkpoints": {"__all__": {"route_snapshot"}},
+                            }
+                        },
+                    }
+                },
             },
         )
         for offset in range(0, length, TRAINING_COPY_CHUNK_ROWS)

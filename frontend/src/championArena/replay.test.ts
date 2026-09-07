@@ -39,7 +39,7 @@ describe("recorded battle evidence", () => {
     const t = response.timeline!;
     t.points.forEach((p, i) => { p.usable = 19 + i; p.observed = 21 + i; p.coverage = p.usable / p.observed; p.mean = p.lower = p.upper = 0; });
     const view = replayFrame(viewForEvent(snapshotFixture(), event), t, 1);
-    expect(battleReadout(view, false)).toMatchObject({ title: "Level so far", plot: true, preliminary: true, evidenceText: "Evidence 20/30 usable · preliminary" });
+    expect(battleReadout(view, false)).toMatchObject({ title: "Level so far", plot: true, preliminary: true, evidenceText: "20 usable · preliminary" });
     expect(view.momentum).toBe("neutral"); expect(view.outcome).toBeNull();
     expect(replayTrail(t, 1).summary).toBe("Level in every measured checkpoint shown.");
   });

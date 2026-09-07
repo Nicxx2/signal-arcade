@@ -64,6 +64,8 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ mode }),
     }),
+  setChampionParticipation: (enabled: boolean) =>
+    request<LearningStatus>("/api/v1/learning/participation", { method: "PUT", body: JSON.stringify({ enabled }) }),
   championJourney: (cursor?: string, signal?: AbortSignal, limit = 8) => request<ChallengerJourneyPage>(
     `/api/v1/learning/champion-journey?limit=${Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.trunc(limit))) : 8}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
     { signal },

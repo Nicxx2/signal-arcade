@@ -1,0 +1,37 @@
+{
+  "capture_at": "2026-09-07T08:19:04.610959+00:00",
+  "images": [
+    {
+      "file": "09-ai-coach-room.png",
+      "dimensions": [
+        1440,
+        1200
+      ],
+      "sha256": "a0ca32b68bac5933bc4aa9a69d421caf600b34fd2d6c939c2c0aa41d8c6f371f"
+    },
+    {
+      "file": "coach-how-it-works.png",
+      "dimensions": [
+        1440,
+        1498
+      ],
+      "sha256": "39f0f5ce96ef61bc48cd9fc075ebe5f6c1a294f0570590d98ddd6ca68675b85e"
+    },
+    {
+      "file": "mobile-ai-coach.png",
+      "dimensions": [
+        390,
+        1971
+      ],
+      "sha256": "75d61a0391ade43f1665008baf924687b7c26e55b49ec457297ea991212fca0c"
+    },
+    {
+      "file": "mobile-coach-how-it-works.png",
+      "dimensions": [
+        390,
+        2640
+      ],
+      "sha256": "518555f7da526e61a0442cd3860442961a04b06057daefc3128dc6cfb44c3888"
+    }
+  ]
+}

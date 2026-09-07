@@ -117,12 +117,15 @@ class AiDecisionLab:
         *,
         select_model: Callable[[str], None],
         configuration_fingerprint: Callable[[], str],
+        shadow_can_run: Callable[[], bool] | None = None,
     ) -> None:
         self.database = database
         self.http = http
         self.settings = settings
         self.select_model = select_model
         self.configuration_fingerprint = configuration_fingerprint
+        self.shadow_can_run = shadow_can_run or (lambda: True)
+        self.shadow_deferred = False
         try:
             self.mode = AiDecisionMode(
                 database.get_setting("ai_decision_mode", AiDecisionMode.OFF.value)
@@ -314,12 +317,7 @@ class AiDecisionLab:
         while True:
             decision, outcome = await self.queue.get()
             try:
-                if self.maintenance_paused:
-                    self.shadow_queue_drops += 1
-                    continue
-                if (
-                    datetime.now(UTC) - decision.created_at
-                ).total_seconds() > MAX_SHADOW_QUEUE_AGE_SECONDS:
+                if not await self._wait_for_shadow_slot(decision):
                     # Do not spend scarce local CPU evaluating an old burst after newer market
                     # opportunities have arrived. No assessment was saved, so a fresh checkpoint
                     # for this mint may be evaluated later.
@@ -353,8 +351,24 @@ class AiDecisionLab:
                         metadata={"decision_id": decision.decision_id},
                     )
             finally:
+                self.shadow_deferred = False
                 self.queued_mints.discard(decision.mint)
                 self.queue.task_done()
+
+    async def _wait_for_shadow_slot(self, decision: Decision) -> bool:
+        """Defer unstarted research without consuming the assessment's inference budget."""
+        while True:
+            if (
+                self.maintenance_paused
+                or self.mode != AiDecisionMode.SHADOW
+                or (datetime.now(UTC) - decision.created_at).total_seconds()
+                > MAX_SHADOW_QUEUE_AGE_SECONDS
+            ):
+                return False
+            self.shadow_deferred = not self.shadow_can_run()
+            if not self.shadow_deferred:
+                return True
+            await asyncio.sleep(0.5)
 
     async def _assess(
         self,
@@ -984,6 +998,9 @@ class AiDecisionLab:
             "queue_depth": self.queue.qsize(),
             "queue_capacity": self.queue.maxsize,
             "queue_drops": self.shadow_queue_drops,
+            "shadow_deferred_reason": (
+                "protecting_market_throughput" if self.shadow_deferred else None
+            ),
             "inference_busy": bool(getattr(self.http, "ollama_generation_busy", False)),
             "qualification": (
                 self.qualification_snapshot() if cached_qualification else self.qualification()

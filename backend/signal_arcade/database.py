@@ -35,9 +35,17 @@ from .models import (
     Position,
     Side,
 )
+from .season_strategy import (
+    decision_participants,
+    incomplete_record,
+    new_strategy_record,
+    read_strategy_record,
+    record_strategy_use,
+    strategy_view,
+)
 from .terminal_evidence import valid_terminal_probe
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 TERMINAL_POLICY_VERSION = "executable-boundary-v3"
 CHALLENGER_JOURNEY_SETTING_PREFIX = "challenger_champion_journey_v1:"
 CHALLENGER_PENDING_SETTING_PREFIX = "challenger_pending_versions_v1:"
@@ -66,6 +74,7 @@ class Database:
         self._storage_cache_at = 0.0
         self._storage_revision = 0
         self._training_publication_active = False
+        self._season_strategy_cache: tuple[str, dict[str, Any]] | None = None
         self._migrate()
         # WAL permits a reader to retain the last committed view while the maintenance writer
         # retires old rows.  Keeping UI/decision reads off the writer's in-process RLock prevents
@@ -730,6 +739,17 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_learning_evidence_trajectory "
                     "ON learning_evidence_episodes(lane,trajectory_key)"
                 )
+            if version < 15:
+                self._conn.execute("""CREATE TABLE IF NOT EXISTS paper_season_strategy (
+                    season_id TEXT PRIMARY KEY REFERENCES paper_seasons(season_id),
+                    record_json TEXT NOT NULL)""")
+                for row in self._conn.execute(
+                    "SELECT season_id FROM paper_seasons WHERE status='current'"
+                ).fetchall():
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO paper_season_strategy VALUES(?,?)",
+                        (row[0], json.dumps(incomplete_record(), separators=(",", ":"))),
+                    )
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _migrate_champion_journal(self) -> None:
@@ -1485,6 +1505,10 @@ class Database:
                 "open",
             ),
         )
+        self._conn.execute(
+            "INSERT INTO paper_season_strategy VALUES(?,?)",
+            (season_id, json.dumps(new_strategy_record(started_at, complete=True))),
+        )
 
     def reconfigure_unstarted_portfolio(
         self,
@@ -1603,7 +1627,9 @@ class Database:
     def list_paper_seasons(self) -> list[dict[str, Any]]:
         with self._reader_lock:
             rows = self._reader_conn.execute(
-                "SELECT * FROM paper_seasons ORDER BY season_number"
+                "SELECT s.*,u.record_json AS strategy_json FROM paper_seasons s "
+                "LEFT JOIN paper_season_strategy u ON u.season_id=s.season_id "
+                "ORDER BY s.season_number"
             ).fetchall()
             unresolved_rows = self._reader_conn.execute(
                 "SELECT season_id,record_json FROM unresolved_paper_positions ORDER BY recorded_at"
@@ -1616,6 +1642,7 @@ class Database:
         seasons: list[dict[str, Any]] = []
         for row in rows:
             season = dict(row)
+            season["strategy_usage"] = strategy_view(season.pop("strategy_json", None))
             raw_profile = season.pop("profile_json", None)
             season["profile"] = json.loads(raw_profile) if raw_profile else None
             season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
@@ -1633,11 +1660,14 @@ class Database:
     def current_paper_season(self) -> dict[str, Any] | None:
         with self._reader_lock:
             row = self._reader_conn.execute(
-                "SELECT * FROM paper_seasons WHERE status='current'"
+                "SELECT s.*,u.record_json AS strategy_json FROM paper_seasons s "
+                "LEFT JOIN paper_season_strategy u ON u.season_id=s.season_id "
+                "WHERE s.status='current'"
             ).fetchone()
         if row is None:
             return None
         season = dict(row)
+        season["strategy_usage"] = strategy_view(season.pop("strategy_json", None))
         raw_profile = season.pop("profile_json", None)
         season["profile"] = json.loads(raw_profile) if raw_profile else None
         season["profile_provenance"] = "exact" if raw_profile else "legacy_unknown"
@@ -1797,17 +1827,54 @@ class Database:
         )
 
     def save_decision(self, decision: Decision) -> None:
-        with self._lock, self._conn:
+        with self._lock:
+            tracked = None
+            with self._conn:
+                inserted = self._conn.execute(
+                    "INSERT OR IGNORE INTO decisions VALUES(?,?,?,?,?)",
+                    (
+                        decision.decision_id,
+                        decision.mint,
+                        decision.action.value,
+                        decision.created_at.isoformat(),
+                        decision.model_dump_json(),
+                    ),
+                ).rowcount
+                if inserted and decision.season_id:
+                    tracked = self._record_season_strategy_use(
+                        decision.season_id,
+                        decision_participants(decision),
+                        decision.created_at.isoformat(),
+                    )
+            # Cache only committed facts; a failed decision write cannot consume a first-use fact.
+            if tracked is not None:
+                self._season_strategy_cache = tracked
+
+    def _record_season_strategy_use(
+        self, season_id: str, participants: list[dict[str, str]], at: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Runs inside the caller's existing write transaction; no journal scan per tick."""
+        cached = self._season_strategy_cache
+        if cached is not None and cached[0] == season_id:
+            original = cached[1]
+        else:
+            row = self._conn.execute(
+                "SELECT u.record_json FROM paper_seasons s "
+                "LEFT JOIN paper_season_strategy u ON s.season_id=u.season_id "
+                "WHERE s.season_id=? AND s.status='current'",
+                (season_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            original = read_strategy_record(row[0]) or incomplete_record()
+        updated = record_strategy_use(original, participants, at)
+        if updated is not original:
             self._conn.execute(
-                "INSERT OR IGNORE INTO decisions VALUES(?,?,?,?,?)",
-                (
-                    decision.decision_id,
-                    decision.mint,
-                    decision.action.value,
-                    decision.created_at.isoformat(),
-                    decision.model_dump_json(),
-                ),
+                "INSERT INTO paper_season_strategy VALUES(?,?) ON CONFLICT(season_id) "
+                "DO UPDATE SET record_json=excluded.record_json",
+                (season_id, json.dumps(updated, separators=(",", ":"))),
             )
+        return season_id, updated
 
     def list_decisions(self, limit: int = 100) -> list[Decision]:
         with self._reader_lock:
@@ -3009,17 +3076,30 @@ class Database:
         return [FillReceipt.model_validate_json(row[0]) for row in rows]
 
     def save_position(self, position: Position) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                """INSERT INTO positions VALUES(?,?,?,?)
-                   ON CONFLICT(position_id) DO UPDATE SET record_json=excluded.record_json""",
-                (
-                    position.position_id,
-                    position.mint,
-                    position.opened_at.isoformat(),
-                    position.model_dump_json(),
-                ),
-            )
+        with self._lock:
+            tracked = None
+            with self._conn:
+                self._conn.execute(
+                    """INSERT INTO positions VALUES(?,?,?,?)
+                       ON CONFLICT(position_id) DO UPDATE SET record_json=excluded.record_json""",
+                    (
+                        position.position_id,
+                        position.mint,
+                        position.opened_at.isoformat(),
+                        position.model_dump_json(),
+                    ),
+                )
+                assessment = position.exit_assessment
+                if assessment is not None and assessment.strategy_season_id:
+                    tracked = self._record_season_strategy_use(
+                        assessment.strategy_season_id,
+                        [assessment.strategy_participant]
+                        if assessment.strategy_participant is not None
+                        else [],
+                        assessment.evaluated_at.isoformat(),
+                    )
+            if tracked is not None:
+                self._season_strategy_cache = tracked
 
     def delete_position(self, position_id: str) -> None:
         with self._lock, self._conn:
@@ -3289,19 +3369,33 @@ class Database:
         """Return detailed recent equity plus hourly close points for long-running seasons."""
 
         recent = self.equity_history(recent_limit)
-        oldest = (
-            str(recent[0]["recorded_at"]) if recent else datetime.now().astimezone().isoformat()
+        # A rollup is the close for its whole hour, not a measurement at bucket_start.
+        # Never place a partially overlapping close before earlier detailed checkpoints.
+        oldest_at = (
+            datetime.fromisoformat(str(recent[0]["recorded_at"]))
+            if recent
+            else datetime.now().astimezone()
         )
+        oldest = oldest_at.replace(minute=0, second=0, microsecond=0).isoformat()
         with self._reader_lock:
             rows = self._reader_conn.execute(
                 """SELECT bucket_start AS recorded_at,
                           close_equity_lamports AS equity_lamports,
-                          close_cash_lamports AS cash_lamports
+                          close_cash_lamports AS cash_lamports,
+                          high_equity_lamports,low_equity_lamports
                    FROM equity_rollups WHERE bucket_start<?
                    ORDER BY bucket_start DESC LIMIT ?""",
                 (oldest, rollup_limit),
             ).fetchall()
-        return [dict(row) for row in reversed(rows)] + recent
+        hourly = []
+        for row in reversed(rows):
+            point = dict(row)
+            point["kind"] = "hourly_close"
+            point["period_end"] = (
+                datetime.fromisoformat(point["recorded_at"]) + timedelta(hours=1)
+            ).isoformat()
+            hourly.append(point)
+        return hourly + [{**point, "kind": "checkpoint"} for point in recent]
 
     def reset_paper_state(
         self,
@@ -3541,6 +3635,7 @@ class Database:
         ).rowcount
         if updated != 1:
             raise RuntimeError("active paper season summary row is missing")
+        self._season_strategy_cache = None
 
     @staticmethod
     def _terminal_boundary_type(terminal_reason: str) -> str:

@@ -112,7 +112,7 @@ describe("arena lifecycle and complete fallback", () => {
     const position = marker.getAttribute("style");
     const fighter = document.querySelector(".ca-name-left em")!.textContent;
     expect(marker).not.toBeNull();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuetext", "35 of 30; evidence progress only");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuetext", "35 usable; minimum 30 met");
     expect(screen.queryByText("Waiting for a fresh update")).toBeNull();
     mounted.rerender(<ArenaDialog {...mounted.props} snapshot={snapshotFixture()} />);
     expect(screen.getByText("Live comparison")).toBeInTheDocument(); expect(instances[0]!.setActive).toHaveBeenLastCalledWith(true);

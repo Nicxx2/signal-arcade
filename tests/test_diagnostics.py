@@ -5,6 +5,7 @@ import copy
 import json
 import sqlite3
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from signal_arcade.diagnostics import (
     DiagnosticsRecorder,
     PipelineCursor,
     artifact_summary,
+    identity,
 )
 from signal_arcade.diagnostics_store import (
     DiagnosticsStore,
@@ -421,6 +423,89 @@ def test_real_collector_uses_no_snapshot_and_keeps_core_budget(settings, monkeyp
     assert second["pipeline"]["critical_count"] == 0
     assert engine.diagnostics.directory != engine.database.path
     engine.database.close()
+
+
+@pytest.mark.parametrize(
+    "legacy_field",
+    ["feature_schema_version", "baseline_version", "risk_mode", "configuration_fingerprint"],
+)
+@pytest.mark.parametrize("legacy_first", [True, False])
+def test_diagnostics_tracks_current_cohort_and_runtime_support(
+    settings, monkeypatch, legacy_field, legacy_first
+):
+    from signal_arcade.intelligence.learning import FEATURE_SCHEMA_VERSION, _challenger_cohort_key
+    from signal_arcade.models import (
+        ChallengerSkill,
+        ChallengerSkillArtifact,
+        ChallengerSkillState,
+        RiskMode,
+    )
+
+    engine = Orchestrator(settings)
+    engine.diagnostics.enabled = True
+    context = {
+        "risk_mode": engine.risk_mode,
+        "configuration_fingerprint": engine._configuration_fingerprint(),
+        "baseline_version": engine.learning.baseline_version(),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+    }
+    legacy_context = {
+        **context,
+        legacy_field: RiskMode.AGGRESSIVE if legacy_field == "risk_mode" else "legacy",
+    }
+    artifacts = []
+    states = []
+    for label, scope in (("current", context), ("legacy", legacy_context)):
+        # A newer imported artifact must not replace the current cohort's summary.
+        artifact = ChallengerSkillArtifact(
+            version=label + "-candidate",
+            skill=ChallengerSkill.EXIT,
+            **scope,
+            created_at=datetime.now(UTC) + timedelta(days=1 if label == "legacy" else 0),
+        )
+        cohort = _challenger_cohort_key(**scope)
+        state = ChallengerSkillState(
+            cohort_key=cohort,
+            skill=ChallengerSkill.EXIT,
+            **scope,
+            champion_version=label + "-champion",
+            active_version=label + "-champion",
+            testing_version=artifact.version,
+            common_forward_count=44 if label == "current" else 1,
+        )
+        artifacts.append(artifact)
+        states.append(state)
+    if legacy_first:
+        artifacts.reverse()
+        states.reverse()
+    engine.learning.skill_artifacts = {a.version: a for a in artifacts}
+    engine.learning.skill_states = {(s.cohort_key, s.skill): s for s in states}
+    engine.learning.active_skill_versions = {"exit": "current-champion"}
+    monkeypatch.setattr(engine, "snapshot", lambda: pytest.fail("no dashboard work in diagnostics"))
+    monkeypatch.setattr(
+        engine.database, "save_challenger_skill_state", lambda *_: pytest.fail("read only")
+    )
+    try:
+        assert (
+            engine.learning._current_skill_state(ChallengerSkill.EXIT).champion_version
+            == "current-champion"
+        )
+        engine._collect_diagnostics()
+        record = json.loads(engine.diagnostics.queue[-1])
+        assert len(record["skills"]) == 1
+        skill = record["skills"][0]
+        assert skill["id"] == identity("current-candidate")
+        assert skill["champion"] == skill["active"] == identity("current-champion")
+        assert skill["testing"] == identity("current-candidate")
+        assert skill["shared"] == 44
+        # A durable activation receipt alone cannot claim current runtime authority.
+        engine.learning.active_skill_versions.clear()
+        engine._collect_diagnostics()
+        inactive = json.loads(engine.diagnostics.queue[-1])["skills"][0]
+        assert inactive["active"] is None
+        assert inactive["champion"] == identity("current-champion")
+    finally:
+        engine.database.close()
 
 
 def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, monkeypatch):

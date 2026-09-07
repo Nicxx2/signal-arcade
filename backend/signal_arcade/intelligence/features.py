@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from threading import RLock
 from typing import Any
@@ -370,6 +370,12 @@ class TokenState:
         price = self.price_sol
         if token_units > 0 and quote_lamports > 0:
             price = (quote_lamports / LAMPORTS_PER_SOL) / (token_units / PUMP_TOKEN_DECIMALS)
+        # Every trade-derived feature uses at most five minutes. Keep the inclusive boundary
+        # and the separate capacity-eviction marker: expired trades are not missing evidence.
+        # effective_at is monotonic even when a source/host timestamp moves backwards.
+        cutoff = effective_at - timedelta(seconds=300)
+        while self.trades and self.trades[0].received_at < cutoff:
+            self.trades.popleft()
         if self.trades.maxlen is not None and len(self.trades) >= self.trades.maxlen:
             self.last_evicted_trade = self.trades[0]
         self.trades.append(

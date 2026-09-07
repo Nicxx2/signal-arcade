@@ -7,10 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from solders.pubkey import Pubkey
+
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 def b58encode(data: bytes) -> str:
+    # Anchor public keys dominate stream decoding. Use the already-required native codec
+    # for that exact width, preserving the generic encoder's other inputs and leading zeros.
+    if len(data) == 32:
+        return str(Pubkey.from_bytes(bytes(data)))
     zeros = len(data) - len(data.lstrip(b"\0"))
     number = int.from_bytes(data, "big")
     encoded = ""

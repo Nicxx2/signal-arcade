@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from signal_arcade import __version__
 from signal_arcade.api import create_app
 from signal_arcade.config import Settings
+from signal_arcade.models import LearningMode
 from signal_arcade.strategy import BASELINE_VERSION, INTEGRITY_POLICY_VERSION
 from starlette.websockets import WebSocketDisconnect
 
@@ -153,6 +154,33 @@ def test_learning_starts_in_shadow_and_rejects_unproven_activation(settings) -> 
         assert "forward and suspension gates" in active.json()["detail"]
 
 
+def test_automatic_support_permission_is_opt_in_and_does_not_bypass_proof(settings):  # type: ignore[no-untyped-def]
+    with TestClient(create_app(settings)) as client:
+        response = client.put("/api/v1/learning/participation", json={"enabled": True})
+        assert response.status_code == 409
+    mainnet = settings.model_copy(
+        update={"demo_mode": False, "data_dir": settings.data_dir / "support"}
+    )
+    with TestClient(create_app(mainnet)) as client:
+        result = client.put("/api/v1/learning/participation", json={"enabled": True})
+        assert result.status_code == 200
+        assert result.json()["auto_participation"] is True
+        assert result.json()["mode"] == "shadow"
+        assert result.json()["active_skill_versions"] == {}
+        assert (
+            client.put(
+                "/api/v1/learning/participation", json={"enabled": True, "skip_proof": True}
+            ).status_code
+            == 422
+        )
+        client.put("/api/v1/learning", json={"mode": "off"})
+        resumed = client.put("/api/v1/learning", json={"mode": "shadow"}).json()
+        assert resumed["auto_participation"] is True
+        disabled = client.put("/api/v1/learning/participation", json={"enabled": False}).json()
+        assert disabled["auto_participation"] is False
+        assert disabled["active_skill_versions"] == {}
+
+
 def test_ai_lab_is_opt_in_curated_and_veto_gated(settings) -> None:  # type: ignore[no-untyped-def]
     with TestClient(create_app(settings)) as client:
         status = client.get("/api/v1/ai-lab")
@@ -248,6 +276,34 @@ def test_coach_contribution_permission_can_be_revoked_while_local_ai_is_off(sett
 
         assert disabled.status_code == 200
         assert disabled.json()["contribution_enabled"] is False
+
+
+def test_coach_permission_before_proof_preserves_paused_learning_and_research(settings) -> None:  # type: ignore[no-untyped-def]
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.put("/api/v1/ai-lab/mode", json={"mode": "shadow"}).status_code == 200
+        paused = client.put("/api/v1/ai-lab/coach-research", json={"enabled": False})
+        assert paused.status_code == 200
+        engine = app.state.orchestrator
+        engine.learning.set_mode(LearningMode.OFF)
+        assert not engine.coach.ready_contribution()
+        assert not engine.learning.active_skill_versions
+        for _ in range(2):
+            response = client.put("/api/v1/ai-lab/coach-contribution", json={"enabled": True})
+            assert response.status_code == 200
+            assert response.json()["contribution_enabled"] is True
+            assert response.json()["contribution_ready"] is False
+            assert response.json()["research_enabled"] is False
+            assert engine.learning.mode == LearningMode.OFF
+            assert not engine.learning.active_skill_versions
+            engine._coach_contribution_tick()  # noqa: SLF001
+            assert not engine.learning.skill_artifacts
+    with TestClient(create_app(settings)) as restarted:
+        snapshot = restarted.get("/api/v1/snapshot").json()
+        assert snapshot["coach"]["contribution_enabled"] is True
+        assert snapshot["coach"]["research_enabled"] is False
+        assert snapshot["learning"]["mode"] == "off"
+        assert snapshot["learning"]["active_skill_versions"] == {}
 
 
 def test_user_must_create_bankroll_before_explicit_start(settings) -> None:  # type: ignore[no-untyped-def]

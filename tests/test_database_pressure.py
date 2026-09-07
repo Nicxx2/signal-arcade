@@ -63,7 +63,7 @@ def test_ai_index_upgrade_keeps_full_cohort_and_tied_order(tmp_path, limit):
     try:
         assert upgraded.list_ai_assessments(limit) == old
         assert upgraded.get_setting("preserved-marker") == {"unchanged": True}
-        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 15
         plan = [
             row[3]
             for row in upgraded._conn.execute(
@@ -176,7 +176,7 @@ def test_additive_index_failure_rolls_back_partial_index_work(tmp_path):
     with pytest.raises(sqlite3.OperationalError, match="already a table"):
         Database(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='idx_ai_assessments_created'"
