@@ -35,6 +35,16 @@ MAX_EVENT_PAYLOAD = 768
 LAG_BOUNDS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 30]
 COUNTERS = ("enqueued", "processed", "shed", "expired", "reordered", "lag_count", "critical_count")
 MAXIMA = ("lag_max", "critical_lag_max", "queue_max")
+_READ_QUERY_SECONDS = 0.1
+
+
+class DiagnosticsReadError(Exception):
+    """A safe export failure category, without raw paths, SQL or payload contents."""
+
+    def __init__(self, reason: str, *, retryable: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retryable = retryable
 
 
 def _pack_summary(value: dict[str, Any]) -> dict[str, Any]:
@@ -421,6 +431,91 @@ class DiagnosticsStore:
         self.connection.close()
 
 
+def _read_records(
+    directory: Path,
+    query: str,
+    parameters: tuple[Any, ...],
+    *,
+    require_existing: bool,
+) -> list[dict[str, Any]]:
+    connection = None
+    deadline_expired = False
+    try:
+        path = directory / "history.sqlite3"
+        if directory.is_symlink() or path.is_symlink() or not path.exists():
+            if require_existing:
+                raise DiagnosticsReadError("diagnostics_file_error")
+            return []
+        try:
+            owned_bytes(directory)
+        except ValueError as exc:
+            raise DiagnosticsReadError("diagnostics_store_unsafe") from exc
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.02)
+        deadline = time.monotonic() + _READ_QUERY_SECONDS
+
+        def expired() -> int:
+            nonlocal deadline_expired
+            deadline_expired = time.monotonic() > deadline
+            return int(deadline_expired)
+
+        connection.set_progress_handler(expired, 1000)
+        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
+            raise DiagnosticsReadError("diagnostics_schema_unsupported")
+        rows: list[tuple[Any, ...]] = []
+        cursor = connection.execute(query, parameters)
+        while True:
+            if time.monotonic() > deadline:
+                if rows:
+                    break
+                raise DiagnosticsReadError("diagnostics_query_deadline", retryable=True)
+            try:
+                row = cursor.fetchone()
+            except sqlite3.Error as exc:
+                # A deadline ends this page at its last complete row. Discarding a valid
+                # ordered prefix would repeatedly spend the budget on the same records
+                # when Python scheduling delays the reader. Other errors still fail.
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                if rows and code == sqlite3.SQLITE_INTERRUPT and deadline_expired:
+                    break
+                raise
+            if row is None:
+                break
+            rows.append(row)
+    except sqlite3.Error as exc:
+        # Extended result codes retain the primary code in their low byte.
+        code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+        if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            reason = (
+                "diagnostics_sqlite_busy"
+                if code == sqlite3.SQLITE_BUSY
+                else "diagnostics_sqlite_locked"
+            )
+            raise DiagnosticsReadError(reason, retryable=True) from exc
+        if code == sqlite3.SQLITE_INTERRUPT and deadline_expired:
+            raise DiagnosticsReadError("diagnostics_query_deadline", retryable=True) from exc
+        if code in (sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_IOERR, sqlite3.SQLITE_READONLY):
+            raise DiagnosticsReadError("diagnostics_file_error") from exc
+        raise DiagnosticsReadError("diagnostics_sqlite_error") from exc
+    except OSError as exc:
+        raise DiagnosticsReadError("diagnostics_file_error") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    # Release the read snapshot before decompression or streaming. Only fully fetched,
+    # decoded rows are returned. A decode failure rejects the whole prefix; retryable
+    # failures without progress keep the same cursor and cannot duplicate records.
+    try:
+        result = []
+        for row in rows:
+            record = decode(row[-1])
+            if not isinstance(record, dict):
+                raise ValueError("invalid_record")
+            result.append({"cursor": list(row[:-1]), "record": record})
+        return result
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise DiagnosticsReadError("diagnostics_decode_error") from exc
+
+
 def read_page(
     directory: Path,
     *,
@@ -428,54 +523,37 @@ def read_page(
     after: tuple[float, str, int] | None = None,
     limit: int = 100,
     before: float | None = None,
+    require_existing: bool = False,
 ) -> list[dict[str, Any]]:
-    path = directory / "history.sqlite3"
-    if directory.is_symlink() or path.is_symlink() or not path.exists():
-        return []
-    owned_bytes(directory)
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.02)
-    try:
-        deadline = time.monotonic() + 0.1
-        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
-        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
-            raise ValueError("unsupported_schema")
-        cursor = after or (-1.0, "", -1)
-        rows = connection.execute(
-            "SELECT at,boot,seq,substr(payload,1,?) FROM intervals "
-            "WHERE tier=? AND (at,boot,seq)>(?,?,?) "
-            "AND until_at<=? ORDER BY at,boot,seq LIMIT ?",
-            (
-                MAX_PAYLOAD + 1,
-                tier,
-                *cursor,
-                before if before is not None else time.time(),
-                max(1, min(100, limit)),
-            ),
-        ).fetchall()
-        return [{"cursor": [row[0], row[1], row[2]], "record": decode(row[3])} for row in rows]
-    finally:
-        connection.close()
+    return _read_records(
+        directory,
+        "SELECT at,boot,seq,substr(payload,1,?) FROM intervals "
+        "WHERE tier=? AND (at,boot,seq)>(?,?,?) "
+        "AND until_at<=? ORDER BY at,boot,seq LIMIT ?",
+        (
+            MAX_PAYLOAD + 1,
+            tier,
+            *(after or (-1.0, "", -1)),
+            before if before is not None else time.time(),
+            max(1, min(100, limit)),
+        ),
+        require_existing=require_existing,
+    )
 
 
 def read_events(
-    directory: Path, *, after: tuple[float, str, int, int] | None = None, before: float
+    directory: Path,
+    *,
+    after: tuple[float, str, int, int] | None = None,
+    before: float,
+    limit: int = 100,
+    require_existing: bool = False,
 ) -> list[dict[str, Any]]:
-    path = directory / "history.sqlite3"
-    if directory.is_symlink() or path.is_symlink() or not path.exists():
-        return []
-    owned_bytes(directory)
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.02)
-    try:
-        deadline = time.monotonic() + 0.1
-        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
-        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
-            raise ValueError("unsupported_schema")
-        rows = connection.execute(
-            "SELECT at,boot,seq,item,substr(payload,1,?) FROM events "
-            "WHERE (at,boot,seq,item)>(?,?,?,?) "
-            "AND at<=? ORDER BY at,boot,seq,item LIMIT 100",
-            (MAX_EVENT_PAYLOAD + 1, *(after or (-1.0, "", -1, -1)), before),
-        ).fetchall()
-        return [{"cursor": list(row[:4]), "record": decode(row[4])} for row in rows]
-    finally:
-        connection.close()
+    return _read_records(
+        directory,
+        "SELECT at,boot,seq,item,substr(payload,1,?) FROM events "
+        "WHERE (at,boot,seq,item)>(?,?,?,?) "
+        "AND at<=? ORDER BY at,boot,seq,item LIMIT ?",
+        (MAX_EVENT_PAYLOAD + 1, *(after or (-1.0, "", -1, -1)), before, max(1, min(100, limit))),
+        require_existing=require_existing,
+    )

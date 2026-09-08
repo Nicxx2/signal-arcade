@@ -471,13 +471,37 @@ After 30 resolved cases, per-skill rolling health checks compare each active ver
 bounded counterfactual in the current activation and exact upstream composition. A downstream
 join does not reset an upstream skill's health; reactivation starts a new health window.
 Pending horizons do not count as failures; resolved unavailable outcomes
-do count against coverage. A harmful or insufficiently observable skill is suspended. Its
-downstream dependants are suspended as well because their proof assumed that upstream ensemble;
-unrelated upstream evidence and every immutable artifact remain intact. With automatic support,
+do count against coverage. A harmful or insufficiently observable skill is suspended. Downstream
+dependants lose authority and need fresh composition proof; this does not mark them as harmful.
+Unrelated upstream evidence and every immutable artifact remain intact. With automatic support,
 the preference stays enabled: a newly proved replacement or another independently qualified skill
-can join after the appropriate fresh proof. A suspended version cannot re-enable itself. Without
-automatic permission, the legacy Entry-first mode returns to Shadow when Entry is suspended.
+can join after the appropriate fresh proof. Without automatic permission, the legacy Entry-first
+mode returns to Shadow when Entry is suspended.
 A restart cannot silently substitute the newest artifact.
+
+With automatic support enabled, a Champion suspended specifically for harm or insufficient
+observability may earn its support back through one fixed prospective shadow trial. The first
+60 new original eligible Policy entries are selected before outcomes exist, after suspension and
+the artifact's creation, in the exact current upstream composition and activation epochs. No
+earlier training, battle or active-health result counts. All 60 must resolve or reach their existing
+checkpoint deadlines before a decision; missing receipts and lost rows remain unavailable in the
+denominator. The trial requires at least 30 usable outcomes, 70% coverage, a positive conservative
+advantage and the existing harm limit. Entry also retains its current Entry activation gates.
+
+There is one trial per suspension, with no sliding window, early success or retry after failure.
+A changed upstream composition invalidates that trial. Failed or invalidated trials wait for a
+newly qualified replacement; training and normal battles continue. Missing, incompatible or corrupt
+artifacts, obsolete comparison proof and unknown suspension reasons cannot use this recovery path.
+Disabling support or pausing learning cannot reset a failed trial or restore authority. Coach
+crowns keep their existing contribution provenance and use the same fresh composition boundaries.
+Recovery restores the same immutable Champion and generation, starts new active-health monitoring,
+and awards no new crown. The bounded recovery receipt and original suspension reason/time survive
+restarts in compatible state JSON; diagnostics intervals retain a compact summary without Policy IDs.
+
+Identical native deterministic Exit fits remain saved for audit but do not start redundant battles
+or replace a different queued policy. Identity requires the complete executable policy contract,
+including verified parameters/digest, risk, configuration, Baseline, feature schema and recipe.
+Ongoing battles are preserved. This rule does not deduplicate learned Linear/XGBoost or Coach ideas.
 
 Changing risk personality or a decision-relevant Baseline/provider/fee configuration returns an
 active ensemble to Shadow and clears influence, while retaining the user's consent and all learning
@@ -543,6 +567,23 @@ outside its exact dependencies. A context change retires the stale contender whi
 existing Champion. The Challenger handoff independently revalidates the complete deterministic
 allowlist—including policy kind, skill, conditions, multiplier or review horizons—so a malformed
 or incompatible persisted Coach record cannot acquire tournament authority.
+
+From v1.10.8, retained forward studies are processed in indexed pages independently of the
+100-item recent notebook window. Current-contract lookups also find older active studies and
+ready contributions. A durable retry cursor rotates waiting contributions, while newly ready
+ideas still receive their first attempt first. This does not grant permission, create a first
+Champion or change the research/activation gates. AI Off remains a stop for new handoffs.
+
+Coach refreshes condition their writes on the saved study still matching, so they cannot replace
+a newer contribution transition. Forward evaluation can yield under market pressure and resumes
+from saved, complete evidence. Inference backoff skips the large history read only when there is
+no unfinished forward study to monitor; it does not pause that study's evidence collection.
+
+Dashboard Policy selection is reused only within one response. Tournament passes may share the
+same contract's selected population, but qualification and health decisions remain fresh. A
+repeated evaluation with unchanged skill state need not create another database write; pending
+replay/history work and failed transactions still require persistence. Verified zero protocol
+fees remain zero in new evidence, matching execution; historical recorded assumptions stay intact.
 
 ### AI Decision Lab
 

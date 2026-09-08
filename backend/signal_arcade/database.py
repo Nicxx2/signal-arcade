@@ -74,6 +74,10 @@ class Database:
         self._storage_cache_at = 0.0
         self._storage_revision = 0
         self._training_publication_active = False
+        self._saved_skill_states: dict[tuple[str, str], tuple[str, datetime]] = {}
+        self._publication_skill_acks: dict[
+            int, tuple[ChallengerSkillState, ChallengerSkillState]
+        ] = {}
         self._season_strategy_cache: tuple[str, dict[str, Any]] | None = None
         self._migrate()
         # WAL permits a reader to retain the last committed view while the maintenance writer
@@ -722,7 +726,8 @@ class Database:
                 row[0]
                 for row in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                    "('ai_critic_assessments','learning_evidence_episodes','fills')"
+                    "('ai_critic_assessments','learning_evidence_episodes','fills',"
+                    "'coach_hypotheses')"
                 )
             }
             if "ai_critic_assessments" in optional_tables:
@@ -762,6 +767,11 @@ class Database:
                 )
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_fills_side_mint ON fills(side,mint)"
+                )
+            if "coach_hypotheses" in optional_tables:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coach_work "
+                    "ON coach_hypotheses(state,created_at,hypothesis_id)"
                 )
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -2373,7 +2383,36 @@ class Database:
         }
 
     def save_challenger_skill_state(self, state: ChallengerSkillState) -> None:
-        with self._lock, self._model_write_scope():
+        with self._lock:
+            key = (state.cohort_key, state.skill.value)
+            signature = self._skill_state_signature(state)
+            previous = self._saved_skill_states.get(key)
+            if (
+                not self._training_publication_active
+                and not self._conn.in_transaction
+                and not state._battle_replay_dirty
+                and not state._pending_battle_replays
+                and previous is not None
+                and previous[0] == signature
+            ):
+                # updated_at describes the last durable change, not a repeated evaluation.
+                state.updated_at = previous[1]
+                return
+            self._persist_challenger_skill_state(state)
+            if not self._training_publication_active:
+                self._saved_skill_states[key] = (
+                    self._skill_state_signature(state),
+                    state.updated_at,
+                )
+                if len(self._saved_skill_states) > 256:
+                    self._saved_skill_states.pop(next(iter(self._saved_skill_states)))
+
+    @staticmethod
+    def _skill_state_signature(state: ChallengerSkillState) -> str:
+        return hashlib.sha256(state.model_dump_json(exclude={"updated_at"}).encode()).hexdigest()
+
+    def _persist_challenger_skill_state(self, state: ChallengerSkillState) -> None:
+        with self._model_write_scope():
             self._insert_champion_events(
                 state.cohort_key, state.skill.value, state.champion_journey
             )
@@ -2413,10 +2452,21 @@ class Database:
                 [(self._challenger_pending_setting_key(state), state.pending_versions)],
                 state.updated_at.isoformat(),
             )
-        state._battle_replay_dirty = False
-        state._pending_battle_replays.clear()
-        state.champion_journey = state.champion_journey[-RECENT_CHAMPION_EVENTS_IN_MEMORY:]
+        if self._training_publication_active:
+            self._publication_skill_acks[id(state)] = (state, state.model_copy(deep=True))
+        else:
+            self._acknowledge_skill_state(state, state)
         self._invalidate_storage_cache()
+
+    @staticmethod
+    def _acknowledge_skill_state(state: ChallengerSkillState, saved: ChallengerSkillState) -> None:
+        if state._battle_replay == saved._battle_replay:
+            state._battle_replay_dirty = False
+        for event_id, replay in list(saved._pending_battle_replays.items()):
+            if state._pending_battle_replays.get(event_id) == replay:
+                state._pending_battle_replays.pop(event_id)
+        if state.champion_journey == saved.champion_journey:
+            state.champion_journey = state.champion_journey[-RECENT_CHAMPION_EVENTS_IN_MEMORY:]
 
     @contextmanager
     def training_publication(self) -> Iterator[None]:
@@ -2425,12 +2475,37 @@ class Database:
             if self._training_publication_active or self._conn.in_transaction:
                 raise RuntimeError("training publication requires its own transaction")
             self._training_publication_active = True
+            self._saved_skill_states.clear()
+            self._publication_skill_acks.clear()
             try:
                 with self._conn:
                     self._conn.execute("BEGIN IMMEDIATE")
                     yield
+                for state, saved in self._publication_skill_acks.values():
+                    self._acknowledge_skill_state(state, saved)
             finally:
                 self._training_publication_active = False
+                self._saved_skill_states.clear()
+                self._publication_skill_acks.clear()
+
+    def save_challenger_authority(
+        self,
+        states: list[ChallengerSkillState],
+        versions: dict[str, str],
+        *,
+        mode: str | None = None,
+    ) -> None:
+        """Commit the entire upstream/downstream activation boundary together."""
+        with self.training_publication():
+            for state in states:
+                self.save_challenger_skill_state(state)
+            self._upsert_settings(
+                [
+                    ("active_challenger_skills", versions),
+                    *([("learning_mode", mode)] if mode else []),
+                ],
+                datetime.now().astimezone().isoformat(),
+            )
 
     @contextmanager
     def _model_write_scope(self) -> Iterator[None]:
@@ -2446,6 +2521,7 @@ class Database:
         states: list[ChallengerSkillState] = []
         # Support imported development records as well as the startup schema migration.
         with self._lock, self._conn:
+            self._saved_skill_states.clear()
             self._migrate_champion_journal()
         with self._reader_lock:
             rows = self._reader_conn.execute(
@@ -2749,6 +2825,154 @@ class Database:
             except ValidationError:
                 continue
         return hypotheses
+
+    def save_coach_hypothesis_if_current(
+        self,
+        expected: CoachHypothesis,
+        updated: CoachHypothesis,
+        *,
+        contribution_cursor: str | None = None,
+    ) -> bool:
+        """An advisory evaluation cannot overwrite a newer handoff or evidence update."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT record_json FROM coach_hypotheses WHERE hypothesis_id=?",
+                (expected.hypothesis_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                if CoachHypothesis.model_validate_json(row[0]) != expected:
+                    return False
+            except ValidationError:
+                return False
+            self._conn.execute(
+                "UPDATE coach_hypotheses SET state=?,record_json=? WHERE hypothesis_id=?",
+                (updated.state.value, updated.model_dump_json(), expected.hypothesis_id),
+            )
+            if contribution_cursor is not None:
+                self._upsert_settings(
+                    [("coach_contribution_cursor", contribution_cursor)],
+                    updated.updated_at.isoformat(),
+                )
+        self._invalidate_storage_cache()
+        return True
+
+    def coach_work_page(
+        self,
+        after: tuple[str, str] | None = None,
+        limit: int = 25,
+    ) -> tuple[list[CoachHypothesis], tuple[str, str] | None]:
+        """Rotate through protected studies independently of the recent display history."""
+        if not 1 <= limit <= 100:
+            raise ValueError("Coach work page must be between 1 and 100")
+        with self._reader_lock:
+            rows = self._reader_conn.execute(
+                "SELECT created_at,hypothesis_id,record_json FROM coach_hypotheses "
+                "WHERE state='testing' AND (created_at,hypothesis_id)>(?,?) "
+                "ORDER BY created_at,hypothesis_id LIMIT ?",
+                (*(after or ("", "")), limit),
+            ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                items.append(CoachHypothesis.model_validate_json(row[2]))
+            except ValidationError:
+                continue
+        # Use the raw page boundary so a damaged record cannot trap the cursor.
+        cursor = (str(rows[-1][0]), str(rows[-1][1])) if len(rows) == limit else None
+        return items, cursor
+
+    def coach_hypothesis(self, hypothesis_id: str) -> CoachHypothesis | None:
+        with self._reader_lock:
+            row = self._reader_conn.execute(
+                "SELECT record_json FROM coach_hypotheses WHERE hypothesis_id=?",
+                (hypothesis_id,),
+            ).fetchone()
+        if row is not None:
+            try:
+                return CoachHypothesis.model_validate_json(row[0])
+            except ValidationError:
+                pass
+        return None
+
+    def coach_context_hypotheses(
+        self,
+        context: dict[str, Any],
+        *,
+        contributions: bool = False,
+        testing: bool = False,
+        best_effort: bool = False,
+    ) -> list[CoachHypothesis]:
+        """Bounded current-contract lookup; JSON object key order is not identity."""
+        if best_effort:
+            # The heartbeat's optional handoff must not wait behind a dashboard/history read.
+            # Hold the reentrant boundary around both the cursor and candidate reads.
+            if not self._reader_lock.acquire(blocking=False):
+                return []
+            try:
+                return self.coach_context_hypotheses(
+                    context, contributions=contributions, testing=testing
+                )
+            except sqlite3.OperationalError as exc:
+                if (getattr(exc, "sqlite_errorcode", 0) & 255) in {
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                }:
+                    return []
+                raise
+            finally:
+                self._reader_lock.release()
+        dependencies = json.dumps(context["dependency_versions"])
+        args: list[Any] = [
+            context["risk_mode"],
+            context["configuration_fingerprint"],
+            context["baseline_version"],
+            context["feature_schema_version"],
+            dependencies,
+            dependencies,
+        ]
+        predicate = ""
+        order = "created_at DESC,hypothesis_id DESC"
+        if contributions:
+            cursor = str(self.get_setting("coach_contribution_cursor", ""))
+            predicate = (
+                " AND state='promising' AND json_extract(record_json,'$.contribution_state') "
+                "IN ('ready','waiting_for_champion')"
+            )
+            order = (
+                "(json_extract(record_json,'$.contribution_state')='ready') DESC,"
+                "(hypothesis_id>?) DESC,hypothesis_id"
+            )
+            args.append(cursor)
+        elif testing:
+            predicate = " AND state='testing'"
+        with self._reader_lock:
+            rows = self._reader_conn.execute(
+                # Fragments below are fixed choices; all context values use SQL parameters.
+                "SELECT record_json FROM coach_hypotheses WHERE risk_mode=? "  # noqa: S608
+                "AND configuration_fingerprint=? AND json_valid(record_json) "
+                "AND COALESCE(json_extract(record_json,'$.baseline_version'),'baseline-v1.1')=? "
+                "AND COALESCE(json_extract(record_json,'$.feature_schema_version'),"
+                "'challenger-features-v1')=? "
+                "AND NOT EXISTS (SELECT key,value FROM "
+                "json_each(record_json,'$.dependency_versions') "
+                "EXCEPT SELECT key,value FROM json_each(?)) "
+                "AND NOT EXISTS (SELECT key,value FROM json_each(?) EXCEPT "
+                "SELECT key,value FROM json_each(record_json,'$.dependency_versions'))"
+                + predicate
+                + " ORDER BY "
+                + order
+                + " LIMIT 25",
+                args,
+            ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                items.append(CoachHypothesis.model_validate_json(row[0]))
+            except ValidationError:
+                continue
+        return items
 
     def save_coach_selection(
         self,

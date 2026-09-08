@@ -1,5 +1,12 @@
 # Local diagnostics history
 
+From v1.10.8, skill interval summaries also retain the current suspension reason/time and a
+compact recovery status, enrolled/resolved/usable counts and restored time when available.
+These describe the saved Champion's support lifecycle, separately from the latest fitted
+candidate and battle. Recovery does not represent a new crown. Individual Policy IDs and the
+full recovery evidence window remain outside the diagnostics export; missing older lifecycle
+fields mean unavailable history, not that a skill was never suspended.
+
 Diagnostics supports later operational reviews and comparisons between builds. It is separate
 from the paper ledger, raw market history, learning observations and Champion proof. It is not a
 complete event replay and cannot establish that a model change caused better returns.
@@ -134,11 +141,48 @@ refreshes once a minute only while mounted. Recording continues with the page cl
 
 `GET /api/v1/diagnostics` returns the lightweight cached recorder status.
 `GET /api/v1/diagnostics/export` downloads newline-delimited JSON with metadata, retained minute
-and hourly rows, compact events and an `export_complete` trailer. Missing stores export no rows.
+and hourly rows, compact events and an `export_complete` trailer. An instance with no recorded
+store exports no rows. If cached recording status says history exists but its file is missing,
+or a store present at export start disappears during paging, the export reports a file error.
 Both routes use the existing authentication. Exports are limited to two concurrent requests and
 100 records per database read; read connections close before each page is sent. Concurrent
 retention can remove old records during an export, so it is a paged review, not an atomic backup.
 An interrupted read emits `export_incomplete`; a cancelled download may lack any trailer.
+
+Healthy recording does not guarantee a complete download: the exporter uses its own short-lived,
+read-only connections. Check the final trailer before relying on an export for a later review.
+In v1.10.8, SQLite busy/locked responses and the reader's own query deadline allow up to two
+retries per page, after 50 ms and 150 ms, with at most six retries across the entire export.
+The 20 ms SQLite lock wait and 100 ms query budget remain unchanged. The reader checks elapsed
+time between rows as well as through SQLite's progress callback. When the budget expires after
+complete rows have been fetched, those rows form a smaller page; the next read resumes after
+its last cursor. It does not throw away useful progress simply because scheduling was slow.
+If no row was fetched, the deadline remains a retryable failure and reduces the requested page
+size from 100 to 50, then 25 for that download. Only fully decoded, ordered rows advance the
+cursor. File/decode errors and unexpected interrupts still fail; the retry limit is unchanged.
+Smaller pages can require more reads but reduce each read's work.
+Backoff is asynchronous,
+without a database connection or engine lock held. A cancelled read retains its export slot until
+its worker finishes; it cannot create extra detached reads beyond the two-export limit.
+
+The trailer includes `read_retries`. Incomplete exports also identify `stage` (minute, hour or
+event) and a safe `reason`: `diagnostics_sqlite_busy`, `diagnostics_sqlite_locked`,
+`diagnostics_query_deadline`, `diagnostics_file_error`, `diagnostics_decode_error`,
+`diagnostics_schema_unsupported`, `diagnostics_store_unsafe` or `diagnostics_sqlite_error`.
+Non-transient failures are not retried or repaired by the export. Completed pages remain usable,
+but a partial file must not be treated as complete history. Older builds report only
+`diagnostics_read_unavailable`, which cannot retrospectively identify the underlying failure.
+Retries do not recover records already removed by retention or never recorded. Exporting never
+changes the recorder's state, writes application records or requests a database checkpoint.
+
+Storage pressure pausing recording does not disable exports of retained history. Validation
+covered all configured row limits (151,960 records), a SQLite file within 8 KiB of its 384 MiB
+page ceiling, and total owned-file usage of 512 MiB. The latter used allocated fixture padding
+to exercise the directory byte guard; a healthy writer pauses earlier to preserve WAL headroom.
+The download is streamed, and expanded NDJSON size is separate from the compressed storage
+allowance. Physical disk failures, browser/network failures and persistent contention can still
+interrupt a download. Check its trailer rather than assuming reaching the end of a file means
+the export completed.
 
 Set `SIGNAL_ARCADE_DIAGNOSTICS_ENABLED=false` and restart to disable recording. Existing diagnostic
 history remains available for export. This switch and the fixed diagnostics allowance are

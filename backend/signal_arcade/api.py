@@ -26,7 +26,7 @@ from starlette.types import Receive, Scope, Send
 from . import __version__
 from .config import Settings, load_settings
 from .database import AdvisoryReadDeferred
-from .diagnostics_store import LAG_BOUNDS, read_events, read_page
+from .diagnostics_store import LAG_BOUNDS, DiagnosticsReadError, read_events, read_page
 from .models import (
     AiDecisionMode,
     LearningMode,
@@ -39,8 +39,11 @@ from .provider_settings import ProviderConfiguration, validate_endpoint
 from .providers.http import ProviderError
 from .redaction import redact_secrets
 from .risk_profiles import DrawdownPolicy, season_profile_catalog
+from .workers import joined_to_thread
 
 _DATABASE_HEALTH_TIMEOUT_SECONDS = 0.5
+_DIAGNOSTICS_RETRY_DELAYS = (0.05, 0.15)
+_DIAGNOSTICS_EXPORT_RETRIES = 6
 
 if TYPE_CHECKING:
     RequestType: TypeAlias = Request[Any]  # noqa: UP040 - mypy 1.8 lacks PEP 695 support
@@ -340,14 +343,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def lines() -> AsyncIterator[str]:
             before = time.time()
             rows = 0
+            retries = 0
+            page_size = 100
+            stage = "metadata"
+            history_exists = False
+
+            async def page_read(
+                reader: Callable[..., list[dict[str, Any]]], **options: Any
+            ) -> list[dict[str, Any]]:
+                nonlocal retries, page_size
+                if not history_exists:
+                    return []
+                for attempt in range(len(_DIAGNOSTICS_RETRY_DELAYS) + 1):
+                    try:
+                        return await joined_to_thread(
+                            reader,
+                            orchestrator.diagnostics.directory,
+                            require_existing=True,
+                            limit=page_size,
+                            **options,
+                        )
+                    except DiagnosticsReadError as exc:
+                        if (
+                            not exc.retryable
+                            or attempt == len(_DIAGNOSTICS_RETRY_DELAYS)
+                            or retries >= _DIAGNOSTICS_EXPORT_RETRIES
+                        ):
+                            raise
+                        retries += 1
+                        if exc.reason == "diagnostics_query_deadline":
+                            # Keep the same cursor and budget, but ask for less work. Retain
+                            # the smaller page throughout this download instead of repeatedly
+                            # hitting the same deadline on every later page under CPU pressure.
+                            page_size = max(25, page_size // 2)
+                        # No connection, transaction or core lock is held during backoff.
+                        await asyncio.sleep(_DIAGNOSTICS_RETRY_DELAYS[attempt])
+                raise AssertionError("unreachable")
+
             try:
+                status = orchestrator.diagnostics.status()
+                # Distinguish an initially absent store from a file lost during paging.
+                # Probe off the event loop and keep the same expectation for every tier.
+                history_exists = await joined_to_thread(
+                    (orchestrator.diagnostics.directory / "history.sqlite3").exists
+                )
                 yield (
                     json.dumps(
                         {
                             "type": "metadata",
                             "schema": 1,
                             "exported_at": before,
-                            "status": orchestrator.diagnostics.status(),
+                            "status": status,
                             "histogram_upper_bounds_seconds": LAG_BOUNDS,
                             "histogram_last_bucket": ">30 seconds",
                             "gauges_and_skills": "last sample; never average these as hourly rates",
@@ -359,12 +405,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                     + "\n"
                 )
+                if not history_exists and any(
+                    value.get("rows", 0) for value in status.get("ranges", {}).values()
+                ):
+                    raise DiagnosticsReadError("diagnostics_file_error")
                 for tier, label in ((0, "minute"), (1, "hour")):
+                    stage = label
                     cursor = None
                     while True:
-                        page = await asyncio.to_thread(
+                        page = await page_read(
                             read_page,
-                            orchestrator.diagnostics.directory,
                             tier=tier,
                             after=cursor,
                             before=before,
@@ -380,10 +430,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         cursor = tuple(page[-1]["cursor"])
                         await asyncio.sleep(0)
                 event_cursor = None
+                stage = "event"
                 while True:
-                    page = await asyncio.to_thread(
+                    page = await page_read(
                         read_events,
-                        orchestrator.diagnostics.directory,
                         after=event_cursor,
                         before=before,
                     )
@@ -396,14 +446,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         rows += 1
                     event_cursor = tuple(page[-1]["cursor"])
                     await asyncio.sleep(0)
-                yield json.dumps({"type": "export_complete", "rows": rows}) + "\n"
-            except (sqlite3.Error, OSError, ValueError):
+                yield (
+                    json.dumps({"type": "export_complete", "rows": rows, "read_retries": retries})
+                    + "\n"
+                )
+            except (DiagnosticsReadError, sqlite3.Error, OSError, ValueError, TypeError) as exc:
+                if isinstance(exc, DiagnosticsReadError):
+                    reason = exc.reason
+                elif isinstance(exc, sqlite3.Error):
+                    reason = "diagnostics_sqlite_error"
+                elif isinstance(exc, OSError):
+                    reason = "diagnostics_file_error"
+                else:
+                    reason = "diagnostics_decode_error"
                 yield (
                     json.dumps(
                         {
                             "type": "export_incomplete",
                             "rows": rows,
-                            "reason": "diagnostics_read_unavailable",
+                            "reason": reason,
+                            "stage": stage,
+                            "read_retries": retries,
                         }
                     )
                     + "\n"
@@ -608,7 +671,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
-        return orchestrator.coach.status()
+        return await joined_to_thread(orchestrator.coach.status)
 
     @app.put(
         "/api/v1/ai-lab/coach-research",
@@ -620,7 +683,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
-        return orchestrator.coach.status()
+        return await joined_to_thread(orchestrator.coach.status)
 
     @app.put("/api/v1/ai-lab/model", dependencies=[Depends(normal_operation)])
     async def select_ai_model(body: AiModelRequest) -> dict[str, Any]:

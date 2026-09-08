@@ -80,6 +80,8 @@ from .strategy import (
     strategy_fingerprint_payload,
 )
 from .terminal_evidence import TERMINAL_PROBE_POLICY, valid_terminal_probe
+from .workers import await_worker as _await_worker
+from .workers import joined_to_thread as _joined_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -89,34 +91,6 @@ _URGENT_PERSIST_BATCH_SIZE = 16
 # Keep generics compatible with the pinned mypy 1.8 checker.
 _WorkerArgs = ParamSpec("_WorkerArgs")
 _WorkerResult = TypeVar("_WorkerResult")
-
-
-async def _await_worker(  # noqa: UP047
-    worker: asyncio.Task[_WorkerResult], *, on_cancel: Callable[[], None] | None = None
-) -> _WorkerResult:
-    """Cancellation cannot release an owner's boundary while its worker still uses it."""
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        if on_cancel is not None:
-            on_cancel()
-        # A second shutdown/disconnect cancellation must not cancel the wrapper Task either:
-        # cancelling to_thread's awaitable leaves the real thread running. Keep joining it.
-        while not worker.done():
-            with suppress(asyncio.CancelledError, Exception):
-                await asyncio.shield(worker)
-        with suppress(asyncio.CancelledError, Exception):
-            worker.result()
-        raise
-
-
-async def _joined_to_thread(  # noqa: UP047
-    function: Callable[_WorkerArgs, _WorkerResult],
-    *args: _WorkerArgs.args,
-    **kwargs: _WorkerArgs.kwargs,
-) -> _WorkerResult:
-    """Join submitted engine work before its caller may release locks or close storage."""
-    return await _await_worker(asyncio.create_task(asyncio.to_thread(function, *args, **kwargs)))
 
 
 async def _timed_to_thread(  # noqa: UP047
@@ -1564,6 +1538,9 @@ class Orchestrator:
                 summary["champion"] = identity(state.champion_version)
                 summary["testing"] = identity(state.testing_version)
                 summary["shared"] = state.common_forward_count
+                suspension = self.learning.skill_suspension_summary(state)
+                if suspension:
+                    summary["suspension"] = suspension
         training = self.learning.training_status()
         equity = self.broker.last_diagnostic_equity
         equity = (

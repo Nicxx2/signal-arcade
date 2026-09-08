@@ -309,3 +309,69 @@ def test_cooperative_screening_preserves_candidate_values(tmp_path):
         assert len(checkpoints) > 10
     finally:
         database.close()
+
+
+def test_retry_backoff_without_forward_work_skips_history_read(tmp_path, monkeypatch):
+    database = Database(tmp_path / "backoff.sqlite3")
+    coach = coach_for(database)
+    coach.next_attempt_at = datetime.now(UTC) + timedelta(minutes=5)
+    monkeypatch.setattr(
+        database,
+        "recent_learning_observations",
+        lambda *args, **kwargs: pytest.fail("unnecessary history read during backoff"),
+    )
+    try:
+        asyncio.run(coach.tick())
+        assert coach.paused_reason == "retry_backoff"
+    finally:
+        database.close()
+
+
+def test_retry_backoff_still_advances_forward_evidence(tmp_path):
+    from test_coach import _hypothesis
+
+    database = Database(tmp_path / "forward-backoff.sqlite3")
+    seed(database, 30)
+    hypothesis = _hypothesis(datetime.now(UTC) - timedelta(hours=2))
+    database.save_coach_hypothesis(hypothesis)
+    coach = coach_for(database)
+    coach.next_attempt_at = datetime.now(UTC) + timedelta(minutes=5)
+    try:
+        asyncio.run(coach.tick())
+        assert database.coach_hypothesis(hypothesis.hypothesis_id).forward_observed_count == 30
+        assert coach.http.calls == 0
+    finally:
+        database.close()
+
+
+def test_pressure_during_forward_refresh_defers_then_recovers_complete_proof(tmp_path, monkeypatch):
+    import signal_arcade.coach as module
+    from test_coach import _hypothesis
+
+    database = Database(tmp_path / "forward-pressure.sqlite3")
+    seed(database, 30)
+    hypothesis = _hypothesis(datetime.now(UTC) - timedelta(hours=2))
+    database.save_coach_hypothesis(hypothesis)
+    permitted = True
+    coach = coach_for(database, can_run=lambda: (permitted, "protecting_market_throughput"))
+    original = module._evaluate_hypothesis
+    monkeypatch.setattr(module, "COACH_OPTIONAL_WORK_SECONDS", 0.05)
+
+    def pressure(*args, **kwargs):
+        nonlocal permitted
+        permitted = False
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_evaluate_hypothesis", pressure)
+    try:
+        asyncio.run(coach.tick())
+        assert database.coach_hypothesis(hypothesis.hypothesis_id) == hypothesis
+        assert coach.last_error is None
+        assert coach.paused_reason == "protecting_market_throughput"
+        permitted = True
+        monkeypatch.setattr(module, "_evaluate_hypothesis", original)
+        monkeypatch.setattr(module, "COACH_OPTIONAL_WORK_SECONDS", 30)
+        asyncio.run(coach.tick())
+        assert database.coach_hypothesis(hypothesis.hypothesis_id).forward_observed_count == 30
+    finally:
+        database.close()

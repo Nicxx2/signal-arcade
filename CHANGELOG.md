@@ -4,6 +4,37 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.10.8 - 2026-09-08
+
+- Allow a health-suspended Champion to earn support back through one fixed prospective shadow
+  trial, with existing coverage, advantage, harm and permission gates. Preserve failed trials,
+  suspension history and Champion generations; commit restored authority atomically.
+- Keep identical native deterministic Exit fits in the audit without redundant battles or loss
+  of a different queued contender. Explain suspension and recovery in compact expandable details.
+- Retry transient diagnostics export reads within short per-page and per-export limits. Reduce
+  slow query pages within the existing deadline and retry budget, retaining fully read rows
+  instead of retrying the same prefix after scheduling delays. Distinguish lock contention,
+  query deadlines, file failures and invalid records in incomplete downloads,
+  and report recorded history that disappears instead of falsely completing an empty or partial
+  export. Keep recording, retention, trading and learning behaviour unchanged.
+- Preserve verified zero protocol fees in new learning observations and correctly label their
+  provenance in execution receipts. Unknown fees still use the configured fallback.
+- Join Coach workers through repeated cancellation and condition forward updates on the saved
+  study still matching, so a refresh cannot overwrite a newer contribution handoff.
+- Move Coach active-study and control-response reads off the main async loop. Recheck research
+  permission, market pressure and the skill context after the monitor lookup returns.
+- Process retained forward studies in bounded indexed pages beyond the recent display window.
+  Keep exact contract/dependency matching and fairly retry waiting contributions across restarts.
+- Let forward monitoring yield under market pressure. Skip a Coach history read during inference
+  backoff only when no unfinished forward study requires monitoring.
+- Reuse Policy selection within one dashboard response or tournament pass, without caching
+  qualification or health decisions across evidence changes.
+- Avoid redundant skill-state writes while preserving pending candidates, Champion history and
+  replay records. Keep replay work pending until the enclosing publication transaction commits,
+  so a rollback can retry it without requiring new evidence.
+- Retain schema 16, Baseline boundaries, saved permissions, historical evidence, Linear/XGBoost
+  recipes and the 70% coverage requirement. No learning reset or new season is required.
+
 ## 1.10.7 - 2026-09-07
 
 - Prioritize checkpoints in their final 15-second collection window within each evidence lane.

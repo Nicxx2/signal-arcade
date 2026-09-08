@@ -1130,7 +1130,11 @@ class PaperBroker:
                     else []
                 ),
                 f"protocol_fee_bps={fee_bps}",
-                "fee_source=observed_event" if state.fee_bps else "fee_source=configured_fallback",
+                (
+                    "fee_source=observed_event"
+                    if state.reserve_fee_components is not None or state.fee_bps
+                    else "fee_source=configured_fallback"
+                ),
                 "filled_after_configured_latency_against_latest_observed_reserves",
                 "constant_product_integer_rounding",
             ],

@@ -40,6 +40,7 @@ from .models import (
 )
 from .providers.http import HttpProviders
 from .strategy import LEARNABLE_BASELINE_VERSIONS
+from .workers import await_worker, joined_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,7 @@ class AiCoach:
         self.context_outcomes_seen = 0
         self.reviews = database.list_coach_reviews(25)
         self.hypotheses = database.list_coach_hypotheses(100)
+        self._work_cursor: tuple[str, str] | None = None
 
     def _context_provenance(self) -> dict[str, Any]:
         mode, fingerprint = self.context()
@@ -254,12 +256,7 @@ class AiCoach:
             kwargs["should_yield"] = should_stop
         worker = asyncio.create_task(asyncio.to_thread(function, *args, pause=pause, **kwargs))
         try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancelled.set()
-            # Join the detached reader/screener before shutdown can close its database.
-            await asyncio.gather(worker, return_exceptions=True)
-            raise
+            return await await_worker(worker, on_cancel=cancelled.set)
         finally:
             cancelled.set()
 
@@ -282,6 +279,11 @@ class AiCoach:
         if not allowed:
             self.paused_reason = reason or "protecting_market_work"
             return
+        if self.next_attempt_at is not None and now < self.next_attempt_at:
+            work, cursor = await joined_to_thread(self.database.coach_work_page, limit=1)
+            if not work and cursor is None:
+                self.paused_reason = "retry_backoff"
+                return
         observations = await self._optional_work(
             self.database.recent_learning_observations, COACH_OBSERVATION_WINDOW
         )
@@ -291,11 +293,22 @@ class AiCoach:
                 "ai_shadow_off" if not self.enabled() else reason or "protecting_market_work"
             )
             return
-        await asyncio.to_thread(self._refresh_hypotheses, now, observations)
+        await self._optional_work(self._refresh_hypotheses, now, observations)
         context = self._context_provenance()
         mode = context["risk_mode"]
         fingerprint = context["configuration_fingerprint"]
-        active = self._active_hypothesis(context)
+        # This durable lookup may wait behind another reader. Keep it off the market loop,
+        # and retain worker ownership through cancellation just like the evidence reads.
+        active = await joined_to_thread(self._active_hypothesis, context)
+        allowed, reason = self.can_run()
+        if not self.enabled() or not allowed:
+            self.paused_reason = (
+                "ai_shadow_off" if not self.enabled() else reason or "protecting_market_work"
+            )
+            return
+        if context != self._context_provenance():
+            self.paused_reason = "context_changed"
+            return
         if active is not None:
             self.paused_reason = "forward_test_in_progress"
             return
@@ -377,7 +390,7 @@ class AiCoach:
                     model_name=model_name,
                     model_digest=model_digest,
                 )
-                await asyncio.to_thread(self._save_review, review)
+                await joined_to_thread(self._save_review, review)
                 self.last_error = None
                 return
 
@@ -429,7 +442,7 @@ class AiCoach:
                     candidate_count=len(candidates),
                     reason="ollama_unavailable_or_timed_out",
                 )
-                await asyncio.to_thread(self._save_review, review)
+                await joined_to_thread(self._save_review, review)
                 self.last_error = review.failure_reason
                 self.next_attempt_at = now + timedelta(seconds=COACH_RETRY_SECONDS)
                 return
@@ -474,7 +487,7 @@ class AiCoach:
                 failure_reason=None if valid else "invalid_structured_response",
             )
             if not valid:
-                await asyncio.to_thread(self._save_review, review)
+                await joined_to_thread(self._save_review, review)
                 self.last_error = review.failure_reason
                 self.next_attempt_at = now + timedelta(seconds=COACH_RETRY_SECONDS)
                 return
@@ -486,9 +499,9 @@ class AiCoach:
                     candidate,
                     selection.summary if selection is not None else "",
                 )
-                await asyncio.to_thread(self._save_selection, review, hypothesis)
+                await joined_to_thread(self._save_selection, review, hypothesis)
             else:
-                await asyncio.to_thread(self._save_review, review)
+                await joined_to_thread(self._save_review, review)
         finally:
             self.busy = False
 
@@ -533,22 +546,58 @@ class AiCoach:
         self,
         now: datetime,
         observations: Sequence[LearningObservation] | None = None,
+        *,
+        pause: Callable[[], None] | None = None,
     ) -> None:
-        if not self.hypotheses:
+        with self._lock:
+            pending = {item.hypothesis_id: item for item in self.hypotheses}
+        work, cursor = self.database.coach_work_page(self._work_cursor)
+        for item in work:
+            pending.setdefault(item.hypothesis_id, item)
+        if not pending:
+            self._work_cursor = cursor
             return
         selected = (
             list(observations)
             if observations is not None
             else self.database.recent_learning_observations(COACH_OBSERVATION_WINDOW)
         )
-        refreshed: list[CoachHypothesis] = []
-        for hypothesis in self.hypotheses:
-            updated = _evaluate_hypothesis(hypothesis, selected, now)
+        for hypothesis in pending.values():
+            if pause is not None:
+                pause()
+            updated = (
+                _evaluate_hypothesis(hypothesis, selected, now, pause=pause)
+                if pause is not None
+                else _evaluate_hypothesis(hypothesis, selected, now)
+            )
             if updated != hypothesis:
-                self.database.save_coach_hypothesis(updated)
-            refreshed.append(updated)
+                if pause is not None:
+                    pause()
+                if self.database.save_coach_hypothesis_if_current(hypothesis, updated):
+                    self._remember_hypothesis(updated, expected=hypothesis)
+                else:
+                    current = self.database.coach_hypothesis(hypothesis.hypothesis_id)
+                    if current is not None:
+                        self._remember_hypothesis(current, expected=hypothesis)
+        self._work_cursor = cursor
+
+    def _remember_hypothesis(
+        self,
+        updated: CoachHypothesis,
+        *,
+        expected: CoachHypothesis | None = None,
+    ) -> None:
         with self._lock:
-            self.hypotheses = refreshed
+            current = next(
+                (item for item in self.hypotheses if item.hypothesis_id == updated.hypothesis_id),
+                None,
+            )
+            if expected is not None and current is not None and current != expected:
+                return
+            self.hypotheses = [
+                updated,
+                *[item for item in self.hypotheses if item.hypothesis_id != updated.hypothesis_id],
+            ][:100]
 
     def _current_hypothesis(self, context: dict[str, Any]) -> CoachHypothesis | None:
         return next(
@@ -557,28 +606,16 @@ class AiCoach:
         )
 
     def _active_hypothesis(self, context: dict[str, Any]) -> CoachHypothesis | None:
-        current = self._current_hypothesis(context)
-        return (
-            current
-            if current is not None and current.state == CoachExperimentState.TESTING
-            else None
-        )
+        active = self.database.coach_context_hypotheses(context, testing=True)
+        return active[0] if active else None
 
     def status(self) -> dict[str, Any]:
         context = self._context_provenance()
         seen = max(self.context_outcomes_seen, max(0, self.outcomes_seen()))
-        current = self._current_hypothesis(context)
         active = self._active_hypothesis(context)
-        contribution_candidate = next(
-            (
-                item
-                for item in self.hypotheses
-                if self._matches_provenance(item, context)
-                and item.state == CoachExperimentState.PROMISING
-                and item.contribution_state in {"ready", "waiting_for_champion"}
-            ),
-            None,
-        )
+        current = active or self._current_hypothesis(context)
+        contributions = self.database.coach_context_hypotheses(context, contributions=True)
+        contribution_candidate = contributions[0] if contributions else None
         last_valid_seen = max(
             (
                 review.outcomes_seen
@@ -657,21 +694,14 @@ class AiCoach:
         if not self.contribution_enabled():
             return None
         context = self._context_provenance()
-        with self._lock:
-            candidates = [
-                item
-                for item in self.hypotheses
-                if self._matches_provenance(item, context)
-                and item.state == CoachExperimentState.PROMISING
-                and item.contribution_state in {"ready", "waiting_for_champion"}
-            ]
-            # Give every newly supported idea one handoff attempt before retrying a study whose
-            # skill has no Champion yet. This prevents one unavailable lane starving the others.
-            selected = next(
-                (item for item in candidates if item.contribution_state == "ready"),
-                candidates[0] if candidates else None,
-            )
-            return selected.model_copy(deep=True) if selected is not None else None
+        candidates = self.database.coach_context_hypotheses(
+            context, contributions=True, best_effort=True
+        )
+        if not candidates:
+            return None
+        selected = candidates[0]
+        self._remember_hypothesis(selected)
+        return selected.model_copy(deep=True)
 
     def mark_contribution(
         self,
@@ -689,6 +719,11 @@ class AiCoach:
             )
             if hypothesis is None:
                 return
+            if (
+                hypothesis.state != CoachExperimentState.PROMISING
+                or hypothesis.contribution_state in {"handed_off", "stale"}
+            ):
+                return
             updated = hypothesis.model_copy(
                 update={
                     "updated_at": datetime.now(UTC),
@@ -696,10 +731,16 @@ class AiCoach:
                     "contributed_artifact_version": artifact_version,
                 }
             )
-            self.hypotheses = [
-                updated if item.hypothesis_id == hypothesis_id else item for item in self.hypotheses
-            ]
-        self.database.save_coach_hypothesis(updated)
+        if self.database.save_coach_hypothesis_if_current(
+            hypothesis,
+            updated,
+            contribution_cursor=hypothesis_id if state == "waiting_for_champion" else None,
+        ):
+            self._remember_hypothesis(updated, expected=hypothesis)
+        else:
+            current = self.database.coach_hypothesis(hypothesis_id)
+            if current is not None:
+                self._remember_hypothesis(current, expected=hypothesis)
 
 
 def _coach_qualification_gates(
@@ -1228,6 +1269,8 @@ def _evaluate_hypothesis(
     hypothesis: CoachHypothesis,
     observations: Sequence[LearningObservation],
     now: datetime,
+    *,
+    pause: Callable[[], None] | None = None,
 ) -> CoachHypothesis:
     if hypothesis.state in {
         CoachExperimentState.PROMISING,
@@ -1253,7 +1296,9 @@ def _evaluate_hypothesis(
     observation_ids = list(hypothesis.forward_observation_ids)
     values = list(hypothesis.forward_values)
     season_counts = dict(hypothesis.forward_season_counts)
-    for item in rows:
+    for index, item in enumerate(rows):
+        if pause is not None and index % 32 == 0:
+            pause()
         if item.observation_id in seen_ids:
             continue
         resolved, relevant, value = _hypothesis_observation_value(hypothesis, item)

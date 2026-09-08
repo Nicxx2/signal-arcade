@@ -533,6 +533,7 @@ class LearningEngine:
         baseline_version: Callable[[], str] | None = None,
     ) -> None:
         self.database = database
+        self._status_policy_cache = threading.local()
         self.settings = settings
         self.configuration_fingerprint = configuration_fingerprint or (lambda: None)
         # A locked predecessor season must finish on its own strategy generation after an
@@ -599,10 +600,15 @@ class LearningEngine:
                 and state.champion_version
                 and state.last_tournament.get("result") == "promoted"
                 and state.last_tournament.get("proof_version") != TOURNAMENT_PROOF_VERSION
+                and (
+                    state.suspended_version != state.champion_version
+                    or state.suspension_reason != "exit_comparison_proof_requires_requalification"
+                )
             ):
+                if state.suspended_version != state.champion_version or state.suspended_at is None:
+                    state.suspended_at = datetime.now(UTC)
                 state.suspended_version = state.champion_version
                 state.suspension_reason = "exit_comparison_proof_requires_requalification"
-                state.suspended_at = datetime.now(UTC)
                 database.save_challenger_skill_state(state)
         # Timing validation is read on every active market event. Recompute it only when
         # a checkpoint/prune changes the chronological evidence, keeping long runs cheap.
@@ -1200,7 +1206,11 @@ class LearningEngine:
         ):
             return False
         size_sol = decision.planned_order_size_sol or RISK_LIMITS[decision.risk_mode].order_size_sol
-        fee_bps = state.fee_bps or self.settings.pump_fee_bps
+        fee_bps = (
+            state.fee_bps
+            if state.reserve_fee_components is not None
+            else state.fee_bps or self.settings.pump_fee_bps
+        )
         try:
             entry = quote_buy(
                 virtual_token_reserves=state.virtual_token_reserves,
@@ -1370,6 +1380,7 @@ class LearningEngine:
             if (identity := _policy_identity(episode)) is not None:
                 self.database.remember_policy_identities([identity])
                 self._policy_identities.update(self.database.policy_identities({identity[0]}))
+            self._enroll_skill_recovery(episode)
             created = True
         if not discovery_exists:
             key = _policy_identity_key(observation)
@@ -2273,6 +2284,16 @@ class LearningEngine:
         )
 
     def status(self, *, demo_mode: bool) -> dict[str, Any]:
+        # The orchestrator holds its market boundary for this read-only response. Reuse only
+        # Policy selection within this thread/response; never cache health or qualification.
+        previous = getattr(self._status_policy_cache, "rows", None)
+        self._status_policy_cache.rows = {}
+        try:
+            return self._status(demo_mode=demo_mode)
+        finally:
+            self._status_policy_cache.rows = previous
+
+    def _status(self, *, demo_mode: bool) -> dict[str, Any]:
         training_mode = self.current_risk_mode
         training_configuration = self.configuration_fingerprint()
         samples = self._training_rows(
@@ -2776,6 +2797,13 @@ class LearningEngine:
                     ),
                     "tournament": dict(state.last_tournament) if state is not None else {},
                     "health": health,
+                    "suspension": self.skill_suspension_summary(state) if state else None,
+                    "latest_policy_unchanged": bool(
+                        state
+                        and latest
+                        and self._redundant_exit_candidate(state, latest)
+                        and latest.version != state.champion_version
+                    ),
                     "gates": _skill_qualification_gates(skill, gate_artifact),
                     "gate_artifact_version": gate_artifact.version if gate_artifact else None,
                     "gate_subject": "testing_candidate"
@@ -2784,6 +2812,32 @@ class LearningEngine:
                 }
             )
         return statuses
+
+    @staticmethod
+    def skill_suspension_summary(state: ChallengerSkillState) -> dict[str, Any] | None:
+        """Read-only, bounded lifecycle context; never expose the enrolled Policy IDs."""
+        recovery = state.activation_proof.get("recovery")
+        recovery = recovery if isinstance(recovery, dict) else {}
+        suspended = bool(
+            state.suspended_version and state.suspended_version == state.champion_version
+        )
+        if not suspended and recovery.get("status") != "restored":
+            return None
+        rows = recovery.get("rows")
+        return {
+            "reason": state.suspension_reason,
+            "since": state.suspended_at.isoformat() if state.suspended_at else None,
+            "status": recovery.get(
+                "status",
+                "waiting" if state.suspension_reason in {"degraded", "unverifiable"} else "blocked",
+            ),
+            "enrolled_count": min(len(rows), ACTIVE_HEALTH_WINDOW) if isinstance(rows, list) else 0,
+            "observed_count": recovery.get("observed_count", 0),
+            "usable_count": recovery.get("usable_count", 0),
+            "availability_fraction": recovery.get("availability_fraction", 0.0),
+            "window_size": ACTIVE_HEALTH_WINDOW,
+            "restored_at": recovery.get("restored_at"),
+        }
 
     def _champion_event_view(
         self,
@@ -3655,6 +3709,7 @@ class LearningEngine:
             # Start only on a real pre-outcome observation, never while rendering status.
             # A replacement must not inherit the old crown's activation evidence.
             state.activation_proof = {
+                **({"recovery": proof["recovery"]} if "recovery" in proof else {}),
                 "policy": "coach-join-v2",
                 "artifact_version": artifact.version,
                 "dependencies": dependencies,
@@ -4442,7 +4497,7 @@ class LearningEngine:
             feature_schema_version=artifact.feature_schema_version,
         )
         state.latest_candidate_version = artifact.version
-        if artifact.qualified:
+        if artifact.qualified and not self._redundant_exit_candidate(state, artifact):
             # Retain one waiting native generation per family and one Coach proposal. Newer
             # immutable cutoff and supersedes an untested older one; the active tournament is never
             # replaced. This bounds backlog without letting job completion order crown a winner.
@@ -4472,6 +4527,50 @@ class LearningEngine:
         state.updated_at = datetime.now(UTC)
         self.skill_states[key] = state
         self.database.save_challenger_skill_state(state)
+
+    def _redundant_exit_candidate(
+        self, state: ChallengerSkillState, candidate: ChallengerSkillArtifact
+    ) -> bool:
+        champion = self.skill_artifacts.get(state.champion_version or "")
+        if (
+            champion is None
+            or not champion.qualified
+            or not candidate.qualified
+            or candidate.skill != ChallengerSkill.EXIT
+            or candidate.model_family != StatisticalModelFamily.DETERMINISTIC
+            or candidate.schema_version != CHALLENGER_SKILL_SCHEMA_VERSION
+            or candidate.implementation_version != "bounded-horizon-selector-v1"
+            or candidate.recipe_version != "exit-horizon-v1"
+            or candidate.payload_format != "inline"
+            or candidate.dependency_versions
+            or _bounded_exit_horizon(candidate) is None
+            or candidate.payload_digest != _stable_digest(candidate.parameters)
+            or (
+                state.suspended_version == champion.version
+                and state.suspension_reason not in {"degraded", "unverifiable"}
+            )
+        ):
+            return False
+        return all(
+            getattr(candidate, field) == getattr(champion, field)
+            for field in (
+                "skill",
+                "schema_version",
+                "model_family",
+                "implementation_version",
+                "recipe_version",
+                "payload_format",
+                "payload_digest",
+                "risk_mode",
+                "configuration_fingerprint",
+                "baseline_version",
+                "feature_schema_version",
+                "feature_names",
+                "parameters",
+                "dependency_versions",
+                "hyperparameters",
+            )
+        )
 
     def _preferred_pending_version(self, state: ChallengerSkillState) -> str | None:
         def metric(
@@ -4561,6 +4660,12 @@ class LearningEngine:
                 state.suspension_reason = "tournament_artifact_unavailable"
                 state.suspended_at = datetime.now(UTC)
                 return
+        state.pending_versions = [
+            version
+            for version in state.pending_versions
+            if version not in self.skill_artifacts
+            or not self._redundant_exit_candidate(state, self.skill_artifacts[version])
+        ]
         selected = self._preferred_pending_version(state)
         if selected is None:
             return
@@ -4762,6 +4867,7 @@ class LearningEngine:
         """Compare contender and champion only on predictions both froze in advance."""
 
         primary_key = str(PRIMARY_HORIZON_SECONDS)
+        policy_rows: dict[tuple[RiskMode, str | None, str], list[LearningEvidenceEpisode]] = {}
         current_cohort_key = _challenger_cohort_key(
             self.current_risk_mode,
             self.configuration_fingerprint(),
@@ -4840,11 +4946,14 @@ class LearningEngine:
                 self.database.save_challenger_skill_state(state)
                 continue
             resolved: list[LearningEvidenceEpisode] = []
-            for observation in self._policy_evidence(
-                mode=state.risk_mode,
-                configuration_fingerprint=state.configuration_fingerprint,
-                baseline_version=state.baseline_version,
-            ):
+            contract = (state.risk_mode, state.configuration_fingerprint, state.baseline_version)
+            if contract not in policy_rows:
+                policy_rows[contract] = self._policy_evidence(
+                    mode=state.risk_mode,
+                    configuration_fingerprint=state.configuration_fingerprint,
+                    baseline_version=state.baseline_version,
+                )
+            for observation in policy_rows[contract]:
                 if (
                     observation.risk_mode != state.risk_mode
                     or observation.configuration_fingerprint != state.configuration_fingerprint
@@ -5007,6 +5116,7 @@ class LearningEngine:
             self.database.save_challenger_skill_state(state)
             if promoted:
                 self._promote_active_skill(candidate, previous_version=champion.version)
+                policy_rows.clear()
 
     def _current_skill_state(self, skill: ChallengerSkill) -> ChallengerSkillState | None:
         cohort_key = _challenger_cohort_key(
@@ -5017,7 +5127,9 @@ class LearningEngine:
         )
         return None if cohort_key is None else self.skill_states.get((cohort_key, skill))
 
-    def _skill_activation_candidate(self) -> ChallengerSkillArtifact | None:
+    def _skill_activation_candidate(
+        self, *, recovering: bool = False
+    ) -> ChallengerSkillArtifact | None:
         state = self._current_skill_state(ChallengerSkill.ENTRY)
         artifact = (
             self.skill_artifacts.get(state.champion_version or "") if state is not None else None
@@ -5031,17 +5143,21 @@ class LearningEngine:
                 or self._load_nonlinear_artifact(artifact) is not None
             )
             and state is not None
-            and state.suspended_version != artifact.version
+            and (state.suspended_version != artifact.version or recovering)
             and self.entry_outcome_availability()["qualified"]
             and (
                 artifact.schema_version != "challenger-skill-coach-v1"
+                or recovering
                 or self._skill_join_evidence(artifact, independent=True)["ready"]
             )
             else None
         )
 
-    def _activate_skill(self, artifact: ChallengerSkillArtifact) -> None:
+    def _activate_skill(
+        self, artifact: ChallengerSkillArtifact, *, recovering: bool = False
+    ) -> None:
         state = self._current_skill_state(artifact.skill)
+        recovery_proof = self._skill_recovery_proof(state) if recovering and state else {}
         if (
             state is None
             or state.champion_version != artifact.version
@@ -5050,18 +5166,19 @@ class LearningEngine:
                 artifact.model_family == StatisticalModelFamily.XGBOOST
                 and self._load_nonlinear_artifact(artifact) is None
             )
-            or state.suspended_version == artifact.version
+            or (state.suspended_version == artifact.version and not recovery_proof.get("ready"))
+            or (recovering and not recovery_proof.get("ready"))
         ):
             raise ValueError("challenger skill champion is not eligible for activation")
-        activation_proof: dict[str, Any] = {}
+        activation_proof: dict[str, Any] = recovery_proof
         is_coach = artifact.schema_version == "challenger-skill-coach-v1"
         if self.auto_participation or is_coach:
             if (
                 artifact.skill == ChallengerSkill.ENTRY
-                and self._skill_activation_candidate() != artifact
+                and self._skill_activation_candidate(recovering=recovering) != artifact
             ):
                 raise ValueError("Entry must still pass its current activation gates")
-            if artifact.skill != ChallengerSkill.ENTRY or is_coach:
+            if not recovering and (artifact.skill != ChallengerSkill.ENTRY or is_coach):
                 activation_proof = self._skill_join_evidence(artifact, independent=True)
                 if not activation_proof["ready"]:
                     raise ValueError("fresh proof for this exact skill composition is required")
@@ -5072,6 +5189,12 @@ class LearningEngine:
             ChallengerSkill.EXIT,
         )
         now = datetime.now(UTC)
+        changed_states = []
+        if recovering:
+            recovery = dict(state.activation_proof["recovery"])
+            recovery.update(status="restored", restored_at=now.isoformat())
+            activation_proof = {**activation_proof, "recovery": recovery}
+            state.suspended_version = None
         # Adding an upstream skill changes the ensemble that every downstream skill observes.
         # Preserve those Champions, but remove their authority until they prove themselves again
         # beside the newly active upstream version.
@@ -5088,7 +5211,7 @@ class LearningEngine:
                 "dependency": artifact.skill.value,
             }
             downstream_state.updated_at = now
-            self.database.save_challenger_skill_state(downstream_state)
+            changed_states.append(downstream_state)
         self.active_skill_versions[artifact.skill.value] = artifact.version
         state.active_version = artifact.version
         state.active_dependencies = {
@@ -5119,8 +5242,304 @@ class LearningEngine:
                 ),
             }
         self.skill_states[(state.cohort_key, state.skill)] = state
-        self.database.save_challenger_skill_state(state)
-        self.database.set_setting("active_challenger_skills", self.active_skill_versions)
+        self.database.save_challenger_authority(
+            [*changed_states, state],
+            self.active_skill_versions,
+            mode=LearningMode.ACTIVE.value if recovering else None,
+        )
+
+    def _recovery_dependencies(self, skill: ChallengerSkill) -> dict[str, str]:
+        order = (
+            ChallengerSkill.ENTRY,
+            ChallengerSkill.MANIPULATION,
+            ChallengerSkill.SIZING,
+            ChallengerSkill.EXIT,
+        )
+        return {
+            item.value: self.active_skill_versions[item.value]
+            for item in order[: order.index(skill)]
+            if item.value in self.active_skill_versions
+        }
+
+    def _recovery_dependency_epochs(self, skill: ChallengerSkill) -> dict[str, str | None]:
+        return {
+            name: state.joined_at.isoformat() if state and state.joined_at else None
+            for name in self._recovery_dependencies(skill)
+            for state in [self._current_skill_state(ChallengerSkill(name))]
+        }
+
+    def _recovery_allowed(self, state: ChallengerSkillState) -> bool:
+        artifact = self.skill_artifacts.get(state.champion_version or "")
+        return bool(
+            state.suspended_version is not None
+            and state.suspended_version == state.champion_version
+            and state.suspended_at
+            and state.suspension_reason in {"degraded", "unverifiable"}
+            and self.auto_participation
+            and self.consent_granted
+            and self.mode != LearningMode.OFF
+            and not self.database.get_setting("demo_mode", self.settings.demo_mode)
+            and artifact
+            and artifact.qualified
+            and artifact.skill == state.skill
+            and artifact.risk_mode == self.current_risk_mode
+            and artifact.configuration_fingerprint == self.configuration_fingerprint()
+            and artifact.baseline_version == self.baseline_version()
+            and artifact.feature_schema_version == FEATURE_SCHEMA_VERSION
+            and (
+                artifact.skill != ChallengerSkill.EXIT
+                or _bounded_exit_horizon(artifact) is not None
+            )
+            and (
+                artifact.model_family != StatisticalModelFamily.XGBOOST
+                or self._load_nonlinear_artifact(artifact) is not None
+            )
+            and artifact.version not in self.disabled_model_versions
+        )
+
+    def _enroll_skill_recovery(self, episode: LearningEvidenceEpisode) -> None:
+        """Select at most 60 original Policy entries before their outcomes exist.
+
+        One fixed trial per suspension: never replace missing/failed rows, slide a window,
+        or reset it on restart/permission toggles. A changed composition requires a new crown.
+        The nested receipt keeps old strict state readers compatible.
+        """
+        if not any(
+            state and state.suspended_version
+            for state in (self._current_skill_state(skill) for skill in ChallengerSkill)
+        ):
+            return
+        identity = self._policy_identities.get(_policy_identity_key(episode))
+        if (
+            not episode.qualification_eligible
+            or episode.synthetic
+            or episode.checkpoints
+            or episode.source_mode != "solana_mainnet"
+            or episode.season_id is None
+            or episode.feature_schema_version != FEATURE_SCHEMA_VERSION
+            or not _evidence_features_complete(episode)
+            or identity is None
+            or not _matches_policy_identity(episode, identity)
+        ):
+            return
+        for skill in ChallengerSkill:
+            state = self._current_skill_state(skill)
+            if state is None or not self._recovery_allowed(state):
+                continue
+            artifact = self.skill_artifacts[state.champion_version or ""]
+            dependencies = self._recovery_dependencies(skill)
+            order = (
+                ChallengerSkill.ENTRY,
+                ChallengerSkill.MANIPULATION,
+                ChallengerSkill.SIZING,
+                ChallengerSkill.EXIT,
+            )
+            downstream = {item.value for item in order[order.index(skill) + 1 :]}
+            since = max(artifact.created_at, state.suspended_at or artifact.created_at)
+            for name in dependencies:
+                upstream = self._current_skill_state(ChallengerSkill(name))
+                if upstream and upstream.joined_at:
+                    since = max(since, upstream.joined_at)
+            if (
+                episode.created_at <= since
+                or episode.risk_mode != artifact.risk_mode
+                or episode.configuration_fingerprint != artifact.configuration_fingerprint
+                or episode.baseline_version != artifact.baseline_version
+                or {k: v for k, v in episode.active_skill_versions.items() if k not in downstream}
+                != dependencies
+                or not self._upstream_skills_supported(episode, skill)
+            ):
+                continue
+            recovery = state.activation_proof.get("recovery")
+            if recovery is None:
+                recovery = {
+                    "policy": "fixed-shadow-60-v1",
+                    "artifact_version": artifact.version,
+                    "suspended_at": state.suspended_at.isoformat() if state.suspended_at else None,
+                    "reason": state.suspension_reason,
+                    "dependencies": dependencies,
+                    "dependency_epochs": self._recovery_dependency_epochs(skill),
+                    "started_at": episode.created_at.isoformat(),
+                    "status": "collecting",
+                    "rows": [],
+                }
+            if (
+                not isinstance(recovery, dict)
+                or recovery.get("status") != "collecting"
+                or recovery.get("dependencies") != dependencies
+            ):
+                continue
+            rows = recovery.get("rows")
+            if (
+                not isinstance(rows, list)
+                or len(rows) >= ACTIVE_HEALTH_WINDOW
+                or any(
+                    not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in rows
+                )
+            ):
+                continue
+            if any(row.get("id") == episode.episode_id for row in rows):
+                continue
+            # Even a missing prediction is enrolled; its result will count as unavailable.
+            horizon = (
+                RISK_LIMITS[episode.risk_mode].max_hold_seconds
+                if skill == ChallengerSkill.EXIT
+                else PRIMARY_HORIZON_SECONDS
+            )
+            rows.append(
+                {
+                    "id": episode.episode_id,
+                    "created_at": episode.created_at.isoformat(),
+                    "deadline": (
+                        episode.created_at + timedelta(seconds=horizon + CHECKPOINT_GRACE_SECONDS)
+                    ).isoformat(),
+                }
+            )
+            recovery["rows"] = rows
+            state.activation_proof = {**state.activation_proof, "recovery": recovery}
+            self.database.save_challenger_skill_state(state)
+
+    def _skill_recovery_proof(self, state: ChallengerSkillState) -> dict[str, Any]:
+        """Resolve the bounded, durable selection without changing evidence or coverage."""
+        empty: dict[str, Any] = {"ready": False}
+        recovery = state.activation_proof.get("recovery")
+        if not self._recovery_allowed(state) or not isinstance(recovery, dict):
+            return empty
+        if (
+            recovery.get("policy") != "fixed-shadow-60-v1"
+            or recovery.get("artifact_version") != state.champion_version
+            or recovery.get("suspended_at") != state.suspended_at.isoformat()  # type: ignore[union-attr]
+            or recovery.get("status") not in ("collecting", "passed")
+        ):
+            return empty
+        if recovery.get("dependencies") != self._recovery_dependencies(state.skill) or recovery.get(
+            "dependency_epochs"
+        ) != self._recovery_dependency_epochs(state.skill):
+            recovery["status"] = "context_changed"
+            self.database.save_challenger_skill_state(state)
+            return empty
+        rows = recovery.get("rows")
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or len(rows) > ACTIVE_HEALTH_WINDOW
+            or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in rows)
+            or len({row["id"] for row in rows}) != len(rows)
+        ):
+            return empty
+        artifact = self.skill_artifacts[state.champion_version or ""]
+        try:
+            since = max(artifact.created_at, state.suspended_at or artifact.created_at)
+            for row in rows:
+                created = datetime.fromisoformat(row["created_at"])
+                deadline = datetime.fromisoformat(row["deadline"])
+                if (
+                    created.tzinfo is None
+                    or deadline.tzinfo is None
+                    or created <= since
+                    or deadline <= created
+                ):
+                    return empty
+                delta = row.get("delta")
+                if delta is not None and (
+                    isinstance(delta, bool)
+                    or not isinstance(delta, int | float)
+                    or not math.isfinite(delta)
+                    or not -11 <= delta <= 11
+                ):
+                    return empty
+        except (KeyError, TypeError, ValueError):
+            return empty
+        before = copy.deepcopy(recovery)
+        now = datetime.now(UTC)
+        for row in rows:
+            if "delta" in row:
+                continue
+            episode = self.evidence_episodes.get(row["id"])
+            if episode and (
+                episode.created_at.isoformat() != row["created_at"]
+                or episode.risk_mode != artifact.risk_mode
+                or episode.configuration_fingerprint != artifact.configuration_fingerprint
+                or episode.baseline_version != artifact.baseline_version
+                or episode.feature_schema_version != artifact.feature_schema_version
+                or not episode.qualification_eligible
+                or episode.synthetic
+                or episode.lane != LearningEvidenceLane.POLICY
+                or not _matches_policy_identity(
+                    episode, self._policy_identities.get(_policy_identity_key(episode), ("", ""))
+                )
+            ):
+                return empty
+            receipt = episode.challenger_evaluations.get(artifact.version) if episode else None
+            if receipt and (
+                receipt.artifact_version != artifact.version or receipt.skill != state.skill
+            ):
+                receipt = None
+            horizons: set[int | None] = (
+                {PRIMARY_HORIZON_SECONDS}
+                if state.skill != ChallengerSkill.EXIT
+                else {
+                    _bounded_exit_horizon(artifact),
+                    RISK_LIMITS[state.risk_mode].max_hold_seconds,
+                }
+            )
+            resolved = bool(
+                episode
+                and (
+                    _skill_receipt_outcome_resolved(episode, receipt)
+                    if receipt
+                    else all(str(horizon) in episode.checkpoints for horizon in horizons)
+                )
+            )
+            if not resolved:
+                try:
+                    deadline = datetime.fromisoformat(row["deadline"])
+                    if deadline.tzinfo is None or now <= deadline:
+                        continue
+                except (KeyError, TypeError, ValueError):
+                    return empty
+            actual, baseline = (
+                _participation_values(episode, receipt)
+                if episode and receipt and resolved
+                else (None, None)
+            )
+            row["delta"] = (
+                actual - baseline if actual is not None and baseline is not None else None
+            )
+        deltas = [
+            row["delta"]
+            for row in rows
+            if isinstance(row.get("delta"), int | float) and math.isfinite(row["delta"])
+        ]
+        observed = sum("delta" in row for row in rows)
+        availability = len(deltas) / observed if observed else 0.0
+        lower = _mean_lower_bound(deltas, z_score=TOURNAMENT_Z_SCORE)
+        harm = sum(value < 0 for value in deltas)
+        complete = observed == ACTIVE_HEALTH_WINDOW
+        ready = bool(
+            complete
+            and len(deltas) >= TOURNAMENT_MINIMUM_COMMON_OUTCOMES
+            and availability >= TOURNAMENT_MINIMUM_AVAILABILITY
+            and lower is not None
+            and lower > 0
+            and harm / len(deltas) <= SIZING_MAXIMUM_HARM_FRACTION
+        )
+        proof = {
+            "ready": ready,
+            "observed_count": observed,
+            "usable_count": len(deltas),
+            "availability_fraction": availability,
+            "uplift_lower_bound": lower,
+            "mean_uplift": fmean(deltas) if deltas else None,
+            "harm_count": harm,
+            "harm_fraction": harm / len(deltas) if deltas else 0.0,
+        }
+        recovery.update(proof)
+        if complete:
+            recovery["status"] = "passed" if ready else "failed"
+        if recovery != before:
+            self.database.save_challenger_skill_state(state)
+        return proof
 
     def _promote_active_skill(
         self,
@@ -5560,6 +5979,7 @@ class LearningEngine:
                 state.suspended_version = version
                 state.suspension_reason = reason
                 state.suspended_at = now
+                state.activation_proof.pop("recovery", None)
             else:
                 state.last_tournament = {
                     **state.last_tournament,
@@ -5725,6 +6145,24 @@ class LearningEngine:
                 continue
             state = self._current_skill_state(skill)
             artifact = self.skill_artifacts.get(state.champion_version or "") if state else None
+            if state and artifact and state.suspended_version == artifact.version:
+                recovery = self._skill_recovery_proof(state)
+                if recovery.get("ready") and (
+                    skill != ChallengerSkill.ENTRY
+                    or self._skill_activation_candidate(recovering=True) == artifact
+                ):
+                    # Publish memory only after the atomic authority write succeeds.
+                    restored = copy.copy(self)
+                    restored.skill_states = {
+                        key: value.model_copy(deep=True) for key, value in self.skill_states.items()
+                    }
+                    restored.active_skill_versions = dict(self.active_skill_versions)
+                    restored._activate_skill(artifact, recovering=True)
+                    self.skill_states = restored.skill_states
+                    self.active_skill_versions = restored.active_skill_versions
+                    self.mode = LearningMode.ACTIVE
+                    return
+                continue
             if (
                 state is None
                 or artifact is None
@@ -5932,6 +6370,29 @@ class LearningEngine:
         availability by giving the system repeated attempts at the same market.
         """
 
+        cache = getattr(self._status_policy_cache, "rows", None)
+        contract = (mode, configuration_fingerprint, baseline_version)
+        if cache is None or contract not in cache:
+            selected = self._select_policy_evidence(
+                mode=mode,
+                configuration_fingerprint=configuration_fingerprint,
+                baseline_version=baseline_version,
+            )
+            if cache is not None:
+                cache[contract] = selected
+        else:
+            selected = cache[contract]
+        return [
+            episode for episode in selected if not_before is None or episode.entry_at >= not_before
+        ][-MODEL_WINDOW_OBSERVATIONS:]
+
+    def _select_policy_evidence(
+        self,
+        *,
+        mode: RiskMode,
+        configuration_fingerprint: str | None,
+        baseline_version: str,
+    ) -> list[LearningEvidenceEpisode]:
         eligible = [
             episode
             for episode in sorted(
@@ -5962,11 +6423,7 @@ class LearningEngine:
             if identity is not None and not _matches_policy_identity(episode, identity):
                 continue
             independent.setdefault(episode.mint, episode)
-        return [
-            episode
-            for episode in independent.values()
-            if not_before is None or episode.entry_at >= not_before
-        ][-MODEL_WINDOW_OBSERVATIONS:]
+        return list(independent.values())[-MODEL_WINDOW_OBSERVATIONS:]
 
     def _new_outcomes_since_model(self, model: LearningModel) -> int:
         """Count genuinely unseen monitoring outcomes inside the model's exact cohort.

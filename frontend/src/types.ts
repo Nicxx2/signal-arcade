@@ -363,6 +363,13 @@ export interface ReadinessGate {
 }
 
 export interface ChallengerSkillStatus {
+  latest_policy_unchanged?: boolean;
+  suspension?: {
+    reason: string | null; since: string | null;
+    status: "waiting" | "collecting" | "passed" | "failed" | "context_changed" | "blocked" | "restored";
+    enrolled_count: number; observed_count: number; usable_count: number;
+    availability_fraction: number; window_size: number; restored_at: string | null;
+  } | null;
   support_proof?: { artifact_version: string; ready: boolean; usable_count: number; observed_count: number; availability_fraction: number; uplift_lower_bound: number | null } | null;
   skill: "entry" | "manipulation" | "sizing" | "exit";
   label: string;

@@ -44,6 +44,7 @@ import { challengerOverviewSummary } from "./learningSummary";
 import { latestDecisionsByMint, organizeDecisions } from "./decisionView";
 import { EquityChart } from "./EquityChart";
 import SeasonStrategy from "./SeasonStrategy";
+import { SkillSuspension } from "./SkillSuspension";
 import { StatusPanel } from "./StatusPanel";
 import { friendlyError, marketHealthDetail, useSystemStatus } from "./systemStatus";
 import type { IssueScope } from "./systemStatus";
@@ -2117,7 +2118,7 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
           {!learning.auto_participation && learning.mode === "active" && <button className="button ghost" onClick={() => void setLearningMode("shadow")} disabled={busy}>Stop current support</button>}
         </div>
       </div>
-      <p className="participation-note">{learning.mode === "off" ? "Learning and champion influence are paused. Saved models remain; already queued work may finish. Resume learning to continue." : learning.auto_participation ? activeSkillCount ? `${activeSkillCount} skill${activeSkillCount === 1 ? " is" : "s are"} supporting the Baseline. Others wait for proof. Harmful or unverifiable skills step out automatically; a newly proved replacement can join.` : "Permission is saved. The Baseline stays in control while Champions earn current activation proof." : learning.mode === "active" ? "Manually enabled support is active. Stop current support to return to Shadow, or opt into automatic qualification checks." : "Automatic support is off. Learning can continue in Shadow; saved Champions do not grant trading authority."} The Baseline's entry approval, executable routes, sizing limits and hard exits remain in force.</p>
+      <p className="participation-note">{learning.mode === "off" ? "Learning and champion influence are paused. Saved models remain; already queued work may finish. Resume learning to continue." : learning.auto_participation ? activeSkillCount ? `${activeSkillCount} skill${activeSkillCount === 1 ? " is" : "s are"} supporting the Baseline. Others wait for proof. Harmful or unverifiable skills step out automatically. Fresh proof is required to return or to admit a replacement.` : "Permission is saved. The Baseline stays in control while Champions earn current activation proof." : learning.mode === "active" ? "Manually enabled support is active. Stop current support to return to Shadow, or opt into automatic qualification checks." : "Automatic support is off. Learning can continue in Shadow; saved Champions do not grant trading authority."} The Baseline's entry approval, executable routes, sizing limits and hard exits remain in force.</p>
 
       <section className="card learning-progress-card">
         <div><span className={`learning-state state-${learning.state}`} /> <strong>{title(learning.state)}</strong><small>{learning.mode === "active" ? `${activeSkillCount} bounded skill${activeSkillCount === 1 ? "" : "s"} active · ${duration(holdReview)} hold review` : `Baseline remains in control · ${duration(holdReview)} hold review`}</small></div>
@@ -2171,6 +2172,8 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
               <span><small>Best proved</small><strong title={skill.champion?.version}>{skill.champion ? `${skill.champion_generation ? `Champion v${skill.champion_generation} · ` : ""}${skill.champion.codename ?? "Champion"}` : "None yet"}</strong>{skill.champion && <em>{modelFamilyLabel(skill.champion.model_family)}</em>}</span>
               <span><small>Influence</small><strong>{skill.active_version ? "Active" : skill.state === "suspended" ? "Suspended" : "Shadow"}</strong></span>
             </div>
+            <SkillSuspension skill={skill} paused={learning.mode === "off"} supportAllowed={Boolean(learning.auto_participation)} />
+            {skill.latest_policy_unchanged && !skill.testing_version && <p className="challenger-waiting"><span>Latest fit · same Exit policy</span>The saved Champion already uses these rules. A different qualified policy can start a new battle.</p>}
             {skill.skill === "entry" && learning.nonlinear_entry && <NonlinearEntryProgress status={learning.nonlinear_entry} />}
             {learning.auto_participation && skill.champion && !skill.active_version && skill.state !== "suspended" && <p className="challenger-waiting"><span>{learning.mode === "off" ? "Support paused" : "Waiting to support"}</span>{supportProof ? `${supportProof.usable_count} usable · Minimum ${commonForwardMinimum} ${supportProof.usable_count >= commonForwardMinimum ? "met" : "needed"} · ${supportProof.observed_count > 0 ? `${percent(supportProof.availability_fraction)} coverage` : "Coverage pending"}. Safe advantage and safety checks required.` : learning.mode === "off" ? "Permission is saved. Resume learning to continue support checks." : "Permission is saved. Current activation proof is checked as new outcomes arrive."}</p>}
             {!candidate?.qualified && waitingGate && <p className="challenger-waiting"><span>Waiting for evidence</span>{waitingGate.label} · {waitingGate.detail}</p>}

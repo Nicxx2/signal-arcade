@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.10.7
+# 🧠 Signal Arcade v1.10.8
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach observes the same saved outcomes outside the trading decision path.
 No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.10.7-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.10.8-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -18,37 +18,40 @@ No wallet keys, live orders, paid provider or cloud AI are required.
 
 ---
 
-## What changed in v1.10.7
+## What changed in v1.10.8
 
-- **More timely learning checkpoints:** evidence nearing its original collection deadline gets
-  priority within its lane. Shared Policy/Discovery tokens retain the earliest eligible deadline
-  while using one fetch slot. Existing fairness, request budgets and grace windows remain intact.
-- **Less wasted refresh work:** a bounded cache avoids repeatedly selecting locally invalid RPC
-  route identities. Changed identities retry; transient provider failures and fresh cached evidence
-  remain eligible. Missing outcomes still count as unknown.
-- **More reliable diagnostics:** brief lock contention retries on the next five-second poll without
-  falsely reporting lost records. New bounded refresh counters help explain deferrals, requests,
-  accepted routes and failures within the existing separate 512 MiB diagnostics allowance.
-- **Less work during market bursts:** held-position updates avoid duplicate valuation and database
-  writes. Urgent evidence is persisted without waiting to collect a batch; queued urgent work then
-  uses small transactions, with priority rechecks and durable evidence before paper fills.
-- **Consistent proof over time:** current Entry coverage matches the active feature and Baseline
-  contract. Compact Policy identities preserve the training/proof separation after payload retention.
-  The original episode and entry clock remain authoritative even after same-season re-enrollment.
-  Candidate scores are compared only on matching Discovery and Policy validation populations.
-- **Complete Coach lifecycle:** a winning Coach contender earns fresh composition proof before
-  support, then collects health evidence under its active identity. Missing mature receipts count
-  as unavailable. New native candidates cannot silently remove a waiting Coach proposal.
-- **Long-season reliability:** cleanup selects the same retained equity rows with less query work.
-  Restart guards, season accounting and Results totals no longer stop at 100,000 fills.
-  Results and Seasons keep a consistent accounting snapshot across fills and rollover. Closed
-  results are reused only while the fill history matches; open positions still refresh.
-- **Preserved learning and safety:** Linear/XGBoost recipes, independent
-  Champion proof and the 70% coverage requirement are unchanged. Collection improvements create
-  better opportunities to gather valid evidence; they do not guarantee a Champion or profit.
+- **Suspension recovery with fresh proof:** a health-suspended Champion can earn support back
+  through one fixed shadow trial when automatic support is enabled. Failed trials stay failed;
+  replacements and learning continue. Recovery preserves the same Champion and all safety gates.
+- **Clearer Exit progress:** identical native Exit fits stay in the audit without repeating the
+  same battle or displacing a different queued policy. Expand suspension details to see progress.
+- **More robust diagnostics downloads:** bounded retries and smaller pages handle temporary
+  read pressure. Incomplete exports report a specific reason; recording and the main database
+  remain separate from the reader.
+- **Consistent fee evidence:** learning preserves verified zero protocol fees, and execution
+  receipts correctly distinguish observed fees from configured fallbacks. Saved historical
+  assumptions are retained.
+- **More dependable Coach progress:** retained forward studies are processed in bounded pages,
+  and waiting contributions receive fair retries across restarts. Research refreshes cannot
+  overwrite a newer handoff. Existing permission and proof requirements remain in force.
+- **Less repeated work:** a dashboard response reuses its own Policy selection; tournament passes
+  share matching evidence selection. Unchanged skill state avoids redundant writes while keeping
+  Champion history, replay records and failed-write retries intact.
+- **Safer optional work:** Coach workers remain joined through repeated cancellation. Forward
+  monitoring yields under market pressure; inference backoff skips the large history read only
+  when no forward study needs monitoring. Active-study and control-response reads run outside
+  the main async loop; research rechecks permissions and context after waiting.
+- **Preserved learning requirements:** Baseline boundaries, Linear/XGBoost validation, independent
+  proof, unknown outcomes and the 70% coverage requirement are unchanged. More efficient evidence
+  processing cannot guarantee a Champion or profitable trading.
 
-Independent Champion support, optional Coach contributions, interactive equity charts and season
-strategy history from [v1.10.6](CHANGELOG.md#1106---2026-09-07) remain available.
+The learning, burst-recovery and long-season improvements from
+[v1.10.7](CHANGELOG.md#1107---2026-09-07) remain in place.
+
+**Operational limits:** busy periods can still expire candidate events. A recovered queue does not
+restore lost evidence or prove sustained peak-load capacity. Check recent losses and worker health
+in Settings diagnostics, and monitor host disk space during extended operation. See the
+[v1.10.8 validation results and remaining limits](docs/V1_10_8_VALIDATION.md).
 
 <details>
 <summary><strong>Release details and verification</strong></summary>
@@ -91,14 +94,16 @@ wait. Priority rechecks, durable evidence before fills and bounded batch fairnes
 under a separate **512 MiB** allowance in `data/diagnostics/`: targets are 30 days of minute summaries,
 one year of hourly summaries and 90 days of compact events. The byte cap takes priority. Recording
 yields under contention and labels gaps; it never supplies training evidence. Current skill summaries
-match the complete Baseline/schema context and actual runtime support. See
+match the complete Baseline/schema context and actual runtime support. Exports retry short-lived
+read contention and report specific failures; check for an `export_complete` trailer before using
+a download as complete history. See
 [diagnostics history and its limits](docs/DIAGNOSTICS_HISTORY.md).
 
-The [v1.10.7 release notes](CHANGELOG.md#1107---2026-09-07) cover learning correctness, Coach lifecycle,
-burst processing, diagnostics and long-season accounting. Entry's 70% coverage and independent proof
-requirements remain.
+The [v1.10.8 release notes](CHANGELOG.md#1108---2026-09-08) describe the latest fixes. Entry's
+70% coverage and independent proof requirements remain.
 
-**Upgrade:** v1.10.7 adds schema 16 for compact, durable Policy identities and indexed fill reads.
+**Upgrade:** v1.10.8 retains schema 16 and adds an index for bounded Coach work. The v1.10.7
+Policy identity and fill indexes remain in place.
 Bankroll, positions, learning records and Champion history are preserved; no new season is required.
 Back up before upgrading. See the [upgrade and rollback notes](#updating).
 
@@ -190,9 +195,9 @@ short evidence-driven exchanges and Champion ceremonies.** Open Learning → Cha
   Chest marks identify family (Linear bars, XGBoost branches, deterministic shield outline);
   XGBoost also has branched antennae. Decorative armor and handheld shields can appear in any family.
 
-The [v1.10.7 verification record](docs/V1_10_7_VALIDATION.md) summarizes regression checks,
+The [v1.10.8 verification record](docs/V1_10_8_VALIDATION.md) summarizes regression checks,
 release verification and remaining endurance limits. Earlier implementation records
-remain available for [v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
+remain available for [v1.10.7](docs/V1_10_7_VALIDATION.md), [v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
 [quote recovery](docs/V1_10_5_QUOTE_RECOVERY.md),
 [overnight reliability](docs/V1_10_5_OVERNIGHT_FIXES.md) and
 [Arena startup](docs/V1_10_5_ARENA_STARTUP.md).
@@ -347,7 +352,7 @@ before supporting Baseline.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.10.7 |
+| Player | What it does | Influence in v1.10.8 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | Optional automatic support lets each qualified skill join after its own Baseline/composition proof; influence remains monitored and reversible |
@@ -412,7 +417,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.10.7
+    image: nicxx2/signal-arcade:1.10.8
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -517,14 +522,15 @@ rather than treating update downtime as market evidence. If preparation cannot f
 normal operation and reports the reason. Users who deliberately prefer a rolling tag can use
 `nicxx2/signal-arcade:latest` instead.
 
-Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.7 preserves the bankroll, open
+Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.8 preserves the bankroll, open
 positions, pending-order accounting, seasons, settings, learning evidence and Champion history in
-the same data volume. For a v1.10.6-to-v1.10.7 upgrade, Baseline stays on v1.5, existing learning
+the same data volume. For an upgrade from v1.10.6 or v1.10.7, Baseline stays on v1.5, existing learning
 records remain available and no new paper season is required. Evidence selection enforces the
 current contract and durable identity rules. Restarts revalidate current activation receipts;
 older artifacts remain available for audit but cannot gain authority under a different feature schema.
 
-**v1.10.7 uses schema 16.** The migration adds compact Policy identity records and fill indexes.
+**v1.10.8 retains schema 16.** Upgrading from v1.10.7 adds no evidence migration or reset.
+The earlier v1.10.7 migration adds compact Policy identity records and fill indexes.
 Retained evidence backfills known identities; already deleted pre-upgrade history cannot be
 reconstructed. The identity ledger remains after larger evidence payloads expire and uses the main
 data volume, separately from diagnostics. Its memory cache follows the retained evidence window;
@@ -546,6 +552,9 @@ v1.10.7 builds, cannot open schema 16; rollback requires restoring the matching 
 image together. Published v1.10.4/v1.10.5 images use schema 14 and cannot open schema 15.
 A v1.10.3 image also cannot open schema 14. Never copy only a running SQLite database file while
 leaving its WAL behind.
+
+Published v1.10.7 and v1.10.8 both use schema 16. A code rollback between these releases can keep
+the current data volume; routinely restoring an older backup would discard newer evidence.
 
 > Portainer users can paste the same Compose file into the Web editor and define
 > `SIGNAL_ARCADE_ADMIN_PASSWORD` as a stack environment variable.
@@ -736,7 +745,8 @@ Signal Arcade also:
 - stores provider secrets server-side and never sends their values back to the UI;
 - fails closed on stale data, unverified migration routes, unsupported quote assets and unsafe or
   unknown mint structures;
-- keeps storage, Docker logs, market-event retention and AI work bounded for long-running hosts.
+- bounds Docker logs, raw market-event retention, diagnostics and optional AI work; durable
+  trading and proof records can still grow and need host-disk monitoring.
 
 ---
 

@@ -310,6 +310,12 @@ def test_local_explanation_rejects_incomplete_or_unsupported_prose() -> None:
     assert clean_local_explanation("WATCH because the evidence looked uncertain.") is None
 
 
+@pytest.mark.parametrize("marker", ["- ", "\u2022 ", "### "])
+def test_local_explanation_removes_list_and_heading_markers(marker: str) -> None:
+    sentence = "WATCH because buy ratio is 52.0% and momentum is -26.3%."
+    assert clean_local_explanation(marker + sentence) == sentence
+
+
 def test_transient_registry_timeouts_are_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
