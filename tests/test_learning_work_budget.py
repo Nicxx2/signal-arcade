@@ -61,9 +61,10 @@ def test_evidence_lanes_reject_other_risk_summary_even_with_matching_configurati
     learner, database, context = training_fixture(settings, count=12)
     try:
         expected = learner.evidence_lane_status()
-        assert learner.evidence_lane_status(
-            training_summary=(RiskMode.SAFE, context[0], 999)
-        ) == expected
+        assert (
+            learner.evidence_lane_status(training_summary=(RiskMode.SAFE, context[0], 999))
+            == expected
+        )
     finally:
         database.close()
 

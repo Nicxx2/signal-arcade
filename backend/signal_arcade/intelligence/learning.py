@@ -5242,9 +5242,8 @@ class LearningEngine:
         skill: ChallengerSkill,
         version: str,
         *,
-        policy_rows: dict[
-            tuple[RiskMode, str | None, str], list[LearningEvidenceEpisode]
-        ] | None = None,
+        policy_rows: dict[tuple[RiskMode, str | None, str], list[LearningEvidenceEpisode]]
+        | None = None,
     ) -> dict[str, Any]:
         artifact = self.skill_artifacts.get(version)
         order = (

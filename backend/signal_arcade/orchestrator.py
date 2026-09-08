@@ -1883,10 +1883,12 @@ class Orchestrator:
                         ):
                             # Commit the first arrival immediately. Amortize only the backlog
                             # behind it, so batching does not delay the first urgent response.
-                            for _ in range(min(
-                                1 if urgent_arrivals == 0 else _URGENT_PERSIST_BATCH_SIZE,
-                                self.settings.event_batch_size - urgent_arrivals,
-                            )):
+                            for _ in range(
+                                min(
+                                    1 if urgent_arrivals == 0 else _URGENT_PERSIST_BATCH_SIZE,
+                                    self.settings.event_batch_size - urgent_arrivals,
+                                )
+                            ):
                                 try:
                                     urgent = self.event_queue.get_nowait_before(1)
                                 except asyncio.QueueEmpty:
@@ -1905,12 +1907,14 @@ class Orchestrator:
                             ]
                             if urgent_events:
                                 with self.diagnostics.measure("event_persist"):
-                                    inserted.update(await _timed_to_thread(
-                                        self.diagnostics,
-                                        "event_persist",
-                                        self.database.append_events,
-                                        urgent_events,
-                                    ))
+                                    inserted.update(
+                                        await _timed_to_thread(
+                                            self.diagnostics,
+                                            "event_persist",
+                                            self.database.append_events,
+                                            urgent_events,
+                                        )
+                                    )
                                 durable_ids.update(event.event_id for event in urgent_events)
                         # A prefetched candidate can become protected after the last event
                         # created an order. Recheck it between urgent arrivals, even though

@@ -195,9 +195,7 @@ def test_thread_timings_preserve_work_and_record_only_on_owner_thread(
 @pytest.mark.parametrize(
     "change", ["quiet", "queue", "in_flight", "lag", "maintenance", "storage", "shutdown"]
 )
-def test_trainer_rechecks_admission_after_wait_and_preserves_request(
-    settings, monkeypatch, change
-):
+def test_trainer_rechecks_admission_after_wait_and_preserves_request(settings, monkeypatch, change):
     engine = Orchestrator(settings)
     engine.learning.request_current_training()
     pending = dict(engine.learning._training_requests)

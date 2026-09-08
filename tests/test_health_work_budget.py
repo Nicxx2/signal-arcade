@@ -12,7 +12,9 @@ from test_participation_progression import (
     "change", ["none", "missing_exit_receipts", "harmful_sizing", "empty_policy"]
 )
 def test_governance_selects_once_but_rechecks_health_after_each_change(
-    progression, monkeypatch, change  # noqa: F811
+    progression,  # noqa: F811
+    monkeypatch,
+    change,
 ):
     setup_combined(progression)
     learner, _, _ = progression
@@ -82,7 +84,10 @@ def test_governance_selects_once_but_rechecks_health_after_each_change(
     ],
 )
 def test_health_population_never_crosses_an_artifact_contract(
-    progression, monkeypatch, field, value  # noqa: F811
+    progression,  # noqa: F811
+    monkeypatch,
+    field,
+    value,
 ):
     setup_combined(progression)
     learner, _, _ = progression
