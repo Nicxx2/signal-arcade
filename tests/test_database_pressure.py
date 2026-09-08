@@ -16,6 +16,36 @@ INDEXES = (
 )
 
 
+@pytest.mark.parametrize("keep", [0, 1, 7, 20, 100])
+@pytest.mark.parametrize("chunk", [1, 3, 50])
+def test_equity_retention_boundary_matches_previous_selection(tmp_path, keep, chunk):
+    db = Database(tmp_path / "equity.sqlite3")
+    try:
+        with db._conn:
+            db._conn.executemany(
+                "INSERT INTO equity_points(id,recorded_at,equity_lamports,cash_lamports) "
+                "VALUES(?,?,1,1)",
+                [(i * 3, datetime.now(UTC).isoformat()) for i in range(1, 21)],
+            )
+        expected = [
+            row[0]
+            for row in db._conn.execute(
+                "SELECT id FROM equity_points WHERE id NOT IN "
+                "(SELECT id FROM equity_points ORDER BY id DESC LIMIT ?) ORDER BY id ASC LIMIT ?",
+                (keep, chunk),
+            )
+        ]
+        before = {row[0] for row in db._conn.execute("SELECT id FROM equity_points")}
+        removed = db.prune_history(
+            datetime.now(UTC), max_equity_points=keep, max_rows_per_category=chunk
+        )
+        after = {row[0] for row in db._conn.execute("SELECT id FROM equity_points")}
+        assert before - after == set(expected)
+        assert removed["equity_points"] == len(expected)
+    finally:
+        db.close()
+
+
 def seed_ai(db):
     now = datetime.now(UTC)
     for i in range(35):
@@ -63,7 +93,7 @@ def test_ai_index_upgrade_keeps_full_cohort_and_tied_order(tmp_path, limit):
     try:
         assert upgraded.list_ai_assessments(limit) == old
         assert upgraded.get_setting("preserved-marker") == {"unchanged": True}
-        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 16
         plan = [
             row[3]
             for row in upgraded._conn.execute(
@@ -176,7 +206,7 @@ def test_additive_index_failure_rolls_back_partial_index_work(tmp_path):
     with pytest.raises(sqlite3.OperationalError, match="already a table"):
         Database(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='idx_ai_assessments_created'"

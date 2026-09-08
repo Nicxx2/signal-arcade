@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.10.6
+# 🧠 Signal Arcade v1.10.7
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach observes the same saved outcomes outside the trading decision path.
 No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.10.6-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.10.7-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -18,24 +18,37 @@ No wallet keys, live orders, paid provider or cloud AI are required.
 
 ---
 
-## What changed in v1.10.6
+## What changed in v1.10.7
 
-- **Independent Champion support:** opt in once and each skill can support Baseline when its own
-  qualification and current combination proof pass. Entry does not have to qualify first.
-- **Clearer learning controls:** distinguish permission, saved Champions, current support,
-  training progress and battle proof. Pause learning and support together while retaining history.
-- **Clearer Coach contributions:** **Allow when ready** saves permission before an idea qualifies.
-  Proved ideas can enter Challenger battles automatically; Champion support still needs its
-  separate permission and activation proof. **How Coach contributes** explains the path on demand.
-- **Better equity charts:** season number, duration, starting bankroll and peak, plus hover,
-  touch and keyboard inspection in Arena and Replay. Chart guidance stays behind a help button.
-- **Season strategy history:** Results records which Champion skills influenced decisions during
-  each season. Partial and older unknown histories remain labelled.
-- **More responsive market processing:** urgent position, order and due-checkpoint events can
-  interrupt candidate batches. Smaller training copies, faster decoding and paced background
-  work preserve the existing evidence, risk and promotion rules.
-- **More accurate diagnostics:** current Baseline/schema matching keeps recorded Champion
-  identities aligned with actual support. The separate 512 MiB diagnostics allowance is unchanged.
+- **More timely learning checkpoints:** evidence nearing its original collection deadline gets
+  priority within its lane. Shared Policy/Discovery tokens retain the earliest eligible deadline
+  while using one fetch slot. Existing fairness, request budgets and grace windows remain intact.
+- **Less wasted refresh work:** a bounded cache avoids repeatedly selecting locally invalid RPC
+  route identities. Changed identities retry; transient provider failures and fresh cached evidence
+  remain eligible. Missing outcomes still count as unknown.
+- **More reliable diagnostics:** brief lock contention retries on the next five-second poll without
+  falsely reporting lost records. New bounded refresh counters help explain deferrals, requests,
+  accepted routes and failures within the existing separate 512 MiB diagnostics allowance.
+- **Less work during market bursts:** held-position updates avoid duplicate valuation and database
+  writes. Urgent evidence is persisted without waiting to collect a batch; queued urgent work then
+  uses small transactions, with priority rechecks and durable evidence before paper fills.
+- **Consistent proof over time:** current Entry coverage matches the active feature and Baseline
+  contract. Compact Policy identities preserve the training/proof separation after payload retention.
+  The original episode and entry clock remain authoritative even after same-season re-enrollment.
+  Candidate scores are compared only on matching Discovery and Policy validation populations.
+- **Complete Coach lifecycle:** a winning Coach contender earns fresh composition proof before
+  support, then collects health evidence under its active identity. Missing mature receipts count
+  as unavailable. New native candidates cannot silently remove a waiting Coach proposal.
+- **Long-season reliability:** cleanup selects the same retained equity rows with less query work.
+  Restart guards, season accounting and Results totals no longer stop at 100,000 fills.
+  Results and Seasons keep a consistent accounting snapshot across fills and rollover. Closed
+  results are reused only while the fill history matches; open positions still refresh.
+- **Preserved learning and safety:** Linear/XGBoost recipes, independent
+  Champion proof and the 70% coverage requirement are unchanged. Collection improvements create
+  better opportunities to gather valid evidence; they do not guarantee a Champion or profit.
+
+Independent Champion support, optional Coach contributions, interactive equity charts and season
+strategy history from [v1.10.6](CHANGELOG.md#1106---2026-09-07) remain available.
 
 <details>
 <summary><strong>Release details and verification</strong></summary>
@@ -65,6 +78,14 @@ private training copies reduce repeated work without changing fitted values or q
 Optional AI, Coach and cleanup work yield under pressure; unavailable outcomes remain unknown.
 Candidate pruning also waits for pending market and learning updates so it preserves their evidence;
 provider requests remain outside that brief coordination step.
+v1.10.7 also avoids repeated Policy identity hashing, shares the current Policy population within
+one health pass, and removes an unnecessary database-lock handoff after market writes. Health and
+qualification decisions remain fresh. Cancellation keeps submitted work inside its boundary, and
+training rechecks market pressure before preparing a fit. See the
+[bounded burst-performance checks and their limits](docs/V1_10_7_BURST_VALIDATION.md).
+Held-position market updates also avoid a duplicate valuation and position write. Newly arriving
+urgent evidence commits first; its queued backlog then uses small transactions, with no collection
+wait. Priority rechecks, durable evidence before fills and bounded batch fairness remain enforced.
 
 **Diagnostics remain separate from learning.** Settings keeps compact operation and learning summaries
 under a separate **512 MiB** allowance in `data/diagnostics/`: targets are 30 days of minute summaries,
@@ -73,9 +94,13 @@ yields under contention and labels gaps; it never supplies training evidence. Cu
 match the complete Baseline/schema context and actual runtime support. See
 [diagnostics history and its limits](docs/DIAGNOSTICS_HISTORY.md).
 
-**Upgrade:** v1.10.6 adds schema 15 for bounded per-season strategy-use records. Bankroll, positions,
-learning evidence and Champion history are preserved. Historical use stays unknown or partial where
-no receipt exists. See the [upgrade and rollback notes](#updating).
+The [v1.10.7 release notes](CHANGELOG.md#1107---2026-09-07) cover learning correctness, Coach lifecycle,
+burst processing, diagnostics and long-season accounting. Entry's 70% coverage and independent proof
+requirements remain.
+
+**Upgrade:** v1.10.7 adds schema 16 for compact, durable Policy identities and indexed fill reads.
+Bankroll, positions, learning records and Champion history are preserved; no new season is required.
+Back up before upgrading. See the [upgrade and rollback notes](#updating).
 
 **Champion Arena makes the four Challenger skills easier to follow through permanent fighters,
 short evidence-driven exchanges and Champion ceremonies.** Open Learning → Challenger and choose
@@ -165,9 +190,9 @@ short evidence-driven exchanges and Champion ceremonies.** Open Learning → Cha
   Chest marks identify family (Linear bars, XGBoost branches, deterministic shield outline);
   XGBoost also has branched antennae. Decorative armor and handheld shields can appear in any family.
 
-The [v1.10.6 verification record](docs/V1_10_6_VALIDATION.md) summarizes regression checks,
-live observations, migration safety and remaining endurance limits. Earlier implementation records
-remain available for [v1.10.5](docs/V1_10_5_VALIDATION.md),
+The [v1.10.7 verification record](docs/V1_10_7_VALIDATION.md) summarizes regression checks,
+release verification and remaining endurance limits. Earlier implementation records
+remain available for [v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
 [quote recovery](docs/V1_10_5_QUOTE_RECOVERY.md),
 [overnight reliability](docs/V1_10_5_OVERNIGHT_FIXES.md) and
 [Arena startup](docs/V1_10_5_ARENA_STARTUP.md).
@@ -177,14 +202,14 @@ can differ from browser automation. Neither a Champion crown nor a successful ch
 
 </details>
 
-![Live v1.10.6 Champion Arena with real measured comparison evidence](docs/screenshots/v1.10.6-live-2026-09-07/11-champion-arena.png)
+![Live v1.10.7 Champion Arena with real measured comparison evidence](docs/screenshots/v1.10.7-live-2026-09-07/11-champion-arena.png)
 
-*Captured from the running v1.10.6 paper app on 7 September 2026. The bar shows measured
+*Captured from the running v1.10.7 paper app on 7 September 2026. The bar shows measured
 advantage and uncertainty, not win probability. Live evidence can change after capture.*
 
-Additional views: [Reigning Champions](docs/screenshots/v1.10.6-live-2026-09-07/12-reigning-champions.png),
-[recorded battle](docs/screenshots/v1.10.6-live-2026-09-07/13-recorded-battle.png)
-and [Entry model profile](docs/screenshots/v1.10.6-live-2026-09-07/16-entry-profile.png).
+Additional views: [Reigning Champions](docs/screenshots/v1.10.7-live-2026-09-07/12-reigning-champions.png),
+[recorded battle](docs/screenshots/v1.10.7-live-2026-09-07/13-recorded-battle.png)
+and [Entry model profile](docs/screenshots/v1.10.7-live-2026-09-07/16-entry-profile.png).
 
 ## Reliability improvements inherited from v1.10.4
 
@@ -225,9 +250,8 @@ See [Learning Lab](docs/LEARNING.md), [paper execution](docs/PAPER_EXECUTION.md)
 ## 📸 See it in action
 
 These screenshots use real live paper-app data captured on **7 September 2026** from the locally
-running **v1.10.6** build. The [main capture record](docs/screenshots/v1.10.6-live-2026-09-07/README.md)
-and [Coach follow-up record](docs/screenshots/v1.10.6-coach-2026-09-07/README.md)
-identify the images, viewports and capture method. Figures and warnings were not altered; each
+running **v1.10.7** build. The [capture record](docs/screenshots/v1.10.7-live-2026-09-07/README.md)
+identifies the images, viewports and capture method. Figures and warnings were not altered; each
 view documents its capture time rather than a performance claim. All earlier screenshot folders
 are preserved.
 
@@ -236,7 +260,7 @@ are preserved.
 Paper equity, the season-locked risk profile, drawdown policy, unattended continuity, positions
 and recent decisions stay together without hiding the assumptions behind the score.
 
-![Signal Arcade v1.10.6 live paper Arena](docs/screenshots/v1.10.6-live-2026-09-07/01-arena-overview.png)
+![Signal Arcade v1.10.7 live paper Arena](docs/screenshots/v1.10.7-live-2026-09-07/01-arena-overview.png)
 
 ### Season progress
 
@@ -248,7 +272,7 @@ Each scorecard's **Strategy used** section shows recorded Champion skills, learn
 support, and the first recorded use of each saved version. Shadow learning does not count as
 influence. Older and partial histories stay labelled; current settings never rewrite past use.
 
-![Signal Arcade v1.10.6 retained season comparisons](docs/screenshots/v1.10.6-live-2026-09-07/03-season-progress.png)
+![Signal Arcade v1.10.7 retained season comparisons](docs/screenshots/v1.10.7-live-2026-09-07/03-season-progress.png)
 
 ### Inspecting equity over time
 
@@ -259,7 +283,7 @@ Scale high and low are labelled beside the chart; the scale includes the startin
 The question-mark button opens chart guidance; the compact readout shows the latest displayed
 checkpoint until you select another point.
 
-![Live Replay equity inspection](docs/screenshots/v1.10.6-live-2026-09-07/18-replay-equity.png)
+![Live Replay equity inspection](docs/screenshots/v1.10.7-live-2026-09-07/18-replay-equity.png)
 
 ### Learning Lab and AI Coach Room
 
@@ -276,46 +300,46 @@ future proved ideas to enter the matching Challenger skill automatically. Each i
 win a fresh Champion battle and pass activation checks, with automatic Champion support allowed,
 before supporting Baseline.
 
-![Signal Arcade v1.10.6 Challenger learning progress](docs/screenshots/v1.10.6-live-2026-09-07/04-learning-lab.png)
+![Signal Arcade v1.10.7 Challenger learning progress](docs/screenshots/v1.10.7-live-2026-09-07/04-learning-lab.png)
 
-[View the four skill cards and their current proof](docs/screenshots/v1.10.6-live-2026-09-07/10-skill-progress.png).
+[View the four skill cards and their current proof](docs/screenshots/v1.10.7-live-2026-09-07/10-skill-progress.png).
 
 <details>
 <summary><strong>📷 More screenshots</strong></summary>
 
 ### Decision board
 
-![Signal Arcade v1.10.6 decision board](docs/screenshots/v1.10.6-live-2026-09-07/02-decision-board.png)
+![Signal Arcade v1.10.7 decision board](docs/screenshots/v1.10.7-live-2026-09-07/02-decision-board.png)
 
 ### Replay receipts and modeled friction
 
-![Signal Arcade v1.10.6 paper receipts and modeled friction](docs/screenshots/v1.10.6-live-2026-09-07/08-replay-receipts.png)
+![Signal Arcade v1.10.7 paper receipts and modeled friction](docs/screenshots/v1.10.7-live-2026-09-07/08-replay-receipts.png)
 
 ### AI Coach Room
 
-![Signal Arcade v1.10.6 AI Coach research room](docs/screenshots/v1.10.6-coach-2026-09-07/09-ai-coach-room.png)
+![Signal Arcade v1.10.7 AI Coach research room](docs/screenshots/v1.10.7-live-2026-09-07/09-ai-coach-room.png)
 
 ### Provider budgets and pacing
 
-![Signal Arcade v1.10.6 provider budgets and activity](docs/screenshots/v1.10.6-live-2026-09-07/05-data-providers.png)
+![Signal Arcade v1.10.7 provider budgets and activity](docs/screenshots/v1.10.7-live-2026-09-07/05-data-providers.png)
 
 ### Optional local AI models
 
-![Signal Arcade v1.10.6 local AI models](docs/screenshots/v1.10.6-live-2026-09-07/06-local-ai.png)
+![Signal Arcade v1.10.7 local AI models](docs/screenshots/v1.10.7-live-2026-09-07/06-local-ai.png)
 
 ### Bounded diagnostics history
 
-![Signal Arcade v1.10.6 diagnostics with its separate storage allowance](docs/screenshots/v1.10.6-live-2026-09-07/15-diagnostics-history.png)
+![Signal Arcade v1.10.7 diagnostics with its separate storage allowance](docs/screenshots/v1.10.7-live-2026-09-07/15-diagnostics-history.png)
 
 ### Mobile layout
 
-<img src="docs/screenshots/v1.10.6-live-2026-09-07/07-mobile-arena.png" alt="Signal Arcade v1.10.6 mobile paper Arena" width="390">
+<img src="docs/screenshots/v1.10.7-live-2026-09-07/07-mobile-arena.png" alt="Signal Arcade v1.10.7 mobile paper Arena" width="390">
 
 ### Mobile Champion battle
 
-<img src="docs/screenshots/v1.10.6-live-2026-09-07/14-mobile-battle.png" alt="Signal Arcade v1.10.6 mobile live Champion comparison" width="390">
+<img src="docs/screenshots/v1.10.7-live-2026-09-07/14-mobile-battle.png" alt="Signal Arcade v1.10.7 mobile live Champion comparison" width="390">
 
-[View the mobile evidence and uncertainty readout](docs/screenshots/v1.10.6-live-2026-09-07/17-mobile-evidence.png).
+[View the mobile evidence and uncertainty readout](docs/screenshots/v1.10.7-live-2026-09-07/17-mobile-evidence.png).
 
 </details>
 
@@ -323,7 +347,7 @@ before supporting Baseline.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.10.6 |
+| Player | What it does | Influence in v1.10.7 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | Optional automatic support lets each qualified skill join after its own Baseline/composition proof; influence remains monitored and reversible |
@@ -388,7 +412,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.10.6
+    image: nicxx2/signal-arcade:1.10.7
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -493,14 +517,21 @@ rather than treating update downtime as market evidence. If preparation cannot f
 normal operation and reports the reason. Users who deliberately prefer a rolling tag can use
 `nicxx2/signal-arcade:latest` instead.
 
-Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.6 preserves the bankroll, open
+Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.7 preserves the bankroll, open
 positions, pending-order accounting, seasons, settings, learning evidence and Champion history in
-the same data volume. For a v1.10.5-to-v1.10.6 upgrade, Baseline stays on v1.5, the current learning
-cohort is preserved and no new paper season is required. Restarts revalidate current activation receipts;
+the same data volume. For a v1.10.6-to-v1.10.7 upgrade, Baseline stays on v1.5, existing learning
+records remain available and no new paper season is required. Evidence selection enforces the
+current contract and durable identity rules. Restarts revalidate current activation receipts;
 older artifacts remain available for audit but cannot gain authority under a different feature schema.
 
-**v1.10.6 uses schema 15.** It adds a bounded per-season strategy-use sidecar, preserving existing
-scores and learning records. Earlier participation is labelled unknown or partial where no receipt
+**v1.10.7 uses schema 16.** The migration adds compact Policy identity records and fill indexes.
+Retained evidence backfills known identities; already deleted pre-upgrade history cannot be
+reconstructed. The identity ledger remains after larger evidence payloads expire and uses the main
+data volume, separately from diagnostics. Its memory cache follows the retained evidence window;
+the compact durable ledger grows with unique proof identities. Existing native activation receipts
+remain valid; Coach crowns need a fresh activation receipt under the corrected lifecycle.
+The bounded per-season strategy-use sidecar preserves existing scores. Earlier participation is
+labelled unknown or partial where no receipt
 exists. Automatic Champion support defaults to disabled for installations without saved permission;
 an existing saved preference is preserved. Browser graphics preferences stay local to each device.
 
@@ -510,8 +541,9 @@ new season rather than rewriting history. Routine cleanup never deletes fills, l
 seasons or learning proof merely to satisfy a storage target.
 
 **Back up before upgrading.** Migrations are forward-only. Keep a consistent SQLite backup or a
-snapshot of the complete stopped data volume. Published v1.10.4/v1.10.5 images use schema 14 and
-cannot open schema 15; rollback requires restoring the matching pre-upgrade data and image together.
+snapshot of the complete stopped data volume. Schema-15 images, including v1.10.6 and earlier local
+v1.10.7 builds, cannot open schema 16; rollback requires restoring the matching pre-upgrade data and
+image together. Published v1.10.4/v1.10.5 images use schema 14 and cannot open schema 15.
 A v1.10.3 image also cannot open schema 14. Never copy only a running SQLite database file while
 leaving its WAL behind.
 

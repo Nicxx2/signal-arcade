@@ -532,7 +532,8 @@ def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, m
             clock[0] += 61
             if waits == 2:
                 # A busy core boundary skips collection, without consuming its counters.
-                assert engine.diagnostics.dropped == 1
+                assert engine.diagnostics.dropped == 0
+                assert engine.diagnostics.collection_deferred == 1
                 assert engine.diagnostics.sequence == 0
                 assert engine.diagnostics.cursor.serial == 0
                 engine._event_lock.release()
@@ -547,7 +548,8 @@ def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, m
         assert record["pipeline"]["processed"] == 2
         assert record["pipeline"]["critical_count"] == 1
         assert sum(record["pipeline"]["lag_histogram"]) == 2
-        assert "recording_gap" in record["flags"]
+        assert record["gauges"]["diagnostics_deferred"] == 1
+        assert "recording_gap" not in record["flags"]
 
     try:
         asyncio.run(scenario())
@@ -856,6 +858,36 @@ def test_full_operational_interval_and_six_proof_events_fit(tmp_path):
             drawdown=0.002,
         ),
         ai_mode="shadow",
+        diagnostics_deferred=3721,
+        learning_refresh={
+            "enabled": True,
+            "state": "yielding",
+            "blocked": "pending_sell",
+            "requests": 120453,
+            "selected": 501771,
+            "accepted": 470136,
+            "checkpoints": 484198,
+            "deferred": {
+                reason: rng.randint(0, 500000)
+                for reason in (
+                    "disabled",
+                    "demo",
+                    "maintenance",
+                    "market_boundary",
+                    "pending_sell",
+                    "queue_pressure",
+                    "processing_lag",
+                    "market_unhealthy",
+                    "context_changed",
+                )
+            },
+            "discarded_batches": 9923,
+            "unavailable_batches": 117,
+            "invalid_routes": 328,
+            "errors": 3,
+            "last_request_seconds": 0.192847,
+            "unavailable_route_identities": 128,
+        },
     )
     value = dict(
         boot="a" * 32,

@@ -1,0 +1,271 @@
+{
+  "version": "1.10.7",
+  "started_at": "2026-09-07T13:49:13.827Z",
+  "source": "Live local paper-trading app on mainnet data",
+  "browser": "Headless msedge",
+  "locale": "en-GB",
+  "timezone": "Europe/London",
+  "graphics": "Low",
+  "capture_policy": "Actual rendered UI; no synthetic responses, altered figures, hidden warnings or selected performance winners.",
+  "image": "sha256:c16e661edbee6c64a5865b5d21f030cf52b871322c9962f72ab8502e02139f34",
+  "screenshots": [
+    {
+      "file": "01-arena-overview.png",
+      "caption": "Live paper Arena: equity, risk profile, positions and engine status.",
+      "captured_at": "2026-09-07T13:49:17.878Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 376753,
+      "sha256": "db1970159b832958196fae409dba74959815bd0ec55aa8c5d4e836caef94bf48"
+    },
+    {
+      "file": "02-decision-board.png",
+      "caption": "Current decision board with real point-in-time evidence.",
+      "captured_at": "2026-09-07T13:49:19.453Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 136032,
+      "sha256": "0694dc50f3fd96af9e01eb511d48aab07a68d5acf7805c231668f5e16878fd3c"
+    },
+    {
+      "file": "03-season-progress.png",
+      "caption": "Default season comparison and recorded strategy use; no performance group was selected for a better result.",
+      "captured_at": "2026-09-07T13:49:22.067Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1400
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1400,
+      "bytes": 367730,
+      "sha256": "f494f66caa452b49c224d9406c55987f12a84d77bb2390966ac08d7b9cc78a5a"
+    },
+    {
+      "file": "04-learning-lab.png",
+      "caption": "Statistical Challenger training, saved permission and actual independently qualified skill support.",
+      "captured_at": "2026-09-07T13:49:24.543Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 351076,
+      "sha256": "fb6c22419a478ae694d2bee268d248845bc9769d883cb29745b126c3f6d9ed1a"
+    },
+    {
+      "file": "10-skill-progress.png",
+      "caption": "Entry, Manipulation, Sizing and Exit: current candidates, saved Champions and proof gates.",
+      "captured_at": "2026-09-07T13:49:25.602Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".challenger-skill-grid",
+      "width": 1180,
+      "height": 754,
+      "bytes": 287541,
+      "sha256": "cd8d2cd13b48b267f2410b226f37397eb366c6125029e58c4b38fd709b9247d4"
+    },
+    {
+      "file": "12-reigning-champions.png",
+      "caption": "Current saved Champions with stable portraits and recorded crown retentions.",
+      "captured_at": "2026-09-07T13:49:26.671Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".reigning-champions",
+      "width": 1180,
+      "height": 224,
+      "bytes": 96688,
+      "sha256": "2c2db88259979038867ca89de1330113e728dfc4364ab4a1abb7691c8d087f68"
+    },
+    {
+      "file": "11-champion-arena.png",
+      "caption": "A live Sizing comparison: measured advantage and uncertainty, not win probability.",
+      "captured_at": "2026-09-07T13:49:31.582Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1440
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1440,
+      "bytes": 393207,
+      "sha256": "02a05be041aade76ec46c6372ac9bec6b26aa96e4162c95d4c88c60fe8473f8a"
+    },
+    {
+      "file": "14-mobile-battle.png",
+      "caption": "Mobile live battle, with the same fighters and measured evidence.",
+      "captured_at": "2026-09-07T13:49:32.976Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "selector": "viewport",
+      "width": 390,
+      "height": 1000,
+      "bytes": 158585,
+      "sha256": "95ed2f1f5631527894a6545dbb9bb2d3ca83d3114ee54fc6ecc4b921724178e7"
+    },
+    {
+      "file": "17-mobile-evidence.png",
+      "caption": "Mobile advantage readout with timestamp, uncertainty and sample requirements.",
+      "captured_at": "2026-09-07T13:49:34.030Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "selector": ".ca-readout",
+      "width": 360,
+      "height": 493,
+      "bytes": 90845,
+      "sha256": "967617fd4aeb9d1c4451b1d3d66fae25a722e59ed4a74555ab9159e6267e470a"
+    },
+    {
+      "file": "13-recorded-battle.png",
+      "caption": "A saved battle result replayed from the recorded comparison.",
+      "captured_at": "2026-09-07T13:49:37.225Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1440
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1440,
+      "bytes": 404733,
+      "sha256": "ba1ab9f0f847342c6714bc8dfa67f70c61eb7b3a374ade5a8e898b85b4985b4f"
+    },
+    {
+      "file": "16-entry-profile.png",
+      "caption": "The current Entry model profile, with its family identity and real proof status.",
+      "captured_at": "2026-09-07T13:49:41.617Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1440
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1440,
+      "bytes": 339945,
+      "sha256": "c4196db329bd1f10af141fe71bd0cb8330115a6e265d330a7abcda26bc7a90f5"
+    },
+    {
+      "file": "09-ai-coach-room.png",
+      "caption": "Optional AI Coach research, separate from trading authority.",
+      "captured_at": "2026-09-07T13:49:43.322Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 285526,
+      "sha256": "6c8f0454085ac9fef8f6bde5beb98c062d0b117ef3ffe06e3c16577a9fa529e7"
+    },
+    {
+      "file": "18-replay-equity.png",
+      "caption": "Keyboard inspection of a saved equity checkpoint; no best-performing point was selected.",
+      "captured_at": "2026-09-07T13:49:45.072Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".replay-chart",
+      "width": 1180,
+      "height": 538,
+      "bytes": 147527,
+      "sha256": "bf0578c8bba5fc6031b314a6f2f83198408f23c08b9370a25c739943b25fb619"
+    },
+    {
+      "file": "08-replay-receipts.png",
+      "caption": "Latest paper fill receipts with recorded fees, impact and latency.",
+      "captured_at": "2026-09-07T13:49:46.116Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": "viewport",
+      "width": 1440,
+      "height": 1040,
+      "bytes": 207655,
+      "sha256": "a32d75a7def43a465eaa0c710a468f7e57bb5fe255e2fc7745f50ae79970063e"
+    },
+    {
+      "file": "05-data-providers.png",
+      "caption": "Provider roles, budgets and current activity; no secret editor is opened.",
+      "captured_at": "2026-09-07T13:49:48.274Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".provider-manager",
+      "width": 1180,
+      "height": 422,
+      "bytes": 143012,
+      "sha256": "66a0d1a571e49e8660731e442d9c77f1de107f3f4be96e23ba0c44083aec7684"
+    },
+    {
+      "file": "06-local-ai.png",
+      "caption": "Installed local AI models and runtime information.",
+      "captured_at": "2026-09-07T13:49:49.304Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".ai-model-manager",
+      "width": 1180,
+      "height": 527,
+      "bytes": 168058,
+      "sha256": "19c18b25c36730616eff60955b6726c6838af5948bb1c0c4b4c7e7b070021759"
+    },
+    {
+      "file": "15-diagnostics-history.png",
+      "caption": "Separate bounded diagnostics history for reviewing long-term operation.",
+      "captured_at": "2026-09-07T13:49:50.187Z",
+      "viewport": {
+        "width": 1440,
+        "height": 1040
+      },
+      "selector": ".diagnostics-card",
+      "width": 1180,
+      "height": 306,
+      "bytes": 105905,
+      "sha256": "d46fdcc77467fd9abbc373363a8d285b1d8e218b98bfb0c700dcfd10a678bc57"
+    },
+    {
+      "file": "07-mobile-arena.png",
+      "caption": "Live paper Arena on a 390-pixel mobile viewport.",
+      "captured_at": "2026-09-07T13:49:52.072Z",
+      "viewport": {
+        "width": 390,
+        "height": 1000
+      },
+      "selector": "viewport",
+      "width": 390,
+      "height": 1000,
+      "bytes": 135058,
+      "sha256": "5c9fe6f78fd2c53cd97a9dbb6c5eb6bec09b46690be5fe80ddbf2d53177e0a6e"
+    }
+  ],
+  "errors": [],
+  "failed_requests": [],
+  "mutations": [],
+  "live_battle_skill": "Sizing",
+  "websocket_frames": 240,
+  "completed_at": "2026-09-07T13:49:52.073Z"
+}

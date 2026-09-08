@@ -36,6 +36,17 @@ PHASES = frozenset(
         "event_register",
         "event_decision_save",
         "season_boundary",
+        "snapshot_cpu",
+        "snapshot_wait",
+        "heartbeat_cpu",
+        "heartbeat_wait",
+        "event_persist_cpu",
+        "event_persist_wait",
+        "event_learning_cpu",
+        "event_learning_wait",
+        "market_lock_wait",
+        "snapshot_lock_wait",
+        "heartbeat_lock_wait",
     }
 )
 
@@ -138,6 +149,7 @@ class DiagnosticsRecorder:
         self.phases: dict[str, list[float]] = {}
         self.cursor = PipelineCursor()
         self.dropped = 0
+        self.collection_deferred = 0
         self.previous_at = time.time()
         self.previous_monotonic = time.monotonic()
         self.previous_context: dict[str, Any] | None = None
@@ -163,7 +175,12 @@ class DiagnosticsRecorder:
     def observe_phase(self, name: str, started: float) -> None:
         if not self.enabled or name not in PHASES:
             return
-        elapsed = max(0, time.monotonic() - started)
+        self.observe_duration(name, max(0, time.monotonic() - started))
+
+    def observe_duration(self, name: str, elapsed: float) -> None:
+        """Aggregate completed worker timings on the event loop, never from worker threads."""
+        if not self.enabled or name not in PHASES or not math.isfinite(elapsed) or elapsed < 0:
+            return
         phase = self.phases.setdefault(name, [0, 0.0, 0.0])
         phase[0] += 1
         phase[1] += elapsed
@@ -227,7 +244,11 @@ class DiagnosticsRecorder:
             "context": context,
             "pipeline": pipeline,
             "phases": self.phases,
-            "gauges": {**gauges, "diagnostics_dropped": self.total_dropped},
+            "gauges": {
+                **gauges,
+                "diagnostics_dropped": self.total_dropped,
+                "diagnostics_deferred": self.collection_deferred,
+            },
             "skills": skills,
             "events": list(self.events),
         }
@@ -271,6 +292,7 @@ class DiagnosticsRecorder:
             "queued": len(self.queue)
             + (self.writer.messages.qsize() + int(self.writer.busy) if self.writer else 0),
             "dropped": self.total_dropped,
+            "collection_deferred": self.collection_deferred,
             "minute_days": 30,
             "hour_days": 365,
             "event_days": 90,

@@ -28,7 +28,11 @@ from test_learning import (
 
 
 def native_champion(
-    learner: LearningEngine, skill: ChallengerSkill, created_at: datetime
+    learner: LearningEngine,
+    skill: ChallengerSkill,
+    created_at: datetime,
+    *,
+    intercept: float | None = None,
 ) -> ChallengerSkillArtifact:
     """Independent qualification is a fixture; activation must earn real forward proof."""
     names = (
@@ -54,7 +58,9 @@ def native_champion(
                 "means": [0.0] * len(names),
                 "scales": [1.0] * len(names),
                 "coefficients": [
-                    0.5 if skill == ChallengerSkill.SIZING else -0.2,
+                    intercept
+                    if intercept is not None
+                    else (0.5 if skill == ChallengerSkill.SIZING else -0.2),
                     *([0.0] * len(names)),
                 ],
             }

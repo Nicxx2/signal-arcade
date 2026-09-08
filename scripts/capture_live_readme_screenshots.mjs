@@ -24,7 +24,10 @@ const browser=await chromium.launch({channel:process.env.SIGNAL_ARCADE_CAPTURE_B
 const context=await browser.newContext({viewport:{width:1440,height:1040},deviceScaleFactor:1,locale:report.locale,timezoneId:report.timezone,
   httpCredentials:{username:'admin',password,origin:base.origin}});
 await context.addInitScript(()=>localStorage.setItem('signal-arcade-champion-graphics-v1','low'));
-await context.grantPermissions(['local-network-access'],{origin:base.origin});
+// Chromium can grant this permission only to trustworthy origins. Direct HTTP
+// navigation to a LAN app does not need a secure-origin permission override.
+if(base.protocol==='https:' || ['localhost','127.0.0.1','[::1]'].includes(base.hostname))
+  await context.grantPermissions(['local-network-access'],{origin:base.origin});
 const page=await context.newPage();
 page.setDefaultTimeout(15000);
 page.setDefaultNavigationTimeout(30000);
@@ -120,7 +123,14 @@ try {
   report.completed_at=new Date().toISOString();
 }catch(error){report.failure=error.message;throw error;}finally{
   await writeFile(path.join(output,'capture.json'),JSON.stringify(report,null,2)+'\n',{flag:'wx'});
-  try { await context.close(); } finally { await browser.close(); }
+  // Some Windows transports leave shutdown promises pending even after the
+  // browser has exited. The manifest is already durable; bound this CLI cleanup.
+  const shutdownTimeout=setTimeout(()=>{
+    console.warn('Browser shutdown timed out; ending the capture helper. See capture.json for the result.');
+    process.exit(report.completed_at&&!report.failure?0:1);
+  },10000);
+  try { try { await context.close(); } finally { await browser.close(); } }
+  finally { clearTimeout(shutdownTimeout); }
 }
 // This is a one-shot CLI. Some external Playwright transports retain idle handles
 // after browser shutdown; all captures and the manifest are fully written above.

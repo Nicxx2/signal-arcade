@@ -4,6 +4,62 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.10.7 - 2026-09-07
+
+- Prioritize checkpoints in their final 15-second collection window within each evidence lane.
+  Preserve the 3:1 Policy/Discovery share, request limits, original deadlines and unknown outcomes.
+  A shared Policy/Discovery token keeps the earliest eligible clock while using one fetch slot.
+- Keep a bounded cache of unqueryable route identities so they stop consuming RPC selection slots;
+  retry when the identity changes. Cached fresh evidence and transient RPC failures remain eligible.
+- Retry brief diagnostics lock deferrals at the next five-second poll without reporting false
+  data loss. Actual collection failures and long recording gaps remain explicit.
+- Record bounded learning-refresh deferrals, requests, accepted routes and failures in the separate
+  diagnostics history. Report a discarded response as yielding and clear recovered worker errors.
+- Match current Entry coverage to its source, feature schema and Baseline contract. Preserve compact
+  Policy identities across payload retention so later seasons cannot recycle a token into proof
+  or release its Discovery twin into training. Schema 16 backfills retained evidence without
+  inventing deleted history; rolling back requires the matching pre-upgrade data backup.
+- Separate Coach research/battle context, fresh crown activation and active health receipts.
+  Require new composition proof after replacement and count missing mature health receipts as
+  unavailable. Preserve native activation receipts and every existing permission and risk guard.
+- Keep one bounded waiting Coach slot separately from native model families. Compare validation
+  scores only for matching cohorts and cutoffs; otherwise serve waiting cohorts chronologically.
+- Use an indexed equity-retention boundary without changing which rows are retained. Stream exact
+  season accounting and indexed entry joins, removing the 100,000-fill authority/history limit.
+- Match retained Policy identity to its original episode and exact UTC entry time, including
+  same-season re-enrollment, equivalent timezone offsets and subsecond timestamps. Later journal
+  records cannot recreate independent proof or release a reserved Discovery token into training.
+- Require matching Policy populations as well as Discovery cohorts before comparing Entry family
+  scores. Include resolved unavailable outcomes in that provenance; legacy or mismatching metadata
+  keeps chronological waiting order without changing qualification thresholds.
+- Keep Results/Seasons snapshots consistent across fills, currency changes and season rollover.
+  Bound retries and cancel interrupted readers before starting another scan. Reuse bounded closed
+  results only at the same accounting revision while refreshing open positions from indexed buys.
+- Exercise actual Coach battle wins, fresh activation, healthy/harmful/unavailable evidence and
+  restart across all four skills, including replacement of an active native Champion.
+- Reduce repeated learning work by filtering unusable training rows before Policy identity checks
+  and reusing only immutable identity digests in a bounded process-local cache. Proof, coverage,
+  retained identity receipts and active health are still evaluated from current evidence.
+- Invalidate market-event storage counts inside the writer boundary so committed events cannot
+  expose an old cached count or wait a second time behind maintenance just to invalidate it.
+- Join submitted engine thread work before cancellation releases its owner, including repeated
+  cancellation during shutdown. Recheck training admission after waiting for the event boundary,
+  preserving pending requests when market pressure or maintenance has arrived meanwhile.
+- Reuse the Discovery training count within one dashboard response and the exact Policy population
+  within one active-health pass. Recompute health for every skill and rebuild the population at
+  the next pass; unavailable receipts and immediate demotion remain effective.
+- Add bounded worker CPU, executor/event-loop delay and event-boundary wait diagnostics to help
+  distinguish remaining burst costs. Queue limits, loss reporting and checkpoint budgets stay intact.
+- Avoid marking and saving the same held position twice within one market update. Independent
+  order processing still refreshes marks; exit assessments and season attribution remain durable.
+- Commit the first newly arriving urgent event immediately, then persist its queued backlog in
+  groups of at most 16 without waiting for more events. Preserve priority changes between events,
+  duplicate handling, rollback/cancellation boundaries and the finite per-batch urgent allowance.
+- Preserve Linear/XGBoost recipes, the 70% coverage requirement
+  and independent Champion proof. Improved collection does not guarantee qualification or profit.
+- Update release metadata, Docker quick start and documentation for v1.10.7, with fresh live
+  screenshots in a separate version folder. Earlier screenshots remain unchanged.
+
 ## 1.10.6 - 2026-09-07
 
 - Coordinate candidate pruning and enrichment selection with in-flight market and learning updates.

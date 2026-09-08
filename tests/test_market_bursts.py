@@ -148,14 +148,14 @@ def test_interrupted_urgent_batch_keeps_accounting_and_later_season_events(
     monkeypatch.setattr(engine, "_critical_event", lambda event: event.mint.startswith("held"))
     gaps = set()
     monkeypatch.setattr(engine, "_note_integrity_mint_gap", lambda mint, _at: gaps.add(mint))
-    real_append = engine.database.append_event
+    real_append = engine.database.append_events
 
-    def append(event):
-        if interruption == "persistence" and event.event_id == "urgent":
+    def append(events):
+        if interruption == "persistence" and any(event.event_id == "urgent" for event in events):
             raise RuntimeError("injected urgent write failure")
-        return real_append(event)
+        return real_append(events)
 
-    monkeypatch.setattr(engine.database, "append_event", append)
+    monkeypatch.setattr(engine.database, "append_events", append)
 
     async def exercise():
         entered = asyncio.Event()

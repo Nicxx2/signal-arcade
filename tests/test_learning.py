@@ -308,6 +308,9 @@ def test_deferred_family_selection_requires_nonlinear_complexity_to_be_earned(
             baseline_version=BASELINE_VERSION,
             feature_schema_version=FEATURE_SCHEMA_VERSION,
             metrics={"validation_rmse": rmse, "policy_uplift_lower": 0.02},
+            evidence_cohort_digest="shared-family-cohort",
+            parameters={"policy_evidence_cohort": "v1:shared-policy-cohort"},
+            training_cutoff_at=now,
             qualified=True,
         )
 

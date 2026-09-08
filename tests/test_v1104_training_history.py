@@ -21,12 +21,12 @@ from signal_arcade.orchestrator import Orchestrator
 from test_learning import make_decision, make_state
 
 
-def training_fixture(settings):
+def training_fixture(settings, count=100):
     database = Database(settings.database_path)
     context = ["training-context"]
     learner = LearningEngine(database, settings, configuration_fingerprint=lambda: context[0])
-    start = datetime.now(UTC) - timedelta(hours=3)
-    for index in range(100):
+    start = datetime.now(UTC) - timedelta(minutes=count + 80)
+    for index in range(count):
         mint = f"row-{index}"
         decision = make_decision(start + timedelta(minutes=index), mint, (index % 10) / 10)
         decision.configuration_fingerprint = context[0]
@@ -39,6 +39,37 @@ def training_fixture(settings):
         )
     learner.request_current_training()
     return learner, database, context
+
+
+def test_linear_and_xgboost_publish_the_same_frozen_policy_population(settings):
+    from signal_arcade.intelligence.learning import _policy_evidence_cohort
+    from signal_arcade.models import StatisticalModelFamily
+    from test_participation_progression import record_policy
+
+    learner, database, _ = training_fixture(settings, count=400)
+    start = datetime.now(UTC) - timedelta(hours=1)
+    for i in range(4):
+        episode = record_policy(learner, f"proof-{i}", start + timedelta(seconds=i))
+        if i == 0:
+            episode.checkpoints["300"].net_return = None
+            episode.checkpoints["300"].missing_reason = "route_unavailable"
+    job = learner.prepare_next_training(("season-1",))
+    assert job is not None
+    expected = _policy_evidence_cohort(list(learner.evidence_episodes.values()))
+    episode.checkpoints["300"].net_return = 0.75
+    assert _policy_evidence_cohort(list(learner.evidence_episodes.values())) != expected
+    learner.fit_training_job(job)
+    assert learner.finish_training_job(job, runtime_context=("season-1",))
+    artifacts = [
+        a for a in database.list_challenger_artifacts() if a.skill == ChallengerSkill.ENTRY
+    ]
+    assert {a.model_family for a in artifacts} == {
+        StatisticalModelFamily.LINEAR,
+        StatisticalModelFamily.XGBOOST,
+    }
+    assert {a.parameters["policy_evidence_cohort"] for a in artifacts} == {expected}
+    assert all(a.metrics["policy_observed"] == 4 for a in artifacts)
+    database.close()
 
 
 def test_fit_reads_a_copy_and_publication_does_not_replace_new_evidence(settings):
@@ -234,5 +265,5 @@ def test_failed_journal_migration_does_not_advance_schema_or_remove_sidecar(sett
         assert conn.execute("SELECT COUNT(*) FROM challenger_champion_events").fetchone()[0] == 0
         conn.execute("UPDATE settings SET value_json='[]' WHERE key=?", (key,))
     database = Database(settings.database_path)
-    assert database._conn.execute("PRAGMA user_version").fetchone()[0] == 15
+    assert database._conn.execute("PRAGMA user_version").fetchone()[0] == 16
     database.close()

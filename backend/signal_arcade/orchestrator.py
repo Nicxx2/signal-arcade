@@ -9,20 +9,20 @@ import re
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Lock
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from . import __version__
 from .ai_lab import AiDecisionLab, decision_evidence_payload
 from .coach import AiCoach
 from .config import Settings
-from .database import TERMINAL_POLICY_VERSION, Database
+from .database import TERMINAL_POLICY_VERSION, AdvisoryReadDeferred, Database
 from .diagnostics import DiagnosticsRecorder, artifact_summary, identity, number
 from .event_queue import SeasonEventQueue
 from .intelligence.decision import DecisionEngine, deterministic_explanation
@@ -83,6 +83,74 @@ from .terminal_evidence import TERMINAL_PROBE_POLICY, valid_terminal_probe
 
 logger = logging.getLogger(__name__)
 
+# Persist already waiting urgent arrivals together, without waiting to collect a batch.
+_URGENT_PERSIST_BATCH_SIZE = 16
+
+# Keep generics compatible with the pinned mypy 1.8 checker.
+_WorkerArgs = ParamSpec("_WorkerArgs")
+_WorkerResult = TypeVar("_WorkerResult")
+
+
+async def _await_worker(  # noqa: UP047
+    worker: asyncio.Task[_WorkerResult], *, on_cancel: Callable[[], None] | None = None
+) -> _WorkerResult:
+    """Cancellation cannot release an owner's boundary while its worker still uses it."""
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        if on_cancel is not None:
+            on_cancel()
+        # A second shutdown/disconnect cancellation must not cancel the wrapper Task either:
+        # cancelling to_thread's awaitable leaves the real thread running. Keep joining it.
+        while not worker.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(worker)
+        with suppress(asyncio.CancelledError, Exception):
+            worker.result()
+        raise
+
+
+async def _joined_to_thread(  # noqa: UP047
+    function: Callable[_WorkerArgs, _WorkerResult],
+    *args: _WorkerArgs.args,
+    **kwargs: _WorkerArgs.kwargs,
+) -> _WorkerResult:
+    """Join submitted engine work before its caller may release locks or close storage."""
+    return await _await_worker(asyncio.create_task(asyncio.to_thread(function, *args, **kwargs)))
+
+
+async def _timed_to_thread(  # noqa: UP047
+    recorder: DiagnosticsRecorder,
+    phase: str,
+    function: Callable[_WorkerArgs, _WorkerResult],
+    *args: _WorkerArgs.args,
+    **kwargs: _WorkerArgs.kwargs,
+) -> _WorkerResult:
+    """Separate thread CPU from executor/loop waiting without sampling live stacks or I/O."""
+    if not recorder.enabled:
+        return await _joined_to_thread(function, *args, **kwargs)
+    dispatched = time.monotonic()
+    timing: list[float] = []
+
+    def run() -> _WorkerResult:
+        started, cpu = time.monotonic(), time.thread_time()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            timing.extend((started, time.monotonic(), time.thread_time() - cpu))
+
+    try:
+        return await _joined_to_thread(run)
+    finally:
+        if timing:
+            started, finished, cpu_seconds = timing
+            resumed = time.monotonic()
+            recorder.observe_duration(phase + "_cpu", max(0.0, cpu_seconds))
+            recorder.observe_duration(
+                phase + "_wait", max(0.0, started - dispatched) + max(0.0, resumed - finished)
+            )
+
+
 _UI_SNAPSHOT_CACHE_SECONDS = 5.0
 _UI_SNAPSHOT_MAX_CACHE_SECONDS = 12.0
 _UI_SNAPSHOT_LOCK_WAIT_SECONDS = 0.75
@@ -109,6 +177,18 @@ _POSITION_WATCHDOG_FREE_MIN_SECONDS = 8.0
 _POSITION_WATCHDOG_PAID_MIN_SECONDS = 2.0
 _POSITION_WATCHDOG_MAX_SECONDS = 60.0
 _SOLANA_MULTIPLE_ACCOUNTS_LIMIT = 100
+_LEARNING_INVALID_ROUTE_CACHE_LIMIT = 128
+_LEARNING_REFRESH_DEFER_REASONS = (
+    "disabled",
+    "demo",
+    "maintenance",
+    "market_boundary",
+    "pending_sell",
+    "queue_pressure",
+    "processing_lag",
+    "market_unhealthy",
+    "context_changed",
+)
 _CANDIDATE_VERIFICATION_LIMIT = 40
 _CANDIDATE_VERIFICATION_RETRY_SECONDS = 60.0
 _CANDIDATE_PRIORITY_FRACTION = 0.75
@@ -249,10 +329,17 @@ def _compact_decision(decision: Decision) -> dict[str, Any]:
     return result
 
 
-def _leaderboard_response(result: dict[str, Any], limit: int) -> dict[str, Any]:
+def _leaderboard_response(
+    result: dict[str, Any], limit: int, *, internal: bool = False
+) -> dict[str, Any]:
     """Return an isolated bounded view of a shared immutable Results calculation."""
 
-    return {**result, "rows": list(result.get("rows", []))[:limit]}
+    public = (
+        result
+        if internal
+        else {key: value for key, value in result.items() if not key.startswith("_")}
+    )
+    return {**public, "rows": list(result.get("rows", []))[:limit]}
 
 
 class EventBus:
@@ -446,12 +533,20 @@ class Orchestrator:
         self._enrichment_incident_active = "enrichment_worker" in active_incident_scopes
         self._heartbeat_incident_active = "heartbeat_worker" in active_incident_scopes
         self._learning_trainer_incident_active = "learning_trainer" in active_incident_scopes
+        self._learning_invalid_routes: OrderedDict[str, tuple[str, ...]] = OrderedDict()
         self._learning_refresh_status: dict[str, Any] = {
             "enabled": settings.learning_reserve_refresh_enabled,
             "requests": 0,
             "accepted_routes": 0,
             "checkpoint_updates": 0,
             "rejected": {},
+            "deferred": dict.fromkeys(_LEARNING_REFRESH_DEFER_REASONS, 0),
+            "blocked_reason": None,
+            "selected_routes": 0,
+            "last_batch_size": 0,
+            "last_request_seconds": None,
+            "worker_errors": 0,
+            "last_error": None,
             "last_completed_at": None,
             "state": "idle",
         }
@@ -601,6 +696,7 @@ class Orchestrator:
         self._ui_snapshot_last_duration = 0.0
         self._ui_leaderboard_refresh_lock = asyncio.Lock()
         self._ui_leaderboard_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._ui_accounting_generation = 0
         self._ui_seasons_refresh_lock = asyncio.Lock()
         self._ui_seasons_cache: tuple[float, dict[str, Any]] | None = None
         self.coach_contribution_enabled = bool(
@@ -784,8 +880,7 @@ class Orchestrator:
             self._terminal_resolution = None
             self.database.set_setting("auto_new_season_terminal_resolution", None)
             self._position_route_probes.clear()
-            self._ui_leaderboard_cache.clear()
-            self._ui_seasons_cache = None
+            self._invalidate_accounting_views()
             self.features = FeatureEngine(stale_market_seconds=self.settings.stale_market_seconds)
             self._event_order_by_mint.clear()
             self.last_decision_at.clear()
@@ -1053,7 +1148,7 @@ class Orchestrator:
         """Best-effort incident persistence must never terminate a recovery loop."""
 
         try:
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.record_incident,
                 scope=scope,
                 severity=severity,
@@ -1070,7 +1165,7 @@ class Orchestrator:
         """Incident cleanup is useful telemetry, not a reason to stop market processing."""
 
         try:
-            await asyncio.to_thread(self.database.resolve_incidents, scope)
+            await _joined_to_thread(self.database.resolve_incidents, scope)
             return True
         except asyncio.CancelledError:
             raise
@@ -1090,7 +1185,7 @@ class Orchestrator:
         """Persist a recovered episode directly to history without raising a red alert."""
 
         try:
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.record_transient_incident,
                 scope=scope,
                 severity=severity,
@@ -1522,6 +1617,7 @@ class Orchestrator:
                 "storage_active": self._storage_maintenance_active,
                 "running": self.running,
                 "workers_healthy": all(self.background_task_status().values()),
+                "learning_refresh": self._learning_refresh_diagnostics(),
             },
         )
 
@@ -1539,9 +1635,18 @@ class Orchestrator:
                     or self.learning.training_status()["state"] == "running"
                 )
                 if time.monotonic() >= due and not busy:
-                    async with asyncio.timeout(0.05), self._event_lock:
-                        self._collect_diagnostics()
-                    due = time.monotonic() + 60
+                    # Only acquiring the boundary is timed. A short deferral has not consumed
+                    # counters or discarded a record; keep it due for the next five-second poll.
+                    try:
+                        await asyncio.wait_for(self._event_lock.acquire(), timeout=0.05)
+                    except TimeoutError:
+                        self.diagnostics.collection_deferred += 1
+                    else:
+                        try:
+                            self._collect_diagnostics()
+                            due = time.monotonic() + 60
+                        finally:
+                            self._event_lock.release()
                 await self.diagnostics.flush_one(allowed=not busy)
             except asyncio.CancelledError:
                 raise
@@ -1585,9 +1690,16 @@ class Orchestrator:
             job = None
             try:
                 async with self._event_lock:
+                    # The initial quiet check can become stale behind a heartbeat/dashboard
+                    # boundary. Recheck before popping a request or freezing its inputs. A
+                    # deferred cohort keeps its original queue age and retries at the normal pace.
+                    if self.stop_event.is_set():
+                        break
+                    if not self._learning_training_can_run():
+                        continue
                     learner = self.learning
                     phase_started = time.monotonic()
-                    job = await asyncio.to_thread(
+                    job = await _joined_to_thread(
                         learner.prepare_next_training,
                         (
                             id(self.learning),
@@ -1601,12 +1713,12 @@ class Orchestrator:
                     continue
                 fit_error = None
                 try:
-                    await asyncio.to_thread(learner.fit_training_job, job)
+                    await _joined_to_thread(learner.fit_training_job, job)
                 except Exception as exc:
                     fit_error = exc
                 async with self._event_lock:
                     phase_started = time.monotonic()
-                    ran = await asyncio.to_thread(
+                    ran = await _joined_to_thread(
                         learner.finish_training_job,
                         job,
                         runtime_context=(
@@ -1745,31 +1857,68 @@ class Orchestrator:
                     durable_ids = {event.event_id for event in durable_events}
                     with self.diagnostics.measure("event_persist"):
                         inserted = (
-                            await asyncio.to_thread(self.database.append_events, durable_events)
+                            await _timed_to_thread(
+                                self.diagnostics,
+                                "event_persist",
+                                self.database.append_events,
+                                durable_events,
+                            )
                             if durable_events
                             else set()
                         )
                     handled_ids: set[str] = set()
                     remaining = deque(working_batch)
+                    urgent_buffer: deque[tuple[int, int, MarketEvent]] = deque()
                     urgent_arrivals = 0
-                    while remaining:
+                    while remaining or urgent_buffer:
                         # Prefetching for persistence must not hide newly arrived position,
                         # order, or due-checkpoint traffic behind hundreds of candidates.
                         # Keep all dequeued receipts in batch until its final task_done calls;
                         # this also preserves the finite season/shutdown admission boundary.
                         if (
-                            urgent_arrivals < self.settings.event_batch_size
+                            remaining
+                            and not urgent_buffer
+                            and urgent_arrivals < self.settings.event_batch_size
                             and self._event_priority(remaining[0][2]) > 0
                         ):
-                            try:
-                                urgent = self.event_queue.get_nowait_before(1)
-                            except asyncio.QueueEmpty:
-                                pass
-                            else:
+                            # Commit the first arrival immediately. Amortize only the backlog
+                            # behind it, so batching does not delay the first urgent response.
+                            for _ in range(min(
+                                1 if urgent_arrivals == 0 else _URGENT_PERSIST_BATCH_SIZE,
+                                self.settings.event_batch_size - urgent_arrivals,
+                            )):
+                                try:
+                                    urgent = self.event_queue.get_nowait_before(1)
+                                except asyncio.QueueEmpty:
+                                    break
                                 batch.append(urgent)
                                 working_batch.append(urgent)
-                                remaining.appendleft(urgent)
+                                urgent_buffer.append(urgent)
                                 urgent_arrivals += 1
+                            urgent_events = [
+                                event
+                                for _, _, event in urgent_buffer
+                                if event.event_id not in durable_ids
+                                and event.event_id not in handled_ids
+                                and not self._terminal_traded_event(event)
+                                and self._durable_event(event, self._event_priority(event))
+                            ]
+                            if urgent_events:
+                                with self.diagnostics.measure("event_persist"):
+                                    inserted.update(await _timed_to_thread(
+                                        self.diagnostics,
+                                        "event_persist",
+                                        self.database.append_events,
+                                        urgent_events,
+                                    ))
+                                durable_ids.update(event.event_id for event in urgent_events)
+                        # A prefetched candidate can become protected after the last event
+                        # created an order. Recheck it between urgent arrivals, even though
+                        # those arrivals now share a persistence transaction.
+                        if urgent_buffer and (
+                            not remaining or self._event_priority(remaining[0][2]) > 0
+                        ):
+                            remaining.appendleft(urgent_buffer.popleft())
                         _initial_priority, sequence, event = remaining.popleft()
                         if event.event_id in handled_ids:
                             continue
@@ -1810,7 +1959,9 @@ class Orchestrator:
                             # first executable tick after an order was submitted earlier in this
                             # batch. Persist it before any fill can reference it.
                             with self.diagnostics.measure("event_persist"):
-                                durable = await asyncio.to_thread(
+                                durable = await _timed_to_thread(
+                                    self.diagnostics,
+                                    "event_persist",
                                     self.database.append_event,
                                     event,
                                 )
@@ -1893,7 +2044,7 @@ class Orchestrator:
                 rollover = (
                     None
                     if self._profile_transition_active()
-                    else await asyncio.to_thread(self._auto_new_season_tick, now)
+                    else await _joined_to_thread(self._auto_new_season_tick, now)
                 )
             if profile is not None:
                 await self.bus.publish({"type": "paper_profile_transition_completed", **profile})
@@ -1914,7 +2065,7 @@ class Orchestrator:
             return
         self._event_sequence += 1
         sequence = self._event_sequence
-        inserted = await asyncio.to_thread(self.database.append_event, event)
+        inserted = await _joined_to_thread(self.database.append_event, event)
         if inserted:
             await self._handle_persisted_event(event, sequence=sequence)
 
@@ -1924,7 +2075,9 @@ class Orchestrator:
         *,
         sequence: int | None = None,
     ) -> bool:
+        lock_wait_started = time.monotonic()
         async with self._event_lock:
+            self.diagnostics.observe_phase("market_lock_wait", lock_wait_started)
             if sequence is None:
                 self._event_sequence += 1
                 sequence = self._event_sequence
@@ -1953,7 +2106,9 @@ class Orchestrator:
             is_trade = event.kind == EventKind.TRADE
             if is_trade and self.learning.has_pending_mint(state.mint):
                 with self.diagnostics.measure("event_learning"):
-                    await asyncio.to_thread(
+                    await _timed_to_thread(
+                        self.diagnostics,
+                        "event_learning",
                         self.learning.observe_market,
                         state,
                         observed_at,
@@ -1961,7 +2116,7 @@ class Orchestrator:
                     )
             if is_trade and self.ai_lab.has_pending_outcome(state.mint):
                 with self.diagnostics.measure("event_ai"):
-                    await asyncio.to_thread(self.ai_lab.observe_market, state, observed_at)
+                    await _joined_to_thread(self.ai_lab.observe_market, state, observed_at)
 
             broker_tracked = bool(
                 state.mint in self.broker.positions or self.broker.has_pending_for(state.mint)
@@ -2028,7 +2183,7 @@ class Orchestrator:
             )
             if (self.running or transition_exit_management) and is_trade and broker_tracked:
                 with self.diagnostics.measure("event_broker"):
-                    receipts = await asyncio.to_thread(
+                    receipts = await _joined_to_thread(
                         self.broker.on_market_state,
                         state=state,
                         features=snapshot,
@@ -2041,7 +2196,7 @@ class Orchestrator:
                     )
             elif not self.running and is_trade and state.mint in self.broker.positions:
                 receipts = []
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.broker.observe_market_state,
                     state=state,
                     features=snapshot,
@@ -2056,7 +2211,7 @@ class Orchestrator:
                 # A position may revive and fill an exit between two five-second heartbeat
                 # checks. Treat the verified sell as a real recovery event so an old, already
                 # due countdown cannot immediately roll the freshly updated portfolio.
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self._set_auto_new_season_clock,
                     None,
                     None,
@@ -2067,12 +2222,12 @@ class Orchestrator:
             if should_evaluate:
                 integrity_learning_eligible = integrity_window_complete
                 with self.diagnostics.measure("event_candidate"):
-                    planned_size = await asyncio.to_thread(
+                    planned_size = await _joined_to_thread(
                         self.broker.planned_order_size_sol,
                         self.risk_mode,
                         sol_usd_price=sol_usd_price,
                     )
-                    baseline_decision = await asyncio.to_thread(
+                    baseline_decision = await _joined_to_thread(
                         self._evaluate_baseline_with_size,
                         snapshot,
                         planned_size,
@@ -2092,7 +2247,7 @@ class Orchestrator:
                 baseline_entry_actionable = False
                 if baseline_decision.action == DecisionAction.ENTER:
                     baseline_entry_actionable = (
-                        await asyncio.to_thread(
+                        await _joined_to_thread(
                             self.broker.entry_blocker,
                             baseline_decision,
                             sol_usd_price=sol_usd_price,
@@ -2103,7 +2258,7 @@ class Orchestrator:
                     # Freeze the untouched Baseline and active-skill receipts before either the
                     # statistical Challenger or optional Local AI can alter this decision.
                     with self.diagnostics.measure("event_register"):
-                        await asyncio.to_thread(
+                        await _joined_to_thread(
                             self.learning.register,
                             baseline_decision,
                             state,
@@ -2136,7 +2291,7 @@ class Orchestrator:
                     )
                 if decision.action == DecisionAction.ENTER:
                     with self.diagnostics.measure("event_broker"):
-                        order, blocker = await asyncio.to_thread(
+                        order, blocker = await _joined_to_thread(
                             self.broker.submit_decision_with_reason,
                             decision,
                             sol_usd_price=sol_usd_price,
@@ -2152,7 +2307,7 @@ class Orchestrator:
                         )
                 if self._should_record_decision(decision):
                     with self.diagnostics.measure("event_decision_save"):
-                        await asyncio.to_thread(self.database.save_decision, decision)
+                        await _joined_to_thread(self.database.save_decision, decision)
                     self.last_recorded_decision[state.mint] = decision
                 if baseline_entry_actionable and integrity_learning_eligible:
                     self.ai_lab.enqueue_shadow(baseline_decision, state)
@@ -2756,14 +2911,7 @@ class Orchestrator:
     async def _run_storage_maintenance(self, now: datetime) -> None:
         cancelled = ThreadEvent()
         worker = asyncio.create_task(self._storage_maintenance_pass(now, cancelled))
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            # SQLite work already running in a thread cannot be cancelled by asyncio. Ask the
-            # bounded pass to yield and join it before shutdown is allowed to close the database.
-            cancelled.set()
-            await worker
-            raise
+        await _await_worker(worker, on_cancel=cancelled.set)
 
     async def _storage_maintenance_pass(self, now: datetime, cancelled: ThreadEvent) -> None:
         """Retire bounded history without creating a periodic market-processing cliff."""
@@ -2782,13 +2930,13 @@ class Orchestrator:
         }
         try:
             phase_started = time.monotonic()
-            capacity_before = await asyncio.to_thread(self.database.storage_capacity_stats)
+            capacity_before = await _joined_to_thread(self.database.storage_capacity_stats)
             phases["capacity_before_seconds"] = time.monotonic() - phase_started
             self._storage_snapshot = self._storage_health_view(
                 {**self._storage_snapshot, **capacity_before}
             )
             if (now - self._storage_counts_checked_at).total_seconds() >= 60:
-                counts = await asyncio.to_thread(self.database.bounded_storage_counts)
+                counts = await _joined_to_thread(self.database.bounded_storage_counts)
                 counted_at = datetime.now(UTC)
                 self._storage_snapshot.update(counts)
                 self._storage_count_timestamps.update(
@@ -2797,7 +2945,7 @@ class Orchestrator:
                 self._storage_counts_at = datetime.fromisoformat(
                     min(self._storage_count_timestamps.values())
                 )
-                self._oldest_retained_trade_at = await asyncio.to_thread(
+                self._oldest_retained_trade_at = await _joined_to_thread(
                     self.database.oldest_retained_trade
                 )
                 self._storage_counts_checked_at = counted_at
@@ -2830,7 +2978,7 @@ class Orchestrator:
             self._storage_maintenance_deferred_since = None
             self._storage_maintenance_deferred_reason = None
             phase_started = time.monotonic()
-            history = await asyncio.to_thread(
+            history = await _joined_to_thread(
                 self.database.prune_history,
                 now - timedelta(hours=self.raw_trade_retention_hours),
                 non_entry_decision_before=now - timedelta(hours=24),
@@ -2846,7 +2994,7 @@ class Orchestrator:
                 for key in ("raw_trades", "non_entry_decisions", "equity_points")
             )
             phase_started = time.monotonic()
-            retired = await asyncio.to_thread(
+            retired = await _joined_to_thread(
                 self.database.prune_retired_decisions,
                 max_rows=self._storage_maintenance_chunk_rows,
                 max_duration_seconds=_STORAGE_HISTORY_PASS_SECONDS,
@@ -2878,7 +3026,7 @@ class Orchestrator:
 
             phase_started = time.monotonic()
             self._refresh_storage_yield_signal()
-            budget = await asyncio.to_thread(
+            budget = await _joined_to_thread(
                 self.database.enforce_storage_budget,
                 self.storage_max_bytes,
                 max_rows_per_pass=_STORAGE_BUDGET_PASS_ROWS,
@@ -2901,8 +3049,8 @@ class Orchestrator:
                 or (now - self._storage_optional_history_at).total_seconds() >= 60
             ):
                 phase_started = time.monotonic()
-                removed["incidents"] = await asyncio.to_thread(self.database.prune_incidents)
-                removed["ai_assessments"] = await asyncio.to_thread(
+                removed["incidents"] = await _joined_to_thread(self.database.prune_incidents)
+                removed["ai_assessments"] = await _joined_to_thread(
                     self.database.prune_ai_assessments
                 )
                 phases["optional_history_seconds"] = time.monotonic() - phase_started
@@ -2911,7 +3059,7 @@ class Orchestrator:
                 self._storage_maintenance_deferred_reason = "protecting_market_throughput"
 
             phase_started = time.monotonic()
-            capacity = await asyncio.to_thread(self.database.storage_capacity_stats)
+            capacity = await _joined_to_thread(self.database.storage_capacity_stats)
             phases["capacity_seconds"] = time.monotonic() - phase_started
             self._storage_snapshot = self._storage_health_view(
                 {**self._storage_snapshot, **capacity}
@@ -3024,7 +3172,7 @@ class Orchestrator:
                                 "source": "position_watchdog",
                             }
                         )
-                    delay = await asyncio.to_thread(self._position_watchdog_interval_seconds)
+                    delay = await _joined_to_thread(self._position_watchdog_interval_seconds)
                     if self._has_pending_sell():
                         delay = min(delay, _POSITION_WATCHDOG_PAID_MIN_SECONDS)
             except asyncio.CancelledError:
@@ -3040,46 +3188,99 @@ class Orchestrator:
             await self._wait_for_stop(delay)
 
     def _learning_reserve_can_run(self) -> bool:
-        return bool(
-            self.settings.learning_reserve_refresh_enabled
-            and not self.demo_mode
-            and not self._maintenance_requested
-            and not self._storage_maintenance_active
-            and not self.event_queue.boundary_active
-            and not self._has_pending_sell()
-            and self.event_queue.qsize() < max(1, self.settings.event_queue_max * 0.05)
-            and self.last_processing_lag_seconds < 1
-            and self._rollover_market_data_healthy(datetime.now(UTC))
-        )
+        return self._learning_reserve_blocked_reason() is None
+
+    def _learning_reserve_blocked_reason(self) -> str | None:
+        """Explain the existing guard without fetching data or changing its thresholds."""
+        if not self.settings.learning_reserve_refresh_enabled:
+            return "disabled"
+        if self.demo_mode:
+            return "demo"
+        if self._maintenance_requested or self._storage_maintenance_active:
+            return "maintenance"
+        if self.event_queue.boundary_active:
+            return "market_boundary"
+        if self._has_pending_sell():
+            return "pending_sell"
+        if self.event_queue.qsize() >= max(1, self.settings.event_queue_max * 0.05):
+            return "queue_pressure"
+        if not self.last_processing_lag_seconds < 1:
+            return "processing_lag"
+        if not self._rollover_market_data_healthy(datetime.now(UTC)):
+            return "market_unhealthy"
+        return None
+
+    def _learning_refresh_deferred(self, reason: str) -> None:
+        counts = self._learning_refresh_status["deferred"]
+        counts[reason] += 1
+        self._learning_refresh_status["blocked_reason"] = reason
+        self._learning_refresh_status["state"] = "disabled" if reason == "disabled" else "yielding"
+
+    def _learning_refresh_diagnostics(self) -> dict[str, Any]:
+        """Bounded cumulative counters; deferrals are guard checks, not lost outcomes."""
+        status = self._learning_refresh_status
+        rejected = status["rejected"]
+        return {
+            "enabled": status["enabled"],
+            "state": status["state"],
+            "blocked": status["blocked_reason"],
+            "requests": status["requests"],
+            "selected": status["selected_routes"],
+            "accepted": status["accepted_routes"],
+            "checkpoints": status["checkpoint_updates"],
+            "deferred": dict(status["deferred"]),
+            "discarded_batches": rejected.get("context_changed_or_market_pressure", 0),
+            "unavailable_batches": rejected.get("provider_unavailable", 0),
+            "invalid_routes": sum(
+                count
+                for reason, count in rejected.items()
+                if reason not in {"context_changed_or_market_pressure", "provider_unavailable"}
+            ),
+            "errors": status["worker_errors"],
+            "last_request_seconds": number(status["last_request_seconds"]),
+            "unavailable_route_identities": len(self._learning_invalid_routes),
+        }
 
     async def _learning_reserve_loop(self) -> None:
         """One bounded background batch; shared RPC quota/backoff protects market processing."""
         while not self.stop_event.is_set():
             try:
-                if self._learning_reserve_can_run():
+                reason = self._learning_reserve_blocked_reason()
+                if reason is None:
                     await self._learning_reserve_tick()
                 else:
-                    self._learning_refresh_status["state"] = (
-                        "yielding" if self.settings.learning_reserve_refresh_enabled else "disabled"
-                    )
+                    self._learning_refresh_deferred(reason)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._learning_refresh_status["state"] = "retrying"
                 self._learning_refresh_status["last_error"] = type(exc).__name__
+                self._learning_refresh_status["worker_errors"] += 1
                 logger.warning("Learning reserve refresh will retry (%s)", type(exc).__name__)
             await self._wait_for_stop(self.settings.learning_reserve_refresh_interval_seconds)
 
     async def _learning_reserve_tick(self) -> None:
         async with self._event_lock:
-            if not self._learning_reserve_can_run():
+            reason = self._learning_reserve_blocked_reason()
+            if reason is not None:
+                self._learning_refresh_deferred(reason)
                 return
-            mints = await asyncio.to_thread(
+            self._learning_refresh_status["blocked_reason"] = None
+            # A malformed identity cannot become queryable merely by waiting. Keep only a
+            # bounded cache, and retry immediately when fresh stream data repairs that identity.
+            self._learning_invalid_routes = OrderedDict(
+                (mint, identity)
+                for mint, identity in self._learning_invalid_routes.items()
+                if (state := self.features.tokens.get(mint)) is not None
+                and route_identity(state) == identity
+            )
+            mints = await _joined_to_thread(
                 self.learning.due_checkpoint_mints,
                 self.features.tokens,
                 datetime.now(UTC),
                 limit=self.settings.learning_reserve_refresh_batch_size,
                 fresh=False,
+                excluded_mints=set(self._learning_invalid_routes),
             )
             originals = {mint: self.features.tokens[mint] for mint in mints}
             snapshots = {mint: replace(state) for mint, state in originals.items()}
@@ -3094,37 +3295,51 @@ class Orchestrator:
                     addresses = proposed
             except (ValueError, TypeError):
                 self._learning_refresh_rejected("route_identity_unavailable")
+                self._learning_invalid_routes[mint] = route_identity(state)
+                self._learning_invalid_routes.move_to_end(mint)
+                while len(self._learning_invalid_routes) > _LEARNING_INVALID_ROUTE_CACHE_LIMIT:
+                    self._learning_invalid_routes.popitem(last=False)
         if not selected:
+            self._learning_refresh_status["state"] = "idle"
             return
         self._learning_refresh_status["state"] = "fetching"
         self._learning_refresh_status["requests"] += 1
+        self._learning_refresh_status["selected_routes"] += len(selected)
+        self._learning_refresh_status["last_batch_size"] = len(selected)
         requested_at = datetime.now(UTC)
-        async with asyncio.timeout(8):
-            result = await self.http.solana_multiple_accounts(
-                addresses,
-                # Validate each route against its own fence after the response. One corrupt
-                # future-slot target must not prevent every other route from being refreshed.
-                min_context_slot=min(
-                    max(state.last_slot, state.last_reserve_slot) for state in selected.values()
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(8):
+                result = await self.http.solana_multiple_accounts(
+                    addresses,
+                    # One corrupt future-slot target must not fence out every other route.
+                    min_context_slot=min(
+                        max(state.last_slot, state.last_reserve_slot) for state in selected.values()
+                    )
+                    or None,
+                    critical=False,
                 )
-                or None,
-                critical=False,
+        finally:
+            self._learning_refresh_status["last_request_seconds"] = max(
+                0.0, time.monotonic() - started
             )
         if result is None:
             self._learning_refresh_rejected("provider_unavailable")
             self._learning_refresh_status["state"] = "retrying"
             return
         async with self._event_lock:
-            if (
-                self.demo_mode
-                or self.learning is not learner
-                or not self._learning_reserve_can_run()
-            ):
+            reason = (
+                "context_changed"
+                if self.learning is not learner
+                else self._learning_reserve_blocked_reason()
+            )
+            if reason is not None:
                 self._learning_refresh_rejected("context_changed_or_market_pressure")
+                self._learning_refresh_deferred(reason)
                 return
             # Validation and learning persistence run under the same event boundary as cached
             # checkpoints. The snapshots never enter FeatureEngine or the paper broker.
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self._apply_learning_reserve_result,
                 selected,
                 originals,
@@ -3132,6 +3347,8 @@ class Orchestrator:
                 requested_at,
             )
         self._learning_refresh_status["state"] = "idle"
+        self._learning_refresh_status["blocked_reason"] = None
+        self._learning_refresh_status["last_error"] = None
         self._learning_refresh_status["last_completed_at"] = datetime.now(UTC).isoformat()
 
     def _learning_refresh_rejected(self, reason: str) -> None:
@@ -3465,7 +3682,7 @@ class Orchestrator:
                 if self.demo_mode:
                     return []
                 observed_at = datetime.now(UTC)
-                batch_receipts, refreshed, slot = await asyncio.to_thread(
+                batch_receipts, refreshed, slot = await _joined_to_thread(
                     self._apply_position_watchdog_result,
                     batch_targets,
                     result,
@@ -3645,12 +3862,16 @@ class Orchestrator:
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
+                lock_wait_started = time.monotonic()
                 async with self._event_lock:
+                    self.diagnostics.observe_phase("heartbeat_lock_wait", lock_wait_started)
                     # Do not reuse a timestamp captured before waiting behind the market/watchdog
                     # lock. It could otherwise predate a reserve snapshot accepted while waiting.
                     now = datetime.now(UTC)
                     phase_started = time.monotonic()
-                    receipts, expired, learning_updates, ai_updates = await asyncio.to_thread(
+                    receipts, expired, learning_updates, ai_updates = await _timed_to_thread(
+                        self.diagnostics,
+                        "heartbeat",
                         self._heartbeat_tick,
                         now,
                     )
@@ -3658,7 +3879,7 @@ class Orchestrator:
                     rollover = (
                         None
                         if self._profile_transition_active()
-                        else await asyncio.to_thread(self._auto_new_season_tick, now)
+                        else await _joined_to_thread(self._auto_new_season_tick, now)
                     )
                     self.diagnostics.observe_phase("heartbeat", phase_started)
                 if receipts or expired or learning_updates or ai_updates:
@@ -3986,7 +4207,7 @@ class Orchestrator:
         previous_running = bool(operation.get("previous_running"))
         target_payload = validated_target.model_dump(mode="json")
         target_payload["locked_at"] = now.isoformat() if previous_running else None
-        previous_season_id, next_season_id = await asyncio.to_thread(
+        previous_season_id, next_season_id = await _joined_to_thread(
             self.broker.rollover,
             now,
             next_profile=target_payload,
@@ -4009,8 +4230,7 @@ class Orchestrator:
         self._route_retry_at.clear()
         self._route_retry_delay_seconds.clear()
         self._position_route_probes.clear()
-        self._ui_leaderboard_cache.clear()
-        self._ui_seasons_cache = None
+        self._invalidate_accounting_views()
         await self._update_season_operation(
             operation_id,
             state="completed",
@@ -4110,7 +4330,7 @@ class Orchestrator:
                     )
             # Commit the preference and cleared timer together before exposing either
             # in memory. A storage failure therefore leaves the prior policy intact.
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_settings,
                 {
                     "auto_new_season_enabled": enabled,
@@ -4632,8 +4852,7 @@ class Orchestrator:
         self._route_retry_at.clear()
         self._route_retry_delay_seconds.clear()
         self._position_route_probes.clear()
-        self._ui_leaderboard_cache.clear()
-        self._ui_seasons_cache = None
+        self._invalidate_accounting_views()
         self.invalidate_snapshot_cache()
         return {
             "at": now.isoformat(),
@@ -4822,7 +5041,7 @@ class Orchestrator:
                 "transition_required": False,
             }
         if not locked:
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.broker.reconfigure_unstarted,
                 resolved_currency,
                 resolved_starting_minor,
@@ -4830,8 +5049,7 @@ class Orchestrator:
             )
             self.risk_mode = mode
             self.learning.set_risk_mode(mode)
-            self._ui_leaderboard_cache.clear()
-            self._ui_seasons_cache = None
+            self._invalidate_accounting_views()
             self.invalidate_snapshot_cache()
             return {
                 "kind": "season_preference",
@@ -4886,12 +5104,12 @@ class Orchestrator:
                         "dormant_last_observed_at": None,
                     },
                 )
-                cancelled = await asyncio.to_thread(
+                cancelled = await _joined_to_thread(
                     self.broker.cancel_pending_buys,
                     now,
                     "profile_transition_cancelled_entry",
                 )
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.database.set_settings,
                     {
                         "trading_enabled": False,
@@ -4918,7 +5136,7 @@ class Orchestrator:
                 raise
             self.running = previous_running
             with suppress(Exception):
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.database.set_setting,
                     "trading_enabled",
                     previous_running,
@@ -5274,7 +5492,7 @@ class Orchestrator:
                 updated["completed_at"] = now
             if state == "ready":
                 updated["ready_at"] = now
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_setting,
                 "maintenance_operation",
                 updated,
@@ -5314,7 +5532,7 @@ class Orchestrator:
                 "cancelled_pending_orders": 0,
                 "interrupted_ai_downloads": 0,
             }
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_settings,
                 {
                     "maintenance_operation": operation,
@@ -5357,7 +5575,7 @@ class Orchestrator:
         now = datetime.now(UTC)
         eligible_since = self._restored_auto_season_eligible_since(operation, now)
         async with self._event_lock:
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_settings,
                 {
                     "auto_new_season_eligible_since": (
@@ -5389,7 +5607,7 @@ class Orchestrator:
                 # Keep the persisted `trading_enabled` preference untouched. A replacement
                 # container can then resume only when the engine was running before preparation.
                 self.running = False
-                cancelled = await asyncio.to_thread(
+                cancelled = await _joined_to_thread(
                     self.broker.cancel_pending_orders,
                     datetime.now(UTC),
                     "upgrade_preparation",
@@ -5425,7 +5643,7 @@ class Orchestrator:
                 await asyncio.sleep(0.1)
             if self._storage_maintenance_active:
                 raise RuntimeError("database cleanup did not settle inside the safe time limit")
-            if not await asyncio.to_thread(self.database.health_check):
+            if not await _joined_to_thread(self.database.health_check):
                 raise RuntimeError("the paper database did not pass its final liveness check")
 
             await self._update_maintenance_operation(
@@ -5514,7 +5732,7 @@ class Orchestrator:
             }
             if values:
                 operation.update(values)
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_setting,
                 "season_operation",
                 operation,
@@ -5550,7 +5768,7 @@ class Orchestrator:
             updated["updated_at"] = now
             if state in {"completed", "failed"}:
                 updated["completed_at"] = now
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_setting,
                 "season_operation",
                 updated,
@@ -5582,7 +5800,7 @@ class Orchestrator:
                     drawdown_policy=drawdown_policy,
                     learning_fingerprint=self._configuration_fingerprint_for_mode(selected_mode),
                 )
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.broker.initialize,
                     quote_currency,
                     starting_minor,
@@ -5592,15 +5810,14 @@ class Orchestrator:
                 self._paper_execution_issues = []
                 self.risk_mode = selected_mode
                 self.learning.set_risk_mode(selected_mode)
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.database.set_settings,
                     {
                         "trading_enabled": False,
                         "risk_mode": selected_mode.value,
                     },
                 )
-                self._ui_leaderboard_cache.clear()
-                self._ui_seasons_cache = None
+                self._invalidate_accounting_views()
         except Exception as exc:
             await self._update_season_operation(
                 operation_id,
@@ -5636,7 +5853,7 @@ class Orchestrator:
         try:
             async with self._event_lock:
                 if self.broker.season_id and self.broker.season_profile is not None:
-                    locked_profile = await asyncio.to_thread(
+                    locked_profile = await _joined_to_thread(
                         self.database.lock_current_season_profile,
                         str(self.broker.season_id),
                         datetime.now(UTC),
@@ -5645,7 +5862,7 @@ class Orchestrator:
                         self.broker.season_profile = locked_profile
                 self.running = True
                 self.started_at = datetime.now(UTC)
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.database.set_setting,
                     "trading_enabled",
                     True,
@@ -5673,7 +5890,7 @@ class Orchestrator:
         except Exception as exc:
             self.running = False
             with suppress(Exception):
-                await asyncio.to_thread(
+                await _joined_to_thread(
                     self.database.set_setting,
                     "trading_enabled",
                     False,
@@ -5700,7 +5917,7 @@ class Orchestrator:
             # A manual stop/reset can coincide with storage maintenance. Keep all SQLite and
             # pending-order persistence off the HTTP event loop while the event lock prevents a
             # new paper action from crossing the stop boundary.
-            await asyncio.to_thread(
+            await _joined_to_thread(
                 self.database.set_settings,
                 {
                     "trading_enabled": False,
@@ -5714,7 +5931,7 @@ class Orchestrator:
             self._auto_new_season_paused_since = None
             self._auto_new_season_last_observed_at = None
             self._auto_new_season_clock_saved_at = None
-            cancelled = await asyncio.to_thread(
+            cancelled = await _joined_to_thread(
                 self.broker.cancel_pending_orders,
                 datetime.now(UTC),
             )
@@ -5913,16 +6130,12 @@ class Orchestrator:
             logger.error("Dashboard refresh failed: %s", task.exception())
 
     async def _refresh_snapshot(self) -> dict[str, Any]:
+        lock_wait_started = time.monotonic()
         async with self._event_lock:
+            self.diagnostics.observe_phase("snapshot_lock_wait", lock_wait_started)
             phase_started = time.monotonic()
-            worker = asyncio.create_task(asyncio.to_thread(self.snapshot))
             try:
-                snapshot = await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                # to_thread keeps running after cancellation. Preserve its read boundary until
-                # it finishes, especially before shutdown closes SQLite or resumes mutations.
-                await worker
-                raise
+                snapshot = await _timed_to_thread(self.diagnostics, "snapshot", self.snapshot)
             finally:
                 self.diagnostics.observe_phase("snapshot", phase_started)
                 self._ui_snapshot_last_duration = max(0.0, time.monotonic() - phase_started)
@@ -6141,7 +6354,7 @@ class Orchestrator:
         # Saving a policy is an interactive control-plane action. Persist it atomically and let
         # the recoverable maintenance worker perform expensive pruning; never make the browser
         # wait for a multi-gigabyte cleanup pass.
-        await asyncio.to_thread(
+        await _joined_to_thread(
             self.database.set_settings,
             {
                 "storage_max_bytes": max_database_bytes,
@@ -6162,40 +6375,110 @@ class Orchestrator:
             "maintenance": self.storage_maintenance_status(),
         }
 
-    async def leaderboard_view(self, sort: str = "profit", limit: int = 100) -> dict[str, Any]:
-        """Share bounded Results work and never race an in-flight position mutation."""
+    def _invalidate_accounting_views(self) -> None:
+        self._ui_accounting_generation += 1
+        self._ui_leaderboard_cache.clear()
+        self._ui_seasons_cache = None
 
-        cached = self._ui_leaderboard_cache.get(sort)
-        now = time.monotonic()
-        if cached is not None and now - cached[0] < _UI_LEADERBOARD_CACHE_SECONDS:
-            return _leaderboard_response(cached[1], limit)
+    def _paper_basis_matches(self, revision: tuple[Any, ...]) -> bool:
+        season, currency, starting, _ = revision
+        return bool(
+            (json.loads(season) if season else None) == self.broker.season_id
+            and (json.loads(currency) if currency else "SOL") == self.broker.quote_currency.value
+            and (json.loads(starting) if starting else 0) == self.broker.starting_lamports
+        )
 
-        # Different tabs and sort buttons should not multiply a potentially large receipt scan.
-        # The lock is asynchronous, so health and snapshot requests remain independently useful.
+    async def leaderboard_view(
+        self, sort: str = "profit", limit: int = 100, *, internal: bool = False
+    ) -> dict[str, Any]:
+        """Validate the copied position boundary against one immutable SQL snapshot."""
         async with self._ui_leaderboard_refresh_lock:
             cached = self._ui_leaderboard_cache.get(sort)
-            now = time.monotonic()
-            if cached is not None and now - cached[0] < _UI_LEADERBOARD_CACHE_SECONDS:
-                return _leaderboard_response(cached[1], limit)
+            if (
+                cached is not None
+                and time.monotonic() - cached[0] < _UI_LEADERBOARD_CACHE_SECONDS
+                and cached[1].get("_generation") == self._ui_accounting_generation
+                and self._paper_basis_matches(cached[1]["_history_revision"])
+            ):
+                return _leaderboard_response(cached[1], limit, internal=internal)
+            for _ in range(2):
+                async with self._event_lock:
+                    generation = self._ui_accounting_generation
+                    revision = self.database.paper_history_revision()
+                    if not self._paper_basis_matches(revision):
+                        continue
+                    positions = [
+                        position.model_copy(deep=True)
+                        for position in self.broker.positions.values()
+                    ]
+                    quote_currency = self.broker.quote_currency.value
+                    quote_decimals = self.broker.quote_decimals
+                stopped = ThreadEvent()
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.leaderboard,
+                        sort=sort,
+                        limit=500,
+                        positions=positions,
+                        quote_currency=quote_currency,
+                        quote_decimals=quote_decimals,
+                        history_revision=revision,
+                        stop_requested=stopped.is_set,
+                        closed_history=(
+                            cached[1].get("_closed_history")
+                            if cached is not None
+                            and cached[1].get("_generation") == generation
+                            and cached[1].get("_history_revision") == revision
+                            else None
+                        ),
+                    )
+                )
+                try:
+                    result = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    stopped.set()
+                    # Keep the single-reader lock until its bounded batch/SQLite callback exits.
+                    # Repeated disconnect/shutdown cancellation must not release it early.
+                    while not task.done():
+                        with suppress(asyncio.CancelledError, Exception):
+                            await asyncio.shield(task)
+                    with suppress(asyncio.CancelledError, Exception):
+                        task.result()
+                    raise
+                except AdvisoryReadDeferred:
+                    continue
+                finally:
+                    stopped.set()
+                if generation != self._ui_accounting_generation or not self._paper_basis_matches(
+                    revision
+                ):
+                    continue
+                result.update({"_generation": generation, "_history_revision": revision})
+                self._ui_leaderboard_cache[sort] = (time.monotonic(), result)
+                return _leaderboard_response(result, limit, internal=internal)
+        raise AdvisoryReadDeferred("Results are refreshing across an accounting boundary")
 
-            # PaperBroker is event-loop owned behind _event_lock. Copy only the small mutable
-            # position set there, then release market processing before parsing durable history.
+    async def _seasons_accounting_basis(
+        self,
+    ) -> tuple[dict[str, Any], PortfolioSnapshot, str | None, list[dict[str, Any]], int]:
+        for _ in range(2):
+            leaderboard = await self.leaderboard_view(sort="profit", limit=500, internal=True)
             async with self._event_lock:
-                positions = [
-                    position.model_copy(deep=True) for position in self.broker.positions.values()
-                ]
-                quote_currency = self.broker.quote_currency.value
-                quote_decimals = self.broker.quote_decimals
-            result = await asyncio.to_thread(
-                self.leaderboard,
-                sort=sort,
-                limit=500,
-                positions=positions,
-                quote_currency=quote_currency,
-                quote_decimals=quote_decimals,
-            )
-            self._ui_leaderboard_cache[sort] = (time.monotonic(), result)
-            return _leaderboard_response(result, limit)
+                generation = self._ui_accounting_generation
+                revision = self.database.paper_history_revision()
+                if (
+                    leaderboard["_generation"] != generation
+                    or leaderboard["_history_revision"] != revision
+                    or not self._paper_basis_matches(revision)
+                ):
+                    self._ui_leaderboard_cache.pop("profit", None)
+                    continue
+                portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
+                current_season_id = self.broker.season_id
+            stored = await _joined_to_thread(self.database.list_paper_seasons)
+            if generation == self._ui_accounting_generation and self._paper_basis_matches(revision):
+                return leaderboard, portfolio, current_season_id, stored, generation
+        raise AdvisoryReadDeferred("Seasons are refreshing across an accounting boundary")
 
     async def seasons_view(self) -> dict[str, Any]:
         """Return a bounded cross-season view without burdening the market worker."""
@@ -6211,11 +6494,13 @@ class Orchestrator:
             if cached is not None and now - cached[0] < _UI_SEASONS_CACHE_SECONDS:
                 return dict(cached[1])
 
-            leaderboard = await self.leaderboard_view(sort="profit", limit=500)
-            async with self._event_lock:
-                portfolio = self.broker.snapshot(self.risk_mode, persist_peak=False)
-                current_season_id = self.broker.season_id
-            stored = await asyncio.to_thread(self.database.list_paper_seasons)
+            (
+                leaderboard,
+                portfolio,
+                current_season_id,
+                stored,
+                generation,
+            ) = await self._seasons_accounting_basis()
             generated_at = datetime.now(UTC)
             seasons: list[dict[str, Any]] = []
             for row in stored:
@@ -6236,12 +6521,7 @@ class Orchestrator:
                             "peak_equity_minor": max(
                                 portfolio.starting_lamports,
                                 portfolio.equity_lamports,
-                                int(
-                                    self.database.get_setting(
-                                        "peak_equity_lamports",
-                                        portfolio.starting_lamports,
-                                    )
-                                ),
+                                portfolio.peak_equity_lamports,
                             ),
                             "realized_pnl_minor": portfolio.realized_pnl_lamports,
                             "net_pnl_minor": (
@@ -6447,6 +6727,8 @@ class Orchestrator:
                     "best_return_fraction": max(returns) if returns else None,
                 },
             }
+            if generation != self._ui_accounting_generation:
+                raise AdvisoryReadDeferred("Season changed during Results assembly")
             self._ui_seasons_cache = (time.monotonic(), result)
             return dict(result)
 
@@ -6458,27 +6740,73 @@ class Orchestrator:
         positions: list[Position] | None = None,
         quote_currency: str | None = None,
         quote_decimals: int | None = None,
+        history_revision: tuple[Any, ...] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        closed_history: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        fills = self.database.list_fills(100_000)
-        orders = {order.order_id: order for order in self.database.list_orders()}
-        chronology_issues = self.broker.chronology_issues(fills=fills)
-        issues_by_mint: dict[str, list[str]] = defaultdict(list)
-        for issue in chronology_issues:
-            issues_by_mint[str(issue["mint"])].append(str(issue["reason"]))
-        buys = {fill.mint: fill for fill in fills if fill.side.value == "buy"}
-        sells = {fill.mint: fill for fill in fills if fill.side.value == "sell"}
         position_rows = (
             positions if positions is not None else self.broker.snapshot(self.risk_mode).positions
         )
         positions_by_mint = {position.mint: position for position in position_rows}
         rows: list[dict[str, Any]] = []
-        for mint, buy in buys.items():
-            sell = sells.get(mint)
+        limit = max(0, min(1000, limit))
+        key = (
+            (lambda row: row["pnl_minor"])
+            if sort in {"profit", "loss"}
+            else (lambda row: row["closed_at"] or row["opened_at"])
+        )
+        summary = dict.fromkeys(
+            (
+                "closed_trades",
+                "open_trades",
+                "wins",
+                "losses",
+                "total_realized_pnl_minor",
+                "invalid_results",
+                "legacy_unverified_results",
+                "audited_exits",
+                "winner_reversals",
+                "total_fees_minor",
+            ),
+            0,
+        )
+        available_rows = peak_count = 0
+        peak_sum = 0.0
+        closed_rows: list[dict[str, Any]] = []
+        open_fees = open_available = 0
+        if closed_history is not None and (
+            history_revision is None
+            or closed_history.get("revision") != history_revision
+            or closed_history.get("sort") != sort
+            or closed_history.get("limit", 0) < limit
+        ):
+            closed_history = None
+        if closed_history is not None:
+            summary = dict(closed_history["summary"])
+            rows = list(closed_history["rows"])
+            closed_rows = list(rows)
+            available_rows = closed_history["available_rows"]
+            peak_count, peak_sum = closed_history["peak_count"], closed_history["peak_sum"]
+        history = (
+            self.database.iter_fill_contexts(
+                expected_revision=history_revision,
+                stop_requested=stop_requested,
+                open_mints=list(positions_by_mint) if closed_history is not None else None,
+            )
+            if history_revision is not None or stop_requested is not None
+            else self.database.iter_fill_contexts()
+        )
+        for fill, order, entry, original_order in history:
+            sell = fill if fill.side.value == "sell" else None
+            buy = entry if sell is not None else fill
+            if buy is None:
+                continue
+            mint = buy.mint
             position = positions_by_mint.get(mint)
             if sell is None and position is None:
                 continue
             assert sell is not None or position is not None
-            entry_order = orders.get(buy.order_id)
+            entry_order = original_order if sell is not None else order
             pnl = (
                 sell.account_net_minor - buy.account_net_minor
                 if sell is not None
@@ -6507,7 +6835,14 @@ class Orchestrator:
             peak_profit = (
                 max(0, sell.peak_account_minor - buy.account_net_minor) if sell is not None else 0
             )
-            audit_reasons = issues_by_mint.get(mint, [])
+            audit_reasons = [
+                reason
+                for reason in (
+                    self.broker.fill_chronology_reason(buy, entry_order, buy),
+                    self.broker.fill_chronology_reason(sell, order, buy) if sell else None,
+                )
+                if reason is not None
+            ]
             audit_status = (
                 "invalid"
                 if audit_reasons
@@ -6569,55 +6904,80 @@ class Orchestrator:
                     "quote_decimals": buy.account_decimals,
                 }
             )
-        closed = [row for row in rows if row["status"] == "closed"]
-        valid_closed = [row for row in closed if row["audit_status"] != "invalid"]
-        visible_rows = rows if sort == "recent" else valid_closed
-        key = (
-            (lambda row: row["pnl_minor"])
-            if sort in {"profit", "loss"}
-            else (lambda row: row["closed_at"] or row["opened_at"])
-        )
-        visible_rows.sort(key=key, reverse=sort != "loss")
+            row = rows.pop()
+            closed = row["status"] == "closed"
+            valid = row["audit_status"] != "invalid"
+            summary["open_trades"] += int(not closed)
+            summary["invalid_results"] += int(closed and not valid)
+            if valid:
+                summary["total_fees_minor"] += row["fees_minor"]
+                if not closed:
+                    open_fees += row["fees_minor"]
+            if closed and valid:
+                summary["closed_trades"] += 1
+                summary["wins"] += int(row["pnl_minor"] > 0)
+                summary["losses"] += int(row["pnl_minor"] < 0)
+                summary["total_realized_pnl_minor"] += row["pnl_minor"]
+                summary["legacy_unverified_results"] += int(
+                    row["audit_status"] == "legacy_unverified"
+                )
+                summary["audited_exits"] += int(row["exit_assessment"] is not None)
+                summary["winner_reversals"] += int(
+                    row["peak_return_fraction"] is not None
+                    and row["peak_return_fraction"] > 0
+                    and row["pnl_minor"] < 0
+                )
+                if row["peak_capture_fraction"] is not None:
+                    peak_sum += row["peak_capture_fraction"]
+                    peak_count += 1
+            if sort == "recent" or (closed and valid):
+                available_rows += 1
+                rows.append(row)
+                if closed:
+                    closed_rows.append(row)
+                else:
+                    open_available += 1
+            if len(rows) > max(1, limit * 2):
+                rows.sort(key=key, reverse=sort != "loss")
+                del rows[limit:]
+            if len(closed_rows) > max(1, limit * 2):
+                closed_rows.sort(key=key, reverse=sort != "loss")
+                del closed_rows[limit:]
+        rows.sort(key=key, reverse=sort != "loss")
+        closed_rows.sort(key=key, reverse=sort != "loss")
         result_currency = quote_currency or self.broker.quote_currency.value
         result_decimals = (
             quote_decimals if quote_decimals is not None else self.broker.quote_decimals
         )
-        peak_captures = [
-            row["peak_capture_fraction"]
-            for row in valid_closed
-            if row["peak_capture_fraction"] is not None
-        ]
-        return {
+        result = {
             "sort": sort,
-            "rows": visible_rows[:limit],
-            "available_rows": len(visible_rows),
+            "rows": rows[:limit],
+            "available_rows": available_rows,
             "summary": {
-                "closed_trades": len(valid_closed),
-                "open_trades": sum(row["status"] == "open" for row in rows),
-                "wins": sum(row["pnl_minor"] > 0 for row in valid_closed),
-                "losses": sum(row["pnl_minor"] < 0 for row in valid_closed),
-                "total_realized_pnl_minor": sum(row["pnl_minor"] for row in valid_closed),
-                "invalid_results": len(closed) - len(valid_closed),
-                "legacy_unverified_results": sum(
-                    row["audit_status"] == "legacy_unverified" for row in valid_closed
-                ),
-                "audited_exits": sum(row["exit_assessment"] is not None for row in valid_closed),
-                "winner_reversals": sum(
-                    row["peak_return_fraction"] is not None
-                    and row["peak_return_fraction"] > 0
-                    and row["pnl_minor"] < 0
-                    for row in valid_closed
-                ),
-                "average_peak_capture_fraction": (
-                    sum(peak_captures) / len(peak_captures) if peak_captures else None
-                ),
-                "total_fees_minor": sum(
-                    row["fees_minor"] for row in rows if row["audit_status"] != "invalid"
-                ),
+                **summary,
+                "average_peak_capture_fraction": peak_sum / peak_count if peak_count else None,
                 "quote_currency": result_currency,
                 "quote_decimals": result_decimals,
             },
         }
+        if history_revision is not None:
+            # Reuse immutable closed receipts only at the identical accounting revision.
+            # Open values/fees are rebuilt from indexed buys and the fresh position snapshot.
+            result["_closed_history"] = {
+                "revision": history_revision,
+                "sort": sort,
+                "limit": limit,
+                "rows": closed_rows[:limit],
+                "available_rows": available_rows - open_available,
+                "summary": {
+                    **summary,
+                    "open_trades": 0,
+                    "total_fees_minor": summary["total_fees_minor"] - open_fees,
+                },
+                "peak_sum": peak_sum,
+                "peak_count": peak_count,
+            }
+        return result
 
     async def begin_reset_portfolio(self) -> dict[str, Any]:
         operation = await self._begin_season_operation(
@@ -6689,7 +7049,7 @@ class Orchestrator:
         async with self._event_lock:
             # Archiving a season is atomic but may briefly wait behind a bounded maintenance
             # writer on a long-running database. Never make that wait freeze health or polling.
-            await asyncio.to_thread(self.broker.reset)
+            await _joined_to_thread(self.broker.reset)
             self._paper_execution_issues = []
             self._auto_new_season_eligible_since = None
             self._auto_new_season_paused_since = None
@@ -6697,8 +7057,7 @@ class Orchestrator:
             self._auto_new_season_clock_saved_at = None
             self.last_decision_at.clear()
             self.last_recorded_decision.clear()
-            self._ui_leaderboard_cache.clear()
-            self._ui_seasons_cache = None
+            self._invalidate_accounting_views()
         await self._resolve_incidents_safe("paper_execution_chronology")
 
     async def reset_portfolio(self) -> None:

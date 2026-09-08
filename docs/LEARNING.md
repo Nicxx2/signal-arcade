@@ -42,6 +42,16 @@ budget. It rotates across eligible tokens, allocating three turns to Policy evid
 Discovery turn when both lanes have work. A stale oldest Discovery token cannot monopolize every
 pass. Unknown and expired outcomes remain in the original qualification denominator.
 
+The v1.10.7 collection refinement gives a checkpoint priority within its own lane during the
+last 15 seconds of its existing grace window. Urgent failed attempts still rotate; the lane share,
+batch size and request cadence do not change. Expired horizons are never reopened.
+When a token has eligible checkpoints in both lanes, its single Policy-lane fetch keeps the
+earliest eligible deadline from either lane. Deduplication does not hide an urgent Discovery clock.
+A bounded 128-entry cache skips identities that cannot form a valid RPC request. A changed route
+identity immediately becomes eligible again; missing tokens are removed and old entries evicted.
+This cache affects only RPC selection, not cached fresh checkpoints, evidence enrollment, outcome
+denominators or retries of transient provider/account-validation failures.
+
 The optional `learning_reserve_refresh_enabled` worker starts disabled. When enabled, it requests
 one batch no more frequently than every ten seconds, with at most twenty routes and one hundred
 unique accounts. It shares the configured provider quota and backoff, yields during maintenance,
@@ -80,6 +90,14 @@ orders, stale/unexecutable active holdings, imminent reviews, training and marke
 take priority. Its detached read/screening workers can pause between batches and resume the same
 complete cohort within a 30-second deadline; interrupted work supplies no partial proof.
 
+The v1.10.7 burst-performance follow-up filters otherwise unusable Discovery rows before checking
+their reserved Policy identity. It also reuses the exact identity digest for unchanged contract
+material in a process-local cache capped at 16,384 entries. The cache holds no observations,
+coefficients, outcomes, eligibility or health decisions. Changed contract fields use a different
+key; eviction or restart recomputes the same digest. Every proof check still reads the current
+retained identity receipt, clocks and outcomes. This changes neither coverage denominators nor
+training/independent-proof separation. See the [validation record](V1_10_7_BURST_VALIDATION.md).
+
 Models, skill artifacts (including nonlinear payloads) and pending skill enrollment commit in one
 SQLite transaction. The live candidate view changes only after that commit. An interrupted write
 or failed commit leaves the previous generation intact and the fit retryable, including after
@@ -106,6 +124,13 @@ soak and later common-forward economic evidence are rollout validation, not resu
 unit tests. Keep the 70% coverage gate and current activation consent. The separately versioned
 prospective portfolio experiment from the improvement plan is not included in this release.
 
+Coverage is the usable fraction of a moving evidence window, not progress that inevitably reaches
+100% with time. Broad Discovery model coverage and actionable Policy proof coverage have different
+populations. Faster collection may recover stale checkpoints, but cannot make an illiquid route
+executable. Changing a training population requires separate validation; higher coverage alone does
+not establish stronger predictions or better trading. The 70% gate and missing-outcome denominator
+remain unchanged.
+
 ### Evidence lanes
 
 Learning has three deliberately separate evidence lanes:
@@ -126,6 +151,17 @@ Learning has three deliberately separate evidence lanes:
 Every lane must come from Solana Mainnet mode and live market evidence. Synthetic Demo decisions,
 structurally unsafe tokens, WATCH states, and repeated snapshots of the same eligible identity are
 excluded. This avoids letting fast updates, selection effects or demo patterns dominate proof.
+
+Schema 16 retains compact Policy identity reservations independently of the larger trajectory
+payloads. The first eligible episode and exact UTC entry time remain the proof identity even after
+its payload is pruned. Neither the same season nor a later season can substitute a second attempt
+or release that mint's Discovery twin for fitting. Equivalent timezone offsets identify the same
+instant; missing, naive or changed clocks cannot authorize a replacement proof episode.
+The migration backfills retained records only: deleted pre-upgrade identities cannot be recovered.
+The durable ledger grows with unique mint/contract identities in the main data volume. Only entries
+needed by retained observations and episodes are cached in memory and copied into a training job.
+Current Entry observability also requires the active source, feature schema and Baseline contract;
+unavailable outcomes from that valid population remain in the denominator.
 
 The saved lesson contains the exact point-in-time features and baseline action. Later live trades
 for that mint add fee-inclusive paper outcomes at 1, 5, 10, 15, and 20 minutes. Each outcome uses
@@ -377,6 +413,12 @@ labelled separately as well. Detailed proof sections begin collapsed and
 Entry's authoritative qualification gates are labelled **Entry's road to influence**; the other
 three skills retain their own independent proof inside their skill cards.
 
+Entry's waiting-family comparison requires matching Discovery cohorts, cutoffs, feature lists and
+sample counts, plus the same recorded Policy population. That Policy fingerprint includes resolved
+unavailable outcomes. Missing legacy provenance or different populations use chronological waiting
+order; current journal data never invents a past comparison. The common-forward battle and all
+qualification requirements still decide whether a contender earns authority.
+
 Events are idempotent across restart and shown only for the exact current
 personality/configuration cohort. Every referenced contender or Champion artifact is protected
 from pruning, so lineage remains reconstructable. Deterministic codenames are derived from
@@ -395,8 +437,12 @@ but only after independent qualification and fresh proof against the Baseline al
 must match the exact prospective upstream versions and start after those versions joined. The
 native proof comparison may ignore downstream roles because the saved upstream proposals and
 paired shadow outcomes precede their actions. It cannot ignore an upstream mismatch, an already
-active version of the skill being tested, or an unknown role. Coach artifacts retain their exact
-full-ensemble context contract. The latest 60 resolved eligible cases must contain at least 30
+active version of the skill being tested, or an unknown role. Coach research and its initial battle
+retain their exact full-ensemble contract. A Coach that earns a crown starts a separate, durable
+composition-proof window before activation, including for Entry; its immutable research artifact
+does not change. After activation, receipts use its active version and upstream dependencies.
+Missing expected receipts count as unavailable once the required outcomes have resolved; pending
+outcomes do not cause premature suspension. The latest 60 resolved eligible cases must contain at least 30
 usable outcomes, at least 70% coverage,
 a positive conservative incremental advantage and the existing harm guard. A saved crown alone
 does not grant influence. The legacy manual Active API keeps its Entry-first contract and rejects

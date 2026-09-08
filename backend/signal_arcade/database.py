@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +45,7 @@ from .season_strategy import (
 )
 from .terminal_evidence import valid_terminal_probe
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 TERMINAL_POLICY_VERSION = "executable-boundary-v3"
 CHALLENGER_JOURNEY_SETTING_PREFIX = "challenger_champion_journey_v1:"
 CHALLENGER_PENDING_SETTING_PREFIX = "challenger_pending_versions_v1:"
@@ -722,7 +722,7 @@ class Database:
                 row[0]
                 for row in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                    "('ai_critic_assessments','learning_evidence_episodes')"
+                    "('ai_critic_assessments','learning_evidence_episodes','fills')"
                 )
             }
             if "ai_critic_assessments" in optional_tables:
@@ -750,6 +750,19 @@ class Database:
                         "INSERT OR IGNORE INTO paper_season_strategy VALUES(?,?)",
                         (row[0], json.dumps(incomplete_record(), separators=(",", ":"))),
                     )
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS learning_policy_identities (
+                identity_key TEXT PRIMARY KEY,
+                first_entry_at TEXT NOT NULL,
+                first_episode_id TEXT NOT NULL
+            ) WITHOUT ROWID""")
+            if "fills" in optional_tables:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_fills_mint_side_time "
+                    "ON fills(mint,side,filled_at,fill_id)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_fills_side_mint ON fills(side,mint)"
+                )
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _migrate_champion_journal(self) -> None:
@@ -988,6 +1001,8 @@ class Database:
         """
         if max_rows_per_category < 1:
             raise ValueError("max rows per category must be positive")
+        if max_equity_points < 0:
+            raise ValueError("max equity points must be nonnegative")
         if max_duration_seconds is not None and max_duration_seconds <= 0:
             raise ValueError("max duration seconds must be positive")
         deadline = (
@@ -1020,8 +1035,8 @@ class Database:
             (
                 "equity_points",
                 """DELETE FROM equity_points WHERE id IN (
-                       SELECT id FROM equity_points WHERE id NOT IN (
-                           SELECT id FROM equity_points ORDER BY id DESC LIMIT ?
+                       SELECT id FROM equity_points WHERE id <= (
+                           SELECT id FROM equity_points ORDER BY id DESC LIMIT 1 OFFSET ?
                        ) ORDER BY id ASC LIMIT ?
                    )""",
                 (max_equity_points, max_rows_per_category),
@@ -1778,8 +1793,11 @@ class Database:
                 )
                 if cursor.rowcount == 1:
                     inserted.add(event.event_id)
-        if inserted:
-            self._invalidate_storage_cache()
+            if inserted:
+                # Publish cache invalidation before another reader/writer can see the commit.
+                # Releasing and reacquiring here also made market processing wait a second
+                # time behind maintenance even though its durable write had already finished.
+                self._invalidate_storage_cache()
         return inserted
 
     def recent_events(self, limit: int = 10_000) -> list[MarketEvent]:
@@ -1989,6 +2007,79 @@ class Database:
                 episode.model_dump_json(),
             ),
         )
+
+    def remember_policy_identities(self, identities: list[tuple[str, str, str]]) -> None:
+        """Keep compact proof reservations after large trajectory payloads are retired.
+
+        Empty entry/id reserves a Discovery mint without inventing an eligible proof episode.
+        Existing retained records backfill the ledger; deleted pre-upgrade history is unknowable.
+        """
+        if not identities:
+            return
+
+        def instant(value: str) -> datetime | None:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed.astimezone(UTC) if parsed.utcoffset() is not None else None
+
+        with self._lock, self._conn:
+            # ISO strings with different offsets do not sort chronologically. Read in bounded
+            # batches and compare exact instants, without rounding away microseconds in SQLite.
+            keys = sorted({key for key, _, _ in identities})
+            existing: dict[str, tuple[str, str]] = {}
+            for offset in range(0, len(keys), 400):
+                batch = keys[offset : offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._conn.execute(
+                    "SELECT * FROM learning_policy_identities "  # noqa: S608
+                    f"WHERE identity_key IN ({placeholders})",
+                    batch,
+                ):
+                    existing[str(row[0])] = (str(row[1]), str(row[2]))
+            updates: dict[str, tuple[str, str]] = {}
+            for key, clock, episode_id in identities:
+                current = existing.get(key)
+                incoming_at = instant(clock)
+                if episode_id and incoming_at is None:
+                    continue
+                incoming = (incoming_at.isoformat(), episode_id) if incoming_at else ("", "")
+                selected = current
+                if current is None or (not current[1] and episode_id):
+                    selected = incoming
+                elif episode_id and incoming_at is not None:
+                    current_at = instant(current[0])
+                    # An ambiguous existing reservation cannot be silently replaced by a retry.
+                    if current_at is not None:
+                        earliest = min((current_at, current[1]), (incoming_at, episode_id))
+                        selected = (earliest[0].isoformat(), earliest[1])
+                if selected is not None and selected != current:
+                    existing[key] = selected
+                    updates[key] = selected
+            self._conn.executemany(
+                """INSERT INTO learning_policy_identities VALUES(?,?,?)
+                   ON CONFLICT(identity_key) DO UPDATE SET
+                       first_entry_at=excluded.first_entry_at,
+                       first_episode_id=excluded.first_episode_id""",
+                [(key, *value) for key, value in updates.items()],
+            )
+
+    def policy_identities(self, keys: set[str]) -> dict[str, tuple[str, str]]:
+        """Read only identities needed by the bounded live evidence window."""
+        result: dict[str, tuple[str, str]] = {}
+        ordered = sorted(keys)
+        with self._reader_lock:
+            for offset in range(0, len(ordered), 400):
+                batch = ordered[offset : offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._reader_conn.execute(
+                    "SELECT * FROM learning_policy_identities "  # noqa: S608 - placeholder count only
+                    f"WHERE identity_key IN ({placeholders})",  # noqa: S608 - placeholder count only
+                    batch,
+                ):
+                    result[str(row[0])] = (str(row[1]), str(row[2]))
+        return result
 
     def list_learning_evidence_episodes(self) -> list[LearningEvidenceEpisode]:
         with self._reader_lock:
@@ -3074,6 +3165,100 @@ class Database:
                 "SELECT record_json FROM fills ORDER BY filled_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [FillReceipt.model_validate_json(row[0]) for row in rows]
+
+    def bought_mints(self) -> set[str]:
+        """Exact re-entry guard; a UI history limit must never affect trading authority."""
+        with self._reader_lock:
+            return {
+                str(row[0])
+                for row in self._reader_conn.execute(
+                    "SELECT DISTINCT mint FROM fills WHERE side='buy'"
+                )
+            }
+
+    @staticmethod
+    def _paper_history_revision(connection: sqlite3.Connection) -> tuple[Any, ...]:
+        # Fills are append-only within a season. Include bankroll identity because rollover
+        # clears fills and an unstarted bankroll can change currency without a new season ID.
+        return tuple(
+            connection.execute(
+                """SELECT
+                (SELECT value_json FROM settings WHERE key='season_id'),
+                (SELECT value_json FROM settings WHERE key='quote_currency'),
+                (SELECT value_json FROM settings WHERE key='starting_lamports'),
+                COALESCE(MAX(rowid),0) FROM fills"""
+            ).fetchone()
+        )
+
+    def paper_history_revision(self) -> tuple[Any, ...]:
+        with self._reader_lock:
+            return self._paper_history_revision(self._reader_conn)
+
+    def iter_fill_contexts(
+        self,
+        *,
+        page_size: int = 256,
+        expected_revision: tuple[Any, ...] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        open_mints: Sequence[str] | None = None,
+    ) -> Iterator[tuple[FillReceipt, PaperOrder | None, FillReceipt | None, PaperOrder | None]]:
+        """Stream an exact season snapshot with bounded decoded batches and indexed entry joins.
+
+        A separate WAL reader avoids owning core locks. It closes on exhaustion/error; callers
+        must exhaust or close it. The snapshot also prevents rollover or concurrent fills from
+        mixing two accounting boundaries.
+        """
+        if not 1 <= page_size <= 1000:
+            raise ValueError("fill page size must be between 1 and 1000")
+        connection = sqlite3.connect(
+            f"{self.path.absolute().as_uri()}?mode=ro", uri=True, timeout=0.25
+        )
+        try:
+            if stop_requested is not None:
+                connection.set_progress_handler(lambda: int(stop_requested()), 1000)
+            connection.execute("BEGIN")
+            if (
+                expected_revision is not None
+                and self._paper_history_revision(connection) != expected_revision
+            ):
+                raise AdvisoryReadDeferred("paper history changed before Results snapshot")
+            cursor = 0
+            selected_mints = json.dumps(list(open_mints)) if open_mints is not None else None
+            while True:
+                if stop_requested is not None and stop_requested():
+                    raise AdvisoryReadDeferred("Results reader cancelled")
+                query = """SELECT f.rowid,f.record_json,o.record_json,b.record_json,bo.record_json
+                       FROM fills f
+                       LEFT JOIN paper_orders o ON o.order_id=f.order_id
+                       LEFT JOIN fills b ON b.fill_id=(
+                           SELECT fill_id FROM fills WHERE mint=f.mint AND side='buy'
+                           ORDER BY filled_at,fill_id LIMIT 1)
+                       LEFT JOIN paper_orders bo ON bo.order_id=b.order_id
+                       WHERE f.rowid>?"""
+                arguments: tuple[Any, ...] = (cursor,)
+                if selected_mints is not None:
+                    query += " AND f.side='buy' AND f.mint IN (SELECT value FROM json_each(?))"
+                    arguments += (selected_mints,)
+                query += " ORDER BY f.rowid LIMIT ?"
+                rows = connection.execute(query, (*arguments, page_size)).fetchall()
+                if not rows:
+                    break
+                cursor = int(rows[-1][0])
+                for row in rows:
+                    if stop_requested is not None and stop_requested():
+                        raise AdvisoryReadDeferred("Results reader cancelled")
+                    yield (
+                        FillReceipt.model_validate_json(row[1]),
+                        PaperOrder.model_validate_json(row[2]) if row[2] else None,
+                        FillReceipt.model_validate_json(row[3]) if row[3] else None,
+                        PaperOrder.model_validate_json(row[4]) if row[4] else None,
+                    )
+        except sqlite3.OperationalError as exc:
+            if stop_requested is not None and stop_requested():
+                raise AdvisoryReadDeferred("Results reader cancelled") from exc
+            raise
+        finally:
+            connection.close()
 
     def save_position(self, position: Position) -> None:
         with self._lock:

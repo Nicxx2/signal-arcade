@@ -144,9 +144,7 @@ class PaperBroker:
         self.pending = {
             item.order_id: item for item in database.list_orders([OrderStatus.PENDING.value])
         }
-        self.traded_mints = {
-            fill.mint for fill in database.list_fills(100_000) if fill.side == Side.BUY
-        }
+        self.traded_mints = database.bought_mints()
         self._fill_decisions = DecisionEngine(
             default_fee_bps=settings.pump_fee_bps,
             one_way_network_fee_lamports=(
@@ -757,7 +755,7 @@ class PaperBroker:
             soft_hold_participant=soft_hold_participant,
         )
         receipts.extend(
-            self.process_due_orders(
+            self._fill_due_orders(
                 state=state,
                 features=features,
                 source_event_id=source_event_id,
@@ -788,7 +786,6 @@ class PaperBroker:
         trader produces a subsequent event. Requiring an unrelated future event trapped
         illiquid positions, so the clock loop may now use the latest observed executable state.
         """
-        receipts: list[FillReceipt] = []
         reserve_observed_at = state.last_reserve_at or state.last_event_at
         if reserve_observed_at is not None and reserve_observed_at > now:
             # Preserve the pending order and every accounting balance. The strict database
@@ -801,6 +798,37 @@ class PaperBroker:
             sol_usd_price,
             self._mark_timestamp(state, features, now),
         )
+        return self._fill_due_orders(
+            state=state,
+            features=features,
+            source_event_id=source_event_id,
+            now=now,
+            mode=mode,
+            sol_usd_price=sol_usd_price,
+            record_equity=record_equity,
+        )
+
+    def _fill_due_orders(
+        self,
+        *,
+        state: TokenState,
+        features: FeatureSnapshot,
+        source_event_id: str,
+        now: datetime,
+        mode: RiskMode,
+        sol_usd_price: float | None,
+        record_equity: bool,
+    ) -> list[FillReceipt]:
+        """Complete a marked update without quoting and saving the same position twice.
+
+        Only synchronous broker paths that just marked this exact state call this helper.
+        Independent clock/watchdog calls still enter through process_due_orders. Keep the
+        causal fill guard here as well: on_market_state may receive a future reserve.
+        """
+        reserve_observed_at = state.last_reserve_at or state.last_event_at
+        if reserve_observed_at is not None and reserve_observed_at > now:
+            return []
+        receipts: list[FillReceipt] = []
         for order in list(self.pending.values()):
             if order.mint != state.mint or now < order.created_at or now < order.fill_after:
                 continue
@@ -1887,25 +1915,24 @@ class PaperBroker:
         """Return conservative, currency-safe metrics for the active paper season."""
 
         portfolio = self.snapshot(persist_peak=False)
-        fills = self.database.list_fills(100_000)
-        chronology_issues = self.chronology_issues(fills=fills)
-        invalid_fill_ids = {
-            str(issue["fill_id"]) for issue in chronology_issues if issue.get("fill_id") is not None
-        }
-        buys = {fill.mint: fill for fill in fills if fill.side == Side.BUY}
-        closed_pnl = [
-            fill.account_net_minor - buys[fill.mint].account_net_minor
-            for fill in fills
+        total_fees = closed_count = wins = losses = break_even = issue_count = 0
+        has_buy = False
+        for fill, order, entry, entry_order in self.database.iter_fill_contexts():
+            total_fees += fill.account_protocol_fee_minor + fill.account_network_fee_minor
+            has_buy = has_buy or fill.side == Side.BUY
+            reason = self.fill_chronology_reason(fill, order, entry)
+            issue_count += int(reason is not None)
             if (
                 fill.side == Side.SELL
-                and fill.mint in buys
-                and fill.fill_id not in invalid_fill_ids
-                and buys[fill.mint].fill_id not in invalid_fill_ids
-            )
-        ]
-        total_fees = sum(
-            fill.account_protocol_fee_minor + fill.account_network_fee_minor for fill in fills
-        )
+                and entry is not None
+                and reason is None
+                and self.fill_chronology_reason(entry, entry_order, entry) is None
+            ):
+                pnl = fill.account_net_minor - entry.account_net_minor
+                closed_count += 1
+                wins += int(pnl > 0)
+                losses += int(pnl < 0)
+                break_even += int(pnl == 0)
         return {
             "ending_equity_minor": portfolio.equity_lamports,
             "last_known_ending_equity_minor": portfolio.last_known_equity_lamports,
@@ -1917,16 +1944,16 @@ class PaperBroker:
             "realized_pnl_minor": portfolio.realized_pnl_lamports,
             "net_pnl_minor": portfolio.equity_lamports - self.starting_lamports,
             "total_fees_minor": total_fees,
-            "closed_trades": len(closed_pnl),
-            "wins": sum(value > 0 for value in closed_pnl),
-            "losses": sum(value < 0 for value in closed_pnl),
-            "break_even": sum(value == 0 for value in closed_pnl),
+            "closed_trades": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "break_even": break_even,
             "ending_drawdown_fraction": portfolio.drawdown_fraction,
             "open_positions": len(portfolio.positions),
             # A durable position is itself evidence of a filled entry. Keeping that invariant in
             # the summary also makes recovery resilient to a partially imported legacy fill log.
-            "meaningful_activity": bool(buys or portfolio.positions or closed_pnl),
-            "execution_audit_issue_count": len(chronology_issues),
+            "meaningful_activity": bool(has_buy or portfolio.positions or closed_count),
+            "execution_audit_issue_count": issue_count,
         }
 
     def chronology_issues(
@@ -1936,7 +1963,19 @@ class PaperBroker:
     ) -> list[dict[str, str]]:
         """Find impossible current-season paper chronology without rewriting its audit trail."""
 
-        current_fills = fills if fills is not None else self.database.list_fills(100_000)
+        if fills is None:
+            return [
+                {
+                    "fill_id": fill.fill_id,
+                    "order_id": fill.order_id,
+                    "mint": fill.mint,
+                    "side": fill.side.value,
+                    "reason": reason,
+                }
+                for fill, order, entry, _ in self.database.iter_fill_contexts()
+                if (reason := self.fill_chronology_reason(fill, order, entry)) is not None
+            ]
+        current_fills = fills
         orders = {order.order_id: order for order in self.database.list_orders()}
         ordered_fills = sorted(current_fills, key=lambda item: (item.filled_at, item.fill_id))
         # Build entry lookup independently from the scan. A valid zero-latency sell may share the
@@ -1948,42 +1987,7 @@ class PaperBroker:
         issues: list[dict[str, str]] = []
         for fill in ordered_fills:
             order = orders.get(fill.order_id)
-            reason: str | None = None
-            if order is None:
-                reason = "matching paper order is unavailable"
-            elif order.mint != fill.mint or order.side != fill.side:
-                reason = "fill does not match its paper order"
-            elif order.status != OrderStatus.FILLED:
-                reason = "paper order is not recorded as filled"
-            elif order.fill_after < order.created_at:
-                reason = "paper order latency boundary predates creation"
-            elif order.filled_at is None or order.filled_at != fill.filled_at:
-                reason = "filled order and receipt disagree on execution time"
-            elif fill.filled_at < order.created_at:
-                reason = "fill predates its paper order"
-            elif fill.filled_at < order.fill_after:
-                reason = "fill predates configured execution latency"
-            elif (
-                fill.reserve_snapshot is not None
-                and fill.reserve_snapshot.observed_at > fill.filled_at
-            ):
-                reason = "fill uses a reserve observation from the future"
-            elif fill.reserve_snapshot is not None and fill.reserve_snapshot.venue != fill.venue:
-                reason = "fill venue does not match its reserve observation"
-            elif fill.side == Side.SELL:
-                entry = buys.get(fill.mint)
-                opened_at = fill.position_opened_at or (entry.filled_at if entry else None)
-                if entry is None:
-                    reason = "sell has no preceding current-season buy"
-                elif (
-                    fill.position_opened_at is not None
-                    and fill.position_opened_at != entry.filled_at
-                ):
-                    reason = "sell does not reference its entry boundary"
-                elif opened_at is not None and fill.filled_at < opened_at:
-                    reason = "sell predates its paper position"
-                elif fill.filled_at < entry.filled_at:
-                    reason = "sell predates its entry fill"
+            reason = self.fill_chronology_reason(fill, order, buys.get(fill.mint))
             if reason is not None:
                 issues.append(
                     {
@@ -1995,6 +1999,45 @@ class PaperBroker:
                     }
                 )
         return issues
+
+    @staticmethod
+    def fill_chronology_reason(
+        fill: FillReceipt,
+        order: PaperOrder | None,
+        entry: FillReceipt | None,
+    ) -> str | None:
+        reason: str | None = None
+        if order is None:
+            reason = "matching paper order is unavailable"
+        elif order.mint != fill.mint or order.side != fill.side:
+            reason = "fill does not match its paper order"
+        elif order.status != OrderStatus.FILLED:
+            reason = "paper order is not recorded as filled"
+        elif order.fill_after < order.created_at:
+            reason = "paper order latency boundary predates creation"
+        elif order.filled_at is None or order.filled_at != fill.filled_at:
+            reason = "filled order and receipt disagree on execution time"
+        elif fill.filled_at < order.created_at:
+            reason = "fill predates its paper order"
+        elif fill.filled_at < order.fill_after:
+            reason = "fill predates configured execution latency"
+        elif (
+            fill.reserve_snapshot is not None and fill.reserve_snapshot.observed_at > fill.filled_at
+        ):
+            reason = "fill uses a reserve observation from the future"
+        elif fill.reserve_snapshot is not None and fill.reserve_snapshot.venue != fill.venue:
+            reason = "fill venue does not match its reserve observation"
+        elif fill.side == Side.SELL:
+            opened_at = fill.position_opened_at or (entry.filled_at if entry else None)
+            if entry is None:
+                reason = "sell has no preceding current-season buy"
+            elif fill.position_opened_at is not None and fill.position_opened_at != entry.filled_at:
+                reason = "sell does not reference its entry boundary"
+            elif opened_at is not None and fill.filled_at < opened_at:
+                reason = "sell predates its paper position"
+            elif fill.filled_at < entry.filled_at:
+                reason = "sell predates its entry fill"
+        return reason
 
     def reset(self) -> None:
         summary = self.season_summary() if self.initialized else None

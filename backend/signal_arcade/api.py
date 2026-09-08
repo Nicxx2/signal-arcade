@@ -25,6 +25,7 @@ from starlette.types import Receive, Scope, Send
 
 from . import __version__
 from .config import Settings, load_settings
+from .database import AdvisoryReadDeferred
 from .diagnostics_store import LAG_BOUNDS, read_events, read_page
 from .models import (
     AiDecisionMode,
@@ -501,11 +502,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sort: Literal["profit", "loss", "recent"] = Query(default="profit"),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> dict[str, Any]:
-        return await orchestrator.leaderboard_view(sort=sort, limit=limit)
+        try:
+            return await orchestrator.leaderboard_view(sort=sort, limit=limit)
+        except AdvisoryReadDeferred as exc:
+            raise HTTPException(
+                status_code=503, detail=str(exc), headers={"Retry-After": "1"}
+            ) from exc
 
     @app.get("/api/v1/seasons")
     async def seasons() -> dict[str, Any]:
-        return await orchestrator.seasons_view()
+        try:
+            return await orchestrator.seasons_view()
+        except AdvisoryReadDeferred as exc:
+            raise HTTPException(
+                status_code=503, detail=str(exc), headers={"Retry-After": "1"}
+            ) from exc
 
     @app.get("/api/v1/decisions/{decision_id}")
     async def decision(decision_id: str) -> dict[str, Any]:

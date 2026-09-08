@@ -2680,10 +2680,14 @@ def test_concurrent_leaderboard_views_share_one_immutable_history_scan(
         positions: list[Position] | None = None,
         quote_currency: str | None = None,
         quote_decimals: int | None = None,
+        history_revision: tuple[object, ...] | None = None,
+        stop_requested: object = None,
+        closed_history: object = None,
     ) -> dict[str, object]:
         calls.append(positions)
         assert quote_currency == "SOL"
         assert quote_decimals == 9
+        assert history_revision is not None and callable(stop_requested)
         time.sleep(0.05)
         return {
             "sort": sort,

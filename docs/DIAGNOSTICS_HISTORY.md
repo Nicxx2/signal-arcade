@@ -45,6 +45,16 @@ created. There is no automatic recovery that overwrites an unreadable store.
   samples can be higher. No samples means unmeasured latency, not a zero-latency result.
 - Bounded duration/count/max summaries for event batches, snapshots, heartbeat work, training
   preparation/publication and storage maintenance. These identify slow phases, not a full profiler.
+- v1.10.7 burst follow-up: `snapshot_cpu`, `heartbeat_cpu`, `event_persist_cpu` and
+  `event_learning_cpu` measure CPU time on the worker thread executing that operation. Matching
+  `_wait` phases measure executor-dispatch plus event-loop resumption delay. They do not isolate
+  database lock time; a worker's remaining elapsed time can include I/O, lock contention, GIL
+  waiting or scheduling. Heartbeat CPU/wait covers its main tick; the existing heartbeat duration
+  also includes the subsequent season check. `market_lock_wait`, `snapshot_lock_wait` and
+  `heartbeat_lock_wait` record completed acquisitions of the shared event boundary. Cancelled
+  lock waiters are not completed samples. Parent/child phases overlap and must not be summed as
+  independent CPU costs. Old intervals without these fields are unmeasured, not zero. These are
+  fixed aggregate counters, not per-event records or an additional live database query.
 - Actual training and cleanup completion records. Readiness-only checks no longer erase the
   last actual fit timing. Publication counts are distinct from retained model counts.
 - Latest per-skill/family sample counts, qualification flags, numeric proof metrics and identities
@@ -56,6 +66,15 @@ created. There is no automatic recovery that overwrites an unreadable store.
   requests another valuation. Samples can be old while trading is idle; check their timestamps.
 - Available app CPU/RSS samples, provider reconnect counts, Local AI queue pressure, Coach state,
   storage sizes and the recorder's own omissions. Retained Coach counts are not lifetime totals.
+- v1.10.7: bounded learning-refresh counters identify requests, selected/accepted routes,
+  checkpoint updates, unavailable/discarded batches, invalid routes and worker errors. Deferrals
+  distinguish pending sells, market boundaries, queue/lag pressure, unhealthy sources, maintenance
+  and changed context. These are cumulative counters within a boot; hourly gauges retain their
+  last value. A deferral counts a blocked guard check, not a failed token or missing outcome.
+  Invalid-route counts and discarded-batch counts use different units and must not be combined
+  into a per-request failure rate. Older intervals lacking these fields remain unknown.
+  `unavailable_route_identities` is the current size of the bounded RPC identity cache, not a
+  lifetime failure count. Identity repair re-enables acquisition without altering saved outcomes.
 
 No wallet keys, provider URLs, passwords, raw settings dictionaries, log messages, feature
 matrices, model weights or per-token market histories are copied. Nothing is sent to an external
@@ -80,17 +99,33 @@ rates without accounting for their actual time bounds.
 Boot changes, skipped records, unavailable history, long intervals and clock jumps remain explicit.
 Skipped diagnostics are separate from expired or shed market events. A collection attempt that
 times out waiting for the core event boundary does not consume pipeline counters; a later
-interval includes them while their bounded source buckets remain available. The marked gap still
-means intermediate proof, equity and phase timing cannot be treated as minute-by-minute samples.
+interval includes them while their bounded source buckets remain available. The v1.10.7 retry
+fix records this as `collection_deferred` and retries at the next five-second poll without
+incrementing `dropped`. Actual collector failures still count as omissions, and long delays still
+mark recording gaps. A marked gap means intermediate proof, equity and phase timing cannot be
+treated as minute-by-minute samples.
 Retention advancement is conservative after time jumps; row and byte bounds still apply. Nothing
 backfills offline time with healthy zeroes. Context is sampled at the interval end; observed
 context changes mark mixed intervals. Brief changes that reverse between samples may not be seen.
 Use the main ledger and immutable proof artifacts for exact decision attribution.
 
+The in-memory event buffer retains eight compact events between collections. A cluster of training
+publications can exceed that allowance: older diagnostic detail is counted as dropped and the
+interval is marked, while the saved learning artifacts remain in the main database. This is distinct
+from losing market events or model publications. The `snapshot_age` gauge is the age of the on-demand
+UI snapshot cache; it can rise when nobody requests a snapshot. Assess engine health using worker,
+queue, critical-lag and training evidence alongside that gauge.
+
 Compare the same risk, quote, evidence cohort and configuration, and account for traffic and
 missing evidence. Merge histogram counts before estimating a percentile; the last bucket means
 **over 30 seconds**, not exactly 30. Sum matching numerators and denominators instead of averaging
 coverage percentages. More fits or Champions alone do not establish profitable improvement.
+
+Phase durations include wall-clock waiting and can overlap: an event batch includes its nested
+phases, while storage can run concurrently. Do not sum them as CPU usage or attribute a burst to
+the browser, Coach or an active skill from overlap alone. Compare arrival rate, event mix, critical
+lag and losses over equivalent intervals, and separate isolated test load from live observations.
+The [v1.10.7 burst review](V1_10_7_BURST_VALIDATION.md) illustrates these limits.
 
 ## Viewing and exporting
 
