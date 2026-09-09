@@ -11,6 +11,13 @@ from signal_arcade.paper.broker import PaperBroker
 from test_broker import make_broker, make_decision, make_features
 
 
+def _update(broker, path, **kwargs):
+    if path == "clock":
+        kwargs.pop("event_kind")
+        return broker.reassess_and_process_due_orders(**kwargs)
+    return broker.on_market_state(**kwargs)
+
+
 @pytest.fixture
 def held(settings):
     database = Database(settings.database_path)
@@ -42,7 +49,10 @@ def held(settings):
 
 
 @pytest.mark.parametrize("route", ["valid", "stale", "empty", "conversion"])
-def test_market_update_values_held_position_once_and_saves_assessment(held, monkeypatch, route):
+@pytest.mark.parametrize("path", ["market", "clock"])
+def test_market_update_values_held_position_once_and_saves_assessment(
+    path, held, monkeypatch, route
+):
     broker, database, state, now = held
     state.last_event_at = state.last_reserve_at = now
     features = make_features(now)
@@ -66,7 +76,9 @@ def test_market_update_values_held_position_once_and_saves_assessment(held, monk
     monkeypatch.setattr(broker, "_mark_position", mark)
     monkeypatch.setattr(database, "save_position", save)
     assert (
-        broker.on_market_state(
+        _update(
+            broker,
+            path,
             state=state,
             features=features,
             event_kind=EventKind.TRADE,
@@ -90,7 +102,8 @@ def test_market_update_values_held_position_once_and_saves_assessment(held, monk
         assert not broker.has_pending_for("mint", Side.SELL)
 
 
-def test_same_timestamp_new_reserves_and_standalone_order_processing_still_refresh(held):
+@pytest.mark.parametrize("path", ["market", "clock"])
+def test_same_timestamp_new_reserves_and_standalone_order_processing_still_refresh(path, held):
     broker, _database, state, now = held
     state.last_event_at = state.last_reserve_at = now
     arguments = dict(
@@ -100,10 +113,10 @@ def test_same_timestamp_new_reserves_and_standalone_order_processing_still_refre
         now=now,
         mode=RiskMode.BALANCED,
     )
-    broker.on_market_state(**arguments, event_kind=EventKind.TRADE)
+    _update(broker, path, **arguments, event_kind=EventKind.TRADE)
     first = broker.positions["mint"].last_mark_lamports
     state.virtual_quote_reserves += 100_000_000
-    broker.on_market_state(**arguments, event_kind=EventKind.TRADE)
+    _update(broker, path, **arguments, event_kind=EventKind.TRADE)
     second = broker.positions["mint"].last_mark_lamports
     assert second > first
     state.virtual_quote_reserves += 100_000_000
@@ -112,7 +125,8 @@ def test_same_timestamp_new_reserves_and_standalone_order_processing_still_refre
 
 
 @pytest.mark.parametrize("failure_at", [1, 2])
-def test_failed_mark_or_assessment_never_continues_to_fill(held, monkeypatch, failure_at):
+@pytest.mark.parametrize("path", ["market", "clock"])
+def test_failed_mark_or_assessment_never_continues_to_fill(path, held, monkeypatch, failure_at):
     broker, database, state, now = held
     original = database.save_position
     calls = 0
@@ -127,7 +141,9 @@ def test_failed_mark_or_assessment_never_continues_to_fill(held, monkeypatch, fa
     monkeypatch.setattr(database, "save_position", save)
     cash = broker.cash_lamports
     with pytest.raises(RuntimeError, match="position persistence failed"):
-        broker.on_market_state(
+        _update(
+            broker,
+            path,
             state=state,
             features=make_features(now),
             event_kind=EventKind.TRADE,
@@ -140,16 +156,17 @@ def test_failed_mark_or_assessment_never_continues_to_fill(held, monkeypatch, fa
     assert not broker.has_pending_for("mint", Side.SELL)
 
 
-def test_recovered_route_peak_and_assessment_survive_restart(held):
+@pytest.mark.parametrize("path", ["market", "clock"])
+def test_recovered_route_peak_and_assessment_survive_restart(path, held):
     broker, database, state, now = held
     state.real_quote_reserves = 0
     arguments = dict(state=state, source_event_id="tick", now=now, mode=RiskMode.BALANCED)
-    broker.on_market_state(**arguments, features=make_features(now), event_kind=EventKind.TRADE)
+    _update(broker, path, **arguments, features=make_features(now), event_kind=EventKind.TRADE)
     assert not broker.positions["mint"].mark_is_executable
     broker.positions["mint"].peak_mark_lamports = 10**15
     state.real_quote_reserves = 20_000_000_000
     state.last_event_at = state.last_reserve_at = now
-    broker.on_market_state(**arguments, features=make_features(now), event_kind=EventKind.TRADE)
+    _update(broker, path, **arguments, features=make_features(now), event_kind=EventKind.TRADE)
     position = broker.positions["mint"]
     assert position.mark_is_executable
     assert position.peak_mark_lamports == position.last_mark_lamports
@@ -157,7 +174,8 @@ def test_recovered_route_peak_and_assessment_survive_restart(held):
     assert restored == position
 
 
-def test_combined_market_path_defers_future_reserve_without_filling_pending_buy(held):
+@pytest.mark.parametrize("path", ["market", "clock"])
+def test_combined_market_path_defers_future_reserve_without_filling_pending_buy(path, held):
     broker, database, entry_state, now = held
     state = deepcopy(entry_state)
     state.mint = "other"
@@ -168,7 +186,9 @@ def test_combined_market_path_defers_future_reserve_without_filling_pending_buy(
     assert order is not None
     cash = broker.cash_lamports
     assert (
-        broker.on_market_state(
+        _update(
+            broker,
+            path,
             state=state,
             features=make_features(now, "other"),
             event_kind=EventKind.TRADE,
@@ -181,7 +201,9 @@ def test_combined_market_path_defers_future_reserve_without_filling_pending_buy(
     assert order.order_id in broker.pending
     assert "other" not in broker.positions
     assert cash == broker.cash_lamports == database.ledger_balance("cash")
-    receipts = broker.on_market_state(
+    receipts = _update(
+        broker,
+        path,
         state=state,
         features=make_features(reserve_at, "other"),
         event_kind=EventKind.TRADE,

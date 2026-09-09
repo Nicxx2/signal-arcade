@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import gc
+import time
 import weakref
 from collections import deque
 from dataclasses import replace
@@ -315,6 +316,12 @@ def test_idle_trainer_releases_completed_workspace(settings, monkeypatch):
 
     def prepare(*args):
         job = WorkspaceJob()
+        job.authority_context = engine.learning._training_authority_context()
+        job.runtime_context = engine._training_runtime_context()
+        job.started_monotonic = time.monotonic()
+        job.phase_seconds = {}
+        job.key = (engine.learning.current_risk_mode, engine.learning.configuration_fingerprint())
+        job.requested_at = datetime.now(UTC)
         references.append(weakref.ref(job))
         return job
 

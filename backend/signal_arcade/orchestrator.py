@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +34,7 @@ from .intelligence.reserve_refresh import (
     route_identity,
     validated_learning_state,
 )
+from .intelligence.training_job import TrainingJob
 from .models import (
     AiDecisionMode,
     DataValue,
@@ -669,6 +670,7 @@ class Orchestrator:
         self._ui_snapshot_cache: tuple[float, datetime, dict[str, Any]] | None = None
         self._ui_snapshot_last_duration = 0.0
         self._ui_leaderboard_refresh_lock = asyncio.Lock()
+        self._ui_detail_read_lock = asyncio.Lock()
         self._ui_leaderboard_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._ui_accounting_generation = 0
         self._ui_seasons_refresh_lock = asyncio.Lock()
@@ -1472,11 +1474,57 @@ class Orchestrator:
             and self.last_processing_lag_seconds < 1
         )
 
-    def _exit_timing_arguments(self) -> dict[str, Any]:
-        seconds = self.learning.recommended_hold_seconds(self.risk_mode)
+    def _learning_publication_can_run(self) -> bool:
+        # Admit only between finite event batches with no queued urgent work. Unlike
+        # preparing a fit, a completed job may publish with a small candidate backlog;
+        # requiring an entirely empty stream here can repeatedly waste valid fits.
+        return bool(
+            not self._maintenance_requested
+            and not self._storage_maintenance_active
+            and not self.event_queue.boundary_active
+            and self._event_batches_in_flight == 0
+            and self.event_queue.qsize() / max(1, self.settings.event_queue_max) < 0.05
+            and not self.event_queue.has_ready_before(1)
+            and self.last_processing_lag_seconds < 1
+        )
+
+    def _training_runtime_context(self) -> tuple[Any, ...]:
+        return (id(self.learning), self.demo_mode, self.broker.season_id, self.stop_event.is_set())
+
+    async def _publish_training_job(
+        self, learner: LearningEngine, job: TrainingJob, error: Exception | None
+    ) -> bool:
+        waited = time.monotonic()
+        while True:
+            # Terminal/error jobs only release bookkeeping; they never need a quiet
+            # market to discard obsolete work. Valid jobs keep one private workspace.
+            terminal = bool(
+                error is not None
+                or self.stop_event.is_set()
+                or job.runtime_context != self._training_runtime_context()
+                or time.monotonic() - job.started_monotonic > 120
+            )
+            if terminal or self._learning_publication_can_run():
+                async with self._event_lock:
+                    context = self._training_runtime_context()
+                    terminal = error is not None or learner.training_job_stale(job, context)
+                    if terminal or self._learning_publication_can_run():
+                        job.phase_seconds["publication_wait_seconds"] = time.monotonic() - waited
+                        started = time.monotonic()
+                        ran = await _joined_to_thread(
+                            learner.finish_training_job, job, runtime_context=context, error=error
+                        )
+                        self.diagnostics.observe_phase("training_publish", started)
+                        self._record_training_diagnostics(job, ran, started)
+                        return ran
+            await self._wait_for_stop(0.25)
+
+    def _exit_timing_arguments(self, mint: str | None = None) -> dict[str, Any]:
+        position = self.broker.positions.get(mint or "")
+        seconds, participant = self.learning.exit_timing_selection(self.risk_mode, position)
         return {
             "soft_hold_seconds": seconds,
-            "soft_hold_participant": self.learning.exit_timing_participant(self.risk_mode, seconds),
+            "soft_hold_participant": participant,
         }
 
     def _shadow_ai_can_run(self) -> bool:
@@ -1520,7 +1568,9 @@ class Orchestrator:
             old = latest.get(key)
             if old is None or artifact.created_at > old.created_at:
                 latest[key] = artifact
-        skills = [artifact_summary(artifact) for _, artifact in sorted(latest.items())[:6]]
+        # Four skills x three supported families. A Coach or contextual Exit candidate
+        # must not push a different skill out of the retained diagnostic summary.
+        skills = [artifact_summary(artifact) for _, artifact in sorted(latest.items())[:12]]
         states = [
             state
             for state in self.learning.skill_states.values()
@@ -1676,15 +1726,22 @@ class Orchestrator:
                         continue
                     learner = self.learning
                     phase_started = time.monotonic()
-                    job = await _joined_to_thread(
-                        learner.prepare_next_training,
-                        (
-                            id(self.learning),
-                            self.demo_mode,
-                            self.broker.season_id,
-                            self.stop_event.is_set(),
-                        ),
+                    preparation = asyncio.create_task(
+                        asyncio.to_thread(
+                            learner.prepare_next_training, self._training_runtime_context()
+                        )
                     )
+                    try:
+                        job = await _await_worker(preparation)
+                    except asyncio.CancelledError:
+                        # Joining keeps the market boundary until preparation finishes, but
+                        # cancellation prevents normal result assignment. Retain its returned
+                        # job so the outer cleanup releases ownership and preserves the request.
+                        if not preparation.cancelled() and preparation.exception() is None:
+                            job = preparation.result()
+                        raise
+                    finally:
+                        del preparation
                     self.diagnostics.observe_phase("training_prepare", phase_started)
                 if job is None:
                     continue
@@ -1693,21 +1750,7 @@ class Orchestrator:
                     await _joined_to_thread(learner.fit_training_job, job)
                 except Exception as exc:
                     fit_error = exc
-                async with self._event_lock:
-                    phase_started = time.monotonic()
-                    ran = await _joined_to_thread(
-                        learner.finish_training_job,
-                        job,
-                        runtime_context=(
-                            id(self.learning),
-                            self.demo_mode,
-                            self.broker.season_id,
-                            self.stop_event.is_set(),
-                        ),
-                        error=fit_error,
-                    )
-                    self.diagnostics.observe_phase("training_publish", phase_started)
-                    self._record_training_diagnostics(job, ran, phase_started)
+                ran = await self._publish_training_job(learner, job, fit_error)
                 if (
                     ran
                     and self._learning_trainer_incident_active
@@ -1731,6 +1774,8 @@ class Orchestrator:
                 )
                 await self._wait_for_stop(5)
             finally:
+                if job is not None:
+                    learner.release_unpublished_training_job(job)
                 # A suspended coroutine otherwise holds the full private fit workspace until
                 # another job is prepared, increasing both idle memory and the next copy's peak.
                 job = None
@@ -1828,6 +1873,10 @@ class Orchestrator:
                             self.retired_candidate_events += 1
                             continue
                         working_batch.append((self._event_priority(event), sequence, event))
+                    # Admission priority can age while an earlier batch creates orders or
+                    # enrolls learning evidence. Use the priorities just revalidated above,
+                    # keeping sequence order within each class. Never scan the whole queue.
+                    working_batch.sort(key=lambda item: (item[0], item[1]))
                     durable_events = [
                         item[2] for item in working_batch if self._durable_event(item[2], item[0])
                     ]
@@ -2173,7 +2222,7 @@ class Orchestrator:
                         now=observed_at,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
-                        **self._exit_timing_arguments(),
+                        **self._exit_timing_arguments(state.mint),
                     )
             elif not self.running and is_trade and state.mint in self.broker.positions:
                 receipts = []
@@ -2276,6 +2325,7 @@ class Orchestrator:
                             self.broker.submit_decision_with_reason,
                             decision,
                             sol_usd_price=sol_usd_price,
+                            exit_timing_plan=self.learning.freeze_exit_timing_plan(decision),
                         )
                     if order is not None:
                         self.learning.link_policy_order(decision.decision_id, order.order_id)
@@ -3732,22 +3782,15 @@ class Orchestrator:
                 continue
             sol_usd_price = self._sol_usd_price(snapshot)
             if self.running or self._profile_transition_exit_management_active(market_now):
-                self.broker.reassess_position(
-                    state=state,
-                    features=snapshot,
-                    now=market_now,
-                    mode=self.risk_mode,
-                    sol_usd_price=sol_usd_price,
-                    **self._exit_timing_arguments(),
-                )
                 receipts.extend(
-                    self.broker.process_due_orders(
+                    self.broker.reassess_and_process_due_orders(
                         state=state,
                         features=snapshot,
                         source_event_id=f"solana-rpc:{slot}:{mint}",
                         now=market_now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
+                        **self._exit_timing_arguments(state.mint),
                     )
                 )
             else:
@@ -3934,17 +3977,8 @@ class Orchestrator:
                 if state is None or snapshot is None:
                     continue
                 sol_usd_price = self._sol_usd_price(snapshot)
-                if mint in self.broker.positions:
-                    self.broker.reassess_position(
-                        state=state,
-                        features=snapshot,
-                        now=market_now,
-                        mode=self.risk_mode,
-                        sol_usd_price=sol_usd_price,
-                        **self._exit_timing_arguments(),
-                    )
                 receipts.extend(
-                    self.broker.process_due_orders(
+                    self.broker.reassess_and_process_due_orders(
                         state=state,
                         features=snapshot,
                         source_event_id=(
@@ -3955,6 +3989,11 @@ class Orchestrator:
                         now=market_now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
+                        **(
+                            self._exit_timing_arguments(state.mint)
+                            if mint in self.broker.positions
+                            else {}
+                        ),
                     )
                 )
         expired = self.broker.expire_stuck_orders(now)
@@ -5866,7 +5905,7 @@ class Orchestrator:
                         now=now,
                         mode=self.risk_mode,
                         sol_usd_price=sol_usd_price,
-                        **self._exit_timing_arguments(),
+                        **self._exit_timing_arguments(state.mint),
                     )
         except Exception as exc:
             self.running = False
@@ -6369,6 +6408,42 @@ class Orchestrator:
             and (json.loads(starting) if starting else 0) == self.broker.starting_lamports
         )
 
+    @asynccontextmanager
+    async def _detail_read_slot(self) -> AsyncIterator[None]:
+        # One detail worker at a time; waiting clients do not occupy executor threads.
+        try:
+            async with asyncio.timeout(0.75):
+                await self._ui_detail_read_lock.acquire()
+        except TimeoutError as exc:
+            raise AdvisoryReadDeferred("History requests are busy; retry shortly") from exc
+        try:
+            yield
+        finally:
+            self._ui_detail_read_lock.release()
+
+    async def decision_view(self, decision_id: str) -> Decision | None:
+        async with self._detail_read_slot():
+            return await _joined_to_thread(
+                self.database.advisory_read, lambda: self.database.get_decision(decision_id)
+            )
+
+    async def champion_journey_view(self, *, limit: int, cursor: str | None) -> dict[str, Any]:
+        async with self._detail_read_slot():
+            async with self._event_lock:
+                learner = self.learning
+                cohort = learner.champion_journey_cohort()
+                metadata = learner.champion_journey_metadata()
+            result = await _joined_to_thread(
+                self.database.advisory_read,
+                lambda: learner.champion_journey_page(
+                    limit=limit, cursor=cursor, cohort=cohort, retained_metadata=metadata
+                ),
+            )
+            async with self._event_lock:
+                if learner is not self.learning or cohort != learner.champion_journey_cohort():
+                    raise ValueError("The learning cohort changed; reopen the saved result.")
+            return result
+
     async def leaderboard_view(
         self, sort: str = "profit", limit: int = 100, *, internal: bool = False
     ) -> dict[str, Any]:
@@ -6385,7 +6460,9 @@ class Orchestrator:
             for _ in range(2):
                 async with self._event_lock:
                     generation = self._ui_accounting_generation
-                    revision = self.database.paper_history_revision()
+                    revision = await _joined_to_thread(
+                        self.database.advisory_read, self.database.paper_history_revision
+                    )
                     if not self._paper_basis_matches(revision):
                         continue
                     positions = [
@@ -6446,7 +6523,9 @@ class Orchestrator:
             leaderboard = await self.leaderboard_view(sort="profit", limit=500, internal=True)
             async with self._event_lock:
                 generation = self._ui_accounting_generation
-                revision = self.database.paper_history_revision()
+                revision = await _joined_to_thread(
+                    self.database.advisory_read, self.database.paper_history_revision
+                )
                 if (
                     leaderboard["_generation"] != generation
                     or leaderboard["_history_revision"] != revision

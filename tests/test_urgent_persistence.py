@@ -11,6 +11,54 @@ from signal_arcade.models import EventKind, MarketEvent
 from signal_arcade.orchestrator import Orchestrator
 
 
+@pytest.mark.parametrize("offset", [3, 9])
+def test_newly_protected_mint_uses_current_priority_within_prefetched_batch(
+    tmp_path, monkeypatch, offset
+):
+    engine = Orchestrator(
+        Settings(data_dir=tmp_path, demo_mode=True, event_batch_size=10, _env_file=None)
+    )
+    engine.running = True
+    protected = set()
+    handled = []
+    monkeypatch.setattr(engine, "_critical_event", lambda event: event.mint in protected)
+
+    async def handle(event, *, sequence=None):
+        handled.append(event.event_id)
+        if event.mint in protected:
+            assert any(row.event_id == event.event_id for row in engine.database.recent_events(20))
+        return True
+
+    monkeypatch.setattr(engine, "_handle_persisted_event", handle)
+
+    async def exercise():
+        for index in range(10):
+            mint = f"mint-{index}"
+            engine.features.tokens[mint] = TokenState(mint=mint)
+            await engine.enqueue_event(
+                MarketEvent(event_id=mint, source="test", kind=EventKind.TRADE, mint=mint)
+            )
+        # An order was accepted after admission, before the next batch is processed.
+        protected.add(f"mint-{offset}")
+        worker = asyncio.create_task(engine._event_worker_loop())
+        try:
+            await asyncio.wait_for(engine.event_queue.join(), 5)
+        finally:
+            engine.stop_event.set()
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            await engine.http.close()
+
+    try:
+        asyncio.run(exercise())
+        assert handled == [f"mint-{offset}", *[f"mint-{i}" for i in range(10) if i != offset]]
+        assert engine.events_processed == 10
+        assert engine.critical_events_processed == engine.events_persisted == 1
+        assert not engine.event_queue._pending_sequences
+    finally:
+        engine.database.close()
+
+
 @pytest.mark.parametrize("duplicates", [False, True])
 @pytest.mark.parametrize("urgent_count", [1, 20, 70])
 @pytest.mark.parametrize("batch_size", [10, 16, 32])

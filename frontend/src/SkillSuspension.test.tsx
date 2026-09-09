@@ -35,3 +35,10 @@ test("restored skills do not keep a suspension warning", () => {
   const { container } = render(<SkillSuspension skill={{ state: "active", suspension: { ...suspension, status: "restored" } }} paused={false} supportAllowed />);
   expect(container).toBeEmptyDOMElement();
 });
+
+test.each([undefined, ["advantage", "harm"], ["future_check"]])("failed trial shows saved checks without inventing legacy results: %j", (failed_checks) => {
+  render(<SkillSuspension skill={{ state: "suspended", suspension: { ...suspension, status: "failed", observed_count: 60, usable_count: 47, failed_checks } }} paused={false} supportAllowed />);
+  expect(screen.getByText(/Recovery trial finished/)).toHaveTextContent("47 usable of 60 resolved");
+  expect(screen.getByText(/This fixed trial will not restart/)).toBeInTheDocument();
+  expect(screen.getByText(failed_checks?.includes("advantage") ? /Checks not met: safe advantage, harm limit/ : /individual results were not recorded/)).toBeInTheDocument();
+});

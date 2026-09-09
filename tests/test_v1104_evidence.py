@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace as NS
 
@@ -14,6 +15,7 @@ from signal_arcade.intelligence.learning import (
 )
 from signal_arcade.models import (
     ChallengerSkill,
+    ChallengerSkillArtifact,
     DecisionAction,
     Position,
     RiskMode,
@@ -126,10 +128,18 @@ def test_exit_tournament_scores_every_required_pair(primary_present: bool) -> No
         rejected_versions=[],
     )
     artifacts = {
-        version: NS(
+        version: ChallengerSkillArtifact(
             version=version,
+            skill=ChallengerSkill.EXIT,
+            risk_mode=mode,
+            configuration_fingerprint=config,
+            baseline_version=BASELINE_VERSION,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
             model_family=StatisticalModelFamily.DETERMINISTIC,
             schema_version="challenger-skill-v2",
+            recipe_version="exit-horizon-v1",
+            implementation_version="bounded-horizon-selector-v1",
+            parameters={"selected_horizon_seconds": 60 if version == "candidate" else 600},
         )
         for version in ("candidate", "champion")
     }
@@ -176,10 +186,13 @@ def test_exit_tournament_scores_every_required_pair(primary_present: bool) -> No
 def test_secondary_outcome_advances_governance_without_requesting_a_fit() -> None:
     calls = []
     engine = NS(
+        _status_policy_cache=threading.local(),
         _govern_active_model=lambda: calls.append("health"),
         _advance_entry_tournaments=lambda: calls.append("tournaments"),
         request_retraining=lambda **kw: calls.append("fit"),
         _govern_skill_ensemble=lambda: calls.append("ensemble"),
     )
+    engine._policy_selection_scope = lambda: LearningEngine._policy_selection_scope(engine)
     LearningEngine._advance_primary_outcomes(engine, set(), outcomes_changed=True)
     assert calls == ["health", "tournaments", "ensemble"]
+    assert engine._status_policy_cache.rows is None

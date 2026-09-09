@@ -4,6 +4,44 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.10.9 - 2026-09-08
+
+- Separate suspended trade support from an ongoing shadow comparison in Champion Arena.
+  Preserve genuine learning/source pauses, saved evidence and unavailable-artifact states.
+- Record failed recovery checks for new fixed trials and display compact results. Legacy trials
+  remain readable without inventing missing reasons; failed windows do not restart.
+- Add one bounded Linear Exit family using original entry features and allowed review horizons.
+  Train before the chronological embargo, validate against both Baseline and the unchanged fixed
+  selector, then require fresh common-forward battle and independent activation proof.
+- Freeze the reigning Champion identity in contextual predictions so replacing a suspended
+  Champion cannot reuse battle evidence for activation. Keep unavailable post-crown outcomes in
+  coverage and reject activation receipts from earlier review builds without that separation.
+- Persist an entry-frozen contextual review plan through order latency, fills and restart.
+  Current permission, health, exact policy/context and upstream activation epochs override the
+  plan. Missing, unfamiliar or incompatible context uses Baseline normal-review timing.
+- Preserve stop loss, structural and trailing exits, absolute hold limits and execution checks.
+  Contextual Exit works with independently qualified upstream skills and Coach contenders;
+  unknown sized quotes remain unavailable when evaluating an Exit/Sizing combination.
+- Verify contextual payloads at selection, activation, health, recovery and restart boundaries.
+  Retain immutable Champions and use a distinct activation receipt for safe older-build fallback.
+- Keep all supported skill/family combinations in bounded diagnostics summaries, with optional
+  fixed-reference comparison fields readable by earlier schema-1 diagnostics readers.
+- Move advisory detail and Results revision reads off the event loop with bounded reader waits,
+  retryable pressure responses, joined cancellation and unchanged cohort/accounting checks.
+- Value each heartbeat/watchdog update once while preserving durable marks, exit assessments,
+  due-order guards and fresh standalone order processing.
+- Recheck market pressure before publishing completed training. Keep one bounded workspace,
+  reject stale results, retain cancelled requests and admit small candidate backlogs safely.
+- Release a prepared training job if forced task cancellation interrupts its result handoff.
+  Preserve a pending retry without publishing the cancelled job or leaving the learner busy.
+- Reuse derived values within the existing trade window, validate Exit timing and attribution
+  together, and share Policy population selection only within one outcome update. Health,
+  permissions and suspension decisions are recalculated; no proof is cached across updates.
+- Order prefetched events by their freshly checked priorities so newly protected mints take
+  precedence within that finite batch. Preserve urgent limits, expiry and loss reporting.
+- Retain schema 16, existing learning populations, Entry Linear/XGBoost recipes, permissions,
+  coverage thresholds, fixed Exit candidates and all v1.10.8 recovery and performance changes.
+
 ## 1.10.8 - 2026-09-08
 
 - Allow a health-suspended Champion to earn support back through one fixed prospective shadow

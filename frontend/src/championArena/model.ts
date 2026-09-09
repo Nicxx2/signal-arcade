@@ -97,12 +97,13 @@ export function viewForSkill(snapshot: Snapshot, skill: Skill): ArenaView | null
   const minimum = count(snapshot.learning.challenger_common_forward_minimum) ?? 30;
   const minimumCoverage = fraction(snapshot.learning.challenger_minimum_availability) ?? 0.7;
   const supported = usable !== null && observed !== null && usable <= observed && usable >= minimum && coverage !== null && coverage >= minimumCoverage;
-  const paused = snapshot.learning.mode === "off" || !snapshot.learning.collecting_from_current_source || status.state === "suspended";
+  // Suspension removes trade influence. A valid shadow pair can still collect proof.
+  const paused = snapshot.learning.mode === "off" || !snapshot.learning.collecting_from_current_source;
   return {
     key: pairKey(context, skill, champion?.id ?? null, status.testing_version ?? (champion ? null : candidate?.id ?? null)), context, skill, mode,
     left: champion ?? candidate, right: hasPair ? artifact(testing) : null, leftIsChampion: Boolean(champion),
     title: mode === "battle" ? "Proof in motion" : mode === "champion" ? "Meet your Champion" : mode === "training" ? "The next contender" : "Battle unavailable",
-    detail: paused ? "Learning is paused, separate from this source, or suspended. Saved proof remains visible." : mode === "battle" ? "New shared evidence shapes the comparison. Every promotion guard still has to pass." : mode === "champion" ? "No battle is underway. A candidate must qualify and enter a comparison before an opponent appears. Influence remains separately gated." : mode === "training" ? "Independent proof comes first. Training here is a visual introduction, not a new model fit." : "A testing artifact is unavailable. No result can be inferred.",
+    detail: paused ? "Learning is paused or is not collecting from this source. Saved proof remains visible." : mode === "battle" ? `${status.state === "suspended" ? "Champion support is suspended; shadow comparison continues. " : ""}New shared evidence shapes the comparison. Every promotion guard still has to pass.` : mode === "champion" ? "No battle is underway. A candidate must qualify and enter a comparison before an opponent appears. Influence remains separately gated." : mode === "training" ? "Independent proof comes first. Training here is a visual introduction, not a new model fit." : "A testing artifact is unavailable. No result can be inferred.",
     outcome: null, event: null, usable, observed, coverage,
     mean, lower, upper, minimum, minimumCoverage,
     momentum: !paused && supported && lower !== null && upper !== null && mean !== null && lower <= mean && mean <= upper ? lower > 0 ? "right" : upper < 0 ? "left" : "neutral" : "neutral",

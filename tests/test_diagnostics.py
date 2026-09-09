@@ -508,6 +508,40 @@ def test_diagnostics_tracks_current_cohort_and_runtime_support(
         engine.database.close()
 
 
+def test_collector_keeps_every_supported_skill_family(settings):
+    from signal_arcade.intelligence.learning import FEATURE_SCHEMA_VERSION
+    from signal_arcade.models import (
+        ChallengerSkill,
+        ChallengerSkillArtifact,
+        StatisticalModelFamily,
+    )
+
+    engine = Orchestrator(settings)
+    engine.diagnostics.enabled = True
+    artifacts = [
+        ChallengerSkillArtifact(
+            version=f"{skill.value}-{family.value}",
+            skill=skill,
+            model_family=family,
+            risk_mode=engine.risk_mode,
+            configuration_fingerprint=engine._configuration_fingerprint(),
+            baseline_version=engine.learning.baseline_version(),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+        for skill in ChallengerSkill
+        for family in StatisticalModelFamily
+    ]
+    try:
+        engine.learning.skill_artifacts = {a.version: a for a in artifacts}
+        engine._collect_diagnostics()
+        record = json.loads(engine.diagnostics.queue[-1])
+        assert {(s["skill"], s["family"]) for s in record["skills"]} == {
+            (a.skill.value, a.model_family.value) for a in artifacts
+        }
+    finally:
+        engine.database.close()
+
+
 def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, monkeypatch):
     import signal_arcade.orchestrator as orchestration
 
@@ -633,12 +667,13 @@ def test_writer_lifecycle_and_duplicate_owner(tmp_path):
     asyncio.run(scenario())
 
 
-def test_six_full_skill_summaries_fit_record_budget(tmp_path):
+@pytest.mark.parametrize("family_count", [6, 12])
+def test_full_skill_summaries_fit_record_budget(tmp_path, family_count):
     import random
 
     rng = random.Random(7)  # noqa: S311 - deterministic synthetic metrics, not credentials
     skills = []
-    for index in range(6):
+    for index in range(family_count):
         artifact = SimpleNamespace(
             version=f"version-{index}",
             skill=SimpleNamespace(value="entry"),
@@ -773,27 +808,68 @@ def test_export_header_disconnect_cannot_leak_a_slot(settings):
         app.state.orchestrator.database.close()
 
 
-def test_full_operational_interval_and_six_proof_events_fit(tmp_path):
+@pytest.mark.parametrize("all_current_families", [False, True])
+def test_full_operational_interval_and_six_proof_events_fit(tmp_path, all_current_families):
     import random
 
     rng = random.Random(7)  # noqa: S311 - deterministic synthetic metrics, not credentials
     skills = []
-    for _index in range(6):
+    # Preserve the original six-summary/all-metrics stress case. Also exercise every
+    # emitted native/Coach family with its own metric set (nine combinations in v1.10.9).
+    families = (
+        [
+            ("entry", "linear", PROOF_METRICS[:20]),
+            ("entry", "xgboost", PROOF_METRICS[:21]),
+            ("entry", "deterministic", PROOF_METRICS[21:26]),
+            ("exit", "deterministic", PROOF_METRICS[26:]),
+            (
+                "exit",
+                "linear",
+                (
+                    "validation_availability_fraction",
+                    "validation_uplift_lower_bound",
+                    "in_distribution_fraction",
+                    "policy_changes",
+                    "harm_fraction",
+                ),
+            ),
+            ("manipulation", "linear", PROOF_METRICS[:18]),
+            ("manipulation", "deterministic", PROOF_METRICS[21:26]),
+            ("sizing", "linear", PROOF_METRICS[7:9] + PROOF_METRICS[21:26]),
+            ("sizing", "deterministic", PROOF_METRICS[21:26]),
+        ]
+        if all_current_families
+        else [("manipulation", "xgboost", PROOF_METRICS)] * 6
+    )
+    for skill, family, metrics in families:
         skills.append(
             dict(
                 id=f"{rng.getrandbits(96):024x}",
-                skill="manipulation",
-                family="xgboost",
+                skill=skill,
+                family=family,
                 qualified=False,
                 created_at=1788610318.012345,
                 counts=[5000, 3000, 1000],
-                metrics={key: round(rng.random(), 6) for key in PROOF_METRICS},
+                metrics={key: round(rng.random(), 6) for key in metrics},
                 champion=f"{rng.getrandbits(96):024x}",
                 active=f"{rng.getrandbits(96):024x}",
                 testing=f"{rng.getrandbits(96):024x}",
                 shared=500,
             )
         )
+    if all_current_families:
+        skills[4]["reference"] = {"coverage": 0.823567, "uplift_lower": 0.042351}
+        for skill in skills:
+            skill["suspension"] = {
+                "status": "failed",
+                "enrolled_count": 60,
+                "observed_count": 60,
+                "usable_count": 48,
+                "failed_checks": ["advantage"],
+                "reason": "unverifiable",
+                "since": "2026-09-08T20:00:00+00:00",
+                "window_size": 60,
+            }
     pipeline = {
         key: rng.randint(0, 500000)
         for key in (
@@ -915,7 +991,7 @@ def test_full_operational_interval_and_six_proof_events_fit(tmp_path):
         gauges=gauges,
         skills=skills,
     )
-    value["events"] = [{"kind": "proof", **item} for item in skills]
+    value["events"] = [{"kind": "proof", **item} for item in skills[:6]]
     recorder = DiagnosticsRecorder(tmp_path)
     for event in value["events"]:
         recorder.event(event)

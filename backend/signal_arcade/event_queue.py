@@ -105,6 +105,11 @@ class SeasonEventQueue(asyncio.PriorityQueue[QueuedEvent]):
                 raise asyncio.QueueEmpty
             return self.get_nowait()
 
+    def has_ready_before(self, priority: int) -> bool:
+        """Inspect admitted priority without consuming or scanning the heap."""
+        with self._boundary_lock:
+            return not self.empty() and self._queue[0][1] < priority
+
     def task_done(self) -> None:
         super().task_done()
         with self._boundary_lock:

@@ -7,7 +7,8 @@ import math
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from statistics import fmean, median
@@ -39,12 +40,14 @@ from ..models import (
     LearningObservation,
     LearningObservationStatus,
     MarketIntegrityState,
+    Position,
     RiskMode,
     StatisticalModelFamily,
 )
 from ..paper.curve_math import quote_buy, quote_sell
 from ..season_strategy import champion_codename as _challenger_codename
 from ..strategy import BASELINE_VERSION, LEARNABLE_BASELINE_VERSIONS
+from . import exit_context
 from .features import NATIVE_SOL_MINT, WRAPPED_SOL_MINT, TokenState
 from .nonlinear import (
     XGBOOST_IMPLEMENTATION_VERSION,
@@ -961,6 +964,21 @@ class LearningEngine:
         job.workspace._retrain_if_ready(target_mode=job.key[0], target_configuration=job.key[1])
         job.phase_seconds["fit_seconds"] = time.monotonic() - started
 
+    def training_job_stale(self, job: TrainingJob, runtime_context: tuple[Any, ...]) -> bool:
+        """The same validity fence applies before and after a deferred publication."""
+        return bool(
+            job.authority_context != self._training_authority_context()
+            or job.runtime_context != runtime_context
+            or time.monotonic() - job.started_monotonic > 120
+        )
+
+    def release_unpublished_training_job(self, job: TrainingJob) -> None:
+        """Release a cancelled owner's private workspace without losing its pending request."""
+        with self._training_request_lock:
+            if self._training_active == job.key:
+                self._training_requests.setdefault(job.key, job.requested_at)
+                self._training_active = None
+
     def finish_training_job(
         self,
         job: TrainingJob,
@@ -973,11 +991,7 @@ class LearningEngine:
         try:
             if error is not None:
                 raise error
-            if (
-                job.authority_context != self._training_authority_context()
-                or job.runtime_context != runtime_context
-                or time.monotonic() - job.started_monotonic > 120
-            ):
+            if self.training_job_stale(job, runtime_context):
                 self._training_discarded += 1
                 self.request_current_training()
                 return False
@@ -1689,17 +1703,18 @@ class LearningEngine:
             return
         # Forward health and suspension are inexpensive safety controls and remain on the
         # outcome boundary. Only coefficient fitting/publishing moves off the event path.
-        self._govern_active_model()
-        self._advance_entry_tournaments()
-        for target_mode, target_configuration in sorted(
-            cohorts,
-            key=lambda item: (item[0].value, item[1] or ""),
-        ):
-            self.request_retraining(
-                target_mode=target_mode,
-                target_configuration=target_configuration,
-            )
-        self._govern_skill_ensemble()
+        with self._policy_selection_scope():
+            self._govern_active_model()
+            self._advance_entry_tournaments()
+            for target_mode, target_configuration in sorted(
+                cohorts,
+                key=lambda item: (item[0].value, item[1] or ""),
+            ):
+                self.request_retraining(
+                    target_mode=target_mode,
+                    target_configuration=target_configuration,
+                )
+            self._govern_skill_ensemble()
 
     def _observe_size_checkpoint(
         self,
@@ -2104,6 +2119,10 @@ class LearningEngine:
                 or artifact.configuration_fingerprint != decision.configuration_fingerprint
                 or artifact.baseline_version != decision.model_version.split("+", maxsplit=1)[0]
                 or not artifact.qualified
+                or (
+                    artifact.skill == ChallengerSkill.EXIT
+                    and not _exit_artifact_available(artifact)
+                )
             ):
                 continue
             prediction = self._predict_artifact(artifact, features)
@@ -2286,10 +2305,17 @@ class LearningEngine:
     def status(self, *, demo_mode: bool) -> dict[str, Any]:
         # The orchestrator holds its market boundary for this read-only response. Reuse only
         # Policy selection within this thread/response; never cache health or qualification.
+        with self._policy_selection_scope():
+            return self._status(demo_mode=demo_mode)
+
+    @contextmanager
+    def _policy_selection_scope(self) -> Iterator[None]:
+        # Rows and identities stay fixed during one synchronous market-boundary pass.
+        # Reuse only population selection, never authority, receipts or health conclusions.
         previous = getattr(self._status_policy_cache, "rows", None)
         self._status_policy_cache.rows = {}
         try:
-            return self._status(demo_mode=demo_mode)
+            yield
         finally:
             self._status_policy_cache.rows = previous
 
@@ -2837,14 +2863,25 @@ class LearningEngine:
             "availability_fraction": recovery.get("availability_fraction", 0.0),
             "window_size": ACTIVE_HEALTH_WINDOW,
             "restored_at": recovery.get("restored_at"),
+            # Report recorded terminal checks only; never recompute proof from later markets.
+            "failed_checks": recovery.get("failed_checks"),
         }
 
     def _champion_event_view(
         self,
         event: ChallengerChampionEvent,
         generation: int | None,
+        retained_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         def metadata(version: str | None) -> dict[str, Any]:
+            if retained_metadata is not None:
+                if (version or "") not in retained_metadata:
+                    archived = self.database.archived_challenger_artifact(version)
+                    retained_metadata[version or ""] = {
+                        **(archived or {}),
+                        "payload_state": "archived" if archived else "missing",
+                    }
+                return retained_metadata[version or ""]
             artifact = self.skill_artifacts.get(version or "")
             if artifact is not None:
                 return {**artifact.model_dump(mode="json"), "payload_state": "retained"}
@@ -2898,25 +2935,45 @@ class LearningEngine:
             "resolution": resolution,
         }
 
-    def champion_journey_page(
-        self,
-        *,
-        limit: int,
-        cursor: str | None = None,
-    ) -> dict[str, Any]:
-        """Page immutable battle history without shipping an unbounded dashboard payload."""
-
-        cohort = _challenger_cohort_key(
+    def champion_journey_cohort(self) -> str | None:
+        return _challenger_cohort_key(
             self.current_risk_mode,
             self.configuration_fingerprint(),
             self.baseline_version(),
             FEATURE_SCHEMA_VERSION,
         )
+
+    def champion_journey_metadata(self) -> dict[str, dict[str, Any]]:
+        """Copy display scalars under the caller's market boundary, never model payloads."""
+        return {
+            version: {
+                "model_family": artifact.model_family.value,
+                "recipe_version": artifact.recipe_version,
+                "payload_state": "retained",
+            }
+            for version, artifact in self.skill_artifacts.items()
+        }
+
+    def champion_journey_page(
+        self,
+        *,
+        limit: int,
+        cursor: str | None = None,
+        cohort: str | None = None,
+        retained_metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Page immutable battle history without shipping an unbounded dashboard payload."""
+
+        # Supplying captured metadata also freezes an absent cohort. Never recalculate
+        # mutable configuration in the off-thread reader, even when it was unavailable.
+        if cohort is None and retained_metadata is None:
+            cohort = self.champion_journey_cohort()
         page = self.database.champion_events_page(cohort, limit=min(50, limit), cursor=cursor)
         return {
             **page,
             "events": [
-                self._champion_event_view(event, generation) for event, generation in page["events"]
+                self._champion_event_view(event, generation, retained_metadata)
+                for event, generation in page["events"]
             ],
         }
 
@@ -3237,10 +3294,7 @@ class LearningEngine:
             )
         return rows
 
-    def recommended_hold_seconds(self, mode: RiskMode) -> int:
-        """Apply timing only after its own chronological validation and active opt-in."""
-
-        limits = RISK_LIMITS[mode]
+    def _active_exit_artifact(self, mode: RiskMode) -> ChallengerSkillArtifact | None:
         exit_version = self.active_skill_versions.get(ChallengerSkill.EXIT.value)
         exit_artifact = self.skill_artifacts.get(exit_version or "")
         exit_state = self._current_skill_state(ChallengerSkill.EXIT)
@@ -3252,6 +3306,8 @@ class LearningEngine:
             and exit_artifact.risk_mode == mode
             and exit_artifact.configuration_fingerprint == self.configuration_fingerprint()
             and exit_artifact.baseline_version == self.baseline_version()
+            and exit_artifact.feature_schema_version == FEATURE_SCHEMA_VERSION
+            and _exit_artifact_available(exit_artifact)
             and exit_state is not None
             and exit_state.active_version == exit_artifact.version
             and exit_state.champion_version == exit_artifact.version
@@ -3260,10 +3316,112 @@ class LearningEngine:
                 self.active_skill_versions.get(key) == value
                 for key, value in exit_state.active_dependencies.items()
             )
+            and (
+                not exit_context.is_contextual(exit_artifact)
+                or (
+                    self.consent_granted
+                    and self._valid_activation_proof(
+                        exit_state, exit_artifact, self._recovery_dependencies(ChallengerSkill.EXIT)
+                    )
+                )
+            )
         ):
+            return exit_artifact
+        return None
+
+    def freeze_exit_timing_plan(self, decision: Decision) -> dict[str, Any] | None:
+        """Select once, before order latency. Existing positions never acquire invented context."""
+        artifact = self._active_exit_artifact(decision.risk_mode)
+        state = self._current_skill_state(ChallengerSkill.EXIT)
+        if (
+            artifact is None
+            or not exit_context.is_contextual(artifact)
+            or state is None
+            or state.joined_at is None
+            or not self.consent_granted
+            or decision.action != DecisionAction.ENTER
+            or decision.created_at <= max(artifact.created_at, state.joined_at)
+            or decision.configuration_fingerprint != artifact.configuration_fingerprint
+            or decision.model_version.split("+", maxsplit=1)[0] != artifact.baseline_version
+        ):
+            return None
+        features = _feature_vector(decision)
+        policy = exit_context.load_policy(artifact)
+        if features is None or policy is None:
+            return None
+        selected, supported = policy.select(features)
+        if not supported:
+            return None
+        return exit_context.ExitTimingPlan(
+            decision_id=decision.decision_id,
+            artifact_version=artifact.version,
+            payload_digest=artifact.payload_digest or "",
+            selected_horizon_seconds=selected,
+            created_at=decision.created_at,
+            risk_mode=decision.risk_mode,
+            configuration_fingerprint=artifact.configuration_fingerprint,
+            baseline_version=artifact.baseline_version,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            joined_at=state.joined_at.isoformat(),
+            dependencies=dict(state.active_dependencies),
+            dependency_epochs=self._recovery_dependency_epochs(ChallengerSkill.EXIT),
+            features={name: features[name] for name in exit_context.FEATURES},
+        ).model_dump(mode="json")
+
+    def recommended_hold_seconds(self, mode: RiskMode, position: Position | None = None) -> int:
+        """Apply qualified timing; contextual authority requires an entry-frozen receipt."""
+        return self._hold_seconds_for_artifact(mode, position, self._active_exit_artifact(mode))
+
+    def exit_timing_selection(
+        self, mode: RiskMode, position: Position | None = None
+    ) -> tuple[int, dict[str, str] | None]:
+        """Select timing and its attribution in one synchronous authority check, never a cache."""
+        artifact = self._active_exit_artifact(mode)
+        seconds = self._hold_seconds_for_artifact(mode, position, artifact)
+        participant = self._exit_participant_for_selection(mode, seconds, artifact, seconds)
+        return seconds, participant
+
+    def _hold_seconds_for_artifact(
+        self,
+        mode: RiskMode,
+        position: Position | None,
+        exit_artifact: ChallengerSkillArtifact | None,
+    ) -> int:
+        limits = RISK_LIMITS[mode]
+        if exit_artifact is not None:
+            if exit_context.is_contextual(exit_artifact):
+                plan = exit_context.read_plan(position.exit_timing_plan) if position else None
+                state = self._current_skill_state(ChallengerSkill.EXIT)
+                if (
+                    plan is not None
+                    and position is not None
+                    and self.consent_granted
+                    and state is not None
+                    and state.joined_at is not None
+                    and plan.artifact_version == exit_artifact.version
+                    and plan.payload_digest == exit_artifact.payload_digest
+                    and plan.risk_mode == mode == position.risk_mode_at_entry
+                    and plan.baseline_version
+                    == exit_artifact.baseline_version
+                    == position.baseline_version_at_entry
+                    and plan.configuration_fingerprint == exit_artifact.configuration_fingerprint
+                    and plan.feature_schema_version == FEATURE_SCHEMA_VERSION
+                    and plan.joined_at == state.joined_at.isoformat()
+                    and plan.dependencies == state.active_dependencies
+                    and plan.dependency_epochs
+                    == self._recovery_dependency_epochs(ChallengerSkill.EXIT)
+                    and max(exit_artifact.created_at, state.joined_at)
+                    < plan.created_at
+                    <= position.opened_at
+                ):
+                    return plan.selected_horizon_seconds
+                return limits.max_hold_seconds
             selected = _bounded_exit_horizon(exit_artifact)
             if selected is not None:
                 return selected
+        retained_exit = self.skill_artifacts.get(self.active_skill_versions.get("exit", ""))
+        if retained_exit is not None and exit_context.is_contextual(retained_exit):
+            return limits.max_hold_seconds
         if (
             self.mode != LearningMode.ACTIVE
             or self.active_model is None
@@ -3282,7 +3440,7 @@ class LearningEngine:
         )
 
     def exit_timing_participant(
-        self, mode: RiskMode, selected_seconds: int
+        self, mode: RiskMode, selected_seconds: int, position: Position | None = None
     ) -> dict[str, str] | None:
         """Describe an already selected timing policy without changing its qualification."""
         if (
@@ -3290,15 +3448,39 @@ class LearningEngine:
             or selected_seconds >= RISK_LIMITS[mode].max_hold_seconds
         ):
             return None
-        version = self.active_skill_versions.get(ChallengerSkill.EXIT.value)
-        artifact = self.skill_artifacts.get(version or "")
+        artifact = self._active_exit_artifact(mode)
+        contextual_seconds = (
+            self._hold_seconds_for_artifact(mode, position, artifact)
+            if artifact is not None and exit_context.is_contextual(artifact)
+            else selected_seconds
+        )
+        return self._exit_participant_for_selection(
+            mode, selected_seconds, artifact, contextual_seconds
+        )
+
+    def _exit_participant_for_selection(
+        self,
+        mode: RiskMode,
+        selected_seconds: int,
+        artifact: ChallengerSkillArtifact | None,
+        contextual_seconds: int,
+    ) -> dict[str, str] | None:
+        if (
+            self.mode != LearningMode.ACTIVE
+            or selected_seconds >= RISK_LIMITS[mode].max_hold_seconds
+        ):
+            return None
         if (
             artifact is not None
             and artifact.qualified
             and artifact.skill == ChallengerSkill.EXIT
             and artifact.risk_mode == mode
             and artifact.configuration_fingerprint == self.configuration_fingerprint()
-            and artifact.parameters.get("selected_horizon_seconds") == selected_seconds
+            and (
+                contextual_seconds == selected_seconds
+                if exit_context.is_contextual(artifact)
+                else artifact.parameters.get("selected_horizon_seconds") == selected_seconds
+            )
         ):
             return {"kind": "champion", "skill": "exit", "version": artifact.version}
         if self.active_model is not None:
@@ -3623,16 +3805,43 @@ class LearningEngine:
                 ):
                     continue
                 if skill == ChallengerSkill.EXIT:
-                    selected_horizon = _bounded_exit_horizon(artifact)
+                    contextual = exit_context.is_contextual(artifact)
+                    policy = exit_context.load_policy(artifact) if contextual else None
+                    if contextual and (
+                        policy is None or observation.created_at <= artifact.created_at
+                    ):
+                        continue
+                    if contextual and (
+                        artifact.risk_mode != observation.risk_mode
+                        or artifact.configuration_fingerprint
+                        != observation.configuration_fingerprint
+                        or artifact.baseline_version != observation.baseline_version
+                        or artifact.feature_schema_version != observation.feature_schema_version
+                    ):
+                        continue
+                    selected_horizon, supported = (
+                        policy.select(observation.features)
+                        if policy is not None
+                        else (_bounded_exit_horizon(artifact), True)
+                    )
                     if selected_horizon is None:
                         continue
                     observation.challenger_evaluations[version] = ChallengerEvaluationReceipt(
                         artifact_version=version,
                         skill=skill,
                         evaluated_at=observation.created_at,
-                        in_distribution=True,
+                        in_distribution=supported,
                         proposed_action=str(selected_horizon),
                         baseline_actionable=observation.baseline_actionable,
+                        parameters={
+                            "timing_contract": exit_context.RECIPE,
+                            "payload_digest": artifact.payload_digest,
+                            # A contender's battle cannot become its own activation proof,
+                            # including when the previous Champion had no active influence.
+                            "champion_version_at_evaluation": state.champion_version,
+                        }
+                        if contextual
+                        else {},
                     )
                     continue
                 prediction = self._predict_artifact(artifact, observation.features)
@@ -4463,6 +4672,120 @@ class LearningEngine:
             qualification_reasons=[] if qualified else ["exit_proof_gates_not_met"],
         )
         self._register_skill_artifact(artifact, cohort_key)
+        self._publish_contextual_exit(artifact, cohort_key, training, validation)
+
+    def _publish_contextual_exit(
+        self,
+        reference: ChallengerSkillArtifact,
+        cohort_key: str,
+        training: list[LearningEvidenceEpisode],
+        validation: list[LearningEvidenceEpisode],
+    ) -> None:
+        """One predeclared small family, compared on the fixed selector's exact cohort.
+
+        Unknown markets may not train a return regression, but remain in the validation
+        denominator. No validation outcome chooses features, ridge strength or horizons.
+        """
+        baseline = RISK_LIMITS[reference.risk_mode].max_hold_seconds
+        horizons = tuple(h for h in LEARNING_HORIZONS_SECONDS if h <= baseline)
+        models: dict[str, Any] = {}
+        for horizon in horizons:
+            rows: list[tuple[LearningObservation | LearningEvidenceEpisode, float]] = [
+                (row, value)
+                for row in training
+                if all(
+                    name in row.features and math.isfinite(row.features[name])
+                    for name in exit_context.FEATURES
+                )
+                and (value := row.checkpoints[str(horizon)].net_return) is not None
+            ]
+            if len(rows) < MINIMUM_FIT_SAMPLES:
+                return
+            parts = _fit(rows, feature_names=exit_context.FEATURES)
+            if parts is None:
+                return
+            models[str(horizon)] = dict(
+                zip(("means", "scales", "coefficients"), parts, strict=True)
+            )
+        parameters = {"baseline_horizon_seconds": baseline, "models": models}
+        artifact = reference.model_copy(
+            update={
+                "version": reference.version + "-context",
+                "created_at": datetime.now(UTC),
+                "model_family": StatisticalModelFamily.LINEAR,
+                "implementation_version": exit_context.IMPLEMENTATION,
+                "recipe_version": exit_context.RECIPE,
+                "feature_names": list(exit_context.FEATURES),
+                "parameters": parameters,
+                "payload_digest": _stable_digest(parameters),
+                "hyperparameters": {
+                    "ridge": 2.0,
+                    "target_min": -1.0,
+                    "target_max": 3.0,
+                    "minimum_predicted_edge": exit_context.MINIMUM_PREDICTED_EDGE,
+                },
+                "qualified": False,
+            }
+        )
+        policy = exit_context.load_policy(artifact)
+        if policy is None:
+            return
+        reference_horizon = int(reference.parameters["selected_horizon_seconds"])
+        deltas: list[float] = []
+        reference_deltas: list[float] = []
+        supported = changed = 0
+        for row in validation:
+            selected, in_support = policy.select(row.features)
+            supported += in_support
+            changed += selected != baseline
+            actual = row.checkpoints[str(selected)].net_return
+            original = row.checkpoints[str(baseline)].net_return
+            fixed = row.checkpoints[str(reference_horizon)].net_return
+            if actual is not None and original is not None:
+                deltas.append(actual - original)
+            if actual is not None and fixed is not None:
+                reference_deltas.append(actual - fixed)
+        training_deltas = []
+        for row in training:
+            selected, _ = policy.select(row.features)
+            actual = row.checkpoints[str(selected)].net_return
+            original = row.checkpoints[str(baseline)].net_return
+            if actual is not None and original is not None:
+                training_deltas.append(actual - original)
+        availability = len(deltas) / len(validation)
+        reference_availability = len(reference_deltas) / len(validation)
+        lower = _mean_lower_bound(deltas, z_score=HOLD_TIMING_Z_SCORE)
+        reference_lower = _mean_lower_bound(reference_deltas, z_score=HOLD_TIMING_Z_SCORE)
+        familiar = supported / len(validation)
+        harm = sum(delta < 0 for delta in deltas) / len(deltas) if deltas else 1.0
+        checks = {
+            "contextual_training_value": bool(training_deltas)
+            and fmean(training_deltas) >= HOLD_TIMING_MINIMUM_UPLIFT,
+            "contextual_usable_outcomes": len(deltas) >= MINIMUM_VALIDATION_SAMPLES,
+            "contextual_coverage": availability >= HOLD_TIMING_MINIMUM_AVAILABILITY,
+            "contextual_advantage": lower is not None and lower >= HOLD_TIMING_MINIMUM_UPLIFT,
+            "contextual_reference_coverage": reference_availability
+            >= HOLD_TIMING_MINIMUM_AVAILABILITY,
+            "contextual_reference_advantage": reference_lower is not None
+            and reference_lower >= HOLD_TIMING_MINIMUM_UPLIFT,
+            "contextual_familiar_evidence": familiar >= 0.90,
+            "contextual_changed_cases": changed >= 5,
+            "contextual_harm": harm <= SIZING_MAXIMUM_HARM_FRACTION,
+        }
+        artifact.metrics = {
+            "validation_availability_fraction": availability,
+            "validation_uplift_lower_bound": lower,
+            "reference_availability_fraction": reference_availability,
+            "reference_uplift_lower_bound": reference_lower,
+            "in_distribution_fraction": familiar,
+            "policy_changes": changed,
+            "harm_fraction": harm,
+            "usable_validation_count": len(deltas),
+            "selected_training_uplift": fmean(training_deltas) if training_deltas else None,
+        }
+        artifact.qualified = all(checks.values())
+        artifact.qualification_reasons = [name for name, passed in checks.items() if not passed]
+        self._register_skill_artifact(artifact, cohort_key)
 
     def _register_skill_artifact(
         self,
@@ -4590,6 +4913,10 @@ class LearningEngine:
             if version in self.skill_artifacts
             and self.skill_artifacts[version].qualified
             and (
+                state.skill != ChallengerSkill.EXIT
+                or _exit_artifact_available(self.skill_artifacts[version])
+            )
+            and (
                 self.skill_artifacts[version].model_family != StatisticalModelFamily.XGBOOST
                 or self._load_nonlinear_artifact(self.skill_artifacts[version]) is not None
             )
@@ -4652,9 +4979,16 @@ class LearningEngine:
             return
         if state.champion_version is not None:
             champion = self.skill_artifacts.get(state.champion_version)
-            if champion is None or (
-                champion.model_family == StatisticalModelFamily.XGBOOST
-                and self._load_nonlinear_artifact(champion) is None
+            if (
+                champion is None
+                or (
+                    champion.skill == ChallengerSkill.EXIT
+                    and not _exit_artifact_available(champion)
+                )
+                or (
+                    champion.model_family == StatisticalModelFamily.XGBOOST
+                    and self._load_nonlinear_artifact(champion) is None
+                )
             ):
                 state.suspended_version = state.champion_version
                 state.suspension_reason = "tournament_artifact_unavailable"
@@ -4893,6 +5227,7 @@ class LearningEngine:
             champion = self.skill_artifacts.get(champion_version or "")
             candidate_available = bool(
                 candidate is not None
+                and (candidate.skill != ChallengerSkill.EXIT or _exit_artifact_available(candidate))
                 and (
                     candidate.model_family != StatisticalModelFamily.XGBOOST
                     or self._load_nonlinear_artifact(candidate) is not None
@@ -4900,6 +5235,7 @@ class LearningEngine:
             )
             champion_available = bool(
                 champion is not None
+                and (champion.skill != ChallengerSkill.EXIT or _exit_artifact_available(champion))
                 and (
                     champion.model_family != StatisticalModelFamily.XGBOOST
                     or self._load_nonlinear_artifact(champion) is not None
@@ -5162,6 +5498,7 @@ class LearningEngine:
             state is None
             or state.champion_version != artifact.version
             or not artifact.qualified
+            or (artifact.skill == ChallengerSkill.EXIT and not _exit_artifact_available(artifact))
             or (
                 artifact.model_family == StatisticalModelFamily.XGBOOST
                 and self._load_nonlinear_artifact(artifact) is None
@@ -5172,7 +5509,8 @@ class LearningEngine:
             raise ValueError("challenger skill champion is not eligible for activation")
         activation_proof: dict[str, Any] = recovery_proof
         is_coach = artifact.schema_version == "challenger-skill-coach-v1"
-        if self.auto_participation or is_coach:
+        independent = self.auto_participation or is_coach or exit_context.is_contextual(artifact)
+        if independent:
             if (
                 artifact.skill == ChallengerSkill.ENTRY
                 and self._skill_activation_candidate(recovering=recovering) != artifact
@@ -5222,11 +5560,15 @@ class LearningEngine:
         state.activation_proof = (
             {
                 **activation_proof,
-                "policy": "coach-independent-v2" if is_coach else "independent-v1",
+                "policy": "coach-independent-v2"
+                if is_coach
+                else exit_context.ACTIVATION_POLICY
+                if exit_context.is_contextual(artifact)
+                else "independent-v1",
                 "artifact_version": artifact.version,
                 "dependencies": dict(state.active_dependencies),
             }
-            if self.auto_participation or is_coach
+            if independent
             else {}
         )
         state.joined_at = now
@@ -5286,10 +5628,7 @@ class LearningEngine:
             and artifact.configuration_fingerprint == self.configuration_fingerprint()
             and artifact.baseline_version == self.baseline_version()
             and artifact.feature_schema_version == FEATURE_SCHEMA_VERSION
-            and (
-                artifact.skill != ChallengerSkill.EXIT
-                or _bounded_exit_horizon(artifact) is not None
-            )
+            and (artifact.skill != ChallengerSkill.EXIT or _exit_artifact_available(artifact))
             and (
                 artifact.model_family != StatisticalModelFamily.XGBOOST
                 or self._load_nonlinear_artifact(artifact) is not None
@@ -5478,10 +5817,7 @@ class LearningEngine:
             horizons: set[int | None] = (
                 {PRIMARY_HORIZON_SECONDS}
                 if state.skill != ChallengerSkill.EXIT
-                else {
-                    _bounded_exit_horizon(artifact),
-                    RISK_LIMITS[state.risk_mode].max_hold_seconds,
-                }
+                else _exit_resolution_horizons(artifact)
             )
             resolved = bool(
                 episode
@@ -5533,6 +5869,23 @@ class LearningEngine:
             "mean_uplift": fmean(deltas) if deltas else None,
             "harm_count": harm,
             "harm_fraction": harm / len(deltas) if deltas else 0.0,
+            "failed_checks": (
+                [
+                    name
+                    for name, passed in (
+                        ("usable_outcomes", len(deltas) >= TOURNAMENT_MINIMUM_COMMON_OUTCOMES),
+                        ("coverage", availability >= TOURNAMENT_MINIMUM_AVAILABILITY),
+                        ("advantage", lower is not None and lower > 0),
+                        (
+                            "harm",
+                            bool(deltas) and harm / len(deltas) <= SIZING_MAXIMUM_HARM_FRACTION,
+                        ),
+                    )
+                    if not passed
+                ]
+                if complete
+                else None
+            ),
         }
         recovery.update(proof)
         if complete:
@@ -5554,7 +5907,11 @@ class LearningEngine:
             or self.active_skill_versions.get(artifact.skill.value) != previous_version
         ):
             return
-        if self.auto_participation or artifact.schema_version == "challenger-skill-coach-v1":
+        if (
+            self.auto_participation
+            or artifact.schema_version == "challenger-skill-coach-v1"
+            or exit_context.is_contextual(artifact)
+        ):
             # A tournament crown is not a join receipt. Stop the old authority; the new
             # champion must pass its own Baseline/composition proof on the next boundary.
             self._suspend_skill(artifact.skill, "champion_replaced")
@@ -5617,6 +5974,10 @@ class LearningEngine:
                 artifact is None
                 or state is None
                 or not artifact.qualified
+                or (
+                    artifact.skill == ChallengerSkill.EXIT
+                    and not _exit_artifact_available(artifact)
+                )
                 or artifact.skill != skill
                 or artifact.version != state.champion_version
                 or (
@@ -5633,6 +5994,7 @@ class LearningEngine:
                     (
                         self.auto_participation
                         or artifact.schema_version == "challenger-skill-coach-v1"
+                        or exit_context.is_contextual(artifact)
                     )
                     and not self._valid_activation_proof(state, artifact, restored)
                 )
@@ -5677,12 +6039,22 @@ class LearningEngine:
             if upstream.value in self.active_skill_versions
         }
         independent = self.auto_participation or bool(
-            artifact and artifact.schema_version == "challenger-skill-coach-v1"
+            artifact
+            and (
+                artifact.schema_version == "challenger-skill-coach-v1"
+                or exit_context.is_contextual(artifact)
+            )
         )
         state = self._current_skill_state(skill) if independent else None
-        if artifact is None or (
-            independent
-            and (state is None or not self._valid_activation_proof(state, artifact, dependencies))
+        if (
+            artifact is None
+            or (skill == ChallengerSkill.EXIT and not _exit_artifact_available(artifact))
+            or (
+                independent
+                and (
+                    state is None or not self._valid_activation_proof(state, artifact, dependencies)
+                )
+            )
         ):
             return {
                 "state": "suspended",
@@ -5743,10 +6115,7 @@ class LearningEngine:
                 resolved = _skill_receipt_outcome_resolved(observation, receipt)
             else:
                 horizons = (
-                    {
-                        _bounded_exit_horizon(artifact),
-                        RISK_LIMITS[observation.risk_mode].max_hold_seconds,
-                    }
+                    _exit_resolution_horizons(artifact)
                     if skill == ChallengerSkill.EXIT
                     else {PRIMARY_HORIZON_SECONDS}
                 )
@@ -5835,7 +6204,7 @@ class LearningEngine:
         independent: bool = False,
     ) -> dict[str, Any]:
         is_coach = artifact.schema_version == "challenger-skill-coach-v1"
-        independent = independent or is_coach
+        independent = independent or is_coach or exit_context.is_contextual(artifact)
         order = (
             ChallengerSkill.ENTRY,
             ChallengerSkill.MANIPULATION,
@@ -5897,6 +6266,13 @@ class LearningEngine:
                 or observation.baseline_action != DecisionAction.ENTER
                 or not observation.baseline_actionable
                 or artifact.version not in observation.challenger_evaluations
+                or (
+                    exit_context.is_contextual(artifact)
+                    and observation.challenger_evaluations[artifact.version].parameters.get(
+                        "champion_version_at_evaluation"
+                    )
+                    != artifact.version
+                )
                 or any(
                     observation.active_skill_versions.get(skill) != version
                     for skill, version in dependencies.items()
@@ -6035,6 +6411,10 @@ class LearningEngine:
                 state is None
                 or artifact is None
                 or not artifact.qualified
+                or (
+                    artifact.skill == ChallengerSkill.EXIT
+                    and not _exit_artifact_available(artifact)
+                )
                 or state.suspended_version == artifact.version
             ):
                 continue
@@ -6055,7 +6435,14 @@ class LearningEngine:
         proof = state.activation_proof
         is_coach = artifact.schema_version == "challenger-skill-coach-v1"
         if (
-            proof.get("policy") != ("coach-independent-v2" if is_coach else "independent-v1")
+            proof.get("policy")
+            != (
+                "coach-independent-v2"
+                if is_coach
+                else exit_context.ACTIVATION_POLICY
+                if exit_context.is_contextual(artifact)
+                else "independent-v1"
+            )
             or state.active_version != artifact.version
             or proof.get("artifact_version") != artifact.version
             or proof.get("dependencies") != dependencies
@@ -6127,6 +6514,10 @@ class LearningEngine:
                 or state is None
                 or state.champion_version != version
                 or not artifact.qualified
+                or (
+                    artifact.skill == ChallengerSkill.EXIT
+                    and not _exit_artifact_available(artifact)
+                )
                 or state.suspended_version == version
                 or not self._valid_activation_proof(state, artifact, dependencies)
                 or (
@@ -6167,13 +6558,16 @@ class LearningEngine:
                 state is None
                 or artifact is None
                 or not artifact.qualified
+                or (
+                    artifact.skill == ChallengerSkill.EXIT
+                    and not _exit_artifact_available(artifact)
+                )
                 or state.suspended_version == artifact.version
                 or artifact.skill != skill
                 or artifact.risk_mode != self.current_risk_mode
                 or artifact.configuration_fingerprint != self.configuration_fingerprint()
                 or artifact.baseline_version != self.baseline_version()
                 or artifact.feature_schema_version != FEATURE_SCHEMA_VERSION
-                or (skill == ChallengerSkill.EXIT and _bounded_exit_horizon(artifact) is None)
                 or (
                     artifact.model_family == StatisticalModelFamily.XGBOOST
                     and self._load_nonlinear_artifact(artifact) is None
@@ -7032,6 +7426,24 @@ def _skill_baseline_value(
     return None if checkpoint is None else checkpoint.net_return
 
 
+def _exit_artifact_available(artifact: ChallengerSkillArtifact) -> bool:
+    return (
+        exit_context.load_policy(artifact) is not None
+        if exit_context.is_contextual(artifact)
+        else _bounded_exit_horizon(artifact) is not None
+    )
+
+
+def _exit_resolution_horizons(artifact: ChallengerSkillArtifact) -> set[int | None]:
+    baseline = RISK_LIMITS[artifact.risk_mode].max_hold_seconds
+    # Without a frozen receipt, wait for the entire possible window; then count unavailable.
+    return (
+        {h for h in LEARNING_HORIZONS_SECONDS if h <= baseline}
+        if exit_context.is_contextual(artifact)
+        else {_bounded_exit_horizon(artifact), baseline}
+    )
+
+
 def _bounded_exit_horizon(artifact: ChallengerSkillArtifact) -> int | None:
     value = artifact.parameters.get("selected_horizon_seconds")
     return (
@@ -7068,7 +7480,7 @@ def _participation_values(
     if not receipt.baseline_actionable or receipt.evaluated_at != observation.created_at:
         return None, None
     baseline = _skill_baseline_value(observation, receipt.skill)
-    if not receipt.in_distribution:
+    if not receipt.in_distribution and receipt.skill != ChallengerSkill.EXIT:
         return baseline, baseline
     if receipt.skill == ChallengerSkill.SIZING:
         selected = _bounded_sizing_multiplier(receipt)
@@ -7088,7 +7500,11 @@ def _participation_values(
         if multiplier is None:
             return None, None
         try:
-            horizon = int(receipt.proposed_action)
+            horizon = (
+                int(receipt.proposed_action)
+                if receipt.in_distribution
+                else RISK_LIMITS[observation.risk_mode].max_hold_seconds
+            )
         except ValueError:
             return None, None
         if multiplier not in SIZING_MULTIPLIERS:
@@ -7099,7 +7515,10 @@ def _participation_values(
                 observation, multiplier, horizon=RISK_LIMITS[observation.risk_mode].max_hold_seconds
             ),
         )
-    return _tournament_policy_value(observation, receipt), baseline
+    return (
+        _tournament_policy_value(observation, receipt) if receipt.in_distribution else baseline,
+        baseline,
+    )
 
 
 def _challenger_cohort_key(
@@ -7671,6 +8090,16 @@ def _skill_qualification_gates(
             ),
         )
     gates: list[dict[str, Any]] = []
+    if skill == ChallengerSkill.EXIT and exit_context.is_contextual(artifact):
+        specifications += (
+            ("selected_training_uplift", "Training timing value", 0.01, ">=", "fraction"),
+            ("usable_validation_count", "Usable validation outcomes", 20, ">=", "count"),
+            ("reference_availability_fraction", "Fixed-reference coverage", 0.70, ">=", "fraction"),
+            ("reference_uplift_lower_bound", "Advantage over fixed timing", 0.01, ">=", "fraction"),
+            ("in_distribution_fraction", "Familiar entry context", 0.90, ">=", "fraction"),
+            ("policy_changes", "Earlier reviews tested", 5, ">=", "count"),
+            ("harm_fraction", "Harm rate", 0.35, "<=", "fraction"),
+        )
     for gate_id, label, target, comparison, unit in specifications:
         current = number(gate_id)
         passed = bool(

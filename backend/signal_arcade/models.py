@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    model_validator,
+)
 
 
 def utc_now() -> datetime:
@@ -839,6 +847,12 @@ RISK_LIMITS: dict[RiskMode, RiskLimits] = {
 }
 
 
+ExitTimingPlanRecord = Annotated[
+    dict[str, Any] | None,
+    BeforeValidator(lambda value: value if isinstance(value, dict) else None),
+]
+
+
 class PaperOrder(BaseModel):
     order_id: str
     decision_id: str | None = None
@@ -858,6 +872,8 @@ class PaperOrder(BaseModel):
     # Added after V1 launch; None keeps older pending-order records loadable.
     risk_mode_at_entry: RiskMode | None = None
     baseline_version_at_entry: str = "baseline-v1.1"
+    # Validate on use, so a damaged optional timing receipt cannot hide a held position.
+    exit_timing_plan: ExitTimingPlanRecord = None
 
 
 class ExecutionReserveSnapshot(BaseModel):
@@ -959,6 +975,7 @@ class Position(BaseModel):
     # migrate through defaults without a destructive schema rewrite.
     risk_mode_at_entry: RiskMode | None = None
     baseline_version_at_entry: str = "baseline-v1.1"
+    exit_timing_plan: ExitTimingPlanRecord = None
     peak_mark_lamports: int = Field(default=0, ge=0)
     peak_marked_at: datetime | None = None
     exit_assessment: ExitAssessment | None = None

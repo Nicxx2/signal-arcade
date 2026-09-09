@@ -313,6 +313,50 @@ blanket authority:
   the normal review, but never extend it or bypass stop loss, structural exits, trailing protection
   or the absolute hold ceiling.
 
+### Contextual Exit timing (v1.10.9)
+
+The existing deterministic fixed-horizon selector remains the simple reference. One additional
+Linear family (`exit-context-v1`) fits small ridge models for the allowed checkpoints at or before
+the risk profile's normal review: 60, 300, 600, 900 and 1,200 seconds where applicable. It uses ten
+existing original-entry features, fixed regularisation and the existing clipped training targets
+and recency weights. There is no new provider request, feature search or hyperparameter search.
+
+Both families use the same newest-at-most-1,000 Policy rows and chronological split. All training
+checkpoint timestamps must precede the held-out boundary. Missing returns cannot train a model,
+but resolved unavailable outcomes stay in the validation denominator. Each horizon needs at
+least 40 usable training rows. The contextual family requires at least 20 usable validation rows,
+70% paired coverage, a conservative advantage of at least one percentage point over both Baseline
+and the fixed selector, at least 90% familiar entry contexts, five earlier-review choices and the
+existing 35% harm limit. An identical fixed choice cannot qualify merely by adding complexity.
+
+A qualified fit still needs the existing fresh battle and independent activation proof. Queued
+versions cannot borrow receipts collected before their battle. Original Policy receipts freeze
+the contextual choice and the reigning Champion's identity before outcomes exist. A contextual
+contender's battle rows cannot activate it after promotion, including when it replaced a suspended
+Champion. Activation needs observations frozen while it was already the Champion; unlabelled older
+review-build receipts do not establish that stage. Unavailable outcomes in the eligible post-crown
+population still reduce coverage. Upstream Entry
+and Manipulation vetoes and exact Sizing quotes remain part of the composition proof. A contextual
+Champion can face a later native or permitted Coach contender, be suspended, or earn recovery
+through the same one-shot 60-entry trial. No trial reset or automatic crown is introduced.
+
+When authorised, contextual timing is selected once from the actual entry decision and persisted
+with the pending order and resulting position. Delayed fills and restart retain this record.
+Every use checks current permission, Champion identity and digest, risk/configuration/Baseline,
+health and upstream activation epochs. It never reruns prediction on later market features.
+Missing or unfamiliar entry context, an old position without a plan, invalid payloads or revoked
+authority use Baseline normal-review timing. Recovery or a changed composition does not retrofit
+an old plan. These optional JSON fields leave schema 16 and existing bankroll/position data intact.
+
+Exit qualification and battle values compare fee-inclusive checkpoints; they do not replay the
+entire adaptive exit policy. Actual exits still respond to current evidence and hard safety rules.
+A better checkpoint comparison therefore does not establish a live P/L improvement. This small
+family adds bounded training cost in the existing private worker; it is not a burst-throughput fix.
+
+Champion Arena distinguishes suspended trade support from continuing shadow comparison. Learning
+Off or a different data source still pauses the live readout. Completed recovery details show
+recorded failed checks when available; older trials do not acquire invented explanations.
+
 Each artifact freezes its skill, feature schema, Baseline version, configuration fingerprint,
 risk personality, parameters, evidence interval and proof metrics. Sizing and Exit do not inherit
 Entry qualification; Manipulation does not inherit the broad model's score. This prevents one good
@@ -602,13 +646,14 @@ include season and configuration provenance and survive a paper-bankroll reset.
 
 ## Deliberately deferred research
 
-This generation adds only one fixed nonlinear Entry recipe. It does not add market-regime
+This generation keeps one fixed nonlinear Entry recipe and adds the small contextual Exit family
+described above. It does not add market-regime
 authority, hyperparameter search, calibrated return probabilities, reinforcement learning or a
 PASS-to-ENTER override. Discovery continues to save eligible PASS counterfactuals for future
-research, but no learned component can turn one into an entry. Any future family or contextual Exit
-contender must use the same point-in-time feature contract, chronological embargo, independent
+research, but no learned component can turn one into an entry. Any future family must use the
+same point-in-time feature contract, chronological embargo, independent
 policy journal, immutable payload validation and common-forward Champion process; added complexity
-must always be allowed to lose to the Linear contender.
+must always be allowed to lose to its simpler reference.
 
 ## Bankroll growth
 

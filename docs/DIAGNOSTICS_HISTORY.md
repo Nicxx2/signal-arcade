@@ -7,6 +7,13 @@ candidate and battle. Recovery does not represent a new crown. Individual Policy
 full recovery evidence window remain outside the diagnostics export; missing older lifecycle
 fields mean unavailable history, not that a skill was never suspended.
 
+From v1.10.9, newly finished recovery trials also retain their failed check names. Older trials
+remain unknown at that level of detail. Interval summaries cover up to all 12 supported
+skill/family combinations (nine currently emitted native/Coach combinations), so a new Exit
+family cannot hide Sizing. Contextual Exit summaries optionally include fixed-reference coverage
+and conservative uplift. These are checkpoint comparisons, not measured live P/L gains. The
+named optional fields stay readable by earlier schema-1 readers; all byte limits remain unchanged.
+
 Diagnostics supports later operational reviews and comparisons between builds. It is separate
 from the paper ledger, raw market history, learning observations and Champion proof. It is not a
 complete event replay and cannot establish that a model change caused better returns.

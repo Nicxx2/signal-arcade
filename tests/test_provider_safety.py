@@ -2540,7 +2540,7 @@ def test_heartbeat_uses_latest_reserve_clock_and_provenance_for_each_mint(
         observed.append((observed_at, source_event_id))
         return []
 
-    monkeypatch.setattr(orchestrator.broker, "process_due_orders", process_due_orders)
+    monkeypatch.setattr(orchestrator.broker, "reassess_and_process_due_orders", process_due_orders)
     orchestrator._heartbeat_tick(requested_at)  # noqa: SLF001
 
     assert observed == [(reserve_at, f"solana-rpc:22:{mint}")]

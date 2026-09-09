@@ -533,7 +533,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cursor: str | None = Query(default=None, min_length=1, max_length=180),
     ) -> dict[str, Any]:
         try:
-            return orchestrator.learning.champion_journey_page(limit=limit, cursor=cursor)
+            return await orchestrator.champion_journey_view(limit=limit, cursor=cursor)
+        except AdvisoryReadDeferred as exc:
+            raise HTTPException(
+                status_code=503, detail=str(exc), headers={"Retry-After": "1"}
+            ) from exc
         except ValueError as exc:
             # A personality/configuration change legitimately invalidates an old page cursor.
             # Ask the browser to restart from its new cohort instead of mixing histories.
@@ -583,7 +587,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/decisions/{decision_id}")
     async def decision(decision_id: str) -> dict[str, Any]:
-        saved = orchestrator.database.get_decision(decision_id)
+        try:
+            saved = await orchestrator.decision_view(decision_id)
+        except AdvisoryReadDeferred as exc:
+            raise HTTPException(
+                status_code=503, detail=str(exc), headers={"Retry-After": "1"}
+            ) from exc
         if saved is None:
             raise HTTPException(status_code=404, detail="decision not found")
         return saved.model_dump(mode="json")

@@ -73,7 +73,7 @@ export function battleReadout(view: ArenaView, stale: boolean) {
     detail = "This pair is no longer testing. A saved result is needed before showing a winner.";
   } else if (!checkpoint && view.paused) {
     title = "Comparison paused";
-    detail = "Learning must be running on this source and the skill must be eligible for the comparison to resume.";
+    detail = "Learning must be running and collecting from this source for the comparison to resume. Champion support is separately gated.";
   } else if (!plot) {
     title = "Building the comparison";
     detail = "Usable shared outcomes and a valid estimate are needed to show the average difference. Missing values stay unknown.";

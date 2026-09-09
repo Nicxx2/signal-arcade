@@ -10,6 +10,15 @@ afterEach(cleanup);
 const live = () => viewForSkill(snapshotFixture(), "entry")!;
 const recap = (kind: "promoted" | "defended" | "inconclusive" | "first_champion") => viewForEvent(snapshotFixture(), eventFixture(kind));
 
+test("suspended support retains current comparison progress", () => {
+  const snapshot = snapshotFixture();
+  Object.assign(snapshot.learning.skills![0]!, { state: "suspended", active_version: null });
+  render(<ArenaReadout view={viewForSkill(snapshot, "entry")!} stale={false} />);
+  expect(screen.queryByText("Comparison paused")).toBeNull();
+  expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuetext", "35 usable; minimum 30 met");
+  expect(document.querySelector(".ca-balance-marker")).not.toBeNull();
+});
+
 test("the screenshot's exact tie keeps the Champion without claiming an advantage", () => {
   const view = { ...recap("defended"), mean: 0, lower: 0, usable: 30, observed: 31, coverage: 30 / 31 };
   render(<ArenaReadout view={view} stale />);

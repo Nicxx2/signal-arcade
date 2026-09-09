@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import math
@@ -300,7 +301,11 @@ class PaperBroker:
         return blocker
 
     def submit_decision_with_reason(
-        self, decision: Decision, *, sol_usd_price: float | None = None
+        self,
+        decision: Decision,
+        *,
+        sol_usd_price: float | None = None,
+        exit_timing_plan: dict[str, Any] | None = None,
     ) -> tuple[PaperOrder | None, str | None]:
         blocker, request, required = self._entry_assessment(decision, sol_usd_price)
         if blocker:
@@ -318,6 +323,7 @@ class PaperBroker:
             fill_after=decision.created_at + timedelta(milliseconds=self.settings.entry_latency_ms),
             risk_mode_at_entry=decision.risk_mode,
             baseline_version_at_entry=decision.model_version.split("+", maxsplit=1)[0],
+            exit_timing_plan=copy.deepcopy(exit_timing_plan),
         )
         # Persist the exact entry thesis before exposing a fillable pending order. The later
         # orchestrator journal call is idempotent, and this closes the zero-latency clock race.
@@ -822,8 +828,8 @@ class PaperBroker:
         """Complete a marked update without quoting and saving the same position twice.
 
         Only synchronous broker paths that just marked this exact state call this helper.
-        Independent clock/watchdog calls still enter through process_due_orders. Keep the
-        causal fill guard here as well: on_market_state may receive a future reserve.
+        Independent order calls still enter through process_due_orders. Keep the causal
+        fill guard here as well: market and clock updates may receive a future reserve.
         """
         reserve_observed_at = state.last_reserve_at or state.last_event_at
         if reserve_observed_at is not None and reserve_observed_at > now:
@@ -900,6 +906,43 @@ class PaperBroker:
             mode,
             soft_hold_seconds=soft_hold_seconds,
             soft_hold_participant=soft_hold_participant,
+        )
+
+    def reassess_and_process_due_orders(
+        self,
+        *,
+        state: TokenState,
+        features: FeatureSnapshot,
+        source_event_id: str,
+        now: datetime,
+        mode: RiskMode,
+        sol_usd_price: float | None = None,
+        soft_hold_seconds: int | None = None,
+        soft_hold_participant: dict[str, str] | None = None,
+    ) -> list[FillReceipt]:
+        """Assess and fill one frozen clock/watchdog update with one durable valuation.
+
+        Keep both required saves (mark and assessment). Any failed save stops before
+        fills. This synchronous path never yields between the mark and guarded orders;
+        separate process_due_orders callers still obtain their own fresh valuation.
+        """
+        self.reassess_position(
+            state=state,
+            features=features,
+            now=now,
+            mode=mode,
+            sol_usd_price=sol_usd_price,
+            soft_hold_seconds=soft_hold_seconds,
+            soft_hold_participant=soft_hold_participant,
+        )
+        return self._fill_due_orders(
+            state=state,
+            features=features,
+            source_event_id=source_event_id,
+            now=now,
+            mode=mode,
+            sol_usd_price=sol_usd_price,
+            record_equity=True,
         )
 
     def cancel_pending_orders(self, now: datetime, reason: str = "paper_engine_stopped") -> int:
@@ -1204,6 +1247,7 @@ class PaperBroker:
             entry_fill_id=receipt.fill_id,
             risk_mode_at_entry=order.risk_mode_at_entry,
             baseline_version_at_entry=order.baseline_version_at_entry,
+            exit_timing_plan=copy.deepcopy(order.exit_timing_plan),
             venue=state.venue,
             curve_address=state.curve_address,
             pool_address=state.pool_address,

@@ -68,6 +68,12 @@ def test_failed_recovery_does_not_slide_to_later_better_markets(progression):  #
     assert state.activation_proof["recovery"]["status"] == "failed"
     assert state.activation_proof["recovery"]["observed_count"] == 60
     assert state.activation_proof["recovery"]["usable_count"] == 0
+    assert learner.skill_suspension_summary(state)["failed_checks"] == [
+        "usable_outcomes",
+        "coverage",
+        "advantage",
+        "harm",
+    ]
 
 
 @pytest.mark.parametrize("skill", list(ChallengerSkill))

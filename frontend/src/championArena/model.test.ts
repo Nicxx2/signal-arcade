@@ -48,9 +48,18 @@ describe("authoritative arena mapping", () => {
     const view = viewForSkill(snapshot, "entry")!;
     expect(view.mean).toBeNull(); expect(view.momentum).toBe("neutral");
   });
-  test("suspension disables directional choreography", () => {
-    const snapshot = snapshotFixture(); snapshot.learning.skills![0]!.state = "suspended";
+  test.each(["entry", "manipulation", "sizing", "exit"] as const)("suspended %s support does not pause a current shadow comparison", (skill) => {
+    const snapshot = snapshotFixture(); Object.assign(snapshot.learning.skills![0]!, { skill, state: "suspended", active_version: null });
     snapshot.learning.skills![0]!.tournament.uplift_lower_bound = .02;
+    const view = viewForSkill(snapshot, skill)!;
+    expect(view.paused).toBe(false); expect(view.momentum).toBe("right");
+    expect(view.left?.influence).toBe("Suspended");
+    expect(view.mode).toBe("battle"); expect(view.outcome).toBeNull();
+  });
+  test.each(["off", "source"])("a real %s pause still stops live choreography", (reason) => {
+    const snapshot = snapshotFixture();
+    if (reason === "off") snapshot.learning.mode = "off";
+    else snapshot.learning.collecting_from_current_source = false;
     const view = viewForSkill(snapshot, "entry")!;
     expect(view.paused).toBe(true); expect(view.momentum).toBe("neutral");
   });

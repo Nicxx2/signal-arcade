@@ -1,7 +1,7 @@
 {
   "name": "signal-arcade",
   "private": true,
-  "version": "1.10.8",
+  "version": "1.10.9",
   "scripts": {
     "build": "pnpm --filter signal-arcade-web build",
     "lint": "pnpm --filter signal-arcade-web lint",

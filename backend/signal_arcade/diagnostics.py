@@ -62,7 +62,7 @@ def number(value: Any) -> float | int | bool | None:
 
 
 def artifact_summary(artifact: Any) -> dict[str, Any]:
-    return {
+    summary: dict[str, Any] = {
         "id": identity(artifact.version),
         "skill": artifact.skill.value,
         "family": artifact.model_family.value,
@@ -75,6 +75,13 @@ def artifact_summary(artifact: Any) -> dict[str, Any]:
             key: number(artifact.metrics[key]) for key in PROOF_METRICS if key in artifact.metrics
         },
     }
+    if "reference_availability_fraction" in artifact.metrics:
+        # Named optional fields remain readable by older diagnostics schema-1 readers.
+        summary["reference"] = {
+            "coverage": number(artifact.metrics.get("reference_availability_fraction")),
+            "uplift_lower": number(artifact.metrics.get("reference_uplift_lower_bound")),
+        }
+    return summary
 
 
 def build_fingerprint(frontend: Path | None = None) -> str:

@@ -4,6 +4,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from signal_arcade.models import ChallengerSkill, RiskMode
 from test_participation_progression import native_champion, progression, record_policy  # noqa: F401
+from test_participation_progression import (
+    test_exit_rejoins_after_sizing_with_fresh_proof_and_fresh_health as setup_combined,
+)
 
 
 def test_status_reuses_only_selection_and_rechecks_changed_evidence(progression, monkeypatch):  # noqa: F811
@@ -82,3 +85,48 @@ def test_tournament_selection_does_not_survive_the_pass(progression, monkeypatch
     learner._advance_entry_tournaments()
     assert len(calls) == 1
     assert all(state.common_forward_count == 0 for state in learner.skill_states.values())
+
+
+def test_outcome_boundary_shares_selection_but_never_delays_health(progression, monkeypatch):  # noqa: F811
+    setup_combined(progression)
+    learner, _, _ = progression
+    active = dict(learner.active_skill_versions)
+    state = learner._current_skill_state(ChallengerSkill.SIZING)
+    learner._register_skill_artifact(
+        learner.skill_artifacts[active["sizing"]].model_copy(update={"version": "new-sizing"}),
+        state.cohort_key,
+    )
+    calls = []
+    select = learner._select_policy_evidence
+
+    def selected(**kwargs):
+        calls.append(kwargs)
+        return select(**kwargs)
+
+    monkeypatch.setattr(learner, "_select_policy_evidence", selected)
+    learner._advance_primary_outcomes(set(), outcomes_changed=True)
+    assert len(calls) == 1
+    assert learner.active_skill_versions == active
+    assert getattr(learner._status_policy_cache, "rows", None) is None
+    for episode in learner.evidence_episodes.values():
+        episode.challenger_evaluations.pop(active["exit"], None)
+    calls.clear()
+    learner._advance_primary_outcomes(set(), outcomes_changed=True)
+    assert len(calls) == 1
+    assert learner.active_skill_versions == {"sizing": active["sizing"]}
+    assert learner._current_skill_state(ChallengerSkill.EXIT).suspended_version == active["exit"]
+
+
+def test_outcome_selection_scope_restores_owner_even_after_failure(progression, monkeypatch):  # noqa: F811
+    learner, _, _ = progression
+    outer = {"outer": []}
+    learner._status_policy_cache.rows = outer
+
+    def failed():
+        assert learner._status_policy_cache.rows == {}
+        raise RuntimeError("injected governance failure")
+
+    monkeypatch.setattr(learner, "_govern_active_model", failed)
+    with pytest.raises(RuntimeError, match="injected governance"):
+        learner._advance_primary_outcomes(set(), outcomes_changed=True)
+    assert learner._status_policy_cache.rows is outer

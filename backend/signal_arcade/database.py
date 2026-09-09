@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
@@ -51,6 +51,7 @@ CHALLENGER_JOURNEY_SETTING_PREFIX = "challenger_champion_journey_v1:"
 CHALLENGER_PENDING_SETTING_PREFIX = "challenger_pending_versions_v1:"
 MAX_STATISTICAL_MODEL_ARTIFACT_BYTES = 8 * 1024**2
 RECENT_CHAMPION_EVENTS_IN_MEMORY = 100
+_ReadResult = TypeVar("_ReadResult")
 
 
 class AdvisoryReadDeferred(Exception):
@@ -93,6 +94,29 @@ class Database:
             self._reader_conn.close()
         with self._lock:
             self._conn.close()
+
+    def advisory_read(self, read: Callable[[], _ReadResult]) -> _ReadResult:  # noqa: UP047
+        """Bound optional reader contention and SQL work; call only from a joined worker.
+
+        Existing reader methods reenter this lock. The deadline is cooperative SQL work,
+        not a hard deadline on filesystem I/O; it never applies to the writer connection.
+        """
+        if not self._reader_lock.acquire(timeout=0.05):
+            raise AdvisoryReadDeferred("History reader is busy; retry shortly")
+        deadline = time.monotonic() + 0.1
+        try:
+            self._reader_conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            return read()
+        except sqlite3.OperationalError as exc:
+            code = (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+            if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_INTERRUPT}:
+                raise AdvisoryReadDeferred("History reader yielded; retry shortly") from exc
+            raise
+        finally:
+            try:
+                self._reader_conn.set_progress_handler(None, 0)
+            finally:
+                self._reader_lock.release()
 
     def _migrate(self) -> None:
         with self._lock, self._conn:

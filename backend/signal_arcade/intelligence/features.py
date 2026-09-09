@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
@@ -67,6 +68,10 @@ class RollingTradeMetrics:
     integrity: dict[str, IntegrityMetric]
     window_span_seconds: float
     buffer_saturated: bool
+    momentum_1m: float
+    momentum_5m: float
+    drawdown_5m: float
+    volume_5m_sol: float
 
 
 @dataclass(slots=True)
@@ -678,8 +683,8 @@ class FeatureEngine:
         created = state.created_at or last_event
         age = max(0.0, (now - created).total_seconds())
         rolling = _rolling_trade_metrics(state, now)
-        trades_1m = list(rolling.trades_1m)
-        trades_5m = list(rolling.trades_5m)
+        trades_1m = rolling.trades_1m
+        trades_5m = rolling.trades_5m
         buys_1m = rolling.buys_1m
         buys_5m = rolling.buys_5m
         sells_5m = len(trades_5m) - buys_5m
@@ -696,10 +701,10 @@ class FeatureEngine:
         if state.initial_real_token_reserves > 0 and state.real_token_reserves >= 0:
             progress = 1 - state.real_token_reserves / state.initial_real_token_reserves
         progress = min(1.0, max(0.0, progress))
-        momentum_1m = _momentum(trades_1m)
-        momentum_5m = _momentum(trades_5m)
-        drawdown = _drawdown(trades_5m)
-        volume_5m_sol = sum(trade.quote_lamports for trade in trades_5m) / LAMPORTS_PER_SOL
+        momentum_1m = rolling.momentum_1m
+        momentum_5m = rolling.momentum_5m
+        drawdown = rolling.drawdown_5m
+        volume_5m_sol = rolling.volume_5m_sol
         reserve_sol = state.virtual_quote_reserves / LAMPORTS_PER_SOL
         dex_at = state.enrichment_times.get("dexscreener")
         dex_age = max(0.0, (now - dex_at).total_seconds()) if dex_at else math.inf
@@ -1040,12 +1045,16 @@ def _rolling_trade_metrics(state: TokenState, now: datetime) -> RollingTradeMetr
         integrity=_stream_integrity_metrics(list(trades_5m)),
         window_span_seconds=span,
         buffer_saturated=buffer_saturated,
+        momentum_1m=_momentum(trades_1m),
+        momentum_5m=_momentum(trades_5m),
+        drawdown_5m=_drawdown(trades_5m),
+        volume_5m_sol=total_volume / LAMPORTS_PER_SOL,
     )
     state.rolling_trade_metrics = result
     return result
 
 
-def _momentum(trades: list[TradeObservation]) -> float:
+def _momentum(trades: Sequence[TradeObservation]) -> float:
     prices = [trade.price_sol for trade in trades if trade.price_sol > 0]
     if len(prices) < 2 or prices[0] <= 0:
         return 0.0
@@ -1315,7 +1324,7 @@ def _amount_bucket(value: int) -> int:
     return int(round(value / width) * width)
 
 
-def _drawdown(trades: list[TradeObservation]) -> float:
+def _drawdown(trades: Sequence[TradeObservation]) -> float:
     prices = [trade.price_sol for trade in trades if trade.price_sol > 0]
     if not prices:
         return 0.0
