@@ -97,6 +97,7 @@ def test_cancelled_work_keeps_its_boundary_until_thread_exits(
         work = engine._heartbeat_loop
     elif operation == "market":
         monkeypatch.setattr(engine.learning, "has_pending_mint", lambda mint: True)
+        monkeypatch.setattr(engine.learning, "has_due_market_work", lambda mint, now: True)
         monkeypatch.setattr(engine.learning, "observe_market", blocked)
 
         async def work():
@@ -158,8 +159,9 @@ def test_joined_worker_preserves_context_result_and_normal_failure():
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("phase", ["heartbeat", "event_learning"])
 def test_thread_timings_preserve_work_and_record_only_on_owner_thread(
-    tmp_path, monkeypatch, enabled, failure
+    tmp_path, monkeypatch, enabled, failure, phase
 ):
     recorder = DiagnosticsRecorder(tmp_path, enabled=enabled)
     recorded_on, workers = [], []
@@ -176,16 +178,26 @@ def test_thread_timings_preserve_work_and_record_only_on_owner_thread(
         return value
 
     monkeypatch.setattr(recorder, "observe_duration", record)
+    original_waits = recorder.observe_learning_waits
+
+    def record_waits(dispatch, resume):
+        assert get_ident() not in workers
+        original_waits(dispatch, resume)
+
+    monkeypatch.setattr(recorder, "observe_learning_waits", record_waits)
 
     async def exercise():
         if failure:
             with pytest.raises(ValueError, match="unchanged error"):
-                await _timed_to_thread(recorder, "heartbeat", work, 17)
+                await _timed_to_thread(recorder, phase, work, 17)
         else:
-            assert await _timed_to_thread(recorder, "heartbeat", work, 17) == 17
+            assert await _timed_to_thread(recorder, phase, work, 17) == 17
         assert workers[0] != get_ident()
         assert recorded_on == ([get_ident(), get_ident()] if enabled else [])
-        assert set(recorder.phases) == ({"heartbeat_cpu", "heartbeat_wait"} if enabled else set())
+        assert set(recorder.phases) == ({phase + "_cpu", phase + "_wait"} if enabled else set())
+        assert sum(recorder.learning_waits_since_boot.values()) == (
+            recorder.phases[phase + "_wait"][1] if enabled and phase == "event_learning" else 0
+        )
         assert all(value[0] == 1 and value[1] >= 0 for value in recorder.phases.values())
         assert not recorder.queue and not recorder.events
 

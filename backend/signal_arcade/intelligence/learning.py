@@ -48,6 +48,8 @@ from ..paper.curve_math import quote_buy, quote_sell
 from ..season_strategy import champion_codename as _challenger_codename
 from ..strategy import BASELINE_VERSION, LEARNABLE_BASELINE_VERSIONS
 from . import exit_context
+from .champion_impact import build_impact
+from .collection_diagnostics import CollectionDiagnostics, CollectionTargets
 from .features import NATIVE_SOL_MINT, WRAPPED_SOL_MINT, TokenState
 from .nonlinear import (
     XGBOOST_IMPLEMENTATION_VERSION,
@@ -112,6 +114,7 @@ CHALLENGER_SKILL_SCHEMA_VERSION = "challenger-skill-v2"
 FEATURE_SCHEMA_VERSION = "challenger-features-v5"
 LEARNING_EVIDENCE_SCHEMA_VERSION = "learning-evidence-v2"
 LINEAR_IMPLEMENTATION_VERSION = "native-ridge-v1"
+ENTRY_VALIDATION_VERSION = "entry-top-group-v2"
 LINEAR_RECIPE_VERSION = "linear-v1"
 LINEAR_TRAINING_SEED = 0
 TOURNAMENT_MINIMUM_COMMON_OUTCOMES = 30
@@ -122,6 +125,7 @@ TOURNAMENT_MAXIMUM_COMMON_OBSERVED = math.ceil(
 )
 TOURNAMENT_Z_SCORE = 1.96
 TOURNAMENT_PROOF_VERSION = "paired-skill-outcomes-v2"
+VETO_SCORING_VERSION = "baseline-fallback-v1"
 MAX_PENDING_CHALLENGERS = 4
 NONLINEAR_COMPLEXITY_MARGIN = 0.02
 RECENT_CHAMPION_JOURNEY_EVENTS = 12
@@ -549,6 +553,7 @@ class LearningEngine:
         self._training_request_lock = threading.Lock()
         self._training_requests: dict[tuple[RiskMode, str | None], datetime] = {}
         self._checkpoint_served: dict[str, dict[str, int]] = {"cache": {}, "rpc": {}}
+        self.collection_diagnostics = CollectionDiagnostics()
         self._checkpoint_turn: dict[str, int] = {"cache": 0, "rpc": 0}
         self._training_active: tuple[RiskMode, str | None] | None = None
         self._training_last_started_at: datetime | None = None
@@ -684,6 +689,7 @@ class LearningEngine:
             if isinstance(saved_active_skills, dict)
             else {}
         )
+        self._pending_authority_states: dict[tuple[str, ChallengerSkill], ChallengerSkillState] = {}
         self._restore_active_skill_versions()
         current_cohort_key = _challenger_cohort_key(
             self.current_risk_mode,
@@ -756,6 +762,38 @@ class LearningEngine:
             and self.evidence_episodes[episode_id].status == LearningEvidenceStatus.PENDING
             for episode_id in self._evidence_episode_ids_by_mint.get(mint, ())
         )
+
+    def has_due_market_work(self, mint: str, now: datetime) -> bool:
+        """Check one mint under the owner's lock before dispatching checkpoint work.
+
+        Keep the Discovery and Policy clocks separate. Overdue work still runs to record
+        unavailable outcomes; a pending record with every checkpoint still needs closure.
+        This does not change event admission, route validation or checkpoint deadlines.
+        """
+
+        def due(entered: datetime, checkpoints: dict[str, LearningCheckpoint]) -> bool:
+            age = max(0.0, (now - entered).total_seconds())
+            return len(checkpoints) == len(LEARNING_HORIZONS_SECONDS) or any(
+                str(horizon) not in checkpoints and age >= horizon
+                for horizon in LEARNING_HORIZONS_SECONDS
+            )
+
+        observation = self.observations.get(mint)
+        if (
+            observation is not None
+            and observation.status == LearningObservationStatus.PENDING
+            and due(observation.created_at, observation.checkpoints)
+        ):
+            return True
+        for episode_id in self._evidence_episode_ids_by_mint.get(mint, ()):
+            episode = self.evidence_episodes[episode_id]
+            if (
+                episode.lane == LearningEvidenceLane.POLICY
+                and episode.status == LearningEvidenceStatus.PENDING
+                and due(episode.entry_at, episode.checkpoints)
+            ):
+                return True
+        return False
 
     def remember_committed_evidence(self, episode: LearningEvidenceEpisode) -> None:
         """Refresh the live read model after the broker commits execution evidence."""
@@ -1173,13 +1211,7 @@ class LearningEngine:
         if mode == LearningMode.ACTIVE:
             skill_candidate = self._skill_activation_candidate()
             if skill_candidate is not None:
-                self.active_model = None
-                self.database.set_setting("active_learning_model", "")
-                self.consent_granted = True
-                self.database.set_setting("challenger_consent_granted", True)
-                self._activate_skill(skill_candidate)
-                self.mode = mode
-                self.database.set_setting("learning_mode", mode.value)
+                self._activate_skill(skill_candidate, grant_consent=True)
                 return
             candidate = self._activation_candidate()
             if candidate is None:
@@ -1395,6 +1427,7 @@ class LearningEngine:
                 self.database.remember_policy_identities([identity])
                 self._policy_identities.update(self.database.policy_identities({identity[0]}))
             self._enroll_skill_recovery(episode)
+            self.collection_diagnostics.enrolled("policy", episode.episode_id)
             created = True
         if not discovery_exists:
             key = _policy_identity_key(observation)
@@ -1402,6 +1435,7 @@ class LearningEngine:
                 self._policy_identities.update(self.database.policy_identities({key}))
             self.observations[state.mint] = observation
             self.database.save_learning_observation(observation)
+            self.collection_diagnostics.enrolled("discovery", observation.observation_id)
             created = True
         return created
 
@@ -1566,6 +1600,16 @@ class LearningEngine:
                 primary_checkpoint_changed or horizon == PRIMARY_HORIZON_SECONDS
             )
             changed += 1
+            self.collection_diagnostics.record(
+                "discovery",
+                horizon,
+                "expired"
+                if age > horizon + CHECKPOINT_GRACE_SECONDS
+                else "usable"
+                if observation.checkpoints[key].net_return is not None
+                else "unavailable",
+                trajectory_id=observation.observation_id,
+            )
         if len(observation.checkpoints) == len(LEARNING_HORIZONS_SECONDS):
             observation.status = LearningObservationStatus.COMPLETE
         if changed:
@@ -1679,6 +1723,16 @@ class LearningEngine:
                     self._observe_size_checkpoint(episode, state, horizon, now)
                 episode_changed = True
                 changed += 1
+                self.collection_diagnostics.record(
+                    "policy",
+                    horizon,
+                    "expired"
+                    if age > horizon + CHECKPOINT_GRACE_SECONDS
+                    else "usable"
+                    if episode.checkpoints[key].net_return is not None
+                    else "unavailable",
+                    trajectory_id=episode.episode_id,
+                )
                 if horizon == PRIMARY_HORIZON_SECONDS:
                     primary_cohorts.add((episode.risk_mode, episode.configuration_fingerprint))
             if len(episode.checkpoints) == len(LEARNING_HORIZONS_SECONDS):
@@ -1805,6 +1859,8 @@ class LearningEngine:
         limit: int,
         fresh: bool,
         excluded_mints: set[str] | None = None,
+        diagnostics: CollectionDiagnostics | None = None,
+        selection: dict[str, list[tuple[str, int]]] | None = None,
     ) -> list[str]:
         """Bound acquisition fairly: three Policy turns, one Discovery turn, with rotation.
 
@@ -1814,17 +1870,25 @@ class LearningEngine:
         rotate behind unserved mints. Neither urgency nor a retry extends the original clock.
         """
         lanes: dict[str, dict[str, datetime]] = {"policy": {}, "discovery": {}}
+        targets = CollectionTargets()
+        channel = "cache" if fresh else "rpc"
         items = [
-            ("discovery", item.mint, item.created_at, item.checkpoints)
+            (
+                "discovery",
+                item.mint,
+                item.created_at,
+                item.checkpoints,
+                getattr(item, "observation_id", ""),
+            )
             for item in self.observations.values()
             if item.status == LearningObservationStatus.PENDING
         ] + [
-            ("policy", item.mint, item.entry_at, item.checkpoints)
+            ("policy", item.mint, item.entry_at, item.checkpoints, getattr(item, "episode_id", ""))
             for item in self.evidence_episodes.values()
             if item.lane == LearningEvidenceLane.POLICY
             and item.status == LearningEvidenceStatus.PENDING
         ]
-        for lane, mint, entered_at, checkpoints in items:
+        for lane, mint, entered_at, checkpoints, trajectory_id in items:
             if not fresh and excluded_mints is not None and mint in excluded_mints:
                 continue
             state = states.get(mint)
@@ -1847,12 +1911,19 @@ class LearningEngine:
                     seconds=CHECKPOINT_GRACE_SECONDS
                 ):
                     lanes[lane][mint] = min(lanes[lane].get(mint, due_at), due_at)
+                    if diagnostics is not None:
+                        diagnostics.track(lane, horizon, trajectory_id)
+                        diagnostics.record(lane, horizon, channel + "_due")
+                    if selection is not None or diagnostics is not None:
+                        targets.setdefault(mint, []).append((lane, horizon))
+                        targets.identities.setdefault(mint, []).append(
+                            (lane, horizon, trajectory_id)
+                        )
         for mint, policy_due in lanes["policy"].items():
             discovery_due = lanes["discovery"].pop(mint, None)
             if discovery_due is not None:
                 # One Policy-lane fetch serves both clocks; retain the earlier eligible one.
                 lanes["policy"][mint] = min(policy_due, discovery_due)
-        channel = "cache" if fresh else "rpc"
         served = self._checkpoint_served[channel]
         pending = set(lanes["policy"]) | set(lanes["discovery"])
         self._checkpoint_served[channel] = served = {
@@ -1886,6 +1957,12 @@ class LearningEngine:
             selected.append(mint)
             served[mint] = turn
             self._checkpoint_turn[channel] = turn + 1
+        if diagnostics is not None:
+            diagnostics.record_targets(targets, channel + "_selected", selected)
+        if selection is not None:
+            selection.update({mint: targets[mint] for mint in selected})
+            if isinstance(selection, CollectionTargets):
+                selection.identities.update({mint: targets.identities[mint] for mint in selected})
         return selected
 
     def sample_due_checkpoints(
@@ -1905,6 +1982,7 @@ class LearningEngine:
                 now,
                 limit=max_observations,
                 fresh=True,
+                diagnostics=self.collection_diagnostics,
             )
         )
 
@@ -1947,6 +2025,9 @@ class LearningEngine:
                 )
                 item_changed = True
                 changed += 1
+                self.collection_diagnostics.record(
+                    "discovery", horizon, "expired", trajectory_id=observation.observation_id
+                )
                 primary_changed = primary_changed or horizon == PRIMARY_HORIZON_SECONDS
                 if horizon == PRIMARY_HORIZON_SECONDS:
                     primary_cohorts.add(
@@ -1990,6 +2071,9 @@ class LearningEngine:
                 )
                 item_changed = True
                 changed += 1
+                self.collection_diagnostics.record(
+                    "policy", horizon, "expired", trajectory_id=episode.episode_id
+                )
                 primary_changed = primary_changed or horizon == PRIMARY_HORIZON_SECONDS
                 if horizon == PRIMARY_HORIZON_SECONDS:
                     primary_cohorts.add((episode.risk_mode, episode.configuration_fingerprint))
@@ -2039,6 +2123,7 @@ class LearningEngine:
             self.mode == LearningMode.ACTIVE
             and self.active_model is not None
             and self.active_model.qualified
+            and _entry_validation_current(self.active_model)
             and model.risk_mode == decision.risk_mode
             and model.configuration_fingerprint == decision.configuration_fingerprint
             and in_distribution
@@ -2118,7 +2203,7 @@ class LearningEngine:
                 or artifact.risk_mode != decision.risk_mode
                 or artifact.configuration_fingerprint != decision.configuration_fingerprint
                 or artifact.baseline_version != decision.model_version.split("+", maxsplit=1)[0]
-                or not artifact.qualified
+                or not _skill_qualified(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -2302,11 +2387,28 @@ class LearningEngine:
             )
         )
 
-    def status(self, *, demo_mode: bool) -> dict[str, Any]:
-        # The orchestrator holds its market boundary for this read-only response. Reuse only
-        # Policy selection within this thread/response; never cache health or qualification.
-        with self._policy_selection_scope():
-            return self._status(demo_mode=demo_mode)
+    def status(
+        self, *, demo_mode: bool, impact_context: tuple[str | None, str | None, int] | None = None
+    ) -> dict[str, Any]:
+        # The owner keeps observations fixed throughout this synchronous read. Reuse only
+        # feature-vector validation and Policy selection within this thread/response;
+        # outcomes, reservations, health and qualification are still checked by each caller.
+        previous = getattr(self._status_policy_cache, "features", None)
+        self._status_policy_cache.features = {}
+        try:
+            with self._policy_selection_scope():
+                return self._status(demo_mode=demo_mode, impact_context=impact_context)
+        finally:
+            self._status_policy_cache.features = previous
+
+    def _complete_discovery_features(self, observation: LearningObservation) -> bool:
+        checks: dict[int, bool] | None = getattr(self._status_policy_cache, "features", None)
+        if checks is None:
+            return _observation_features_complete(observation)
+        key = id(observation)
+        if key not in checks:
+            checks[key] = _observation_features_complete(observation)
+        return checks[key]
 
     @contextmanager
     def _policy_selection_scope(self) -> Iterator[None]:
@@ -2319,7 +2421,9 @@ class LearningEngine:
         finally:
             self._status_policy_cache.rows = previous
 
-    def _status(self, *, demo_mode: bool) -> dict[str, Any]:
+    def _status(
+        self, *, demo_mode: bool, impact_context: tuple[str | None, str | None, int] | None = None
+    ) -> dict[str, Any]:
         training_mode = self.current_risk_mode
         training_configuration = self.configuration_fingerprint()
         samples = self._training_rows(
@@ -2440,6 +2544,11 @@ class LearningEngine:
             "auto_participation": self.auto_participation,
             "active_skill_versions": dict(self.active_skill_versions),
             "skills": skill_statuses,
+            "champion_impact": (
+                self.champion_impact(skill_statuses, impact_context, demo_mode=demo_mode)
+                if impact_context is not None
+                else None
+            ),
             "nonlinear_entry": self.nonlinear_entry_status(),
             "champion_records": self.champion_records(),
             "champion_journey": journey_page["events"],
@@ -2498,6 +2607,11 @@ class LearningEngine:
     ) -> list[dict[str, Any]]:
         """Summarize distinct evidence lanes without implying that all rows can qualify policy."""
 
+        feature_check = (
+            self._complete_discovery_features
+            if getattr(self._status_policy_cache, "features", None) is not None
+            else _observation_features_complete
+        )
         mode = self.current_risk_mode
         configuration = self.configuration_fingerprint()
         baseline = self.baseline_version()
@@ -2523,7 +2637,7 @@ class LearningEngine:
             and observation.configuration_fingerprint == configuration
             and observation.baseline_version == baseline
             and observation.feature_schema_version == FEATURE_SCHEMA_VERSION
-            and _observation_features_complete(observation)
+            and feature_check(observation)
             and not self._observation_has_policy_twin(observation)
         ]
         policy = self._policy_evidence(
@@ -2603,6 +2717,54 @@ class LearningEngine:
                 "qualification_role": "audit",
             },
         ]
+
+    def champion_impact(
+        self,
+        skill_statuses: list[dict[str, Any]],
+        context: tuple[str | None, str | None, int],
+        *,
+        demo_mode: bool,
+    ) -> dict[str, Any]:
+        """Spectator-only view, sharing the status pass's bounded Policy selection."""
+        versions = dict(self.active_skill_versions)
+        boundaries = []
+        valid = self.mode == LearningMode.ACTIVE and not demo_mode and bool(versions)
+        for skill in skill_statuses:
+            version = versions.get(skill["skill"])
+            if version is None:
+                continue
+            state = self._current_skill_state(ChallengerSkill(skill["skill"]))
+            artifact = self.skill_artifacts.get(version)
+            if (
+                state is None
+                or artifact is None
+                or state.joined_at is None
+                or state.active_version != version
+                or state.champion_version != version
+                or skill["health"]["state"] == "suspended"
+            ):
+                valid = False
+                continue
+            boundaries.append(max(state.joined_at, artifact.created_at))
+        valid = valid and len(boundaries) == len(versions)
+        rows = (
+            self._policy_evidence(
+                mode=self.current_risk_mode,
+                configuration_fingerprint=self.configuration_fingerprint(),
+                baseline_version=self.baseline_version(),
+            )
+            if valid
+            else []
+        )
+        return build_impact(
+            rows,
+            versions=versions,
+            since=max(boundaries) if valid else None,
+            season_id=context[0],
+            profile=context[1],
+            normal_hold=context[2],
+            now=datetime.now(UTC),
+        )
 
     def baseline_scorecard(self) -> dict[str, Any]:
         """Describe current Baseline evidence without changing policy or inventing returns."""
@@ -3076,7 +3238,7 @@ class LearningEngine:
                 "collecting"
                 if artifact is None
                 else "qualified"
-                if artifact.qualified
+                if _skill_qualified(artifact)
                 else "proof_not_met"
             )
             if state is not None and artifact is not None:
@@ -3202,22 +3364,35 @@ class LearningEngine:
             if artifact.model_family == StatisticalModelFamily.XGBOOST
         ]
         latest_nonlinear = nonlinear_artifacts[-1] if nonlinear_artifacts else None
-        eligible_training_count = latest_linear.training_count if latest_linear is not None else 0
+        latest_fit = max(
+            (artifact for artifact in (latest_linear, latest_nonlinear) if artifact is not None),
+            key=lambda artifact: (artifact.created_at, artifact.version),
+            default=None,
+        )
+        eligible_training_count = latest_fit.training_count if latest_fit is not None else 0
         status = "collecting"
         if latest_nonlinear is not None:
-            eligible_training_count = max(
-                eligible_training_count,
-                latest_nonlinear.training_count,
-            )
             if state is not None and state.suspended_version == latest_nonlinear.version:
                 status = "suspended"
-            elif state is not None and state.active_version == latest_nonlinear.version:
+            elif (
+                state is not None
+                and state.active_version == latest_nonlinear.version
+                and _entry_validation_current(latest_nonlinear)
+            ):
                 status = "active"
             elif state is not None and state.champion_version == latest_nonlinear.version:
                 status = "champion"
-            elif state is not None and state.testing_version == latest_nonlinear.version:
+            elif (
+                state is not None
+                and state.testing_version == latest_nonlinear.version
+                and _entry_validation_current(latest_nonlinear)
+            ):
                 status = "testing"
-            elif state is not None and latest_nonlinear.version in state.pending_versions:
+            elif (
+                state is not None
+                and latest_nonlinear.version in state.pending_versions
+                and _entry_validation_current(latest_nonlinear)
+            ):
                 status = "queued"
             elif (
                 latest_linear is not None and latest_linear.created_at > latest_nonlinear.created_at
@@ -3229,7 +3404,7 @@ class LearningEngine:
                 )
             elif state is not None and latest_nonlinear.version in state.rejected_versions:
                 status = "linear_retained"
-            elif latest_nonlinear.qualified:
+            elif _skill_qualified(latest_nonlinear):
                 status = "qualified"
             else:
                 status = "proof_not_met"
@@ -3238,6 +3413,7 @@ class LearningEngine:
         return {
             "state": status,
             "eligible_training_count": eligible_training_count,
+            "training_count_at": latest_fit.created_at.isoformat() if latest_fit else None,
             "minimum_training_samples": XGBOOST_MINIMUM_TRAINING_SAMPLES,
             "required_linear_improvement_fraction": NONLINEAR_COMPLEXITY_MARGIN,
             "latest_artifact": _skill_artifact_summary(latest_nonlinear),
@@ -3472,7 +3648,7 @@ class LearningEngine:
             return None
         if (
             artifact is not None
-            and artifact.qualified
+            and _skill_qualified(artifact)
             and artifact.skill == ChallengerSkill.EXIT
             and artifact.risk_mode == mode
             and artifact.configuration_fingerprint == self.configuration_fingerprint()
@@ -3712,6 +3888,11 @@ class LearningEngine:
     ) -> dict[str, Any]:
         """Measure recent primary-label observability without inventing missing returns."""
 
+        feature_check = (
+            self._complete_discovery_features
+            if getattr(self._status_policy_cache, "features", None) is not None
+            else _observation_features_complete
+        )
         selected_mode = mode or self.current_risk_mode
         selected_configuration = (
             self.configuration_fingerprint()
@@ -3727,7 +3908,7 @@ class LearningEngine:
             and observation.source_mode == "solana_mainnet"
             and observation.feature_schema_version == FEATURE_SCHEMA_VERSION
             and observation.baseline_version == self.baseline_version()
-            and _observation_features_complete(observation)
+            and feature_check(observation)
             and not self._observation_has_policy_twin(observation)
             and key in observation.checkpoints
         ]
@@ -4034,7 +4215,7 @@ class LearningEngine:
                     model.qualification_evidence_schema_version == LEARNING_EVIDENCE_SCHEMA_VERSION
                 ),
             },
-            qualified=model.qualified,
+            qualified=model.qualified and _entry_validation_current(model),
             qualification_reasons=([] if model.qualified else ["entry_proof_gates_not_met"]),
         )
         self._register_skill_artifact(
@@ -4195,7 +4376,11 @@ class LearningEngine:
             model_family=StatisticalModelFamily.XGBOOST,
             implementation_version=XGBOOST_IMPLEMENTATION_VERSION,
             recipe_version=XGBOOST_RECIPE_VERSION,
-            hyperparameters={**XGBOOST_PARAMETERS, "rounds": XGBOOST_ROUNDS},
+            hyperparameters={
+                **XGBOOST_PARAMETERS,
+                "rounds": XGBOOST_ROUNDS,
+                "entry_validation_version": ENTRY_VALIDATION_VERSION,
+            },
             training_seed=XGBOOST_TRAINING_SEED,
             training_cutoff_at=validation_start,
             evidence_cohort_digest=cohort_digest,
@@ -4820,7 +5005,7 @@ class LearningEngine:
             feature_schema_version=artifact.feature_schema_version,
         )
         state.latest_candidate_version = artifact.version
-        if artifact.qualified and not self._redundant_exit_candidate(state, artifact):
+        if _skill_qualified(artifact) and not self._redundant_exit_candidate(state, artifact):
             # Retain one waiting native generation per family and one Coach proposal. Newer
             # immutable cutoff and supersedes an untested older one; the active tournament is never
             # replaced. This bounds backlog without letting job completion order crown a winner.
@@ -4911,7 +5096,7 @@ class LearningEngine:
             self.skill_artifacts[version]
             for version in state.pending_versions
             if version in self.skill_artifacts
-            and self.skill_artifacts[version].qualified
+            and _skill_qualified(self.skill_artifacts[version])
             and (
                 state.skill != ChallengerSkill.EXIT
                 or _exit_artifact_available(self.skill_artifacts[version])
@@ -5038,6 +5223,11 @@ class LearningEngine:
             "candidate_version": selected,
             "champion_version": state.champion_version,
             "common_usable_count": 0,
+            **(
+                {"action_scoring": VETO_SCORING_VERSION}
+                if state.skill in {ChallengerSkill.ENTRY, ChallengerSkill.MANIPULATION}
+                else {}
+            ),
         }
         start_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY)
         record_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY)
@@ -5227,6 +5417,7 @@ class LearningEngine:
             champion = self.skill_artifacts.get(champion_version or "")
             candidate_available = bool(
                 candidate is not None
+                and _entry_validation_current(candidate)
                 and (candidate.skill != ChallengerSkill.EXIT or _exit_artifact_available(candidate))
                 and (
                     candidate.model_family != StatisticalModelFamily.XGBOOST
@@ -5341,14 +5532,10 @@ class LearningEngine:
                     continue
                 deltas.append(candidate_value - champion_value)
                 candidate_winner_vetoes += int(
-                    candidate_receipt.proposed_action == "veto"
-                    and outcome is not None
-                    and outcome > 0
+                    _veto_applies(candidate_receipt) and outcome is not None and outcome > 0
                 )
                 champion_winner_vetoes += int(
-                    champion_receipt.proposed_action == "veto"
-                    and outcome is not None
-                    and outcome > 0
+                    _veto_applies(champion_receipt) and outcome is not None and outcome > 0
                 )
                 candidate_harm_count += int(candidate_value < champion_value)
             mean_delta = fmean(deltas) if deltas else None
@@ -5397,6 +5584,11 @@ class LearningEngine:
             state.last_tournament = {
                 "result": result,
                 "proof_version": TOURNAMENT_PROOF_VERSION,
+                **(
+                    {"action_scoring": VETO_SCORING_VERSION}
+                    if state.skill in {ChallengerSkill.ENTRY, ChallengerSkill.MANIPULATION}
+                    else {}
+                ),
                 "candidate_version": candidate_version,
                 "champion_version": champion.version,
                 "common_observed_count": observed_count,
@@ -5473,7 +5665,7 @@ class LearningEngine:
         return (
             artifact
             if artifact is not None
-            and artifact.qualified
+            and _skill_qualified(artifact)
             and (
                 artifact.model_family != StatisticalModelFamily.XGBOOST
                 or self._load_nonlinear_artifact(artifact) is not None
@@ -5490,14 +5682,20 @@ class LearningEngine:
         )
 
     def _activate_skill(
-        self, artifact: ChallengerSkillArtifact, *, recovering: bool = False
+        self,
+        artifact: ChallengerSkillArtifact,
+        *,
+        recovering: bool = False,
+        grant_consent: bool = False,
+        dependency_reason: str = "dependency_activated",
     ) -> None:
+        self._persist_revoked_authority()
         state = self._current_skill_state(artifact.skill)
         recovery_proof = self._skill_recovery_proof(state) if recovering and state else {}
         if (
             state is None
             or state.champion_version != artifact.version
-            or not artifact.qualified
+            or not _skill_qualified(artifact)
             or (artifact.skill == ChallengerSkill.EXIT and not _exit_artifact_available(artifact))
             or (
                 artifact.model_family == StatisticalModelFamily.XGBOOST
@@ -5526,6 +5724,10 @@ class LearningEngine:
             ChallengerSkill.SIZING,
             ChallengerSkill.EXIT,
         )
+        # Prepare detached authority; publish only after the complete transaction commits.
+        # Callers own the event boundary, with no await between commit and publication.
+        state = state.model_copy(deep=True)
+        versions = dict(self.active_skill_versions)
         now = datetime.now(UTC)
         changed_states = []
         if recovering:
@@ -5537,25 +5739,24 @@ class LearningEngine:
         # Preserve those Champions, but remove their authority until they prove themselves again
         # beside the newly active upstream version.
         for downstream in order[order.index(artifact.skill) + 1 :]:
-            old_version = self.active_skill_versions.pop(downstream.value, None)
+            old_version = versions.pop(downstream.value, None)
             downstream_state = self._current_skill_state(downstream)
             if downstream_state is None or old_version is None:
                 continue
+            downstream_state = downstream_state.model_copy(deep=True)
             downstream_state.active_version = None
             downstream_state.active_dependencies = {}
             downstream_state.last_tournament = {
                 **downstream_state.last_tournament,
-                "result": "dependency_activated",
+                "result": dependency_reason,
                 "dependency": artifact.skill.value,
             }
             downstream_state.updated_at = now
             changed_states.append(downstream_state)
-        self.active_skill_versions[artifact.skill.value] = artifact.version
+        versions[artifact.skill.value] = artifact.version
         state.active_version = artifact.version
         state.active_dependencies = {
-            skill: version
-            for skill, version in self.active_skill_versions.items()
-            if skill != artifact.skill.value
+            skill: version for skill, version in versions.items() if skill != artifact.skill.value
         }
         state.activation_proof = (
             {
@@ -5583,12 +5784,29 @@ class LearningEngine:
                     for skill, version in sorted(state.active_dependencies.items())
                 ),
             }
-        self.skill_states[(state.cohort_key, state.skill)] = state
         self.database.save_challenger_authority(
             [*changed_states, state],
-            self.active_skill_versions,
-            mode=LearningMode.ACTIVE.value if recovering else None,
+            versions,
+            mode=LearningMode.ACTIVE.value,
+            grant_consent=grant_consent,
+            clear_legacy_model=True,
         )
+        for item in [*changed_states, state]:
+            key = (item.cohort_key, item.skill)
+            previous = self.skill_states.get(key)
+            if previous is None:
+                self.skill_states[key] = item
+            else:
+                # Tournament callers retain this object. Publish committed fields into it
+                # rather than leaving the caller holding an obsolete authority snapshot.
+                for field in type(item).model_fields:
+                    setattr(previous, field, getattr(item, field))
+                previous.__pydantic_private__ = item.__pydantic_private__
+        self.active_skill_versions = versions
+        self.mode = LearningMode.ACTIVE
+        self.active_model = None
+        if grant_consent:
+            self.consent_granted = True
 
     def _recovery_dependencies(self, skill: ChallengerSkill) -> dict[str, str]:
         order = (
@@ -5622,7 +5840,7 @@ class LearningEngine:
             and self.mode != LearningMode.OFF
             and not self.database.get_setting("demo_mode", self.settings.demo_mode)
             and artifact
-            and artifact.qualified
+            and _skill_qualified(artifact)
             and artifact.skill == state.skill
             and artifact.risk_mode == self.current_risk_mode
             and artifact.configuration_fingerprint == self.configuration_fingerprint()
@@ -5916,28 +6134,19 @@ class LearningEngine:
             # champion must pass its own Baseline/composition proof on the next boundary.
             self._suspend_skill(artifact.skill, "champion_replaced")
             return
-        order = (
-            ChallengerSkill.ENTRY,
-            ChallengerSkill.MANIPULATION,
-            ChallengerSkill.SIZING,
-            ChallengerSkill.EXIT,
+        self._activate_skill(artifact, dependency_reason="dependency_promoted")
+
+    def _persist_revoked_authority(self) -> None:
+        """Retry failed revocation persistence before any subsequent grant of authority."""
+        if not self._pending_authority_states:
+            return
+        self.database.save_challenger_authority(
+            list(self._pending_authority_states.values()),
+            self.active_skill_versions,
+            mode=self.mode.value,
+            clear_legacy_model=True,
         )
-        now = datetime.now(UTC)
-        for downstream in order[order.index(artifact.skill) + 1 :]:
-            old_version = self.active_skill_versions.pop(downstream.value, None)
-            downstream_state = self._current_skill_state(downstream)
-            if downstream_state is None or old_version is None:
-                continue
-            downstream_state.active_version = None
-            downstream_state.active_dependencies = {}
-            downstream_state.last_tournament = {
-                **downstream_state.last_tournament,
-                "result": "dependency_promoted",
-                "dependency": artifact.skill.value,
-            }
-            downstream_state.updated_at = now
-            self.database.save_challenger_skill_state(downstream_state)
-        self._activate_skill(artifact)
+        self._pending_authority_states.clear()
 
     def _deactivate_all_skills(self) -> None:
         for state in self.skill_states.values():
@@ -5946,9 +6155,15 @@ class LearningEngine:
             state.active_version = None
             state.active_dependencies = {}
             state.updated_at = datetime.now(UTC)
-            self.database.save_challenger_skill_state(state)
+            self._pending_authority_states[(state.cohort_key, state.skill)] = state
         self.active_skill_versions = {}
-        self.database.set_setting("active_challenger_skills", {})
+        self.active_model = None
+        if self.mode != LearningMode.OFF:
+            self.mode = LearningMode.SHADOW
+        if self._pending_authority_states:
+            self._persist_revoked_authority()
+        else:
+            self.database.save_challenger_authority([], {}, mode=self.mode.value)
 
     def _restore_active_skill_versions(self) -> None:
         if self.mode != LearningMode.ACTIVE:
@@ -5973,7 +6188,7 @@ class LearningEngine:
             if (
                 artifact is None
                 or state is None
-                or not artifact.qualified
+                or not _skill_qualified(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6363,16 +6578,17 @@ class LearningEngine:
                     "dependency": skill.value,
                 }
             state.updated_at = now
-            self.database.save_challenger_skill_state(state)
-        self.database.set_setting("active_challenger_skills", self.active_skill_versions)
+            self._pending_authority_states[(state.cohort_key, state.skill)] = state
         if self.auto_participation:
             self.mode = LearningMode.ACTIVE if self.active_skill_versions else LearningMode.SHADOW
-            self.database.set_setting("learning_mode", self.mode.value)
         elif ChallengerSkill.ENTRY.value not in self.active_skill_versions:
             self.mode = LearningMode.SHADOW
-            self.database.set_setting("learning_mode", self.mode.value)
+
+        self.active_model = None
+        self._persist_revoked_authority()
 
     def _govern_skill_ensemble(self) -> None:
+        self._persist_revoked_authority()
         if self.auto_participation:
             self._govern_independent_participation()
             return
@@ -6410,7 +6626,7 @@ class LearningEngine:
             if (
                 state is None
                 or artifact is None
-                or not artifact.qualified
+                or not _skill_qualified(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6513,7 +6729,7 @@ class LearningEngine:
                 artifact is None
                 or state is None
                 or state.champion_version != version
-                or not artifact.qualified
+                or not _skill_qualified(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6542,22 +6758,13 @@ class LearningEngine:
                     skill != ChallengerSkill.ENTRY
                     or self._skill_activation_candidate(recovering=True) == artifact
                 ):
-                    # Publish memory only after the atomic authority write succeeds.
-                    restored = copy.copy(self)
-                    restored.skill_states = {
-                        key: value.model_copy(deep=True) for key, value in self.skill_states.items()
-                    }
-                    restored.active_skill_versions = dict(self.active_skill_versions)
-                    restored._activate_skill(artifact, recovering=True)
-                    self.skill_states = restored.skill_states
-                    self.active_skill_versions = restored.active_skill_versions
-                    self.mode = LearningMode.ACTIVE
+                    self._activate_skill(artifact, recovering=True)
                     return
                 continue
             if (
                 state is None
                 or artifact is None
-                or not artifact.qualified
+                or not _skill_qualified(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6588,8 +6795,6 @@ class LearningEngine:
                 if not join["ready"]:
                     continue
             self._activate_skill(artifact)
-            self.mode = LearningMode.ACTIVE
-            self.database.set_setting("learning_mode", self.mode.value)
             return
         if not self.active_skill_versions and self.mode != LearningMode.SHADOW:
             self.mode = LearningMode.SHADOW
@@ -6603,6 +6808,7 @@ class LearningEngine:
     ) -> bool:
         return bool(
             model.qualified
+            and _entry_validation_current(model)
             and model.version.startswith(LEARNER_VERSION_PREFIX)
             and _model_shape_valid(model)
             and model.risk_mode == self.current_risk_mode
@@ -6707,6 +6913,11 @@ class LearningEngine:
         the Discovery copy whenever an exact-cohort Policy trajectory exists for the mint.
         """
 
+        feature_check = (
+            self._complete_discovery_features
+            if getattr(self._status_policy_cache, "features", None) is not None
+            else _observation_features_complete
+        )
         rows: list[tuple[LearningObservation, float]] = []
         key = str(PRIMARY_HORIZON_SECONDS)
         for observation in sorted(self.observations.values(), key=lambda item: item.created_at):
@@ -6726,7 +6937,7 @@ class LearningEngine:
             if (
                 checkpoint is not None
                 and checkpoint.net_return is not None
-                and _observation_features_complete(observation)
+                and feature_check(observation)
                 and not self._observation_has_policy_twin(observation)
             ):
                 rows.append((observation, checkpoint.net_return))
@@ -6995,6 +7206,7 @@ class LearningEngine:
             implementation_version=LINEAR_IMPLEMENTATION_VERSION,
             recipe_version=LINEAR_RECIPE_VERSION,
             hyperparameters={
+                "entry_validation_version": ENTRY_VALIDATION_VERSION,
                 "intercept_ridge": 1e-6,
                 "feature_ridge": 2.0,
                 "recency_half_life_rows": 500,
@@ -7369,6 +7581,15 @@ def _best_size_multiplier(
     return max(values, key=lambda item: (item[1], -abs(item[0] - 1.0)))[0]
 
 
+def _veto_applies(receipt: ChallengerEvaluationReceipt) -> bool:
+    """A proposal outside learned support cannot override the Baseline."""
+    return (
+        receipt.skill in {ChallengerSkill.ENTRY, ChallengerSkill.MANIPULATION}
+        and receipt.in_distribution
+        and receipt.proposed_action == "veto"
+    )
+
+
 def _tournament_policy_value(
     observation: LearningObservation | LearningEvidenceEpisode,
     receipt: ChallengerEvaluationReceipt,
@@ -7389,7 +7610,9 @@ def _tournament_policy_value(
     checkpoint = observation.checkpoints.get(str(PRIMARY_HORIZON_SECONDS))
     if checkpoint is None or checkpoint.net_return is None:
         return None
-    return checkpoint.net_return if receipt.proposed_action == "support" else 0.0
+    if receipt.proposed_action not in {"support", "veto"}:
+        return None
+    return 0.0 if _veto_applies(receipt) else checkpoint.net_return
 
 
 def _skill_receipt_outcome_resolved(
@@ -7883,10 +8106,34 @@ def _correlation(left: list[float], right: list[float]) -> float:
     return 0.0 if denominator <= 0 else max(-1.0, min(1.0, numerator / denominator))
 
 
+def _entry_validation_current(value: LearningModel | ChallengerSkillArtifact) -> bool:
+    if isinstance(value, ChallengerSkillArtifact) and (
+        value.skill != ChallengerSkill.ENTRY or value.schema_version == "challenger-skill-coach-v1"
+    ):
+        return True
+    return value.hyperparameters.get("entry_validation_version") == ENTRY_VALIDATION_VERSION
+
+
+def _skill_qualified(artifact: ChallengerSkillArtifact) -> bool:
+    return artifact.qualified and _entry_validation_current(artifact)
+
+
 def _top_mean(predictions: list[float], outcomes: list[float]) -> float:
+    if (
+        not outcomes
+        or len(predictions) != len(outcomes)
+        or not all(math.isfinite(value) for value in [*predictions, *outcomes])
+    ):
+        raise ValueError("invalid top-group validation population")
     count = max(1, len(outcomes) // 3)
-    ranked = sorted(zip(predictions, outcomes, strict=True), reverse=True)
-    return fmean(outcome for _, outcome in ranked[:count])
+    boundary = sorted(predictions, reverse=True)[count - 1]
+    selected = [
+        value for score, value in zip(predictions, outcomes, strict=True) if score > boundary
+    ]
+    tied = [value for score, value in zip(predictions, outcomes, strict=True) if score == boundary]
+    # Fractional inclusion at the boundary treats equal forecasts equally. Outcomes never
+    # decide membership, and an unchanged prediction population is independent of row order.
+    return (math.fsum(selected) + (count - len(selected)) * fmean(tied)) / count
 
 
 def _model_summary(model: LearningModel | None) -> dict[str, Any] | None:
@@ -7931,7 +8178,7 @@ def _model_summary(model: LearningModel | None) -> dict[str, Any] | None:
         "policy_mean_uplift": model.policy_mean_uplift,
         "policy_uplift_lower_bound": model.policy_uplift_lower_bound,
         "qualification_evidence_schema_version": model.qualification_evidence_schema_version,
-        "qualified": model.qualified,
+        "qualified": model.qualified and _entry_validation_current(model),
     }
 
 
@@ -7959,7 +8206,7 @@ def _skill_artifact_summary(
         "training_count": artifact.training_count,
         "validation_count": artifact.validation_count,
         "embargoed_count": artifact.embargoed_count,
-        "qualified": artifact.qualified,
+        "qualified": _skill_qualified(artifact),
         "metrics": dict(artifact.metrics),
         "parameters": dict(artifact.parameters),
     }
@@ -8117,10 +8364,10 @@ def _skill_qualification_gates(
         gate(
             "qualified",
             "Independent proof",
-            artifact.qualified,
+            _skill_qualified(artifact),
             True,
             "=",
-            artifact.qualified,
+            _skill_qualified(artifact),
             "boolean",
         )
     )
@@ -8132,10 +8379,13 @@ def _entry_family_proof_gates(
     *,
     source: LearningModel | None = None,
 ) -> list[dict[str, Any]]:
-    """Explain saved family evidence. The stored qualified flag remains authoritative."""
+    """Explain saved family evidence under the current validation contract."""
     if artifact is None:
         return []
     metrics = dict(artifact.metrics)
+    metrics["evidence_schema_current"] = bool(
+        metrics.get("evidence_schema_current")
+    ) and _entry_validation_current(artifact)
     if (
         artifact.model_family == StatisticalModelFamily.LINEAR
         and "in_distribution_fraction" not in metrics
@@ -8336,7 +8586,7 @@ def _entry_qualification_gates(
             ),
             (
                 "policy_supported",
-                "Supported policy cases",
+                "Familiar policy cases",
                 ENTRY_MINIMUM_POLICY_SUPPORTED,
                 "count",
             ),
@@ -8463,13 +8713,14 @@ def _entry_qualification_gates(
                 ),
                 gate(
                     "policy_supported",
-                    "Supported policy cases",
+                    "Familiar policy cases",
                     model.policy_supported_count,
                     ENTRY_MINIMUM_POLICY_SUPPORTED,
                     ">=",
                     model.policy_supported_count >= ENTRY_MINIMUM_POLICY_SUPPORTED,
                     "count",
-                    "The contender must also keep enough familiar entries, not veto everything.",
+                    "Enough Policy cases must be within learned support; "
+                    "these may be kept or vetoed.",
                 ),
                 gate(
                     "policy_vetoes",

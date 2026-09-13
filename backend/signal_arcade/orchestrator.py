@@ -9,8 +9,9 @@ import re
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,14 +21,16 @@ from typing import Any, ParamSpec, TypeVar
 
 from . import __version__
 from .ai_lab import AiDecisionLab, decision_evidence_payload
-from .coach import AiCoach
+from .coach import COACH_INFERENCE_TIMEOUT_SECONDS, AiCoach
 from .config import Settings
 from .database import TERMINAL_POLICY_VERSION, AdvisoryReadDeferred, Database
 from .diagnostics import DiagnosticsRecorder, artifact_summary, identity, number
 from .event_queue import SeasonEventQueue
+from .intelligence.collection_diagnostics import CollectionTargets, rejection_category
 from .intelligence.decision import DecisionEngine, deterministic_explanation
 from .intelligence.features import FeatureEngine, TokenState
 from .intelligence.learning import FEATURE_SCHEMA_VERSION, LearningEngine
+from .intelligence.reserve_health import ReserveValidationHealth, compact_validation_health
 from .intelligence.reserve_refresh import (
     ReserveRefreshRejected,
     reserve_addresses,
@@ -41,6 +44,7 @@ from .models import (
     Decision,
     DecisionAction,
     EventKind,
+    ExitAssessment,
     FeatureSnapshot,
     FillReceipt,
     LearningMode,
@@ -56,6 +60,7 @@ from .models import (
 )
 from .paper.broker import PaperBroker
 from .paper.curve_math import quote_sell
+from .paper.exit_policy import POLICY_VERSION as EXIT_POLICY_VERSION
 from .provider_settings import (
     PROVIDER_PRESETS,
     ProviderConfiguration,
@@ -88,10 +93,38 @@ logger = logging.getLogger(__name__)
 
 # Persist already waiting urgent arrivals together, without waiting to collect a batch.
 _URGENT_PERSIST_BATCH_SIZE = 16
+_COACH_EXIT_GUARD_SECONDS = 30
+_COACH_HOLD_ASSESSMENT_MAX_AGE_SECONDS = 30
+_LEARNING_TRANSIENT_GUARDS = frozenset(
+    {
+        "maintenance",
+        "market_boundary",
+        "pending_sell",
+        "queue_pressure",
+        "processing_lag",
+        "market_unhealthy",
+    }
+)
 
 # Keep generics compatible with the pinned mypy 1.8 checker.
 _WorkerArgs = ParamSpec("_WorkerArgs")
 _WorkerResult = TypeVar("_WorkerResult")
+_HEARTBEAT_WORK: ContextVar[dict[str, float] | None] = ContextVar("heartbeat_work", default=None)
+
+
+@contextmanager
+def _measure_heartbeat_work(name: str) -> Iterator[None]:
+    # to_thread copies this context. Only its owning worker updates the local dict;
+    # recorder aggregation happens on the event loop after that worker has joined.
+    timing = _HEARTBEAT_WORK.get()
+    if timing is None:
+        yield
+        return
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        timing[name] = max(0.0, time.monotonic() - started)
 
 
 async def _timed_to_thread(  # noqa: UP047
@@ -121,9 +154,11 @@ async def _timed_to_thread(  # noqa: UP047
             started, finished, cpu_seconds = timing
             resumed = time.monotonic()
             recorder.observe_duration(phase + "_cpu", max(0.0, cpu_seconds))
-            recorder.observe_duration(
-                phase + "_wait", max(0.0, started - dispatched) + max(0.0, resumed - finished)
-            )
+            dispatch_wait = max(0.0, started - dispatched)
+            resume_wait = max(0.0, resumed - finished)
+            recorder.observe_duration(phase + "_wait", dispatch_wait + resume_wait)
+            if phase == "event_learning":
+                recorder.observe_learning_waits(dispatch_wait, resume_wait)
 
 
 _UI_SNAPSHOT_CACHE_SECONDS = 5.0
@@ -509,6 +544,8 @@ class Orchestrator:
         self._heartbeat_incident_active = "heartbeat_worker" in active_incident_scopes
         self._learning_trainer_incident_active = "learning_trainer" in active_incident_scopes
         self._learning_invalid_routes: OrderedDict[str, tuple[str, ...]] = OrderedDict()
+        self._reserve_validation = ReserveValidationHealth()
+        self._learning_dispatch_counts = {"due": 0, "not_due": 0}
         self._learning_refresh_status: dict[str, Any] = {
             "enabled": settings.learning_reserve_refresh_enabled,
             "requests": 0,
@@ -1614,6 +1651,8 @@ class Orchestrator:
             "profile": identity(self.broker.season_profile),
             "scope": "sampled_at_interval_end",
         }
+        self._record_collection_diagnostics()
+        self._record_collection_detail_diagnostics()
         recorder.collect(
             pipeline=pipeline,
             context=context,
@@ -2135,15 +2174,21 @@ class Orchestrator:
 
             is_trade = event.kind == EventKind.TRADE
             if is_trade and self.learning.has_pending_mint(state.mint):
-                with self.diagnostics.measure("event_learning"):
-                    await _timed_to_thread(
-                        self.diagnostics,
-                        "event_learning",
-                        self.learning.observe_market,
-                        state,
-                        observed_at,
-                        live=not self.demo_mode,
-                    )
+                due = self.learning.has_due_market_work(state.mint, observed_at)
+                category = "due" if due else "not_due"
+                self._learning_dispatch_counts[category] = min(
+                    2**63 - 1, self._learning_dispatch_counts[category] + 1
+                )
+                if due:
+                    with self.diagnostics.measure("event_learning"):
+                        await _timed_to_thread(
+                            self.diagnostics,
+                            "event_learning",
+                            self.learning.observe_market,
+                            state,
+                            observed_at,
+                            live=not self.demo_mode,
+                        )
             if is_trade and self.ai_lab.has_pending_outcome(state.mint):
                 with self.diagnostics.measure("event_ai"):
                     await _joined_to_thread(self.ai_lab.observe_market, state, observed_at)
@@ -3272,15 +3317,127 @@ class Orchestrator:
             "unavailable_route_identities": len(self._learning_invalid_routes),
         }
 
+    def _reserve_validation_status(self) -> dict[str, Any]:
+        return self._reserve_validation.status(
+            learning=(
+                not self.demo_mode
+                and self.settings.learning_reserve_refresh_enabled
+                and self.learning.mode != LearningMode.OFF
+            ),
+            watchdog=not self.demo_mode and bool(self.broker.positions),
+        )
+
+    def _record_collection_diagnostics(self) -> None:
+        self._record_reserve_layout_diagnostics()
+        recorder = self.diagnostics
+        tracker = self.learning.collection_diagnostics
+        previous = getattr(self, "_collection_diagnostic_emission", None)
+        now = time.monotonic()
+        if not recorder.enabled or (
+            previous and previous[0] == tracker.scope and now - previous[1] < 300
+        ):
+            return
+        # Proof/training events have priority. Cumulative counters survive this deferral.
+        if len(recorder.events) > 6:
+            return
+        events = tracker.events()
+        validation = self._reserve_validation_status()
+        if not events and any(row["state"] != "not_observed" for row in validation["components"]):
+            # A held-position fault must remain observable even with no learning collection.
+            events = [{"kind": "reserve_validation", "version": 1, "at": time.time()}]
+        if not events:
+            return
+        rejections: dict[str, int] = {}
+        for reason, count in self._learning_refresh_status["rejected"].items():
+            category = rejection_category(reason)
+            rejections[category] = rejections.get(category, 0) + count
+        events[0]["rejections_since_boot"] = rejections
+        # The Policy event has room: Discovery already carries rejection-category totals.
+        events[-1]["reserve_validation"] = compact_validation_health(validation)
+        events[-1]["dispatch_since_boot"] = dict(self._learning_dispatch_counts)
+        events[-1]["wait_seconds_since_boot"] = dict(recorder.learning_waits_since_boot)
+        for event in events:
+            recorder.event(event)
+        self._collection_diagnostic_emission = (tracker.scope, now)
+
+    def _record_reserve_layout_diagnostics(self) -> None:
+        recorder = self.diagnostics
+        scope = self.learning.collection_diagnostics.scope
+        previous = getattr(self, "_layout_diagnostic_emission", None)
+        now = time.monotonic()
+        # Leave two slots for collection and every already-queued proof event untouched.
+        # Separate cadence allows a deferred layout sample to retry after the queue drains.
+        if (
+            not recorder.enabled
+            or len(recorder.events) > 5
+            or (previous and previous[0] == scope and now - previous[1] < 300)
+        ):
+            return
+        validation = self._reserve_validation_status()
+        layouts = [row["layout"] for row in validation["components"]]
+        if not any(layouts):
+            return
+        recorder.event(
+            {
+                "kind": "reserve_layout",
+                "version": 1,
+                "at": time.time(),
+                "scope": scope,
+                "reserve_validation": compact_validation_health(validation),
+                "layouts": layouts,
+            }
+        )
+        self._layout_diagnostic_emission = (scope, now)
+
+    def _record_collection_detail_diagnostics(self) -> None:
+        """Low-priority cumulative detail; never displace core/proof events."""
+        recorder = self.diagnostics
+        if not recorder.enabled:
+            return
+        tracker = self.learning.collection_diagnostics
+        previous = getattr(self, "_collection_detail_emission", {})
+        now = time.monotonic()
+        events = tracker.expiry_events()
+        if recorder.heartbeat_work_since_boot:
+            events.append(
+                {
+                    "kind": "heartbeat_work",
+                    "version": 1,
+                    "at": time.time(),
+                    "scope": recorder.boot,
+                    "seconds_since_boot": dict(recorder.heartbeat_work_since_boot),
+                }
+            )
+        for event in events:
+            key = str(event["kind"]) + str(event.get("lane", "")) + str(event.get("horizons", []))
+            last = previous.get(key)
+            if last and last[0] == event["scope"] and now - last[1] < 300:
+                continue
+            if len(recorder.events) >= 8:
+                break
+            recorder.event(event)
+            previous[key] = (event["scope"], now)
+        self._collection_detail_emission = previous
+
     async def _learning_reserve_loop(self) -> None:
         """One bounded background batch; shared RPC quota/backoff protects market processing."""
+        deferred_checks = 0
         while not self.stop_event.is_set():
+            delay = float(self.settings.learning_reserve_refresh_interval_seconds)
             try:
                 reason = self._learning_reserve_blocked_reason()
                 if reason is None:
-                    await self._learning_reserve_tick()
+                    reason = await self._learning_reserve_tick()
                 else:
                     self._learning_refresh_deferred(reason)
+                if reason in _LEARNING_TRANSIENT_GUARDS:
+                    # Only a pre-selection guard returns a reason. After an attempted RPC,
+                    # empty selection, or provider failure the full interval still applies.
+                    # Stagger checks to reduce repeated alignment with brief periodic work.
+                    delay = min(delay, 1.0 + 0.25 * (deferred_checks % 2))
+                    deferred_checks = (deferred_checks + 1) % 2
+                else:
+                    deferred_checks = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3288,14 +3445,16 @@ class Orchestrator:
                 self._learning_refresh_status["last_error"] = type(exc).__name__
                 self._learning_refresh_status["worker_errors"] += 1
                 logger.warning("Learning reserve refresh will retry (%s)", type(exc).__name__)
-            await self._wait_for_stop(self.settings.learning_reserve_refresh_interval_seconds)
+                deferred_checks = 0
+            await self._wait_for_stop(delay)
 
-    async def _learning_reserve_tick(self) -> None:
+    async def _learning_reserve_tick(self) -> str | None:
+        targets = CollectionTargets()
         async with self._event_lock:
             reason = self._learning_reserve_blocked_reason()
             if reason is not None:
                 self._learning_refresh_deferred(reason)
-                return
+                return reason
             self._learning_refresh_status["blocked_reason"] = None
             # A malformed identity cannot become queryable merely by waiting. Keep only a
             # bounded cache, and retry immediately when fresh stream data repairs that identity.
@@ -3312,10 +3471,13 @@ class Orchestrator:
                 limit=self.settings.learning_reserve_refresh_batch_size,
                 fresh=False,
                 excluded_mints=set(self._learning_invalid_routes),
+                diagnostics=self.learning.collection_diagnostics,
+                selection=targets,
             )
             originals = {mint: self.features.tokens[mint] for mint in mints}
             snapshots = {mint: replace(state) for mint, state in originals.items()}
             learner = self.learning
+            collection = learner.collection_diagnostics
         selected: dict[str, TokenState] = {}
         addresses: list[str] = []
         for mint, state in snapshots.items():
@@ -3324,7 +3486,10 @@ class Orchestrator:
                 if len(proposed) <= 100:
                     selected[mint] = state
                     addresses = proposed
+                else:
+                    collection.record_targets(targets, "rpc_address_limit", [mint])
             except (ValueError, TypeError):
+                collection.record_targets(targets, "rpc_identity", [mint])
                 self._learning_refresh_rejected("route_identity_unavailable")
                 self._learning_invalid_routes[mint] = route_identity(state)
                 self._learning_invalid_routes.move_to_end(mint)
@@ -3332,12 +3497,13 @@ class Orchestrator:
                     self._learning_invalid_routes.popitem(last=False)
         if not selected:
             self._learning_refresh_status["state"] = "idle"
-            return
+            return None
         self._learning_refresh_status["state"] = "fetching"
         self._learning_refresh_status["requests"] += 1
         self._learning_refresh_status["selected_routes"] += len(selected)
         self._learning_refresh_status["last_batch_size"] = len(selected)
         requested_at = datetime.now(UTC)
+        collection.record_targets(targets, "rpc_requested", selected)
         started = time.monotonic()
         try:
             async with asyncio.timeout(8):
@@ -3350,14 +3516,24 @@ class Orchestrator:
                     or None,
                     critical=False,
                 )
+        except asyncio.CancelledError:
+            collection.record_targets(targets, "rpc_cancelled", selected)
+            raise
+        except TimeoutError:
+            collection.record_targets(targets, "rpc_timeout", selected)
+            raise
+        except Exception:
+            collection.record_targets(targets, "rpc_error", selected)
+            raise
         finally:
             self._learning_refresh_status["last_request_seconds"] = max(
                 0.0, time.monotonic() - started
             )
         if result is None:
+            collection.record_targets(targets, "rpc_unavailable", selected)
             self._learning_refresh_rejected("provider_unavailable")
             self._learning_refresh_status["state"] = "retrying"
-            return
+            return None
         async with self._event_lock:
             reason = (
                 "context_changed"
@@ -3365,9 +3541,10 @@ class Orchestrator:
                 else self._learning_reserve_blocked_reason()
             )
             if reason is not None:
+                collection.record_targets(targets, "rpc_discarded", selected)
                 self._learning_refresh_rejected("context_changed_or_market_pressure")
                 self._learning_refresh_deferred(reason)
-                return
+                return None
             # Validation and learning persistence run under the same event boundary as cached
             # checkpoints. The snapshots never enter FeatureEngine or the paper broker.
             await _joined_to_thread(
@@ -3376,11 +3553,13 @@ class Orchestrator:
                 originals,
                 result,
                 requested_at,
+                targets,
             )
         self._learning_refresh_status["state"] = "idle"
         self._learning_refresh_status["blocked_reason"] = None
         self._learning_refresh_status["last_error"] = None
         self._learning_refresh_status["last_completed_at"] = datetime.now(UTC).isoformat()
+        return None
 
     def _learning_refresh_rejected(self, reason: str) -> None:
         counts = self._learning_refresh_status["rejected"]
@@ -3392,36 +3571,46 @@ class Orchestrator:
         originals: dict[str, TokenState],
         result: dict[str, Any],
         requested_at: datetime,
+        targets: CollectionTargets | None = None,
     ) -> None:
         now = datetime.now(UTC)
-        for mint, snapshot in selected.items():
-            current = self.features.tokens.get(mint)
-            if current is not originals[mint] or route_identity(current) != route_identity(
-                snapshot
-            ):
-                self._learning_refresh_rejected("route_changed_during_request")
-                continue
-            try:
-                refreshed = validated_learning_state(
-                    current,
-                    result,
-                    self.solana.decoder,
-                    requested_at=requested_at,
-                    observed_at=now,
+        collection = self.learning.collection_diagnostics
+        targets = targets if targets is not None else CollectionTargets()
+        with self._reserve_validation.batch("learning") as validation:
+            for mint, snapshot in selected.items():
+                current = self.features.tokens.get(mint)
+                if current is not originals[mint] or route_identity(current) != route_identity(
+                    snapshot
+                ):
+                    self._learning_refresh_rejected("route_changed_during_request")
+                    collection.record_targets(targets, "rpc_rejected", [mint])
+                    continue
+                try:
+                    refreshed = validated_learning_state(
+                        current,
+                        result,
+                        self.solana.decoder,
+                        requested_at=requested_at,
+                        observed_at=now,
+                    )
+                except ReserveRefreshRejected as exc:
+                    validation.rejected(current.venue, exc)
+                    collection.record_targets(targets, "rpc_rejected", [mint])
+                    self._learning_refresh_rejected(str(exc))
+                    continue
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    collection.record_targets(targets, "rpc_rejected", [mint])
+                    self._learning_refresh_rejected("malformed_snapshot")
+                    continue
+                validation.accepted(current.venue)
+                self._learning_refresh_status["accepted_routes"] += 1
+                collection.record_targets(targets, "rpc_accepted", [mint])
+                self._learning_refresh_status["checkpoint_updates"] += self.learning.observe_market(
+                    refreshed,
+                    now,
+                    live=True,
+                    cached=True,
                 )
-            except ReserveRefreshRejected as exc:
-                self._learning_refresh_rejected(str(exc))
-                continue
-            except (ValueError, TypeError, KeyError, OverflowError):
-                self._learning_refresh_rejected("malformed_snapshot")
-                continue
-            self._learning_refresh_status["accepted_routes"] += 1
-            self._learning_refresh_status["checkpoint_updates"] += self.learning.observe_market(
-                refreshed,
-                now,
-                live=True,
-                cached=True,
-            )
 
     def _position_watchdog_interval_seconds(self) -> float:
         quota = self.quota.snapshot().get("solana", {})
@@ -3740,32 +3929,37 @@ class Orchestrator:
         if slot <= 0 or not isinstance(accounts, dict):
             return [], set(), 0
         refreshed: set[str] = set()
-        for target in targets:
-            mint = str(target["mint"])
-            state = self.features.tokens.get(mint)
-            position = self.broker.positions.get(mint)
-            if (
-                state is None
-                or position is None
-                or (target.get("position_id") and target["position_id"] != position.position_id)
-                or state.venue != target.get("venue")
-                or state.curve_address != str(target.get("curve_address") or "")
-                or state.pool_address != str(target.get("pool_address") or "")
-            ):
-                continue
-            try:
-                reserve_snapshot = validated_learning_state(
-                    state,
-                    result,
-                    self.solana.decoder,
-                    requested_at=_stored_datetime(target.get("requested_at")) or now,
-                    observed_at=now,
-                    allow_empty=True,
-                )
-            except (ValueError, TypeError, KeyError, OverflowError):
-                continue
-            if self.features.apply_validated_watchdog_snapshot(reserve_snapshot):
-                refreshed.add(mint)
+        with self._reserve_validation.batch("watchdog") as validation:
+            for target in targets:
+                mint = str(target["mint"])
+                state = self.features.tokens.get(mint)
+                position = self.broker.positions.get(mint)
+                if (
+                    state is None
+                    or position is None
+                    or (target.get("position_id") and target["position_id"] != position.position_id)
+                    or state.venue != target.get("venue")
+                    or state.curve_address != str(target.get("curve_address") or "")
+                    or state.pool_address != str(target.get("pool_address") or "")
+                ):
+                    continue
+                try:
+                    reserve_snapshot = validated_learning_state(
+                        state,
+                        result,
+                        self.solana.decoder,
+                        requested_at=_stored_datetime(target.get("requested_at")) or now,
+                        observed_at=now,
+                        allow_empty=True,
+                    )
+                except ReserveRefreshRejected as exc:
+                    validation.rejected(state.venue, exc)
+                    continue
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    continue
+                validation.accepted(state.venue)
+                if self.features.apply_validated_watchdog_snapshot(reserve_snapshot):
+                    refreshed.add(mint)
 
         receipts: list[FillReceipt] = []
         for mint in refreshed:
@@ -3893,18 +4087,28 @@ class Orchestrator:
                     # lock. It could otherwise predate a reserve snapshot accepted while waiting.
                     now = datetime.now(UTC)
                     phase_started = time.monotonic()
-                    receipts, expired, learning_updates, ai_updates = await _timed_to_thread(
-                        self.diagnostics,
-                        "heartbeat",
-                        self._heartbeat_tick,
-                        now,
+                    work_timing: dict[str, float] = {}
+                    timing_token = _HEARTBEAT_WORK.set(
+                        work_timing if self.diagnostics.enabled else None
                     )
-                    profile_transition = await self._profile_transition_tick(now)
-                    rollover = (
-                        None
-                        if self._profile_transition_active()
-                        else await _joined_to_thread(self._auto_new_season_tick, now)
-                    )
+                    try:
+                        receipts, expired, learning_updates, ai_updates = await _timed_to_thread(
+                            self.diagnostics,
+                            "heartbeat",
+                            self._heartbeat_tick,
+                            now,
+                        )
+                        with _measure_heartbeat_work("profile"):
+                            profile_transition = await self._profile_transition_tick(now)
+                        with _measure_heartbeat_work("season"):
+                            rollover = (
+                                None
+                                if self._profile_transition_active()
+                                else await _joined_to_thread(self._auto_new_season_tick, now)
+                            )
+                    finally:
+                        _HEARTBEAT_WORK.reset(timing_token)
+                        self.diagnostics.observe_heartbeat_work(work_timing)
                     self.diagnostics.observe_phase("heartbeat", phase_started)
                 if receipts or expired or learning_updates or ai_updates:
                     await self.bus.publish(
@@ -3949,71 +4153,73 @@ class Orchestrator:
     ) -> tuple[list[FillReceipt], list[PaperOrder], int, int]:
         """Run the persistence-capable clock tick away from the HTTP event loop."""
         receipts: list[FillReceipt] = []
-        if self._profile_transition_active():
-            # Defence in depth for interrupted/legacy transitions: once an exits-only
-            # operation is durable, no stale entry may execute even if it somehow survived.
-            self.broker.cancel_pending_buys(now, "profile_transition_entry_guard")
-        if self.running or self._profile_transition_exit_management_active(now):
-            active_mints = {order.mint for order in self.broker.pending.values()} | set(
-                self.broker.positions
+        with _measure_heartbeat_work("positions"):
+            if self._profile_transition_active():
+                # Defence in depth for interrupted/legacy transitions: once an exits-only
+                # operation is durable, no stale entry may execute even if it somehow survived.
+                self.broker.cancel_pending_buys(now, "profile_transition_entry_guard")
+            if self.running or self._profile_transition_exit_management_active(now):
+                active_mints = {order.mint for order in self.broker.pending.values()} | set(
+                    self.broker.positions
+                )
+                for mint in active_mints:
+                    state = self.features.tokens.get(mint)
+                    market_times = [
+                        observed_at
+                        for observed_at in (
+                            now,
+                            state.last_event_at if state else None,
+                            state.last_reserve_at if state else None,
+                        )
+                        if observed_at is not None
+                    ]
+                    market_now = max(market_times)
+                    snapshot = (
+                        self.features.position_snapshot(mint, market_now)
+                        if mint in self.broker.positions
+                        else self.features.snapshot(mint, market_now)
+                    )
+                    if state is None or snapshot is None:
+                        continue
+                    sol_usd_price = self._sol_usd_price(snapshot)
+                    receipts.extend(
+                        self.broker.reassess_and_process_due_orders(
+                            state=state,
+                            features=snapshot,
+                            source_event_id=(
+                                state.last_reserve_event_id
+                                or state.last_event_id
+                                or f"observed-state:{mint}"
+                            ),
+                            now=market_now,
+                            mode=self.risk_mode,
+                            sol_usd_price=sol_usd_price,
+                            **(
+                                self._exit_timing_arguments(state.mint)
+                                if mint in self.broker.positions
+                                else {}
+                            ),
+                        )
+                    )
+            expired = self.broker.expire_stuck_orders(now)
+            if self._auto_new_season_eligible_since is not None and any(
+                receipt.side == Side.SELL for receipt in receipts
+            ):
+                # The clock worker can fill an exit without a new provider event. That recovery must
+                # invalidate the previous dormant observation window before the rollover tick runs.
+                self._set_auto_new_season_clock(None, None, None)
+        with _measure_heartbeat_work("cache"):
+            learning_updates = self.learning.sample_due_checkpoints(
+                self.features.tokens,
+                now,
+                live=not self.demo_mode,
             )
-            for mint in active_mints:
-                state = self.features.tokens.get(mint)
-                market_times = [
-                    observed_at
-                    for observed_at in (
-                        now,
-                        state.last_event_at if state else None,
-                        state.last_reserve_at if state else None,
-                    )
-                    if observed_at is not None
-                ]
-                market_now = max(market_times)
-                snapshot = (
-                    self.features.position_snapshot(mint, market_now)
-                    if mint in self.broker.positions
-                    else self.features.snapshot(mint, market_now)
-                )
-                if state is None or snapshot is None:
-                    continue
-                sol_usd_price = self._sol_usd_price(snapshot)
-                receipts.extend(
-                    self.broker.reassess_and_process_due_orders(
-                        state=state,
-                        features=snapshot,
-                        source_event_id=(
-                            state.last_reserve_event_id
-                            or state.last_event_id
-                            or f"observed-state:{mint}"
-                        ),
-                        now=market_now,
-                        mode=self.risk_mode,
-                        sol_usd_price=sol_usd_price,
-                        **(
-                            self._exit_timing_arguments(state.mint)
-                            if mint in self.broker.positions
-                            else {}
-                        ),
-                    )
-                )
-        expired = self.broker.expire_stuck_orders(now)
-        if self._auto_new_season_eligible_since is not None and any(
-            receipt.side == Side.SELL for receipt in receipts
-        ):
-            # The clock worker can fill an exit without a new provider event. That recovery must
-            # invalidate the previous dormant observation window before the rollover tick runs.
-            self._set_auto_new_season_clock(None, None, None)
-        learning_updates = self.learning.sample_due_checkpoints(
-            self.features.tokens,
-            now,
-            live=not self.demo_mode,
-        )
-        learning_updates += self.learning.expire_checkpoints(
-            now,
-            states=self.features.tokens,
-        )
-        self._coach_contribution_tick()
-        ai_updates = self.ai_lab.expire_outcomes(now)
+        with _measure_heartbeat_work("expiry"):
+            learning_updates += self.learning.expire_checkpoints(now, states=self.features.tokens)
+        with _measure_heartbeat_work("coach"):
+            self._coach_contribution_tick()
+        with _measure_heartbeat_work("ai"):
+            ai_updates = self.ai_lab.expire_outcomes(now)
         return receipts, expired, learning_updates, ai_updates
 
     async def _profile_transition_tick(self, now: datetime) -> dict[str, Any] | None:
@@ -5986,13 +6192,28 @@ class Orchestrator:
             if position.market_status.value != "active":
                 continue
             limits = self.broker._position_exit_limits(position, self.risk_mode)
+            try:
+                age = (now - position.opened_at).total_seconds()
+                mark_age = (
+                    (now - position.last_marked_at).total_seconds()
+                    if position.last_marked_at is not None
+                    else -1.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False, "protecting_open_positions"
             if (
                 not position.mark_is_executable
                 or position.mark_is_stale
-                or position.last_marked_at is None
-                or (now - position.last_marked_at).total_seconds()
-                > self.settings.position_mark_stale_seconds
-                or (now - position.opened_at).total_seconds() >= limits.max_hold_seconds - 30
+                or position.mark_blockers
+                or age < 0
+                or not 0 <= mark_age <= self.settings.position_mark_stale_seconds
+                # A bounded inference already in flight may need its full timeout to finish.
+                or limits.hard_max_hold_seconds - age
+                <= COACH_INFERENCE_TIMEOUT_SECONDS + _COACH_EXIT_GUARD_SECONDS
+            ):
+                return False, "protecting_open_positions"
+            if age >= limits.max_hold_seconds - _COACH_EXIT_GUARD_SECONDS and not (
+                self._coach_has_fresh_extended_hold(position, limits, now)
             ):
                 return False, "protecting_open_positions"
         capacity = max(1, self.settings.event_queue_max)
@@ -6006,6 +6227,46 @@ class Orchestrator:
         ):
             return False, "protecting_market_throughput"
         return True, None
+
+    def _coach_has_fresh_extended_hold(
+        self, position: Position, limits: RiskLimits, now: datetime
+    ) -> bool:
+        """Recognize a completed normal review without assessing or changing the trade."""
+        assessment = position.exit_assessment
+        if not isinstance(assessment, ExitAssessment):
+            return False
+        try:
+            if (
+                self.started_at is None
+                or not self.broker.season_id
+                or assessment.strategy_season_id != self.broker.season_id
+                or assessment.policy_version != EXIT_POLICY_VERSION
+                or assessment.action != "hold"
+                or assessment.reason != "adaptive_extension"
+                or not 0 < assessment.soft_hold_seconds <= limits.max_hold_seconds
+                or assessment.hard_hold_seconds != limits.hard_max_hold_seconds
+                or not limits.minimum_hold_support <= assessment.support_score <= 1
+                or not math.isfinite(assessment.age_seconds)
+            ):
+                return False
+            assessed_age = (assessment.evaluated_at - position.opened_at).total_seconds()
+            freshness = (now - assessment.evaluated_at).total_seconds()
+            return bool(
+                position.last_marked_at is not None
+                and self.started_at <= assessment.evaluated_at
+                and position.last_marked_at <= assessment.evaluated_at
+                and 0
+                <= freshness
+                <= min(
+                    self.settings.position_mark_stale_seconds,
+                    _COACH_HOLD_ASSESSMENT_MAX_AGE_SECONDS,
+                )
+                # An earlier Champion review is not evidence that the normal review is done.
+                and assessed_age >= limits.max_hold_seconds
+                and math.isclose(assessed_age, assessment.age_seconds, rel_tol=0, abs_tol=0.001)
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def _coach_provenance(self) -> dict[str, Any]:
         strategy = self._active_strategy_versions()
@@ -6099,6 +6360,7 @@ class Orchestrator:
             "recent_windows": self._recent_pipeline_windows(now),
             "learning_training": self.learning.training_status(),
             "learning_reserve_refresh": dict(self._learning_refresh_status),
+            "reserve_validation": self._reserve_validation_status(),
             "degraded": bool(reasons),
             "degraded_reasons": reasons,
         }
@@ -6177,6 +6439,13 @@ class Orchestrator:
         # Overlay it so navigation and polling never hide a reset behind an otherwise valid cache.
         response["season_operation"] = self.season_operation_status()
         response["maintenance_operation"] = self.maintenance_operation_status()
+        if "event_pipeline" in response:
+            # A recent cached dashboard must not overwrite a newer component fault from
+            # /health. This fixed-size status reads no database and does not mutate the cache.
+            response["event_pipeline"] = {
+                **response["event_pipeline"],
+                "reserve_validation": self._reserve_validation_status(),
+            }
         if self._auto_season_progress is not None:
             progress = dict(self._auto_season_progress)
             progress_at = _stored_datetime(progress.get("observed_at"))
@@ -6251,7 +6520,14 @@ class Orchestrator:
             ],
             "quotas": self.quota.snapshot(),
             "provider_settings": self.provider_settings_view(),
-            "learning": self.learning.status(demo_mode=self.demo_mode),
+            "learning": self.learning.status(
+                demo_mode=self.demo_mode,
+                impact_context=(
+                    self.broker.season_id,
+                    (self.broker.season_profile or {}).get("profile_fingerprint"),
+                    self.broker.risk_limits(self.risk_mode).max_hold_seconds,
+                ),
+            ),
             "ai_lab": self.ai_lab.status(recent_limit=5, cached_qualification=True),
             "coach": self.coach.status(),
             "providers_configured": {

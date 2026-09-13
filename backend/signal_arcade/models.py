@@ -677,12 +677,28 @@ class CoachReview(BaseModel):
     failure_reason: str | None = Field(default=None, max_length=120)
 
 
+class CoachForwardEvidence(BaseModel):
+    """Bounded, ordered enrollment; resolved values survive journal retention."""
+
+    model_config = ConfigDict(extra="forbid")
+    episode_id: str
+    identity: str
+    entry_at: datetime
+    season_id: str
+    resolved: bool = False
+    value: float | None = Field(default=None, allow_inf_nan=False)
+
+
 class CoachHypothesis(BaseModel):
     """A zero-influence experiment measured only on outcomes created after its cutoff."""
 
     model_config = ConfigDict(extra="forbid")
 
     hypothesis_id: str
+    evidence_contract: Literal["discovery-v1", "policy-v1"] = "discovery-v1"
+    forward_cursor: tuple[str, str] | None = None
+    forward_enrollments: list[CoachForwardEvidence] = Field(default_factory=list, max_length=180)
+    collection_counts: dict[str, int] = Field(default_factory=dict)
     signature: str
     coach_review_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -710,15 +726,17 @@ class CoachHypothesis(BaseModel):
     discovery_observed_count: int = Field(ge=0)
     discovery_usable_count: int = Field(ge=0)
     discovery_availability_fraction: float = Field(ge=0, le=1)
-    discovery_mean_uplift: float | None = Field(default=None, ge=-10, le=10)
-    discovery_uplift_lower_bound: float | None = Field(default=None, ge=-10, le=10)
+    # Differences between two outcomes (or size-normalized values) can exceed either
+    # individual return. Preserve finite evidence instead of making the study unreadable.
+    discovery_mean_uplift: float | None = Field(default=None, allow_inf_nan=False)
+    discovery_uplift_lower_bound: float | None = Field(default=None, allow_inf_nan=False)
     forward_observed_count: int = Field(default=0, ge=0)
     forward_usable_count: int = Field(default=0, ge=0)
     forward_availability_fraction: float = Field(default=0, ge=0, le=1)
     forward_season_count: int = Field(default=0, ge=0)
-    forward_mean_uplift: float | None = Field(default=None, ge=-10, le=10)
-    forward_uplift_lower_bound: float | None = Field(default=None, ge=-10, le=10)
-    forward_uplift_upper_bound: float | None = Field(default=None, ge=-10, le=10)
+    forward_mean_uplift: float | None = Field(default=None, allow_inf_nan=False)
+    forward_uplift_lower_bound: float | None = Field(default=None, allow_inf_nan=False)
+    forward_uplift_upper_bound: float | None = Field(default=None, allow_inf_nan=False)
     forward_observation_ids: list[str] = Field(default_factory=list, max_length=240)
     forward_values: list[float] = Field(default_factory=list, max_length=240)
     forward_season_counts: dict[str, int] = Field(default_factory=dict)

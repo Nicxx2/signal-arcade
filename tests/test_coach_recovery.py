@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
-import signal_arcade.coach as coach_module
 from signal_arcade.database import Database
 from signal_arcade.models import CoachExperimentState
 from test_coach import _hypothesis
@@ -257,13 +256,13 @@ def test_refresh_preserves_concurrent_handoff(tmp_path, monkeypatch):
     )
     database.save_coach_hypothesis(hypothesis)
     coach = coach_for(database)
-    original = coach_module._evaluate_hypothesis
+    original = database.coach_work_page
 
-    def overlapping(item, rows, now):
-        coach.mark_contribution(item.hypothesis_id, "handed_off", "durable-artifact")
-        return original(item, rows, now)
+    def overlapping(*args, **kwargs):
+        coach.mark_contribution(hypothesis.hypothesis_id, "handed_off", "durable-artifact")
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(coach_module, "_evaluate_hypothesis", overlapping)
+    monkeypatch.setattr(database, "coach_work_page", overlapping)
     try:
         coach._refresh_hypotheses(datetime.now(UTC), [])
         assert coach.hypotheses[0].contribution_state == "handed_off"

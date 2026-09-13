@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.10.9
+# 🧠 Signal Arcade v1.10.10
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach observes the same saved outcomes outside the trading decision path.
 No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.10.9-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Release](https://img.shields.io/badge/release-v1.10.10-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -18,41 +18,85 @@ No wallet keys, live orders, paid provider or cloud AI are required.
 
 ---
 
-## What changed in v1.10.9
+## What changed in v1.10.10
 
-- **Accurate suspended-skill comparisons:** suspending Champion support no longer makes an
-  ongoing shadow battle look paused. Learning and source pauses still stop the live readout.
-  Expand suspension details for a finished recovery trial's recorded results.
-- **Contextual Exit contenders:** alongside the existing fixed timing selector, a small Linear
-  family can learn which earlier normal-review checkpoint suits the original entry context.
-  It must beat the fixed reference on held-out evidence, then pass the normal fresh battle
-  and activation checks. Extra complexity does not earn a crown by itself.
-- **Saved entry-time choices:** a qualified contextual Champion chooses once before order
-  latency. The order and position retain that choice across restart. Changed permissions,
-  health, dependencies or incompatible data return the position to Baseline review timing.
-  Existing positions do not acquire reconstructed entry features.
-- **Preserved safety and evidence:** the 70% requirement, fees, missing outcomes, chronology,
-  independent proof, Entry Linear/XGBoost comparison and all Baseline exit controls remain.
-  Exit proof compares fee-inclusive checkpoint values; actual exits also follow current
-  signals and safety rules. It is not a full replay or a guarantee of live improvement.
-- **Bounded work and visibility:** contextual fitting uses the existing limited training
-  population and worker. Held positions reuse the saved choice. Diagnostics keep all current
-  skill/family summaries and the contextual reference comparison within the existing budget.
-- **Less repeated work during bursts:** history detail reads yield to the event loop, position
-  checks avoid duplicate valuation, and completed training rechecks market pressure before
-  publication. Feature windows and each outcome update share only repeated calculations;
-  current health, permissions and qualification checks remain in force. Interrupted training
-  preparation releases its job and preserves a pending retry.
+- **Honest Entry ranking:** equal predictions share the top-group boundary equally; later
+  returns cannot break prediction ties. Linear and XGBoost use the same versioned validation.
+- **Durable Champion authority:** activation commits the complete skill combination before
+  applying it. Failed safety suspensions keep support off and retry persistence.
+- **Coach forward evidence:** new studies follow eligible Policy entries, including tokens
+  that became actionable after an initial Pass. Pending and unavailable outcomes remain in
+  chronological proof; bounded collection resumes after restart and detects retention gaps.
+- **Automatic dashboard reconnection:** stalled handshakes and interrupted browser sessions
+  recover without a page reload. **Auto refresh** identifies the periodic fallback while the
+  live connection retries. Notifications stay coalesced, hidden tabs refresh more slowly and
+  connection failures cannot postpone fallback polling indefinitely.
+- **Champion impact:** Learning Overview compares recorded outcomes with and without current
+  Champion support on the same opportunities. View each active skill or the combined team,
+  including unavailable pairs, coverage and uncertainty. This is a bounded checkpoint
+  comparison after modeled fees, not portfolio profit or a second trading account; the details
+  stay behind **How this works**. It adds no trading authority or background requests.
+  Shadow learning waits for active support; it is not labelled paused. A new crown still needs
+  activation proof, and suspended support remains clearly separate.
+- **Correct Entry and Manipulation comparisons:** an unsupported veto proposal now receives
+  the Baseline outcome it would actually use, rather than credit for avoiding a loss. Shared
+  battles and manual health/join checks agree with execution; winner-veto counts include only
+  supported vetoes. Missing outcomes remain unknown.
+- **Current XGBoost eligibility:** the displayed training count comes from the latest matching
+  Linear/XGBoost fit, with its fit time, rather than the largest retained historical count.
+  Familiar Policy cases can be kept or vetoed; the wording no longer implies a keep quota.
+- **Collection diagnostics:** compact periodic events distinguish Discovery and Policy lanes,
+  checkpoint horizons, RPC request outcomes and checkpoint closures. They use existing storage
+  limits and add no per-attempt database writes. Aggregate counters are separate from model
+  and activation coverage; see [how to interpret them](docs/DIAGNOSTICS_HISTORY.md).
+- **Collection scheduling:** temporary safety deferrals get lightweight, staggered rechecks.
+  Actual requests keep their configured spacing and provider limits. Additional bounded
+  diagnostics identify expired checkpoints' last known RPC stage and slow heartbeat substeps;
+  batch settings, proof requirements and saved outcomes remain unchanged.
+- **Coach opportunities during extended holds:** a fresh approved adaptive hold can permit
+  bounded research after the normal review. Pending orders, stale evidence, approaching hard
+  exits, training and market pressure retain priority; research screening and proof are unchanged.
+- **Reserve-validation visibility:** repeated unsupported shared-account layouts surface as a
+  separate system-status issue for learning refresh or held-position refresh. HTTP liveness or
+  success on another venue cannot hide the fault. New reserve warnings also appear while the
+  dashboard is catching up; clearing a warning still requires a fresh confirming report.
+  Bounded layout lengths and sample digests help
+  identify changes without retaining account bodies in diagnostics. Unverified snapshots remain excluded.
+- **Fewer idle learning dispatches:** market processing sends checkpoint work to a worker only
+  when that mint has a due horizon or pending completion. Discovery and Policy keep their separate
+  clocks; feature updates, held positions, missing outcomes and overdue work retain their protections.
+- **Current Pump/PumpSwap reserve accounts:** support reviewed creator-fee and shared-config
+  extensions, retain legacy layouts, and apply configured creator fees and venue-specific Mayhem
+  supply rules. The 12 September holder-reward fields are decoded from the pinned official
+  contract; rewards redirect the existing creator fee without adding paper reward income or
+  charging that fee twice. Unsupported routes and unknown future fields remain excluded.
+- **Less repeated dashboard work:** validate each Discovery feature vector once within a
+  locked status response. Subsequent responses and trading/qualification checks remain fresh;
+  this does not remove the portfolio consistency lock or establish burst-free performance.
+- **Honest replay continuity:** completed histories stay unchanged. An ongoing battle crossing
+  the scoring correction starts a labelled partial recording; new battles record from the start.
+  Existing Exit proof keeps its compatible proof marker.
+- **Preserved qualification:** the 70% requirement, fees, missing-outcome denominators, training
+  populations, chronology, independent proof and Baseline boundaries remain intact. These fixes
+  improve scoring, collection compatibility and observability; they do not guarantee higher
+  coverage or an Entry Champion.
 
-The collection, burst recovery, Coach and diagnostics improvements from
-[v1.10.7](CHANGELOG.md#1107---2026-09-07) and
-[v1.10.8](CHANGELOG.md#1108---2026-09-08) remain in place.
+**Compatibility follow-up — 12 September:** the official holder-rewards contract now explains
+the newer 33-byte Pump Global suffix. The adapter and isolated regressions support that layout,
+including legacy curves/pools and the position watchdog. Initial live checks after deployment
+confirmed that learning and position refresh validate both venues again, with new saved reserve
+receipts. Longer observation under comparable market load is still needed to assess coverage
+and burst performance. See the [current validation and release limits](docs/V1_10_10_VALIDATION.md#holder-rewards-and-dashboard-recheck--12-september).
+
+The contextual Exit, suspended-skill comparison and burst-performance improvements from
+[v1.10.9](CHANGELOG.md#1109---2026-09-08), together with the earlier Coach and recovery fixes,
+remain in place. Collection deadlines, scheduler priorities and live batch settings are unchanged.
 
 **Operational limits:** busy periods can still delay processing or expire candidate events. Zero
 event losses do not mean zero lag, and a recovered queue does not restore lost evidence or prove
 sustained peak-load capacity. Check retained critical-lag peaks, recent losses and worker health
 in Settings diagnostics, and monitor host disk space during extended operation. See the
-[v1.10.9 validation results and remaining limits](docs/V1_10_9_VALIDATION.md).
+[v1.10.10 validation results and remaining limits](docs/V1_10_10_VALIDATION.md).
 
 <details>
 <summary><strong>Release details and verification</strong></summary>
@@ -100,11 +144,14 @@ read contention and report specific failures; check for an `export_complete` tra
 a download as complete history. See
 [diagnostics history and its limits](docs/DIAGNOSTICS_HISTORY.md).
 
-The [v1.10.9 release notes](CHANGELOG.md#1109---2026-09-08) describe the latest fixes. Entry's
+The [v1.10.10 release notes](CHANGELOG.md#11010---2026-09-09) describe the latest fixes. Entry's
 70% coverage and independent proof requirements remain.
 
-**Upgrade:** v1.10.9 retains schema 16 and adds optional saved Exit plans. Earlier Coach,
-Policy identity and fill indexes remain in place.
+**Upgrade:** v1.10.10 retains database schema 16. Saved Exit plans, Policy identities and fill
+indexes remain in place. Native Entry artifacts with the old ranking-validation contract remain
+historical records but need a fresh, corrected fit before supporting trades. Unfinished legacy
+Coach studies close once as inconclusive with their evidence preserved; new proposals collect
+fresh Policy evidence after selection. Research and support permissions are preserved.
 Bankroll, positions, learning records and Champion history are preserved; no new season is required.
 Back up before upgrading. See the [upgrade and rollback notes](#updating).
 
@@ -196,9 +243,11 @@ short evidence-driven exchanges and Champion ceremonies.** Open Learning → Cha
   Chest marks identify family (Linear bars, XGBoost branches, deterministic shield outline);
   XGBoost also has branched antennae. Decorative armor and handheld shields can appear in any family.
 
-The [v1.10.9 verification record](docs/V1_10_9_VALIDATION.md) summarizes regression checks,
-release verification and remaining endurance limits. Earlier implementation records
-remain available for [v1.10.7](docs/V1_10_7_VALIDATION.md), [v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
+The [v1.10.10 verification record](docs/V1_10_10_VALIDATION.md) summarizes regression checks,
+the isolated capacity comparison and remaining live-validation limits. Earlier implementation
+records remain available for [v1.10.9](docs/V1_10_9_VALIDATION.md),
+[v1.10.8](docs/V1_10_8_VALIDATION.md), [v1.10.7](docs/V1_10_7_VALIDATION.md),
+[v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
 [quote recovery](docs/V1_10_5_QUOTE_RECOVERY.md),
 [overnight reliability](docs/V1_10_5_OVERNIGHT_FIXES.md) and
 [Arena startup](docs/V1_10_5_ARENA_STARTUP.md).
@@ -230,7 +279,9 @@ and [Entry model profile](docs/screenshots/v1.10.7-live-2026-09-07/16-entry-prof
 - Learning checkpoints rotate fairly between Policy and Discovery evidence. The optional reserve
   worker validates current on-chain accounts outside the trading decision path. It starts disabled;
   enable `SIGNAL_ARCADE_LEARNING_RESERVE_REFRESH_ENABLED=true` for a staged Shadow rollout after
-  checking provider capacity. Defaults allow one batch every 10 seconds, at most 20 routes and
+  checking provider capacity. For the image-only Compose example below, add
+  `SIGNAL_ARCADE_LEARNING_RESERVE_REFRESH_ENABLED: "true"` to the app service's `environment` block.
+  Defaults allow one batch every 10 seconds, at most 20 routes and
   100 unique accounts. Provider backoff and market pressure can reduce that rate.
 - Exit tournament scoring includes every required paired horizon. Training fits a private snapshot
   and publishes only if its season, configuration and authority context still match. Decision Lab
@@ -353,7 +404,7 @@ before supporting Baseline.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.10.9 |
+| Player | What it does | Influence in v1.10.10 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | Optional automatic support lets each qualified skill join after its own Baseline/composition proof; influence remains monitored and reversible |
@@ -378,6 +429,9 @@ before supporting Baseline.
   outcomes. Discovery can propose a contender, but only exact-cohort actionable policy episodes
   can qualify it; actual fills remain a separate execution audit. Qualified influence is bounded,
   versioned, auditable and suspended if health degrades.
+  Unfamiliar Entry/Manipulation predictions leave Baseline in control and receive that same
+  fallback value in comparisons. The XGBoost eligibility counter describes the latest completed
+  Linear/XGBoost fit in the current context; it can decrease as the training window moves.
 - 🔎 **Manipulation-aware decisions** — Wallet loops, gross-versus-net flow, trade structure and
   price paths require mature, independently corroborated evidence. A new entry waits for minimum
   integrity coverage, and an extreme isolated warning must resolve before the Baseline acts;
@@ -418,7 +472,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.10.9
+    image: nicxx2/signal-arcade:1.10.10
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -523,23 +577,29 @@ rather than treating update downtime as market evidence. If preparation cannot f
 normal operation and reports the reason. Users who deliberately prefer a rolling tag can use
 `nicxx2/signal-arcade:latest` instead.
 
-Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.9 preserves the bankroll, open
+Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.10 preserves the bankroll, open
 positions, pending-order accounting, seasons, settings, learning evidence and Champion history in
 the same data volume. For an upgrade from v1.10.6 or v1.10.7, Baseline stays on v1.5, existing learning
 records remain available and no new paper season is required. Evidence selection enforces the
 current contract and durable identity rules. Restarts revalidate current activation receipts;
 older artifacts remain available for audit but cannot gain authority under a different feature schema.
 
-**v1.10.9 retains schema 16.** Upgrading from published v1.10.7 or v1.10.8 adds no evidence
-migration or reset. New contextual Exit timing is optional position/order JSON, not a new table.
+**v1.10.10 retains schema 16.** Upgrading from published v1.10.7, v1.10.8 or v1.10.9 adds no
+evidence migration or reset. Contextual Exit timing introduced in v1.10.9 uses optional
+position/order JSON, not a new table.
 Existing positions use Baseline timing when a contextual Champion has no original saved plan.
 The existing fixed timing family remains available.
+An ongoing Entry/Manipulation comparison crossing this release's scoring correction starts a
+partial replay; completed histories stay unchanged. Collection diagnostic counters begin a new
+scope on restart without reconstructing older attempts or changing retained learning evidence.
 The earlier v1.10.7 migration adds compact Policy identity records and fill indexes.
 Retained evidence backfills known identities; already deleted pre-upgrade history cannot be
 reconstructed. The identity ledger remains after larger evidence payloads expire and uses the main
 data volume, separately from diagnostics. Its memory cache follows the retained evidence window;
-the compact durable ledger grows with unique proof identities. Existing native activation receipts
-remain valid; Coach crowns need a fresh activation receipt under the corrected lifecycle.
+the compact durable ledger grows with unique proof identities. Existing native Manipulation, Sizing
+and Exit activation receipts remain subject to their normal context and health checks. Native Entry
+needs the corrected ranking-validation contract; Coach crowns need a fresh activation receipt under
+the corrected lifecycle.
 The bounded per-season strategy-use sidecar preserves existing scores. Earlier participation is
 labelled unknown or partial where no receipt
 exists. Automatic Champion support defaults to disabled for installations without saved permission;
@@ -557,9 +617,12 @@ image together. Published v1.10.4/v1.10.5 images use schema 14 and cannot open s
 A v1.10.3 image also cannot open schema 14. Never copy only a running SQLite database file while
 leaving its WAL behind.
 
-v1.10.7, v1.10.8 and v1.10.9 use schema 16. A code rollback can retain the current data
-volume; routinely restoring an older backup would discard newer evidence. Older releases do not
-implement contextual Exit plans. Its versioned activation receipt cannot restore that authority
+v1.10.10 and published v1.10.7 through v1.10.9 use schema 16. A code rollback can retain the current data
+volume; routinely restoring an older backup would discard newer evidence. Older builds cannot
+read the new Coach forward-study fields and restore the old Entry tie scoring, so research and
+support state must be checked explicitly after rollback. Returning to v1.10.9 also restores its
+unsupported-veto scoring defect. Releases before v1.10.9 do not implement
+contextual Exit plans. The versioned contextual activation receipt cannot restore that authority
 on v1.10.8; existing Baseline safeguards remain. Take a consistent backup before rollback as well,
 and verify support and position state after changing builds. Old builds may discard unknown
 optional plan fields when rewriting positions; upgrading again cannot reconstruct those choices.
@@ -662,7 +725,9 @@ without Ollama.
 The Decision Reviews tab labels any persisted legacy **Guarded critic** mode separately: it may veto an entry after its own proof checks. Shadow reviews have no direct trading influence; switching to Shadow removes those legacy vetoes. The interface does not enable legacy Guarded mode.
 
 The AI Coach Room is a separate research workflow and can be paused without disabling saved Shadow
-decision reviews. It runs only when trading work is quiet. Deterministic code creates a small
+decision reviews. It runs only when trading work is quiet, including during freshly verified
+adaptive holds with enough time before the hard exit. An old hold label or a waiting exit cannot
+grant that opportunity. Deterministic code creates a small
 allowlist across Entry, Manipulation, Sizing and Exit; the model may select one candidate or none.
 Historical evidence can reject or propose an idea, but only exact-cohort outcomes recorded after
 that proposal can support it. The proof clock survives pruning and restart, while incompatible

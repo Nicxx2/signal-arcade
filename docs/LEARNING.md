@@ -52,6 +52,14 @@ identity immediately becomes eligible again; missing tokens are removed and old 
 This cache affects only RPC selection, not cached fresh checkpoints, evidence enrollment, outcome
 denominators or retries of transient provider/account-validation failures.
 
+The 12 September dispatch refinement checks the pending mint under the existing event owner lock
+before handing work to a thread. Each unresolved horizon uses its own Discovery creation or Policy
+entry clock. Work at or after a horizon, including expired work, still runs; a pending record with
+all checkpoints also retains its completion pass. Nothing about route freshness or availability
+can suppress a due dispatch. Market feature updates, AI outcomes, held positions, order handling,
+admission priorities and heartbeat/RPC collection retain their existing paths. No future work is
+cached as unnecessary, so the next event after a horizon or a restart reevaluates the saved state.
+
 The optional `learning_reserve_refresh_enabled` worker starts disabled. When enabled, it requests
 one batch no more frequently than every ten seconds, with at most twenty routes and one hundred
 unique accounts. It shares the configured provider quota and backoff, yields during maintenance,
@@ -59,14 +67,51 @@ season boundaries, pending sells, queue pressure and market lag, and times out e
 eight seconds. Provider-unavailable, unsupported or malformed responses remain unknown. A target
 with an implausible future slot cannot poison the slot requirement for the other targets.
 
+Temporary guards are rechecked after alternating 1 and 1.25 seconds, without selecting candidates
+or calling a provider while blocked. The stagger reduces repeated alignment with brief periodic
+maintenance. Guards are checked again after acquiring the market boundary. Every actual attempt,
+including discarded/unavailable responses and errors, retains the full configured wait after
+completion. Empty selections, disabled collection and demo mode also keep that wait. This does
+not change batch size, lane fairness, quota, checkpoint deadlines or the eight-second validity
+window. Fetched responses are still discarded if application is unsafe; no response buffer was
+introduced. Stopping new learning still allows already-enrolled evidence to finish under its
+existing rules, and held-position monitoring remains independent.
+
 Snapshots must validate current mint safety, program owners, curve/pool PDAs, native-SOL quote
 mapping, initialized unfrozen vaults, token-program extensions, fee configuration, slot fences and
-request/observation times. Fee recipes are pinned to the reviewed Pump SDK 1.36.0 and PumpSwap SDK
-1.19.0 semantics. Unknown layout extensions are rejected. v1.10.5 also supports verified Mayhem
-bonding curves: their fee tier uses current mint supply from the same validated account batch;
-ordinary curves retain the SDK's fixed billion-token supply. The learning copy is
+request/observation times. v1.10.10's reserve adapter follows the reviewed account extensions and
+fee rules in the official Rust client 0.1.13, without replacing the stream/event IDLs. Exact legacy
+prefixes default the appended fields to zero; partial fields, invalid booleans and unknown nonzero
+tails remain rejected. A nonzero per-coin creator fee replaces the scheduled creator rate only
+while the global configuration gate is enabled. The maximum for setting a fee and permission to
+edit it do not clamp a previously stored trade fee. An absent creator still receives no fee.
+Mayhem bonding curves use current verified mint supply for sell fee tiers; ordinary curves use
+fixed billion-token supply. PumpSwap uses the opposite supply selection: Mayhem pools use fixed
+supply and ordinary pools use current verified mint supply. Noncanonical pools retain flat fees.
+Unsupported quote currencies remain unsupported. The learning copy is
 separate from the live feature cache and paper broker. Checkpoints record account hashes, slot,
 reserves, fees and their observation time; the worker cannot fill a past horizon retroactively.
+New receipts use `learning-account-snapshot-v2` and name `pump-rust-client-0.1.13` as the fee recipe.
+Existing receipts, entry assumptions, expired checkpoints and Champion/Coach proof remain intact;
+this receipt version does not restart tournaments or alter qualification thresholds.
+
+The official holder-rewards contract published on 12 September, revision
+`f216b6724c6ede79d7cef9ce210b741f7e17e93b`, explains the additional 33 Global bytes as
+`holder_reward_claim_authority` and `is_holder_reward_enabled`. BondingCurve and Pool append
+`is_holder_reward`. Legacy missing flags default to false, and existing zero allocation padding
+remains supported; nonzero partial fields and invalid booleans remain rejected. The Global flag
+controls creation, so disabling it does not block existing coin trades. Holder rewards redirect
+the already-charged creator fee; they are not added again to costs or credited as paper income.
+Receipts retain the fee recipe and also identify the account contract and holder-reward flag.
+Historical event IDLs stay pinned because existing creator-fee event fields still report the
+same costs. These account changes apply equally to learning and the position watchdog.
+See the [follow-up validation](V1_10_10_VALIDATION.md#holder-rewards-and-dashboard-recheck--12-september).
+
+Dashboard status reuses feature-vector completeness checks only inside its synchronous, locked
+response, using thread-local temporary storage. Outcomes, exact Policy reservations, populations,
+coverage and health retain their normal checks. The next response, standalone qualification and
+trading work do not inherit the temporary results. Cancellation still waits for the worker before
+releasing the market boundary; no unlocked access to mutable learning state was introduced.
 
 The original network/priority fee budget is frozen for each new observation and Decision Lab
 assessment. Validated sell quotes round fee components individually and account for LP fees
@@ -86,7 +131,7 @@ Champion dependencies, learner identity, demo state, season and shutdown state. 
 or over-120-second job publishes no result and queues a current retry. The elapsed limit rejects
 late output; it does not forcibly interrupt native fitting. Existing row, round and CPU bounds
 remain necessary. Coach can study while holdings are dormant or healthy and executable. Pending
-orders, stale/unexecutable active holdings, imminent reviews, training and market pressure still
+orders, stale/unexecutable active holdings, imminent/unassessed reviews, training and market pressure still
 take priority. Its detached read/screening workers can pause between batches and resume the same
 complete cohort within a 30-second deadline; interrupted work supplies no partial proof.
 
@@ -247,6 +292,10 @@ with at least 20 validation examples. Validation is chronological, never randoml
 training outcome observed on or after the first validation decision is embargoed, so overlapping
 five-minute labels cannot leak future information across the split.
 
+The XGBoost eligibility display uses the latest matching Linear/XGBoost fit, not the maximum
+sample count of retained artifacts or a live recount. Its measurement time appears in the
+details. Older XGBoost or Coach artifacts cannot inflate a newer, smaller fitted cohort.
+
 A model is fitted only within one exact risk mode and decision-relevant configuration, including
 the Baseline, integrity and sizing-policy versions. A new deterministic policy therefore starts a
 new forward cohort without deleting or relabelling older lessons or models. Risk
@@ -273,12 +322,20 @@ qualifies only when its untouched validation section:
 Ranking is not enough. The `learning-evidence-v2` policy journal independently freezes whether a
 Baseline ENTER was genuinely submittable under cash, exposure, capacity, and conversion gates.
 Only episodes from the exact current risk, configuration, Baseline and feature generation count.
-At least 20 usable policy outcomes, 70% policy-outcome availability, ten supported/kept cases and
-five proposed vetoes are required. No more than 35% of tested vetoes may discard winners, and the
+At least 20 usable policy outcomes, 70% policy-outcome availability, ten familiar cases (within
+learned support, whether kept or vetoed) and five proposed vetoes are required. No more than 35%
+of tested vetoes may discard winners, and the
 bounded fee-inclusive uplift must retain a positive conservative lower bound. At least 95% of the
 broad validation section must also remain inside fitted feature support. An out-of-distribution
 policy case is kept by the Baseline—it is never credited as a Challenger veto—and a later
 unfamiliar decision always falls back to the transparent Baseline.
+
+The same fallback applies to Entry/Manipulation shared-battle scoring and manual health/join
+checks. A recorded `veto` proposal outside learned support earns the Baseline return, including
+its losses, and is not counted as a winner veto. Unknown executable outcomes remain unknown.
+An ongoing replay crossing this scoring correction restarts its displayed points as a partial
+recording; contestants and evidence remain intact. Completed historical replays are preserved.
+The correction does not change the shared Exit proof version or suspend an existing Exit Champion.
 
 The persisted coefficients are the exact older-section candidate evaluated by those checks. The
 app does not refit that artifact on the validation outcomes after it passes. This gives every
@@ -585,19 +642,57 @@ none. It cannot invent a condition, submit an order, change a live decision, or 
 gate. Coach research can be paused independently without deleting its notebook or disabling saved
 Shadow decision reviews.
 
+After a position's normal review, a current `hold / adaptive_extension` assessment can allow
+research to resume. It must match the current season and exit-policy version, follow process
+start and the latest mark, and be no more than 30 seconds old (or the configured mark limit,
+if shorter). The completed assessment must reach the position's effective normal review;
+an earlier Champion review alone does not satisfy that check. Effective hard limits and hold
+support are rechecked, with more than the 75-second inference budget plus a 30-second guard
+remaining before any active position's hard exit. Missing, malformed or stale evidence keeps
+the exception closed. The scheduling check uses bounded in-memory state; it does not reassess
+positions, change orders, request quotes or read learning history. Dormant inventory retains
+its existing scheduling behaviour, while any pending order still takes priority.
+The complete Coach inference request has a 75-second deadline, including generation-lock and
+quota waits. Timeouts retain the existing failed-review/backoff path and create no hypothesis.
+Cancelling a local request does not prove that a remote inference server has already stopped
+computing; resource sharing and burst behaviour still require observation on the deployment host.
+
 Historical evidence may screen or reject an idea, but cannot prove it. Every selected study
 freezes its risk personality, decision-configuration fingerprint, Baseline version, feature schema,
-active skill dependencies and proposal cutoff. Only exact-cohort, fee-inclusive outcomes created
-after that cutoff contribute to forward proof. Observation IDs, measured values and meaningful
-season counts are stored durably, so restart, history pruning or a rolling observation window
-cannot replay evidence or silently reset the proof clock. Legacy and incompatible rows stay
-readable but do not enter a current study.
+active skill dependencies and proposal cutoff. The cutoff is frozen after the model selects an
+idea, not at the beginning of inference.
+New `policy-v1` studies use canonical, Baseline-actionable Policy entries created after that
+cutoff, including tokens whose earlier Discovery observation was a Pass. Matching risk, fees,
+Baseline/features and active dependencies remain mandatory. Discovery remains the separate
+historical screen and cannot supply forward proof to a new study.
+
+Each study enrolls at most 180 independent identities in chronological order and reads at most
+64 new journal keys per page, plus its bounded pending identities. Only the resolved prefix
+contributes to qualification: later quick successes cannot jump over earlier pending outcomes.
+Unavailable, missing or invalidated enrolled outcomes count as unknown. Persisted identities
+and values survive restart and cleanup. If retention overtakes an unscanned page, the study closes as
+inconclusive (`policy_history_gap`) instead of treating surviving records as a complete sample.
+The watermark is deliberately conservative across contexts; a retention gap can end a study
+without establishing that its own eligible outcomes were lost.
+The cursor and pruning watermark both include time and episode identity, so entries sharing a
+timestamp cannot hide a retention gap. Pending records are rechecked against their frozen
+identity and dependencies before resolution.
+
+Unfinished `discovery-v1` studies transition once to inconclusive (`evidence_contract_changed`),
+preserving their old counts and values. A newly screened idea receives a fresh cutoff; no old
+outcomes are retroactively credited. Terminal studies and existing contributed artifacts keep
+normal history, permission, battle and activation rules. Older builds do not understand the new
+research records; rollback must not overwrite newer trading evidence just to restore a study.
 
 A supported study needs at least 60 usable outcomes, at least 70% executable coverage, two
 independent seasons with at least ten usable outcomes each, and a confidence-adjusted improvement
 above one percentage point. Clearly harmful evidence may reject a study after 120 usable outcomes.
 A study that reaches 180 resolved observations or 90 days without enough support closes as
 inconclusive, including quiet cohorts that never reached 60 samples; it cannot collect forever.
+Coach reports the actual finite difference between alternatives. That difference and its
+confidence bounds can exceed the range of either individual return; they are not clipped to
+the single-return limits. This corrects storage/reporting without changing the support or
+rejection thresholds, fees, or underlying outcomes.
 
 Support still grants no trading authority. The Coach card's **Allow when ready** control saves
 explicit permission in advance, even before an idea qualifies. The preference survives restart;
@@ -620,8 +715,9 @@ Champion or change the research/activation gates. AI Off remains a stop for new 
 
 Coach refreshes condition their writes on the saved study still matching, so they cannot replace
 a newer contribution transition. Forward evaluation can yield under market pressure and resumes
-from saved, complete evidence. Inference backoff skips the large history read only when there is
-no unfinished forward study to monitor; it does not pause that study's evidence collection.
+from saved, complete evidence. Active Policy studies skip the historical screening read entirely. Inference backoff does not
+pause their bounded forward collection. Saved `collection_counts` report enrollment, pending
+work and exclusions; the full internal enrollment ledger is omitted from dashboard snapshots.
 
 Dashboard Policy selection is reused only within one response. Tournament passes may share the
 same contract's selected population, but qualification and health decisions remain fresh. A
@@ -655,6 +751,45 @@ same point-in-time feature contract, chronological embargo, independent
 policy journal, immutable payload validation and common-forward Champion process; added complexity
 must always be allowed to lose to its simpler reference.
 
+## Champion impact
+
+Learning Overview includes a passive comparison of current Champion support against its reference.
+It uses existing independent Policy episodes and entry-frozen Champion receipts. It never supplies
+an input to training, activation, suspension, Coach admission or the broker.
+
+Entry and Manipulation compare the recorded five-minute Baseline outcome against either that
+outcome or cash preserved by a supported veto. Sizing compares the saved bounded multiplier with
+the same opportunity at 1× after modeled fees. Exit compares its frozen timing choice with the
+normal review at the same size. Team applies the current skills in order on the same opportunities
+against a 1× reference at the normal review. Overlapping vetoes count once; a prior veto prevents
+downstream roles from receiving credit. Individual deltas cannot be added to calculate team impact.
+Unfamiliar cases retain their reference behavior, and unavailable quotes or unverifiable receipts
+remain unknown rather than being assigned a profitable outcome.
+
+Sizing and team outcomes are normalized by the reference entry cost, so **percentage points**
+describe differences in the modeled outcome per opportunity. Both outcomes can be negative while
+support reduces the loss. Exit uses saved checkpoints, not a replay of adaptive reviews, hard exits
+or actual fill timing. This view does not simulate a second bankroll, freed capacity, later entries
+or compounding. Account performance remains in Results.
+
+The report shares the dashboard's bounded Policy selection (at most 1,000 independent rows) and
+uses up to 60 recent resolved opportunities per comparison. It requires the exact current season,
+profile and active versions, after the latest activation and artifact creation. It cannot import
+results from an old reign, different composition or pre-activation evidence. Pending observations
+and opportunities blocked by an earlier veto are reported separately. Counts are for this retained
+comparison window, not lifetime activity.
+
+An observed-advantage/disadvantage label needs 30 usable pairs, 70% coverage and an approximate
+95% paired-mean interval wholly above/below zero. Otherwise the panel says collecting or no clear
+advantage. This descriptive interval does not address all market dependence or repeated looks;
+it is neither independent qualification proof nor a prediction of future profit. Existing proof
+and health requirements are unchanged. Paused/suspended support, missing context and incompatible
+or stale responses display no current performance claim. Method details are collapsed by default.
+
+There are no new provider requests, inference, database writes, retention rules or polling loops.
+The report is computed from existing records inside the normal snapshot; it remains bounded for
+long seasons. A full independent two-portfolio experiment is still deferred.
+
 ## Bankroll growth
 
 The portfolio always distinguishes total cash, cash reserved by pending orders, cash available for
@@ -667,3 +802,20 @@ new order.
 This keeps the accounting honest and makes growth visible without turning one lucky mark into an
 aggressive bet. The main goal remains a truthful experiment: wait when evidence is weak, include
 all modeled friction, and preserve enough history to learn whether the strategy helped or hurt.
+
+### Entry validation and authority commit boundaries
+
+Native Linear and XGBoost Entry fits record `entry-top-group-v2` in their validation provenance.
+The top third is selected by predictions alone. Scores strictly above the boundary are fully
+included, and the remaining places are shared equally across the tied boundary group. With
+identical forecasts this returns the whole group's mean, not the retrospectively best outcomes.
+No-tie results and the 70% coverage, performance, independent-proof and complexity gates stay
+unchanged. Old artifacts remain readable and can be frozen comparison references, but their
+old qualification cannot restore, recover or newly activate native Entry support.
+
+Champion activation prepares detached authority, atomically commits the affected states, active
+map and mode, and then publishes into the existing state objects held by tournament callers.
+Manual consent and legacy-model removal join that same commit. Failed grants retain the prior
+safe authority. Suspension/deactivation instead removes affected support first; a failed write
+is retained for retry and must commit before another grant. None of these changes move hard
+exits, alter existing order execution or give Coach direct trading control.

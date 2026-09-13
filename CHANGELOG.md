@@ -4,6 +4,87 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.10.10 - 2026-09-09
+
+- Remove future-outcome tie breaking from Entry top-group validation. Use equal boundary-tie
+  weights for Linear, XGBoost and Baseline comparisons; require the corrected validation contract
+  for native Entry qualification and activation while preserving historical artifacts.
+  Keep XGBoost qualification and participation labels consistent with that contract while
+  retaining historical Champion and suspension labels.
+- Commit Champion grants, upstream/downstream authority, mode and manual consent before
+  publishing memory. Preserve tournament object references. Safety revocations remove all
+  affected authority even on a failed save and retry before granting new support.
+- Collect new Coach forward studies from canonical, post-selection Policy entries. Persist
+  bounded enrollment and pending evidence; evaluate chronological resolved prefixes, retain
+  unknown outcomes and detect unscanned retention gaps. Close unfinished legacy studies once
+  without rewriting their results or changing contribution permission. Active studies avoid
+  repeated historical-screen reads; internal enrollment records stay out of dashboard payloads.
+- Preserve valid Coach outcome differences beyond the single-return range, including their
+  confidence bounds, so large gains or losses do not make persisted research unreadable.
+  Research thresholds and the underlying fee-inclusive outcomes are unchanged.
+- Show newly reported reserve-validation faults even while the dashboard snapshot is stale.
+  Preserve existing market warnings, fresh-confirmation recovery and request pacing; this is
+  a display correction with no trading, learning or backend scheduling change.
+- Recover stalled dashboard WebSocket handshakes, missed close events, network changes and
+  suspended browser sessions without a reload. Preserve bounded backoff and shared in-flight
+  refreshes, keep fallback polling from being postponed by retries, and suppress notification
+  refreshes in hidden tabs. Label the fallback **Auto refresh**; backend trading is unchanged.
+- Add a passive Champion impact panel in Learning Overview. Compare frozen decisions on matched,
+  fee-inclusive checkpoints for each active skill and the exact combined team. Preserve unknown
+  outcomes in coverage, show uncertainty and reset the comparison scope on season, version or
+  activation changes. Reuse bounded Policy evidence without new storage, model calls, permissions
+  or trading changes. This is not a second portfolio or a measure of realized account profit.
+  Distinguish Shadow learning awaiting active support from paused comparisons, including after
+  a replacement crown. Keep suspended skills labelled separately and hide inactive results.
+- Let Coach research resume during a freshly assessed adaptive hold after the normal review,
+  while preserving order, market-pressure, restart/season freshness and hard-exit guards.
+  Bound the complete inference request to its 75-second budget. Keep research screening,
+  forward proof, contribution permission and trading rules unchanged.
+- Score unsupported Entry/Manipulation proposals as Baseline fallback in shared battles and
+  manual health/join checks. Count only executable, supported vetoes as winner vetoes. Preserve
+  unavailable outcomes, qualification thresholds, existing Exit proof and frozen replay history.
+- Show XGBoost training eligibility from the latest matching Linear/XGBoost fit, rather than
+  the largest retained training count. Explain that familiar Policy cases may be kept or vetoed.
+- Add bounded collection diagnostics by evidence lane and horizon, including RPC failure stages
+  and completed/expired checkpoints. Emit compact periodic events within existing storage limits;
+  no additional per-attempt database writes, deadline changes or live configuration changes.
+- Recheck temporary reserve-collection guards after 1–1.25 seconds instead of losing a full
+  interval to brief maintenance or market pressure. Keep the configured wait after every actual
+  attempt, provider backoff, disabled/idle pacing and all market-protection guards.
+- Record bounded expiry attribution by the last known RPC stage, with separate trajectory clocks
+  and explicit unknown history after restart/eviction. Add low-priority heartbeat substep timings;
+  preserve evidence records, operation order and diagnostics storage limits.
+- Report repeated shared-account layout failures separately from market lag and process health,
+  with independent learning/watchdog and curve/swap status. Preserve rejection of unreviewed
+  extensions and add independent public-account regression fixtures.
+- Include bounded account-layout lengths and sample digests in optional diagnostic events.
+  Separate cumulative learning dispatch and resumption waits without enlarging interval records
+  or displacing queued proof. Unknown layout bytes are still rejected.
+- Skip market-event learning worker dispatches between checkpoints, checking Discovery and
+  Policy entry clocks independently. Preserve due/expired evidence, feature updates, held-position
+  processing, joined cancellation and the unchanged training/proof populations.
+- Decode the holder-reward Global, BondingCurve and Pool extensions using official Pump
+  documentation revision `f216b6724c6ede79d7cef9ce210b741f7e17e93b`. Keep existing fee amounts,
+  event prefixes and legacy accounts; reject malformed booleans, nonzero partial fields and
+  later unknown extensions. Creation permission does not disable trading existing coins.
+- Reuse Discovery feature-vector validation only inside one locked dashboard response. Drop
+  temporary checks on completion or error; never reuse them across threads or later responses,
+  or cache coverage, health, permissions or qualification conclusions.
+- Support the Pump/PumpSwap account extensions documented in the official Rust client 0.1.13,
+  including configured creator fees and Mayhem AMM fee-tier supply. Keep legacy account support,
+  unchanged stream/event decoding, fee-component rounding and current route validation. New
+  reserve receipts identify the revised recipe; saved outcomes are not rewritten. See the
+  validation record for the isolated checks, confirmed live collection recovery and observation limits.
+- Retain schema 16, the 70% coverage requirement, fees, training/proof separation and Baseline
+  boundaries. A comparison spanning the scoring correction begins a partial replay; new battles
+  retain their complete recording. No new season or learning reset is required.
+
+See the [v1.10.10 validation record](docs/V1_10_10_VALIDATION.md) for regression results,
+the isolated collection-capacity comparison and remaining live-observation requirements.
+The additional Pump Global suffix observed on 12 September is covered by the pinned holder-rewards
+contract. Initial post-deployment checks confirm collection recovery; mature coverage and sustained
+burst performance still require longer observation.
+
 ## 1.10.9 - 2026-09-08
 
 - Separate suspended trade support from an ongoing shadow comparison in Champion Arena.

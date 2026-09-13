@@ -1,4 +1,4 @@
-"""Pure validation of learning-only account snapshots; no live market state is changed."""
+"""Pure reserve validation shared by learning collection and the position watchdog."""
 
 from __future__ import annotations
 
@@ -16,11 +16,50 @@ from ..providers.solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, SolanaLogProvider
 from .features import NATIVE_SOL_MINT, WRAPPED_SOL_MINT, TokenState
 
 FEE_PROGRAM = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
-RESERVE_PROOF_VERSION = "learning-account-snapshot-v1"
+RESERVE_PROOF_VERSION = "learning-account-snapshot-v2"
+# Official holder-rewards contract; the fee amounts and trade interfaces are unchanged.
+RESERVE_ACCOUNT_RECIPE = "f216b6724c6ede79d7cef9ce210b741f7e17e93b"
+
+# Appended account fields from pump-rust-client 0.1.13 (published 2026-09-09).
+# Its archive SHA-256 and independent account definitions are retained in
+# tests/fixtures/pump_rust_account_contract_0_1_13.json. Keep the stream IDLs pinned:
+# replacing them would also change historical CreateEvent/CreatePoolEvent decoding.
+_ACCOUNT_EXTENSIONS = {
+    "FeeConfig": "<QQQ",
+    "Global": "<BQ",
+    "GlobalConfig": "<BQ",
+    "BondingCurve": "<QB",
+    "Pool": "<QB",
+}
 
 
 class ReserveRefreshRejected(ValueError):
-    pass
+    def __init__(
+        self,
+        reason: str,
+        *,
+        account_type: str | None = None,
+        layout: dict[str, int | str] | None = None,
+    ) -> None:
+        super().__init__(reason)
+        # Diagnostic context only: keep the existing reason and acceptance rules intact.
+        self.account_type = account_type
+        self.layout = dict(layout) if layout is not None else None
+
+
+def _layout_details(raw: bytes, reviewed_bytes: int | None = None) -> dict[str, int | str]:
+    # Do not retain account bodies or hash arbitrarily large RPC data on the market boundary.
+    # The explicit sample length distinguishes a full-account digest from a bounded prefix.
+    sample = raw[:4096]
+    details: dict[str, int | str] = {
+        "account_bytes": len(raw),
+        "sample_bytes": len(sample),
+        "sample_sha256": hashlib.sha256(sample).hexdigest(),
+    }
+    if reviewed_bytes is not None:
+        details["reviewed_bytes"] = reviewed_bytes
+        details["unreviewed_bytes"] = max(0, len(raw) - reviewed_bytes)
+    return details
 
 
 def pda(program: str, *seeds: bytes) -> str:
@@ -83,11 +122,91 @@ def _decoded(
 ) -> dict[str, Any]:
     result = decoder.decode_account(account["raw"], expected_program=program, expected_name=name)
     if result is None:
-        raise ReserveRefreshRejected("unsupported_account_layout")
+        raise ReserveRefreshRejected(
+            "unsupported_account_layout", account_type=name, layout=_layout_details(account["raw"])
+        )
     values = result[2]
     remaining = int(values.get("_remaining_bytes", 0))
-    if remaining and any(account["raw"][-remaining:]):
-        raise ReserveRefreshRejected("unreviewed_account_extension")
+    tail = account["raw"][-remaining:] if remaining else b""
+    layout = _ACCOUNT_EXTENSIONS.get(name)
+    reviewed_bytes = len(account["raw"]) - remaining
+    if layout is not None:
+        size = struct.calcsize(layout)
+        if tail:
+            reviewed_bytes += size
+        # Exact legacy prefixes have no appended fields. Do not zero-pad a partially
+        # received extension, even when its bytes happen to be zero.
+        if tail and len(tail) < size:
+            raise ReserveRefreshRejected(
+                "unsupported_account_layout",
+                account_type=name,
+                layout=_layout_details(account["raw"], reviewed_bytes),
+            )
+        extension = struct.unpack(layout, tail[:size] if tail else bytes(size))
+        if name == "FeeConfig":
+            values["exotic_flat_fees"] = dict(
+                zip(("lp_fee_bps", "protocol_fee_bps", "creator_fee_bps"), extension, strict=True)
+            )
+        elif name in {"Global", "GlobalConfig"}:
+            if extension[0] not in (0, 1):
+                raise ReserveRefreshRejected(
+                    "unsupported_account_layout",
+                    account_type=name,
+                    layout=_layout_details(account["raw"], reviewed_bytes),
+                )
+            values["creator_fee_configurable"] = bool(extension[0])
+            values["max_configurable_creator_fee_bps"] = extension[1]
+        else:
+            if extension[1] not in (0, 1):
+                raise ReserveRefreshRejected(
+                    "unsupported_account_layout",
+                    account_type=name,
+                    layout=_layout_details(account["raw"], reviewed_bytes),
+                )
+            values["creator_fee_bps"] = extension[0]
+            values["can_edit_creator_fee"] = bool(extension[1])
+        tail = tail[size:]
+    if name == "Global":
+        values["holder_reward_claim_authority"] = NATIVE_SOL_MINT
+        values["is_holder_reward_enabled"] = False
+        if len(tail) >= 33:
+            reviewed_bytes += 33
+            if tail[32] not in (0, 1):
+                raise ReserveRefreshRejected(
+                    "unsupported_account_layout",
+                    account_type=name,
+                    layout=_layout_details(account["raw"], reviewed_bytes),
+                )
+            values["holder_reward_claim_authority"] = str(Pubkey.from_bytes(tail[:32]))
+            values["is_holder_reward_enabled"] = bool(tail[32])
+            tail = tail[33:]
+        elif any(tail):
+            # Preserve legacy zero allocation padding, but never complete a partially
+            # received authority with invented bytes or a default enabled flag.
+            raise ReserveRefreshRejected(
+                "unsupported_account_layout",
+                account_type=name,
+                layout=_layout_details(account["raw"], reviewed_bytes + 33),
+            )
+    elif name in {"BondingCurve", "Pool"}:
+        values["is_holder_reward"] = False
+        if tail:
+            reviewed_bytes += 1
+            if tail[0] not in (0, 1):
+                raise ReserveRefreshRejected(
+                    "unsupported_account_layout",
+                    account_type=name,
+                    layout=_layout_details(account["raw"], reviewed_bytes),
+                )
+            values["is_holder_reward"] = bool(tail[0])
+            tail = tail[1:]
+    if any(tail):
+        raise ReserveRefreshRejected(
+            "unreviewed_account_extension",
+            account_type=name,
+            layout=_layout_details(account["raw"], reviewed_bytes),
+        )
+    values["_remaining_bytes"] = len(tail)
     return values
 
 
@@ -185,6 +304,9 @@ def validated_learning_state(
     if not safety or not safety.get("safe") or not safety.get("verified"):
         raise ReserveRefreshRejected("mint_not_verified_safe")
     _account(accounts, original.mint, safety["owner"])
+    mint_supply = int(safety["supply"])
+    if not 0 < mint_supply <= 2**64 - 1:
+        raise ReserveRefreshRejected("invalid_fee_supply")
     program = PUMP_PROGRAM if original.venue == "pump_curve" else PUMP_AMM_PROGRAM
     fee_account = _account(accounts, addresses[1], FEE_PROGRAM)
     fee_config = _decoded(decoder, fee_account, program, "FeeConfig")
@@ -196,8 +318,10 @@ def validated_learning_state(
     )
     state = replace(original)
     creator: str
+    coin_creator_fee_bps: int
     canonical = True
     mayhem = False
+    holder_reward = False
     if original.venue == "pump_curve":
         curve = _decoded(
             decoder,
@@ -210,15 +334,17 @@ def validated_learning_state(
         if curve.get("quote_mint") not in {NATIVE_SOL_MINT, WRAPPED_SOL_MINT}:
             raise ReserveRefreshRejected("unsupported_quote_mint")
         mayhem = bool(curve.get("is_mayhem_mode"))
+        holder_reward = bool(curve["is_holder_reward"])
         state.virtual_token_reserves = int(curve["virtual_token_reserves"])
         state.virtual_quote_reserves = int(curve["virtual_quote_reserves"])
         state.real_token_reserves = int(curve["real_token_reserves"])
         state.real_quote_reserves = int(curve["real_quote_reserves"])
         creator = str(curve["creator"])
-        # pump-sdk 1.36.0 getFee(): Mayhem uses the current mint-account supply,
-        # not the curve's original token_total_supply (burns can change it).
-        # The verified mint is in the same RPC account batch as these reserves.
-        fee_supply = int(safety["supply"]) if mayhem else 1_000_000_000_000_000
+        coin_creator_fee_bps = int(curve["creator_fee_bps"])
+        # pump-rust-client 0.1.13 math/bonding_curve.rs fee_for_quote(): curve
+        # Mayhem sells use current mint supply; ordinary curves use fixed supply.
+        fixed_supply = not mayhem
+        fee_supply = 1_000_000_000_000_000 if fixed_supply else mint_supply
         state.reserve_lp_fee_bps = 0
     else:
         pool = _decoded(
@@ -228,6 +354,7 @@ def validated_learning_state(
             "Pool",
         )
         mayhem = bool(pool.get("is_mayhem_mode"))
+        holder_reward = bool(pool["is_holder_reward"])
         if pool["base_mint"] != original.mint or pool["quote_mint"] != WRAPPED_SOL_MINT:
             raise ReserveRefreshRejected("pool_mint_mismatch")
         expected_pool = pda(
@@ -268,12 +395,16 @@ def validated_learning_state(
         state.quote_mint = str(pool["quote_mint"])
         state.route_verified = True
         creator = str(pool["coin_creator"])
+        coin_creator_fee_bps = int(pool["creator_fee_bps"])
         canonical = pool["creator"] == pda(
             PUMP_PROGRAM,
             b"pool-authority",
             bytes(Pubkey.from_string(original.mint)),
         )
-        fee_supply = int(safety["supply"])
+        # This differs from bonding curves. The current SDK's sdk/mod.rs
+        # fee_tier_supply(), mirroring Pool::market_cap, fixes Mayhem AMM supply.
+        fixed_supply = mayhem
+        fee_supply = 1_000_000_000_000_000 if fixed_supply else mint_supply
     if not 0 < fee_supply <= 2**64 - 1:
         raise ReserveRefreshRejected("invalid_fee_supply")
     if state.real_quote_reserves < 0 or state.real_token_reserves < 0:
@@ -287,6 +418,11 @@ def validated_learning_state(
         else None
     )
     fees = _fees(fee_config, market_cap or 0, canonical)
+    creator_fee_gate = bool(global_values["creator_fee_configurable"])
+    if creator_fee_gate and coin_creator_fee_bps != 0:
+        # The global maximum and can_edit_creator_fee constrain configuration,
+        # not a trade against an existing stored rate. Zero means use the schedule.
+        fees["creator_fee_bps"] = coin_creator_fee_bps
     state.reserve_lp_fee_bps = fees["lp_fee_bps"] if original.venue == "pump_swap" else 0
     state.reserve_fee_components = (
         state.reserve_lp_fee_bps,
@@ -294,6 +430,8 @@ def validated_learning_state(
         fees["creator_fee_bps"] if creator != NATIVE_SOL_MINT else 0,
     )
     state.fee_bps = sum(state.reserve_fee_components)
+    if any(value < 0 for value in state.reserve_fee_components) or state.fee_bps >= 10_000:
+        raise ReserveRefreshRejected("invalid_fee_rates")
     if empty:
         # No pricing claim is made for an empty route. Only the watchdog may use this
         # fully validated state as evidence of current non-executability.
@@ -320,11 +458,13 @@ def validated_learning_state(
         "economic_state": "empty_route" if empty else "reserves_present",
         "fee_market_cap": market_cap,
         "fee_supply": fee_supply,
-        "fee_supply_source": (
-            "verified_mint" if mayhem or original.venue == "pump_swap" else "fixed_billion"
-        ),
+        "fee_supply_source": "fixed_billion" if fixed_supply else "verified_mint",
         "is_mayhem_mode": mayhem,
-        "fee_recipe": "pump-sdk-1.36.0/pump-swap-sdk-1.19.0",
+        "is_holder_reward": holder_reward,
+        "account_recipe": RESERVE_ACCOUNT_RECIPE,
+        "creator_fee_configurable": creator_fee_gate,
+        "stored_creator_fee_bps": coin_creator_fee_bps,
+        "fee_recipe": "pump-rust-client-0.1.13",
         "accounts": [
             {
                 "address": address,

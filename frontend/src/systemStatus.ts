@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useReducer } from "react";
+import type { ReserveValidationStatus } from "./types";
 
-export type IssueScope = "server" | "dashboard" | "database" | "market" | "risk" | "learning" | "ai" | "explanation" | "mode" | "reset" | "setup" | "engine" | "providers" | "storage" | "leaderboard" | "maintenance";
+export type IssueScope = "server" | "dashboard" | "database" | "market" | "collection" | "risk" | "learning" | "ai" | "explanation" | "mode" | "reset" | "setup" | "engine" | "providers" | "storage" | "leaderboard" | "maintenance";
 
 export interface SystemIssue {
   id: string;
@@ -33,6 +34,13 @@ export const INITIAL_SYSTEM_STATUS: SystemStatusState = {
 };
 
 const MAX_HISTORY = 20;
+
+export function reserveValidationDetail(status: ReserveValidationStatus): string {
+  const venues = [...new Set(status.components
+    .filter((item) => item.active && item.state === "blocked")
+    .map((item) => item.venue === "pump_curve" ? "Pump curves" : "PumpSwap"))].sort();
+  return `${venues.join(" and ") || "Reserve refresh"} shared account layouts repeatedly failed validation. RPC evidence refresh is affected; unverified snapshots remain excluded. Stream processing is independent. See diagnostics for details.`;
+}
 
 export function marketHealthDetail(reasons: readonly string[] | undefined): string {
   const descriptions: Record<string, string> = {

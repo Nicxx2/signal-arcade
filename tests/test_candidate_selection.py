@@ -2,7 +2,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from signal_arcade.database import Database
-from signal_arcade.intelligence.learning import LearningEngine, _challenger_cohort_key
+from signal_arcade.intelligence.learning import (
+    ENTRY_VALIDATION_VERSION,
+    LearningEngine,
+    _challenger_cohort_key,
+)
 from signal_arcade.models import ChallengerSkill, StatisticalModelFamily
 from test_participation_progression import native_champion
 
@@ -101,6 +105,7 @@ def test_entry_selection_requires_matching_policy_population(settings, monkeypat
         update={
             "version": "older-linear",
             "skill": ChallengerSkill.ENTRY,
+            "hyperparameters": {"entry_validation_version": ENTRY_VALIDATION_VERSION},
             "model_family": StatisticalModelFamily.LINEAR,
             "evidence_cohort_digest": "discovery",
             "training_cutoff_at": now,

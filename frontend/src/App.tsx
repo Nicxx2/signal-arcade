@@ -28,7 +28,6 @@ import {
   TrendingUp,
   Trophy,
   Wifi,
-  WifiOff,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -45,8 +44,9 @@ import { latestDecisionsByMint, organizeDecisions } from "./decisionView";
 import { EquityChart } from "./EquityChart";
 import SeasonStrategy from "./SeasonStrategy";
 import { SkillSuspension } from "./SkillSuspension";
+import { ChampionImpact } from "./ChampionImpact";
 import { StatusPanel } from "./StatusPanel";
-import { friendlyError, marketHealthDetail, useSystemStatus } from "./systemStatus";
+import { friendlyError, marketHealthDetail, reserveValidationDetail, useSystemStatus } from "./systemStatus";
 import type { IssueScope } from "./systemStatus";
 import type {
   Decision,
@@ -69,6 +69,7 @@ import type {
   ProviderView,
   QuoteCurrency,
   ReadinessGate,
+  ReserveValidationStatus,
   RiskMode,
   SeasonAutomation,
   SeasonProfile,
@@ -549,11 +550,17 @@ export default function App() {
     });
   }, []);
 
-  const updateMarketStatus = useCallback((health: { degraded?: boolean; degraded_reasons?: string[] } | undefined) => {
+  const updateMarketStatus = useCallback((health: { degraded?: boolean; degraded_reasons?: string[]; reserve_validation?: ReserveValidationStatus } | undefined) => {
     if (health?.degraded === true) {
       reportIssue("market", "Market processing needs attention", new Error(marketHealthDetail(health.degraded_reasons)));
     } else if (health?.degraded === false) {
       resolveIssue("market");
+    }
+    if (health?.reserve_validation?.attention === true) {
+      reportIssue("collection", "Reserve validation needs attention", new Error(reserveValidationDetail(health.reserve_validation)));
+    } else if (health?.reserve_validation?.attention === false) {
+      // A fresh component report can resolve this; HTTP liveness and missing fields cannot.
+      resolveIssue("collection");
     }
   }, [reportIssue, resolveIssue]);
 
@@ -584,6 +591,11 @@ export default function App() {
             "Dashboard view is catching up",
             new Error("The trading engine is still running. This screen is showing the last complete snapshot and will refresh automatically."),
           );
+          if (next.event_pipeline?.reserve_validation?.attention === true) {
+            // Reserve faults are refreshed separately from the cached market view. Surface
+            // them now, without letting stale healthy fields clear either component warning.
+            updateMarketStatus({ reserve_validation: next.event_pipeline.reserve_validation });
+          }
         } else {
           resolveIssue("dashboard");
           // Only a fresh, explicit market report can confirm recovery. HTTP liveness alone
@@ -652,12 +664,22 @@ export default function App() {
     let socketOpen = false;
     let stopped = false;
     let pollTimer: number | null = null;
+    let pollDue = 0;
     let reconnectTimer: number | null = null;
+    let reconnectDue = 0;
     let reconnectAttempt = 0;
-    const schedulePoll = () => {
+    let handshakeTimer: number | null = null;
+    let connectionStarted = 0;
+    let hiddenAt: number | null = document.hidden ? Date.now() : null;
+    let resumeRepairPending = false;
+    const schedulePoll = (reset = false) => {
       if (stopped) return;
-      if (pollTimer !== null) window.clearTimeout(pollTimer);
       const delay = document.hidden ? 30_000 : socketOpen ? 15_000 : 5_000;
+      const due = Date.now() + delay;
+      // Failed handshakes must not keep pushing the fallback refresh into the future.
+      if (pollTimer !== null && !reset && pollDue <= due) return;
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
+      pollDue = due;
       pollTimer = window.setTimeout(() => {
         pollTimer = null;
         void refresh().finally(schedulePoll);
@@ -666,21 +688,56 @@ export default function App() {
     const initial = window.setTimeout(() => void refresh().finally(schedulePoll), 0);
     let websocketRefresh: number | null = null;
     let lastWebsocketRefresh = 0;
-    const scheduleReconnect = () => {
-      if (stopped || reconnectTimer !== null) return;
-      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 5));
-      reconnectAttempt += 1;
+    const scheduleReconnect = (resume = false) => {
+      if (stopped) return;
+      const delay = resume ? 1_000 : Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 5));
+      const due = Date.now() + delay;
+      if (reconnectTimer !== null && (!resume || reconnectDue <= due)) return;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (!resume) reconnectAttempt += 1;
+      reconnectDue = due;
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = null;
         connect();
       }, delay);
     };
+    const retireSocket = () => {
+      const previous = socket;
+      socket = null;
+      socketOpen = false;
+      if (handshakeTimer !== null) window.clearTimeout(handshakeTimer);
+      handshakeTimer = null;
+      if (websocketRefresh !== null) window.clearTimeout(websocketRefresh);
+      websocketRefresh = null;
+      if (previous) {
+        previous.onopen = previous.onclose = previous.onerror = previous.onmessage = null;
+        try { previous.close(); } catch { /* Recovery still proceeds if the browser cannot close it. */ }
+      }
+    };
+    const disconnected = (next: WebSocket) => {
+      if (socket !== next || stopped) return;
+      retireSocket();
+      setConnected(false);
+      schedulePoll();
+      scheduleReconnect();
+    };
     const connect = () => {
-      if (stopped) return;
-      const next = new WebSocket(socketUrl);
+      if (stopped || socket !== null) return;
+      setConnected(false);
+      let next: WebSocket;
+      try { next = new WebSocket(socketUrl); } catch {
+        setConnected(false);
+        schedulePoll();
+        scheduleReconnect();
+        return;
+      }
       socket = next;
+      connectionStarted = Date.now();
+      handshakeTimer = window.setTimeout(() => disconnected(next), 15_000);
       next.onopen = () => {
         if (socket !== next || stopped) return;
+        if (handshakeTimer !== null) window.clearTimeout(handshakeTimer);
+        handshakeTimer = null;
         if (reconnectTimer !== null) {
           window.clearTimeout(reconnectTimer);
           reconnectTimer = null;
@@ -690,41 +747,56 @@ export default function App() {
         setConnected(true);
         schedulePoll();
       };
-      next.onclose = () => {
-        if (socket !== next || stopped) return;
-        socket = null;
-        socketOpen = false;
-        setConnected(false);
-        schedulePoll();
-        scheduleReconnect();
-      };
-      next.onerror = () => {
-        if (socket !== next || stopped) return;
-        socketOpen = false;
-        setConnected(false);
-        schedulePoll();
-        // Browsers normally follow an error with `close`, but that is not guaranteed to be
-        // prompt on every proxy/network failure. Start the bounded recovery path immediately.
-        scheduleReconnect();
-        next.close();
-      };
+      next.onclose = () => disconnected(next);
+      next.onerror = () => disconnected(next);
       next.onmessage = () => {
-        if (socket !== next || stopped) return;
+        if (socket !== next || stopped || document.hidden) return;
         const delay = Math.max(0, 3_000 - (Date.now() - lastWebsocketRefresh));
         if (websocketRefresh !== null) return;
         websocketRefresh = window.setTimeout(() => {
           websocketRefresh = null;
+          if (stopped || socket !== next || document.hidden) return;
           lastWebsocketRefresh = Date.now();
           void refresh();
         }, delay);
       };
     };
     connect();
-    const visibilityChanged = () => {
-      if (!document.hidden) void refresh();
+    const resume = (networkChanged = false) => {
+      if (stopped) return;
+      // Some browsers report network/history restoration before making the page visible.
+      resumeRepairPending ||= networkChanged;
+      if (document.hidden) return;
+      const wasSuspended = hiddenAt !== null && Date.now() - hiddenAt >= 30_000;
+      hiddenAt = null;
+      lastWebsocketRefresh = Date.now();
+      void refresh();
+      if (socket && (
+        socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING
+        || (!socketOpen && Date.now() - connectionStarted >= 15_000)
+        || (socketOpen && (wasSuspended || resumeRepairPending))
+      )) {
+        retireSocket();
+        setConnected(false);
+      }
+      resumeRepairPending = false;
+      // Preserve an in-progress handshake and only one bounded retry, even if resume events overlap.
+      if (socket === null) scheduleReconnect(true);
       schedulePoll();
     };
+    const visibilityChanged = () => {
+      if (document.hidden) {
+        hiddenAt ??= Date.now();
+        if (websocketRefresh !== null) window.clearTimeout(websocketRefresh);
+        websocketRefresh = null;
+        schedulePoll(true);
+      } else resume();
+    };
+    const online = () => resume(true);
+    const pageShown = (event: PageTransitionEvent) => { if (event.persisted) resume(true); };
     document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("online", online);
+    window.addEventListener("pageshow", pageShown);
     return () => {
       stopped = true;
       window.clearTimeout(initial);
@@ -732,7 +804,9 @@ export default function App() {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (websocketRefresh !== null) window.clearTimeout(websocketRefresh);
       document.removeEventListener("visibilitychange", visibilityChanged);
-      socket?.close();
+      window.removeEventListener("online", online);
+      window.removeEventListener("pageshow", pageShown);
+      retireSocket();
     };
   }, [refresh]);
 
@@ -978,9 +1052,9 @@ export default function App() {
               <AlertTriangle size={14} /> Risk paused
             </span>
           )}
-          <span className={`connection ${connected ? "online" : "offline"}`}>
-            {connected ? <Wifi size={15} /> : <WifiOff size={15} />}
-            {connected ? "Live updates" : expectedRestart ? "Updating" : "Polling"}
+          <span className={`connection ${connected ? "online" : "fallback"}`} title={connected ? "Live notifications with automatic refresh fallback." : expectedRestart ? "Waiting for the app to finish updating." : "Refreshing periodically; the live connection will retry automatically."}>
+            {connected ? <Wifi size={15} /> : <RotateCcw size={15} />}
+            {connected ? "Live updates" : expectedRestart ? "Updating" : "Auto refresh"}
           </span>
           <StatusPanel
             activeIssues={activeIssues}
@@ -1770,11 +1844,12 @@ function NonlinearEntryProgress({ status }: { status: NonNullable<Snapshot["lear
     </div>
     <div className="nonlinear-entry-progress-copy">
       <span>{thresholdMet ? `${eligible.toLocaleString()} eligible rows` : `${eligible.toLocaleString()} / ${minimum.toLocaleString()} training rows`}</span>
-      <small>{thresholdMet ? `${minimum.toLocaleString()}-row eligibility threshold met` : "Eligibility—not promotion progress"}</small>
+      <small>Latest fit · {thresholdMet ? `${minimum.toLocaleString()}-row threshold met` : "eligibility only"}</small>
     </div>
     <div className="nonlinear-entry-progress" role="progressbar" aria-label="XGBoost Entry training eligibility" aria-valuemin={0} aria-valuemax={minimum} aria-valuenow={shown}><span style={{ width: `${shown / minimum * 100}%` }} /></div>
     <details>
       <summary>How nonlinear Entry earns a place</summary>
+      <p>Row counts describe the latest completed fit in this context{status.training_count_at ? ` (${shortDate(status.training_count_at)})` : ""}. They can fall as the training window moves; an older XGBoost artifact does not raise this count.</p>
       <p>After enough exact-cohort training rows exist, XGBoost must materially beat its paired Linear model and pass independent proof. Either family can earn the first Entry crown; once a Champion exists, replacements must also win the shared forward comparison. Reaching the row threshold alone grants no influence.</p>
       <small>Required validation improvement over Linear: {percent(status.required_linear_improvement_fraction)}.</small>
     </details>
@@ -2086,6 +2161,7 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
         <button type="button" onClick={() => setActiveView("challenger")}><span>Statistical Challenger</span><strong>{challengerState}</strong><small>{challengerOverviewSummary(learning)}</small><em>Open Challenger <ChevronRight size={12} /></em></button>
         <button type="button" onClick={() => setActiveView("coach")}><span>Local AI Lab</span><strong>{snapshot.ai_lab.mode === "guarded" ? "Legacy critic" : title(snapshot.ai_lab.mode)} · {coachState}</strong><small>{snapshot.ai_lab.mode === "guarded" ? "Entry vetoes allowed · Coach research stays separate" : "Coach + saved reviews · no direct trade influence"}</small><em>Open AI Coach <ChevronRight size={12} /></em></button>
       </section>
+      <ChampionImpact learning={learning} seasonId={snapshot.season_context?.season_id ?? null} profile={snapshot.season_profile?.profile_fingerprint ?? null} serverTime={snapshot.server_time} />
       <div className="learning-overview-note"><ShieldCheck size={15} /><span><strong>The Baseline acts; the others must earn trust.</strong><small>Challenger and local AI evidence stays separate, measurable, bounded, and reversible.</small></span></div>
     </>}
 

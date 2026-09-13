@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .database import AdvisoryReadDeferred, Database
 from .intelligence.learning import (
+    CHECKPOINT_GRACE_SECONDS,
     COACH_ENTRY_RULES,
     COACH_MANIPULATION_COMBINATIONS,
     COACH_MANIPULATION_RULES,
@@ -25,6 +26,9 @@ from .intelligence.learning import (
     LEARNING_HORIZONS_SECONDS,
     PRIMARY_HORIZON_SECONDS,
     SIZING_MULTIPLIERS,
+    _matches_policy_identity,
+    _policy_identity,
+    _policy_identity_key,
 )
 from .models import (
     RISK_LIMITS,
@@ -32,9 +36,11 @@ from .models import (
     CoachCondition,
     CoachExperimentKind,
     CoachExperimentState,
+    CoachForwardEvidence,
     CoachHypothesis,
     CoachReview,
     DecisionAction,
+    LearningEvidenceEpisode,
     LearningObservation,
     RiskMode,
 )
@@ -44,8 +50,8 @@ from .workers import await_worker, joined_to_thread
 
 logger = logging.getLogger(__name__)
 
-COACH_PROMPT_VERSION = "coach-research-v4"
-COACH_SCHEMA_VERSION = "coach-research-schema-v4"
+COACH_PROMPT_VERSION = "coach-research-v5"
+COACH_SCHEMA_VERSION = "coach-research-schema-v5"
 COACH_REVIEW_INTERVAL_OUTCOMES = 25
 COACH_FIRST_REVIEW_OUTCOMES = 80
 COACH_MINIMUM_DISCOVERY_SAMPLES = 20
@@ -284,16 +290,13 @@ class AiCoach:
             if not work and cursor is None:
                 self.paused_reason = "retry_backoff"
                 return
-        observations = await self._optional_work(
-            self.database.recent_learning_observations, COACH_OBSERVATION_WINDOW
-        )
         allowed, reason = self.can_run()
         if not self.enabled() or not allowed:
             self.paused_reason = (
                 "ai_shadow_off" if not self.enabled() else reason or "protecting_market_work"
             )
             return
-        await self._optional_work(self._refresh_hypotheses, now, observations)
+        await self._optional_work(self._refresh_hypotheses, now, [])
         context = self._context_provenance()
         mode = context["risk_mode"]
         fingerprint = context["configuration_fingerprint"]
@@ -311,6 +314,14 @@ class AiCoach:
             return
         if active is not None:
             self.paused_reason = "forward_test_in_progress"
+            return
+        # A live Policy study needs only its bounded forward page. Historical screening
+        # remains separate and is read only when there is room for a new proposal.
+        observations = await self._optional_work(
+            self.database.recent_learning_observations, COACH_OBSERVATION_WINDOW
+        )
+        if context != self._context_provenance():
+            self.paused_reason = "context_changed"
             return
         exact_seen = _context_outcomes_seen(observations, context)
         # The fallback keeps the standalone v2 constructor contract used by older integrations;
@@ -405,18 +416,22 @@ class AiCoach:
             }
             serialized = json.dumps(prompt_payload, separators=(",", ":"), sort_keys=True)
             schema = _selection_schema([item.candidate_id for item in candidates])
-            response = await self.http.ollama_structured(
-                prompt=(
-                    "Choose one candidate_id from the supplied JSON or 'none'. Give one short "
-                    "plain summary explaining the evidence tradeoff. Output only the schema. JSON:"
-                    + serialized
-                ),
-                schema=schema,
-                # Unlike the fast critic, Coach Shadow never sits in a decision path. Give a
-                # CPU-only mini PC enough room for one cold model load while retaining a hard
-                # bound and the existing five-minute failure backoff.
-                timeout_seconds=COACH_INFERENCE_TIMEOUT_SECONDS,
-            )
+            try:
+                # Bound the whole request, including lock/quota waits and a slow response body.
+                # Admission reserves this budget before a held position's hard exit. The HTTP
+                # provider's finally block retains generation-lock ownership through cancellation.
+                async with asyncio.timeout(COACH_INFERENCE_TIMEOUT_SECONDS):
+                    response = await self.http.ollama_structured(
+                        prompt=(
+                            "Choose one candidate_id from the supplied JSON or 'none'. Give one "
+                            "short plain summary explaining the evidence tradeoff. Output only "
+                            "the schema. JSON:" + serialized
+                        ),
+                        schema=schema,
+                        timeout_seconds=COACH_INFERENCE_TIMEOUT_SECONDS,
+                    )
+            except TimeoutError:
+                response = None
             # A pause may arrive while a slow CPU inference is in flight. Discard that optional
             # result instead of allowing a proposal to appear after the user paused research.
             if not self.enabled():
@@ -460,10 +475,11 @@ class AiCoach:
                 None,
             )
             valid = bool(selection is not None and (selection.candidate_id == "none" or candidate))
+            selected_at = datetime.now(UTC)
             review = CoachReview(
                 review_id="coach-review-" + uuid.uuid4().hex,
-                created_at=now,
-                cutoff_at=now,
+                created_at=selected_at,
+                cutoff_at=selected_at,
                 outcomes_seen=seen,
                 risk_mode=mode,
                 configuration_fingerprint=fingerprint,
@@ -557,19 +573,39 @@ class AiCoach:
         if not pending:
             self._work_cursor = cursor
             return
-        selected = (
-            list(observations)
-            if observations is not None
-            else self.database.recent_learning_observations(COACH_OBSERVATION_WINDOW)
-        )
         for hypothesis in pending.values():
             if pause is not None:
                 pause()
-            updated = (
-                _evaluate_hypothesis(hypothesis, selected, now, pause=pause)
-                if pause is not None
-                else _evaluate_hypothesis(hypothesis, selected, now)
-            )
+            if hypothesis.state != CoachExperimentState.TESTING:
+                continue
+            if hypothesis.evidence_contract == "discovery-v1":
+                # One explicit terminal transition preserves old receipts and frees the
+                # context slot. A new proposal earns new evidence under the new contract.
+                updated = hypothesis.model_copy(
+                    update={
+                        "state": CoachExperimentState.INCONCLUSIVE,
+                        "resolved_at": now,
+                        "updated_at": now,
+                        "resolution_reason": "evidence_contract_changed",
+                    }
+                )
+            else:
+                try:
+                    episodes, identities, next_cursor, gap = self.database.coach_policy_page(
+                        hypothesis, pause=pause
+                    )
+                    updated = _evaluate_policy_hypothesis(
+                        hypothesis, episodes, identities, next_cursor, gap, now
+                    )
+                except ValidationError:
+                    updated = hypothesis.model_copy(
+                        update={
+                            "state": CoachExperimentState.INCONCLUSIVE,
+                            "resolved_at": now,
+                            "updated_at": now,
+                            "resolution_reason": "policy_evidence_unreadable",
+                        }
+                    )
             if updated != hypothesis:
                 if pause is not None:
                     pause()
@@ -641,7 +677,7 @@ class AiCoach:
         qualification_gates = _coach_qualification_gates(current)
         recent_hypotheses = []
         for item in self.hypotheses[:6]:
-            view = item.model_dump(mode="json")
+            view = item.model_dump(mode="json", exclude={"forward_enrollments", "forward_cursor"})
             view["context_active"] = bool(self._matches_provenance(item, context))
             recent_hypotheses.append(view)
         return {
@@ -1120,7 +1156,7 @@ def _hold_stats(
 
 
 def _coach_size_value(
-    observation: LearningObservation,
+    observation: LearningObservation | LearningEvidenceEpisode,
     multiplier: float,
 ) -> float | None:
     trial = observation.size_trials.get(f"{multiplier:g}")
@@ -1259,10 +1295,10 @@ def _stats(
 def _mean_bounds(values: Sequence[float]) -> tuple[float, float, float]:
     mean = fmean(values)
     if len(values) < 2:
-        return mean, max(-10.0, mean - 1.0), min(10.0, mean + 1.0)
+        return mean, mean - 1.0, mean + 1.0
     variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
     margin = COACH_Z_SCORE * math.sqrt(variance / len(values))
-    return mean, max(-10.0, mean - margin), min(10.0, mean + margin)
+    return mean, mean - margin, mean + margin
 
 
 def _evaluate_hypothesis(
@@ -1313,6 +1349,176 @@ def _evaluate_hypothesis(
         if len(observation_ids) >= COACH_MAXIMUM_FORWARD_OBSERVED:
             break
 
+    return _finish_forward_evidence(hypothesis, observation_ids, values, season_counts, now)
+
+
+def _coach_policy_contract(hypothesis: CoachHypothesis, episode: LearningEvidenceEpisode) -> bool:
+    identity = _policy_identity(episode)
+    return bool(
+        identity is not None
+        and identity[1]
+        and identity[2]
+        and episode.created_at.utcoffset() is not None
+        and episode.entry_at.utcoffset() is not None
+        and episode.created_at > hypothesis.cutoff_at
+        and episode.entry_at > hypothesis.cutoff_at
+        and episode.created_at == episode.entry_at
+        and episode.risk_mode == hypothesis.risk_mode
+        and episode.configuration_fingerprint == hypothesis.configuration_fingerprint
+        and episode.baseline_version == hypothesis.baseline_version
+        and episode.feature_schema_version == hypothesis.feature_schema_version
+        and episode.active_skill_versions == hypothesis.dependency_versions
+    )
+
+
+def _evaluate_policy_hypothesis(
+    hypothesis: CoachHypothesis,
+    episodes: Sequence[LearningEvidenceEpisode],
+    identities: dict[str, tuple[str, str]],
+    cursor: tuple[str, str],
+    retention_gap: bool,
+    now: datetime,
+) -> CoachHypothesis:
+    if hypothesis.state != CoachExperimentState.TESTING:
+        return hypothesis
+    enrolled = [item.model_copy(deep=True) for item in hypothesis.forward_enrollments]
+    if retention_gap and len(enrolled) < COACH_MAXIMUM_FORWARD_OBSERVED:
+        return hypothesis.model_copy(
+            update={
+                "state": CoachExperimentState.INCONCLUSIVE,
+                "resolved_at": now,
+                "updated_at": now,
+                "resolution_reason": "policy_history_gap",
+            }
+        )
+    counts = dict(hypothesis.collection_counts)
+    known = {item.identity for item in enrolled}
+    after = hypothesis.forward_cursor or (hypothesis.cutoff_at.isoformat(), "\uffff")
+    ordered = sorted(episodes, key=lambda item: (item.created_at.isoformat(), item.episode_id))
+    for episode in ordered:
+        position = (episode.created_at.isoformat(), episode.episode_id)
+        if position <= after or len(enrolled) >= COACH_MAXIMUM_FORWARD_OBSERVED:
+            continue
+        counts["scanned"] = counts.get("scanned", 0) + 1
+        if not _coach_policy_contract(hypothesis, episode):
+            counts["context_excluded"] = counts.get("context_excluded", 0) + 1
+            continue
+        identity = _policy_identity_key(episode)
+        if (
+            not _matches_policy_identity(episode, identities.get(identity, ("", "")))
+            or identity in known
+        ):
+            counts["identity_excluded"] = counts.get("identity_excluded", 0) + 1
+            continue
+        _, relevant, _ = _hypothesis_observation_value(hypothesis, episode)
+        if not relevant:
+            counts["condition_excluded"] = counts.get("condition_excluded", 0) + 1
+            continue
+        assert episode.season_id is not None
+        enrolled.append(
+            CoachForwardEvidence(
+                episode_id=episode.episode_id,
+                identity=identity,
+                entry_at=episode.entry_at,
+                season_id=episode.season_id,
+            )
+        )
+        known.add(identity)
+    by_id = {item.episode_id: item for item in episodes}
+    for item in enrolled:
+        if item.resolved:
+            continue
+        pending_episode = by_id.get(item.episode_id)
+        if pending_episode is None:
+            # A pending enrollment cannot disappear from the denominator after retention.
+            item.resolved = True
+            counts["missing_enrolled"] = counts.get("missing_enrolled", 0) + 1
+            continue
+        if not (
+            _coach_policy_contract(hypothesis, pending_episode)
+            and _policy_identity_key(pending_episode) == item.identity
+            and _matches_policy_identity(
+                pending_episode, (item.entry_at.isoformat(), item.episode_id)
+            )
+            and _matches_policy_identity(pending_episode, identities.get(item.identity, ("", "")))
+        ):
+            item.resolved = True
+            counts["changed_enrolled"] = counts.get("changed_enrolled", 0) + 1
+            continue
+        resolved, relevant, value = _hypothesis_observation_value(hypothesis, pending_episode)
+        horizon = (
+            max(
+                hypothesis.hold_seconds or PRIMARY_HORIZON_SECONDS,
+                hypothesis.baseline_hold_seconds
+                or RISK_LIMITS[hypothesis.risk_mode].max_hold_seconds,
+            )
+            if hypothesis.skill == ChallengerSkill.EXIT
+            else PRIMARY_HORIZON_SECONDS
+        )
+        # Do not consume future-dated checkpoints; overdue unresolved evidence remains unknown.
+        horizons = (
+            {
+                str(hypothesis.hold_seconds),
+                str(
+                    hypothesis.baseline_hold_seconds
+                    or RISK_LIMITS[hypothesis.risk_mode].max_hold_seconds
+                ),
+            }
+            if hypothesis.skill == ChallengerSkill.EXIT
+            else {str(PRIMARY_HORIZON_SECONDS)}
+        )
+        relevant_checkpoints = [
+            value for key, value in pending_episode.checkpoints.items() if key in horizons
+        ]
+        if hypothesis.skill == ChallengerSkill.SIZING:
+            relevant_checkpoints = [
+                value
+                for multiplier in ("1", f"{hypothesis.size_multiplier:g}")
+                if (trial := pending_episode.size_trials.get(multiplier)) is not None
+                for key, value in trial.checkpoints.items()
+                if key in horizons
+            ]
+        future = any(
+            checkpoint.observed_at.utcoffset() is None or checkpoint.observed_at > now
+            for checkpoint in relevant_checkpoints
+        )
+        if future:
+            resolved, value = False, None
+        if resolved or now > item.entry_at + timedelta(seconds=horizon + CHECKPOINT_GRACE_SECONDS):
+            item.resolved = True
+            item.value = value if resolved and relevant and not future else None
+    observation_ids: list[str] = []
+    values: list[float] = []
+    seasons: dict[str, int] = {}
+    # Only a chronological resolved prefix may qualify. Later quick successes cannot jump
+    # over earlier pending or unavailable outcomes.
+    for item in enrolled:
+        if not item.resolved:
+            break
+        observation_ids.append(item.episode_id)
+        if item.value is not None:
+            values.append(item.value)
+            seasons[item.season_id] = seasons.get(item.season_id, 0) + 1
+    updated = _finish_forward_evidence(hypothesis, observation_ids, values, seasons, now)
+    counts["enrolled"] = len(enrolled)
+    counts["pending"] = sum(not item.resolved for item in enrolled)
+    collection = {
+        "forward_enrollments": enrolled,
+        "forward_cursor": cursor,
+        "collection_counts": counts,
+    }
+    if any(getattr(updated, key) != value for key, value in collection.items()):
+        updated = updated.model_copy(update={**collection, "updated_at": now})
+    return updated
+
+
+def _finish_forward_evidence(
+    hypothesis: CoachHypothesis,
+    observation_ids: list[str],
+    values: list[float],
+    season_counts: dict[str, int],
+    now: datetime,
+) -> CoachHypothesis:
     observed = len(observation_ids)
     usable = len(values)
     availability = usable / observed if observed else 0.0
@@ -1376,7 +1582,7 @@ def _evaluate_hypothesis(
 
 def _hypothesis_observation_value(
     hypothesis: CoachHypothesis,
-    observation: LearningObservation,
+    observation: LearningObservation | LearningEvidenceEpisode,
 ) -> tuple[bool, bool, float | None]:
     if observation.baseline_action != DecisionAction.ENTER or not observation.baseline_actionable:
         return False, False, None
@@ -1453,7 +1659,7 @@ def _skill_for_kind(kind: CoachExperimentKind) -> ChallengerSkill:
 
 
 def _condition_matches(
-    observation: LearningObservation,
+    observation: LearningObservation | LearningEvidenceEpisode,
     feature: str,
     operator: str,
     threshold: float,
@@ -1465,7 +1671,7 @@ def _condition_matches(
 
 
 def _conditions_match(
-    observation: LearningObservation,
+    observation: LearningObservation | LearningEvidenceEpisode,
     conditions: Sequence[CoachCondition],
 ) -> bool:
     return bool(conditions) and all(
@@ -1530,6 +1736,7 @@ def _hypothesis_from_candidate(
     now = review.created_at
     return CoachHypothesis(
         hypothesis_id="coach-hypothesis-" + uuid.uuid4().hex,
+        evidence_contract="policy-v1",
         signature=candidate.signature,
         coach_review_id=review.review_id,
         created_at=now,

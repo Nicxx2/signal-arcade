@@ -2160,13 +2160,31 @@ class Database:
         with self._lock, self._conn:
             for lane in ("policy", "execution"):
                 rows = self._conn.execute(
-                    """SELECT episode_id FROM learning_evidence_episodes
+                    """SELECT episode_id,created_at FROM learning_evidence_episodes
                        INDEXED BY idx_learning_evidence_retention
                        WHERE lane=? AND status IN (?,?,?)
                        ORDER BY created_at DESC,rowid DESC LIMIT -1 OFFSET ?""",
                     (lane, *terminal, max_complete_per_lane),
                 ).fetchall()
                 ids = [str(row[0]) for row in rows]
+                if lane == "policy" and rows:
+                    # Coach must detect an unscanned retention gap instead of measuring only
+                    # surviving successes. This watermark commits with the actual deletions.
+                    previous = self._conn.execute(
+                        "SELECT value_json FROM settings WHERE key='coach_policy_pruned_through'"
+                    ).fetchone()
+                    watermark = max((str(row[1]), str(row[0])) for row in rows)
+                    if previous is not None:
+                        old = json.loads(previous[0])
+                        old_position = (
+                            (str(old[0]), str(old[1]))
+                            if isinstance(old, list) and len(old) == 2
+                            else (str(old), "\uffff")
+                        )
+                        watermark = max(watermark, old_position)
+                    self._upsert_settings(
+                        [("coach_policy_pruned_through", watermark)], datetime.now(UTC).isoformat()
+                    )
                 self._conn.executemany(
                     "DELETE FROM learning_evidence_episodes WHERE episode_id=?",
                     ((episode_id,) for episode_id in ids),
@@ -2518,6 +2536,8 @@ class Database:
         versions: dict[str, str],
         *,
         mode: str | None = None,
+        grant_consent: bool = False,
+        clear_legacy_model: bool = False,
     ) -> None:
         """Commit the entire upstream/downstream activation boundary together."""
         with self.training_publication():
@@ -2527,6 +2547,8 @@ class Database:
                 [
                     ("active_challenger_skills", versions),
                     *([("learning_mode", mode)] if mode else []),
+                    *([("challenger_consent_granted", True)] if grant_consent else []),
+                    *([("active_learning_model", "")] if clear_legacy_model else []),
                 ],
                 datetime.now().astimezone().isoformat(),
             )
@@ -3043,6 +3065,91 @@ class Database:
             )
         self._invalidate_storage_cache()
         return True
+
+    def coach_policy_page(
+        self,
+        hypothesis: CoachHypothesis,
+        *,
+        limit: int = 64,
+        pause: Callable[[], None] | None = None,
+    ) -> tuple[list[LearningEvidenceEpisode], dict[str, tuple[str, str]], tuple[str, str], bool]:
+        """One indexed advisory page plus bounded pending identities, in one read snapshot."""
+        from .intelligence.learning import _policy_identity_key
+
+        if not 1 <= limit <= 64:
+            raise ValueError("Coach policy page must be between 1 and 64")
+        after = hypothesis.forward_cursor or (hypothesis.cutoff_at.isoformat(), "\uffff")
+        pending = [row.episode_id for row in hypothesis.forward_enrollments if not row.resolved]
+        connection = sqlite3.connect(
+            f"{self.path.absolute().as_uri()}?mode=ro", uri=True, timeout=0.05
+        )
+        deadline = time.monotonic() + 0.25
+
+        def checkpoint() -> None:
+            nonlocal deadline
+            if pause is not None:
+                pause()
+            deadline = time.monotonic() + 0.25
+
+        try:
+            checkpoint()
+            connection.execute("PRAGMA cache_size=-1024")
+            connection.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+            connection.execute("BEGIN")
+            raw_watermark = connection.execute(
+                "SELECT value_json FROM settings WHERE key='coach_policy_pruned_through'"
+            ).fetchone()
+            watermark = json.loads(raw_watermark[0]) if raw_watermark else None
+            pruned_through = (
+                (str(watermark[0]), str(watermark[1]))
+                if isinstance(watermark, list) and len(watermark) == 2
+                else (str(watermark), "\uffff")
+                if watermark is not None
+                else ("", "")
+            )
+            gap = pruned_through > after
+            rows = connection.execute(
+                "SELECT episode_id,created_at FROM learning_evidence_episodes "
+                "WHERE lane='policy' AND (created_at,episode_id)>(?,?) "
+                "ORDER BY created_at,episode_id LIMIT ?",
+                (*after, limit if len(hypothesis.forward_enrollments) < 180 else 0),
+            ).fetchall()
+            cursor = (str(rows[-1][1]), str(rows[-1][0])) if rows else after
+            ids = list(dict.fromkeys([*(str(row[0]) for row in rows), *pending]))
+            episodes: list[LearningEvidenceEpisode] = []
+            for start in range(0, len(ids), 25):
+                checkpoint()
+                batch = ids[start : start + 25]
+                raw = connection.execute(
+                    "SELECT record_json FROM learning_evidence_episodes WHERE episode_id IN ("  # noqa: S608
+                    + ",".join("?" for _ in batch)
+                    + ")",
+                    batch,
+                ).fetchall()
+                episodes.extend(LearningEvidenceEpisode.model_validate_json(row[0]) for row in raw)
+            identities: dict[str, tuple[str, str]] = {}
+            keys = sorted({_policy_identity_key(item) for item in episodes})
+            for start in range(0, len(keys), 25):
+                checkpoint()
+                batch = keys[start : start + 25]
+                raw = connection.execute(
+                    "SELECT * FROM learning_policy_identities WHERE identity_key IN ("  # noqa: S608
+                    + ",".join("?" for _ in batch)
+                    + ")",
+                    batch,
+                ).fetchall()
+                identities.update({str(row[0]): (str(row[1]), str(row[2])) for row in raw})
+            return episodes, identities, cursor, gap
+        except sqlite3.OperationalError as exc:
+            if (getattr(exc, "sqlite_errorcode", 0) & 255) in {
+                sqlite3.SQLITE_INTERRUPT,
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise AdvisoryReadDeferred from exc
+            raise
+        finally:
+            connection.close()
 
     def recent_learning_observations(
         self,

@@ -7,6 +7,7 @@ import pytest
 from signal_arcade.database import Database
 from signal_arcade.intelligence.features import TokenState
 from signal_arcade.intelligence.learning import (
+    ENTRY_VALIDATION_VERSION,
     FEATURE_NAMES,
     FEATURE_SCHEMA_VERSION,
     LEARNER_VERSION_PREFIX,
@@ -187,6 +188,7 @@ def resolve_forward_primary(
 def qualified_model(version: str, prediction: float, outcomes_seen: int) -> LearningModel:
     return LearningModel(
         version=f"{LEARNER_VERSION_PREFIX}{version}",
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         outcomes_seen=outcomes_seen,
         risk_mode=RiskMode.BALANCED,
         sample_count=80,
@@ -302,6 +304,7 @@ def test_deferred_family_selection_requires_nonlinear_complexity_to_be_earned(
             version=version,
             created_at=now,
             skill=ChallengerSkill.ENTRY,
+            hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
             model_family=family,
             risk_mode=RiskMode.BALANCED,
             configuration_fingerprint="family-config",
@@ -390,6 +393,7 @@ def test_unavailable_champion_does_not_discard_available_contender(settings) -> 
     champion = ChallengerSkillArtifact(
         version="missing-xgb-champion",
         skill=ChallengerSkill.ENTRY,
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         model_family=StatisticalModelFamily.XGBOOST,
         payload_format="json",
         payload_digest="0" * 64,
@@ -815,6 +819,7 @@ def test_nonlinear_entry_status_is_exact_cohort_eligibility_not_promotion_progre
     stale_linear = ChallengerSkillArtifact(
         version="challenger-skill-v2-entry-stale-linear-status",
         skill=ChallengerSkill.ENTRY,
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         model_family=StatisticalModelFamily.LINEAR,
         risk_mode=RiskMode.BALANCED,
         configuration_fingerprint=configuration,
@@ -827,6 +832,7 @@ def test_nonlinear_entry_status_is_exact_cohort_eligibility_not_promotion_progre
     assert learner.nonlinear_entry_status() == {
         "state": "collecting",
         "eligible_training_count": 0,
+        "training_count_at": None,
         "minimum_training_samples": 250,
         "required_linear_improvement_fraction": 0.02,
         "latest_artifact": None,
@@ -836,6 +842,7 @@ def test_nonlinear_entry_status_is_exact_cohort_eligibility_not_promotion_progre
     linear = ChallengerSkillArtifact(
         version="challenger-skill-v2-entry-linear-status",
         skill=ChallengerSkill.ENTRY,
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         model_family=StatisticalModelFamily.LINEAR,
         risk_mode=RiskMode.BALANCED,
         configuration_fingerprint=configuration,
@@ -851,6 +858,7 @@ def test_nonlinear_entry_status_is_exact_cohort_eligibility_not_promotion_progre
     nonlinear = ChallengerSkillArtifact(
         version=version,
         skill=ChallengerSkill.ENTRY,
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         model_family=StatisticalModelFamily.XGBOOST,
         risk_mode=RiskMode.BALANCED,
         configuration_fingerprint=configuration,
@@ -892,10 +900,51 @@ def test_nonlinear_entry_status_is_exact_cohort_eligibility_not_promotion_progre
     assert refreshed_status["state"] == "eligible"
     assert refreshed_status["eligible_training_count"] == 275
 
+    # A retained older XGBoost fit must not hide a shrinking recent training cohort.
+    smaller_fit = newer_linear.model_copy(
+        update={
+            "version": "newest-smaller-fit",
+            "created_at": newer_linear.created_at + timedelta(seconds=1),
+            "training_count": 218,
+        }
+    )
+    learner.skill_artifacts[smaller_fit.version] = smaller_fit
+    coach = smaller_fit.model_copy(
+        update={
+            "version": "newer-coach-proposal",
+            "model_family": StatisticalModelFamily.DETERMINISTIC,
+            "created_at": smaller_fit.created_at + timedelta(seconds=1),
+            "training_count": 999,
+        }
+    )
+    learner.skill_artifacts[coach.version] = coach
+    assert learner.nonlinear_entry_status()["state"] == "collecting"
+    assert learner.nonlinear_entry_status()["eligible_training_count"] == 218
+    assert (
+        learner.nonlinear_entry_status()["training_count_at"] == smaller_fit.created_at.isoformat()
+    )
+    assert nonlinear.training_count == 250
+
     learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)].champion_version = version
     assert learner.nonlinear_entry_status()["state"] == "champion"
     learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)].suspended_version = version
     assert learner.nonlinear_entry_status()["state"] == "suspended"
+    assert learner.nonlinear_entry_status()["eligible_training_count"] == 218
+    learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)].suspended_version = None
+    learner.skill_states[(cohort_key, ChallengerSkill.ENTRY)].champion_version = None
+    recovered_fit = smaller_fit.model_copy(
+        update={
+            "version": "recovered-fit",
+            "created_at": smaller_fit.created_at + timedelta(seconds=1),
+            "training_count": 250,
+        }
+    )
+    learner.skill_artifacts[recovered_fit.version] = recovered_fit
+    assert learner.nonlinear_entry_status()["state"] == "eligible"
+    for artifact in (linear, newer_linear, smaller_fit, recovered_fit):
+        del learner.skill_artifacts[artifact.version]
+    assert learner.nonlinear_entry_status()["eligible_training_count"] == 250
+    assert learner.nonlinear_entry_status()["training_count_at"] == nonlinear.created_at.isoformat()
     database.close()
 
 
@@ -2957,6 +3006,7 @@ def _coach_test_champion(now: datetime) -> ChallengerSkillArtifact:
     return ChallengerSkillArtifact(
         version="challenger-skill-entry-existing-champion",
         skill=ChallengerSkill.ENTRY,
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         created_at=now,
         risk_mode=RiskMode.BALANCED,
         configuration_fingerprint="coach-fp",

@@ -32,6 +32,7 @@ def start_replay(state: ChallengerSkillState, minimum: int, coverage: float) -> 
         "champion_version": state.champion_version,
         "minimum_samples": minimum,
         "minimum_coverage": coverage,
+        "action_scoring": state.last_tournament.get("action_scoring"),
         "partial": False,
         "sampled": False,
         "points": [],
@@ -52,6 +53,14 @@ def record_replay(state: ChallengerSkillState, minimum: int, coverage: float) ->
     ):
         return
     replay = state._battle_replay
+    # An update can correct scoring without changing the contestants or their evidence.
+    # Never join points measured under different rules. Completed frozen replays stay intact.
+    if replay is not None and replay.get("action_scoring") != stats.get("action_scoring"):
+        partial = bool(replay.get("points")) or bool(replay.get("partial"))
+        start_replay(state, minimum, coverage)
+        replay = state._battle_replay
+        assert replay is not None
+        replay["partial"] = partial
     if (
         replay is None
         or replay.get("candidate_version") != state.testing_version

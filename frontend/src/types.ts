@@ -483,6 +483,7 @@ export interface ChallengerJourneyPage {
 export interface NonlinearEntryStatus {
   state: "collecting" | "eligible" | "testing" | "queued" | "qualified" | "champion" | "active" | "suspended" | "linear_retained" | "proof_not_met";
   eligible_training_count: number;
+  training_count_at?: string | null;
   minimum_training_samples: number;
   required_linear_improvement_fraction: number;
   latest_artifact: ChallengerSkillStatus["latest_candidate"];
@@ -511,6 +512,38 @@ export interface EntryProofIdentity {
   version: string;
   model_family: string;
   codename: string;
+}
+
+export interface ChampionImpactComparison {
+  subject: ChallengerSkillStatus["skill"] | "team";
+  state: "collecting" | "positive" | "negative" | "uncertain";
+  observed_count: number;
+  usable_count: number;
+  pending_count: number;
+  not_reached_count: number;
+  coverage: number;
+  mean_advantage: number | null;
+  lower_bound: number | null;
+  upper_bound: number | null;
+  reference_mean: number | null;
+  supported_mean: number | null;
+  from: string | null;
+  to: string | null;
+  reference_horizon_seconds: number;
+}
+
+export interface ChampionImpactReport {
+  schema_version: 1;
+  state: "available" | "unavailable";
+  as_of: string;
+  season_id: string | null;
+  profile_fingerprint: string | null;
+  versions: Partial<Record<ChallengerSkillStatus["skill"], string>>;
+  since: string | null;
+  window_size: number;
+  minimum_pairs: number;
+  minimum_coverage: number;
+  comparisons: ChampionImpactComparison[];
 }
 
 export interface LearningStatus {
@@ -587,6 +620,7 @@ export interface LearningStatus {
   consent_granted?: boolean;
   auto_participation?: boolean;
   active_skill_versions?: Partial<Record<"entry" | "manipulation" | "sizing" | "exit", string>>;
+  champion_impact?: ChampionImpactReport | null;
   skills?: ChallengerSkillStatus[];
   nonlinear_entry?: NonlinearEntryStatus;
   champion_records?: ChallengerChampionRecord[];
@@ -1221,6 +1255,7 @@ export interface Snapshot {
     >;
     degraded: boolean;
     degraded_reasons: string[];
+    reserve_validation?: ReserveValidationStatus;
   };
   portfolio: Portfolio;
   season_automation: SeasonAutomation;
@@ -1245,6 +1280,21 @@ export interface Snapshot {
   storage: StorageStatus;
 }
 
+export interface ReserveValidationStatus {
+  attention: boolean;
+  components: {
+    source: "learning" | "watchdog";
+    venue: "pump_curve" | "pump_swap";
+    active: boolean;
+    state: "not_observed" | "checking" | "verified" | "blocked";
+    failed_batches: number;
+    reason: string | null;
+    account_type: string | null;
+    last_failure_at: number | null;
+    last_success_at: number | null;
+  }[];
+}
+
 export interface HealthStatus {
   ok: boolean;
   running: boolean;
@@ -1252,6 +1302,7 @@ export interface HealthStatus {
   database_ok: boolean;
   degraded: boolean;
   degraded_reasons: string[];
+  reserve_validation?: ReserveValidationStatus;
   paper_only: boolean;
   version: string;
 }

@@ -154,6 +154,8 @@ class DiagnosticsRecorder:
         self.queue: deque[bytes] = deque(maxlen=4)
         self.events: deque[dict[str, Any]] = deque(maxlen=8)
         self.phases: dict[str, list[float]] = {}
+        self.learning_waits_since_boot = {"dispatch": 0.0, "resume": 0.0}
+        self.heartbeat_work_since_boot: dict[str, list[float]] = {}
         self.cursor = PipelineCursor()
         self.dropped = 0
         self.collection_deferred = 0
@@ -192,6 +194,30 @@ class DiagnosticsRecorder:
         phase[0] += 1
         phase[1] += elapsed
         phase[2] = max(phase[2], elapsed)
+
+    def observe_learning_waits(self, dispatch: float, resume: float) -> None:
+        """Bounded cumulative seconds for collection events, outside the interval budget."""
+        if not self.enabled:
+            return
+        for key, elapsed in (("dispatch", dispatch), ("resume", resume)):
+            if math.isfinite(elapsed) and elapsed >= 0:
+                self.learning_waits_since_boot[key] = min(
+                    1e12, self.learning_waits_since_boot[key] + elapsed
+                )
+
+    def observe_heartbeat_work(self, timing: dict[str, float]) -> None:
+        """Called on the event loop after joining the heartbeat's worker."""
+        if not self.enabled:
+            return
+        for name, elapsed in timing.items():
+            if name not in {"positions", "cache", "expiry", "coach", "ai", "profile", "season"}:
+                continue
+            if not math.isfinite(elapsed) or elapsed < 0:
+                continue
+            values = self.heartbeat_work_since_boot.setdefault(name, [0, 0.0, 0.0])
+            values[0] = min(2**53 - 1, values[0] + 1)
+            values[1] = min(1e12, values[1] + elapsed)
+            values[2] = max(values[2], min(1e12, elapsed))
 
     @contextmanager
     def measure(self, name: str) -> Iterator[None]:

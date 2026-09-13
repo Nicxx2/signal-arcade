@@ -317,6 +317,20 @@ def test_legacy_exit_quarantine_timestamp_is_stable_across_restart(
     assert not second.active_skill_versions
 
 
+def test_entry_scoring_update_preserves_current_exit_proof(progression):  # noqa: F811
+    learner, database, settings = progression
+    artifact = activate_first(learner, ChallengerSkill.EXIT)
+    state = learner._current_skill_state(ChallengerSkill.EXIT)
+    state.last_tournament = {"result": "promoted", "proof_version": "paired-skill-outcomes-v2"}
+    database.save_challenger_skill_state(state)
+    restarted = LearningEngine(
+        database, settings, configuration_fingerprint=learner.configuration_fingerprint
+    )
+    restored = restarted._current_skill_state(ChallengerSkill.EXIT)
+    assert restored.suspended_version is None
+    assert restarted.active_skill_versions["exit"] == artifact.version
+
+
 @pytest.mark.parametrize("bad_rows", [[None], ["bad-row"], [{"id": None}], "bad-list"])
 def test_bad_saved_recovery_rows_do_not_interrupt_new_evidence(progression, bad_rows):  # noqa: F811
     learner, _, _ = progression

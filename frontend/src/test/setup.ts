@@ -7,12 +7,16 @@ class ResizeObserverStub {
 }
 
 class WebSocketStub {
+  static CONNECTING = 0;
   static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  readyState = WebSocketStub.CONNECTING;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: (() => void) | null = null;
-  close() {}
+  close() { this.readyState = WebSocketStub.CLOSED; }
 }
 
 Object.assign(globalThis, {

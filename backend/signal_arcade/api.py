@@ -516,6 +516,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # restart loop. `ok` remains a liveness signal.
             "degraded": event_pipeline["degraded"],
             "degraded_reasons": event_pipeline["degraded_reasons"],
+            "reserve_validation": event_pipeline["reserve_validation"],
             "event_pipeline": event_pipeline,
             "paper_only": True,
             "version": __version__,

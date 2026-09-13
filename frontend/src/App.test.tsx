@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
+import { StrictMode } from "react";
 
 import App from "./App";
 import type { ChallengerSkillStatus, Decision, Fill, Position, SeasonAutomation, Snapshot } from "./types";
@@ -441,6 +442,282 @@ test("reconnects the live dashboard after a WebSocket interruption", async () =>
   expect(RecoveringWebSocket.instances).toHaveLength(1);
   await act(async () => vi.advanceTimersByTime(1));
   expect(RecoveringWebSocket.instances).toHaveLength(2);
+});
+
+class DashboardSocket {
+  static instances: DashboardSocket[] = [];
+  static failConstruction = false;
+  static OPEN = 1;
+  static CONNECTING = 0;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: (() => void) | null = null;
+  constructor(readonly url: string) {
+    if (DashboardSocket.failConstruction) throw new Error("Browser connection unavailable");
+    DashboardSocket.instances.push(this);
+  }
+  close() { this.readyState = 3; }
+}
+
+function recoveringDashboard(failConstruction = false, strict = false) {
+  vi.useFakeTimers();
+  DashboardSocket.instances = [];
+  DashboardSocket.failConstruction = failConstruction;
+  vi.stubGlobal("WebSocket", DashboardSocket);
+  const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+  vi.stubGlobal("fetch", fetcher);
+  const view = render(strict ? <StrictMode><App /></StrictMode> : <App />);
+  return { ...view, fetcher };
+}
+
+test("recovers a stalled handshake without reloading the page", async () => {
+  recoveringDashboard();
+  await act(async () => { await vi.advanceTimersByTimeAsync(16_000); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+  act(() => {
+    const next = DashboardSocket.instances[1]!;
+    next.readyState = 1;
+    next.onopen?.();
+  });
+  expect(screen.getByText("Live updates")).toBeInTheDocument();
+});
+
+test("repairs a missed close when returning to the tab", async () => {
+  const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  recoveringDashboard();
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = 1; first.onopen?.(); });
+  hidden.mockReturnValue(true);
+  act(() => fireEvent(document, new Event("visibilitychange")));
+  first.readyState = 3; // Browser resumes without dispatching the old close callback.
+  hidden.mockReturnValue(false);
+  await act(async () => { fireEvent(document, new Event("visibilitychange")); await vi.advanceTimersByTimeAsync(1_000); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+});
+
+test("reconnect failures do not starve fallback polling", async () => {
+  const { fetcher } = recoveringDashboard();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  act(() => DashboardSocket.instances[0]!.onerror?.());
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  act(() => DashboardSocket.instances[1]!.onerror?.());
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+  act(() => DashboardSocket.instances[2]!.onerror?.());
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+  expect(fetcher.mock.calls.filter(([path]) => path === "/api/v1/snapshot")).toHaveLength(2);
+});
+
+test("dashboard recovers from a constructor failure while retaining auto refresh", async () => {
+  const { fetcher } = recoveringDashboard(true);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(screen.getByText("Auto refresh")).toBeInTheDocument();
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  DashboardSocket.failConstruction = false;
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  expect(DashboardSocket.instances).toHaveLength(1);
+});
+
+test("dashboard keeps a successful handshake and ignores retired socket callbacks", async () => {
+  recoveringDashboard();
+  const first = DashboardSocket.instances[0]!;
+  const late = [first.onopen, first.onclose, first.onerror, first.onmessage];
+  vi.spyOn(first, "close").mockImplementation(() => { first.readyState = 2; });
+  act(() => first.onerror?.());
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  const next = DashboardSocket.instances[1]!;
+  await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+  act(() => { next.readyState = 1; next.onopen?.(); });
+  act(() => late.forEach(callback => callback?.()));
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+  expect(screen.getByText("Live updates")).toBeInTheDocument();
+  expect(first.onmessage).toBeNull();
+});
+
+test("dashboard reconnect backoff stays bounded without overlapping attempts", async () => {
+  recoveringDashboard();
+  const delays = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+  for (const [index, delay] of delays.entries()) {
+    act(() => DashboardSocket.instances[index]!.onerror?.());
+    await act(async () => { await vi.advanceTimersByTimeAsync(delay - 1); });
+    expect(DashboardSocket.instances).toHaveLength(index + 1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(DashboardSocket.instances).toHaveLength(index + 2);
+    expect(DashboardSocket.instances.filter(socket => socket.readyState < 2)).toHaveLength(1);
+  }
+});
+
+test.each(["online", "pageshow"])("dashboard repairs a half-open connection after %s without duplicate retries", async eventName => {
+  recoveringDashboard();
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = 1; first.onopen?.(); });
+  await act(async () => {
+    for (let i = 0; i < 5; i++) window.dispatchEvent(Object.assign(new Event(eventName), { persisted: true }));
+    await vi.advanceTimersByTimeAsync(1_000);
+  });
+  expect(first.readyState).toBe(3);
+  expect(DashboardSocket.instances).toHaveLength(2);
+  expect(screen.getByText("Auto refresh")).toBeInTheDocument();
+});
+
+test("dashboard leaves a healthy connection alone on a short tab switch", async () => {
+  const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  recoveringDashboard();
+  const socket = DashboardSocket.instances[0]!;
+  act(() => { socket.readyState = 1; socket.onopen?.(); });
+  hidden.mockReturnValue(true);
+  act(() => fireEvent(document, new Event("visibilitychange")));
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  hidden.mockReturnValue(false);
+  await act(async () => { fireEvent(document, new Event("visibilitychange")); await vi.advanceTimersByTimeAsync(1_000); });
+  expect(DashboardSocket.instances).toHaveLength(1);
+  expect(screen.getByText("Live updates")).toBeInTheDocument();
+});
+
+test.each(["online", "pageshow"])("dashboard remembers a hidden %s event without requesting background catch-up", async eventName => {
+  const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  const { fetcher } = recoveringDashboard();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = 1; first.onopen?.(); });
+  hidden.mockReturnValue(true);
+  act(() => fireEvent(document, new Event("visibilitychange")));
+  await act(async () => {
+    window.dispatchEvent(Object.assign(new Event(eventName), { persisted: true }));
+    await vi.advanceTimersByTimeAsync(5_000);
+  });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(DashboardSocket.instances).toHaveLength(1);
+  hidden.mockReturnValue(false);
+  await act(async () => { fireEvent(document, new Event("visibilitychange")); await vi.advanceTimersByTimeAsync(1_000); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  const recovered = DashboardSocket.instances[1]!;
+  act(() => { recovered.readyState = 1; recovered.onopen?.(); });
+  hidden.mockReturnValue(true);
+  act(() => fireEvent(document, new Event("visibilitychange")));
+  await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+  hidden.mockReturnValue(false);
+  await act(async () => { fireEvent(document, new Event("visibilitychange")); await vi.advanceTimersByTimeAsync(1_000); });
+  // The remembered signal was consumed: another short switch keeps the recovered socket.
+  expect(DashboardSocket.instances).toHaveLength(2);
+});
+
+test("dashboard timeout releases the shared refresh and recovers after the server returns", async () => {
+  const { fetcher } = recoveringDashboard();
+  let snapshots = 0;
+  let requestsActive = 0;
+  let peakRequests = 0;
+  fetcher.mockImplementation((path, options) => {
+    requestsActive += 1;
+    peakRequests = Math.max(peakRequests, requestsActive);
+    if (path === "/api/v1/snapshot" && ++snapshots === 1) {
+      return new Promise((_, reject) => {
+        (options.signal as AbortSignal).addEventListener("abort", () => {
+          requestsActive -= 1;
+          reject(new DOMException("Request aborted", "AbortError"));
+        }, { once: true });
+      });
+    }
+    requestsActive -= 1;
+    return Promise.resolve({ ok: true, json: async () => path === "/api/v1/snapshot" ? snapshot : { service_running: true, database_ok: true } });
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = 1; first.onopen?.(); first.onmessage?.(); first.onerror?.(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+  expect(snapshots).toBe(1);
+  await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  expect(peakRequests).toBe(1);
+  expect(snapshots).toBe(2);
+  expect(screen.getByRole("button", { name: "System status: all good" })).toBeInTheDocument();
+});
+
+test("dashboard can recover even if retiring the browser socket throws", async () => {
+  recoveringDashboard();
+  const first = DashboardSocket.instances[0]!;
+  vi.spyOn(first, "close").mockImplementation(() => { throw new Error("Browser close failed"); });
+  act(() => first.onerror?.());
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  const next = DashboardSocket.instances[1]!;
+  act(() => { next.readyState = 1; next.onopen?.(); });
+  expect(screen.getByText("Live updates")).toBeInTheDocument();
+  expect(first.onmessage).toBeNull();
+});
+
+test("dashboard coalesces bursts, slows hidden refreshes and reconnects after a long suspension", async () => {
+  const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  const { fetcher } = recoveringDashboard();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = 1; first.onopen?.(); });
+  act(() => { for (let i = 0; i < 100; i++) first.onmessage?.(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  act(() => { for (let i = 0; i < 100; i++) first.onmessage?.(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_999); });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(fetcher).toHaveBeenCalledTimes(3);
+  // A queued visible notification must not fire after the page becomes hidden.
+  act(() => first.onmessage?.());
+  hidden.mockReturnValue(true);
+  act(() => fireEvent(document, new Event("visibilitychange")));
+  act(() => { for (let i = 0; i < 100; i++) first.onmessage?.(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(29_999); });
+  expect(fetcher).toHaveBeenCalledTimes(3);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(fetcher).toHaveBeenCalledTimes(4);
+  hidden.mockReturnValue(false);
+  await act(async () => { fireEvent(document, new Event("visibilitychange")); await vi.advanceTimersByTimeAsync(1_000); });
+  expect(fetcher).toHaveBeenCalledTimes(5);
+  expect(DashboardSocket.instances).toHaveLength(2);
+});
+
+test("dashboard shares an in-flight refresh and cleans up even when it settles after unmount", async () => {
+  const { fetcher, unmount } = recoveringDashboard();
+  let finish!: (value: unknown) => void;
+  fetcher.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  act(() => {
+    const first = DashboardSocket.instances[0]!;
+    first.readyState = 1;
+    first.onopen?.();
+    first.onmessage?.();
+    fireEvent(document, new Event("visibilitychange"));
+    window.dispatchEvent(new Event("online"));
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  unmount();
+  const count = DashboardSocket.instances.length;
+  await act(async () => {
+    finish({ ok: true, json: async () => snapshot });
+    window.dispatchEvent(new Event("online"));
+    fireEvent(document, new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(DashboardSocket.instances).toHaveLength(count);
+  expect(DashboardSocket.instances.every(socket => socket.readyState === 3)).toBe(true);
+});
+
+test("dashboard Strict Mode leaves only one connection and uses the secure origin", async () => {
+  vi.stubGlobal("location", { protocol: "https:", host: "example.test:8443" });
+  const { fetcher, unmount } = recoveringDashboard(false, true);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+  expect(DashboardSocket.instances.every(socket => socket.url === "wss://example.test:8443/ws")).toBe(true);
+  expect(DashboardSocket.instances.filter(socket => socket.readyState < 2)).toHaveLength(1);
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  unmount();
+  await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+  expect(fetcher).toHaveBeenCalledTimes(1);
 });
 
 test("renders the paper-only arena from a snapshot", async () => {
@@ -3828,6 +4105,107 @@ test("keeps degraded market processing visible until a fresh report confirms rec
   await refresh(); // Historical totals alone do not keep the warning active.
   expect(screen.getByRole("button", { name: "System status: all good" })).toBeInTheDocument();
   expect(within(screen.getByText("Market processing needs attention").closest("article")!).getByText("Resolved")).toBeInTheDocument();
+});
+
+test.each([14.999, 15, 15.001, 120])("reports reserve faults on initial snapshots aged %s seconds", async (age) => {
+  const response: Snapshot = {
+    ...snapshot,
+    snapshot_age_seconds: age,
+    event_pipeline: { ...snapshot.event_pipeline, degraded: false,
+      reserve_validation: {
+        attention: true,
+        components: [{ source: "watchdog", venue: "pump_swap", active: true, state: "blocked",
+          failed_batches: 3, reason: "unreviewed_account_extension", account_type: "GlobalConfig",
+          last_failure_at: 123, last_success_at: null }],
+      } },
+  };
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => response });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "System status: issue" }));
+  expect(screen.getByText("Reserve validation needs attention")).toBeInTheDocument();
+  expect(screen.getByText(/PumpSwap shared account layouts repeatedly failed validation/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: /History/ }));
+  expect(Boolean(screen.queryByText("Dashboard view is catching up"))).toBe(age > 15);
+  expect(screen.queryByText("Market processing needs attention")).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/snapshot")).toHaveLength(1);
+  expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/health")).toHaveLength(0);
+});
+
+test("adds stale reserve faults without clearing market faults or increasing polling", async () => {
+  let response: Snapshot = { ...snapshot, event_pipeline: { ...snapshot.event_pipeline,
+    degraded: true, degraded_reasons: ["recent_candidate_shedding"] } };
+  const fetchMock = vi.fn().mockImplementation(() => Promise.resolve({ ok: true, json: async () => response }));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "System status: issue" }));
+  expect(screen.getByText("Market processing needs attention")).toBeInTheDocument();
+  response = { ...snapshot, snapshot_age_seconds: 30, event_pipeline: { ...snapshot.event_pipeline,
+    degraded: false, reserve_validation: { attention: true, components: [
+      { source: "learning", venue: "pump_curve", active: true, state: "blocked", failed_batches: 3,
+        reason: "unreviewed_account_extension", account_type: "Global", last_failure_at: 123, last_success_at: null },
+    ] } } };
+  const refresh = async () => { await act(async () => { fireEvent(document, new Event("visibilitychange")); }); };
+  await refresh();
+  expect(screen.getByText("Reserve validation needs attention")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: /History/ }));
+  const current = (title: string) => within(screen.getByText(title).closest("article")!).getByText("Current");
+  expect(current("Market processing needs attention")).toBeInTheDocument();
+  expect(current("Reserve validation needs attention")).toBeInTheDocument();
+  await refresh();
+  expect(screen.getAllByText("Reserve validation needs attention")).toHaveLength(1);
+  for (const reserve_validation of [undefined, { attention: false, components: [] }]) {
+    response = { ...response, event_pipeline: { ...response.event_pipeline, reserve_validation } };
+    await refresh();
+    expect(current("Market processing needs attention")).toBeInTheDocument();
+    expect(current("Reserve validation needs attention")).toBeInTheDocument();
+  }
+  response = { ...response, snapshot_age_seconds: 0, event_pipeline: { ...response.event_pipeline,
+    degraded: true, degraded_reasons: ["recent_candidate_shedding"] } };
+  await refresh();
+  expect(current("Market processing needs attention")).toBeInTheDocument();
+  expect(within(screen.getByText("Reserve validation needs attention").closest("article")!).getByText("Resolved")).toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/snapshot")).toHaveLength(6);
+  expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/health")).toHaveLength(0);
+});
+
+test("keeps shared-account validation faults separate from market health and missing reports", async () => {
+  const reserve_validation = {
+    attention: true,
+    components: [{ source: "learning" as const, venue: "pump_curve" as const, active: true,
+      state: "blocked" as const, failed_batches: 3, reason: "unreviewed_account_extension",
+      account_type: "FeeConfig", last_failure_at: 123, last_success_at: null }],
+  };
+  let response: Snapshot = { ...snapshot, event_pipeline: { ...snapshot.event_pipeline, reserve_validation } };
+  let healthOnly = false;
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string) => {
+    if (healthOnly && path !== "/api/v1/health") return Promise.reject(new Error("Snapshot delayed"));
+    return Promise.resolve({ ok: true, json: async () => path === "/api/v1/health"
+      ? { service_running: true, database_ok: true, degraded: false, reserve_validation }
+      : response });
+  }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "System status: issue" }));
+  expect(screen.getByText("Reserve validation needs attention")).toBeInTheDocument();
+  expect(screen.getByText(/Pump curves shared account layouts repeatedly failed validation/)).toBeInTheDocument();
+  expect(screen.queryByText("Market processing needs attention")).not.toBeInTheDocument();
+  const refresh = async () => { await act(async () => { fireEvent(document, new Event("visibilitychange")); }); };
+  response = snapshot;
+  await refresh(); // Missing optional field does not assert recovery, even with HTTP 200.
+  expect(screen.getByRole("button", { name: "System status: issue" })).toBeInTheDocument();
+  response = { ...snapshot, snapshot_age_seconds: 30, event_pipeline: { ...snapshot.event_pipeline,
+    reserve_validation: { attention: false, components: [] } } };
+  await refresh(); // Stale component report cannot clear a fault.
+  fireEvent.click(screen.getByRole("tab", { name: /History/ }));
+  expect(within(screen.getByText("Reserve validation needs attention").closest("article")!).getByText("Current")).toBeInTheDocument();
+  healthOnly = true;
+  await refresh(); // Component health remains available when snapshot assembly is delayed.
+  expect(within(screen.getByText("Reserve validation needs attention").closest("article")!).getByText("Current")).toBeInTheDocument();
+  healthOnly = false;
+  response = { ...response, snapshot_age_seconds: 0 };
+  await refresh();
+  expect(screen.getByRole("button", { name: "System status: all good" })).toBeInTheDocument();
+  expect(within(screen.getByText("Reserve validation needs attention").closest("article")!).getByText("Resolved")).toBeInTheDocument();
 });
 
 test.each([{ reasons: [] }, { reasons: ["future_pipeline_reason"] }])("shows a useful warning when market reasons are unrecognized: $reasons", async ({ reasons }) => {

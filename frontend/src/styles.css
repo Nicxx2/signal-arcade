@@ -1,6 +1,66 @@
 @import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap");
 
 :root { color-scheme: dark; font-family: "DM Sans", system-ui, sans-serif; background: #070b16; color: #f4f5fb; font-synthesis: none; --bg: #070b16; --panel: #111827; --panel-2: #151d2e; --line: #263147; --muted: #8d98ad; --purple: #6f66ff; --purple-bright: #8c84ff; --mint: #36d6a1; --red: #ff6379; --blue: #4da3ff; }
+.champion-impact { padding: 22px; margin: 18px 0; border: 1px solid var(--line); border-radius: 18px; background: linear-gradient(125deg, #141d30, #101827 70%); --impact-color: #a7a0ff; }
+.champion-impact header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.champion-impact header > svg { color: #aaa4e9; }
+.champion-impact .eyebrow { color: #aaa3ff; font-size: 10px; letter-spacing: .13em; font-weight: 700; }
+.champion-impact h3 { margin: 7px 0 4px; font: 700 19px Manrope, sans-serif; }
+.champion-impact header p { margin: 0; color: var(--muted); font-size: 12px; }
+.impact-select { display: flex; flex-wrap: wrap; gap: 5px; padding: 18px 0 14px; }
+.impact-select button { border: 1px solid transparent; background: #0b1220; color: #a6b0c2; border-radius: 8px; padding: 8px 13px; cursor: pointer; font-size: 12px; }
+.impact-select button[aria-pressed="true"] { color: #e6e2ff; background: #282644; border-color: #4f4880; }
+.impact-select button:hover { border-color: #625c8c; }
+.impact-select button:focus-visible, .impact-help summary:focus-visible { outline: 2px solid #b2aaff; outline-offset: 3px; }
+.impact-contenders { display: flex; flex-wrap: wrap; gap: 12px 24px; }
+.impact-contenders:empty { display: none; }
+.impact-champion { display: flex; align-items: center; gap: 10px; padding: 3px 0 14px; min-width: 0; }
+.impact-champion .ca-reign-portrait { flex: 0 0 44px; width: 44px; height: 48px; }
+.impact-champion .ca-reign-portrait .fighter-portrait { width: 44px; height: 44px; }
+.impact-champion strong { font-size: 12px; overflow-wrap: anywhere; }
+.impact-champion small { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; }
+.champion-impact .tone-positive { --impact-color: #79dec0; }
+.champion-impact .tone-negative { --impact-color: #ffa1b1; }
+.champion-impact .tone-collecting, .champion-impact .tone-uncertain { --impact-color: #aaa6cd; }
+.impact-verdict { color: var(--impact-color); display: flex; align-items: center; gap: 7px; font-size: 12px; margin: 3px 0 18px; }
+.impact-verdict > span { background: currentColor; width: 6px; height: 6px; border-radius: 50%; }
+.impact-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0 0 22px; }
+.impact-values div { padding-left: 16px; border-left: 1px solid var(--line); }
+.impact-values div:first-child { padding-left: 0; border: 0; }
+.impact-values dt { color: #a3aec0; font-size: 11px; min-height: 16px; }
+.impact-values dd { margin: 6px 0 0; font: 700 clamp(16px, 2vw, 26px) Manrope, sans-serif; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.impact-scale { margin: 0 1px 17px; }
+.impact-track { height: 8px; position: relative; border-radius: 8px; background: #222e42; }
+.impact-zero { position: absolute; left: 50%; top: -4px; height: 16px; width: 1px; background: #68758c; }
+.impact-range { position: absolute; height: 8px; background: var(--impact-color); opacity: .42; border-radius: 6px; }
+.impact-track b { position: absolute; top: -2px; height: 12px; width: 4px; background: var(--impact-color); border-radius: 3px; transform: translateX(-50%); }
+.impact-scale-labels { display: flex; justify-content: space-between; margin-top: 10px; color: #93a0b6; font-size: 10px; }
+.impact-sample { color: #abb5c8; margin: 0; font-size: 12px; }
+.impact-empty { padding: 12px 0 18px; }
+.impact-empty strong { font-size: 14px; }
+.impact-empty p { margin: 6px 0 0; color: #a0acc0; font-size: 12px; line-height: 1.6; }
+.champion-impact footer { position: relative; border-top: 1px solid var(--line); padding-top: 13px; margin-top: 17px; color: var(--muted); font-size: 11px; }
+.champion-impact footer > span { display: inline-block; padding-right: 125px; }
+.impact-help summary { position: absolute; top: 9px; right: 0; min-height: 28px; display: flex; align-items: center; gap: 6px; list-style: none; cursor: pointer; color: #bdb7ea; }
+.impact-help summary::-webkit-details-marker { display: none; }
+.impact-help > div { padding-top: 12px; color: #a9b4c6; line-height: 1.7; }
+.impact-help p { margin: 10px 0 0; }
+@media (max-width: 520px) {
+  .champion-impact { padding: 17px 15px; }
+  .champion-impact h3 { font-size: 17px; }
+  .impact-select { gap: 4px; }
+  .impact-select button { padding: 9px 10px; font-size: 11px; }
+  .impact-contenders { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .impact-champion { gap: 8px; }
+  .impact-champion strong { font-size: 11px; }
+  .impact-champion .ca-reign-portrait { flex-basis: 36px; width: 36px; height: 42px; }
+  .impact-champion .ca-reign-portrait .fighter-portrait { width: 36px; height: 38px; }
+  .impact-values { gap: 9px; }
+  .impact-values div { padding-left: 9px; }
+  .impact-values dt { font-size: 10px; min-height: 28px; }
+  .impact-help summary span { display: none; }
+  .champion-impact footer > span { padding-right: 30px; }
+}
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 85% -10%, rgba(92, 75, 255, .13), transparent 32rem), var(--bg); }
 button, input, select { font: inherit; }

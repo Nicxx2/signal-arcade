@@ -90,6 +90,20 @@ def test_mid_battle_capture_is_partial_and_keeps_real_turning_points_bounded():
     assert valid_replay(replay)
 
 
+def test_scoring_correction_does_not_mix_old_points_or_rewrite_frozen_history():
+    state = state_fixture()
+    checkpoint(state)
+    freeze_replay(state, "historical")
+    historical = copy.deepcopy(state._pending_battle_replays["historical"])
+    state.last_tournament["action_scoring"] = "baseline-fallback-v1"
+    record_replay(state, 30, 0.7)
+    assert len(state._battle_replay["points"]) == 1
+    assert state._battle_replay["partial"]
+    assert state._battle_replay["action_scoring"] == "baseline-fallback-v1"
+    assert state._pending_battle_replays["historical"] == historical
+    assert valid_replay(state._battle_replay)
+
+
 def test_freezing_and_restart_preserve_result_and_isolate_next_pair(settings):
     database = Database(settings.database_path)
     state = state_fixture()

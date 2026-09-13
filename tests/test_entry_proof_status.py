@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from signal_arcade.database import Database
 from signal_arcade.intelligence.learning import (
+    ENTRY_VALIDATION_VERSION,
     FEATURE_SCHEMA_VERSION,
     SKILL_ARTIFACT_VERSION_PREFIX,
     LearningEngine,
@@ -25,6 +26,7 @@ def artifact(version="entry-linear", family=StatisticalModelFamily.LINEAR):
     return ChallengerSkillArtifact(
         version=version,
         skill=ChallengerSkill.ENTRY,
+        hyperparameters={"entry_validation_version": ENTRY_VALIDATION_VERSION},
         model_family=family,
         risk_mode=RiskMode.BALANCED,
         configuration_fingerprint="proof-context",

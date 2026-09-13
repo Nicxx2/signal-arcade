@@ -809,7 +809,10 @@ def test_export_header_disconnect_cannot_leak_a_slot(settings):
 
 
 @pytest.mark.parametrize("all_current_families", [False, True])
-def test_full_operational_interval_and_six_proof_events_fit(tmp_path, all_current_families):
+@pytest.mark.parametrize("include_layout", [False, True])
+def test_full_operational_interval_and_six_proof_events_fit(
+    tmp_path, all_current_families, include_layout
+):
     import random
 
     rng = random.Random(7)  # noqa: S311 - deterministic synthetic metrics, not credentials
@@ -991,7 +994,60 @@ def test_full_operational_interval_and_six_proof_events_fit(tmp_path, all_curren
         gauges=gauges,
         skills=skills,
     )
-    value["events"] = [{"kind": "proof", **item} for item in skills[:6]]
+    from signal_arcade.intelligence.collection_diagnostics import (
+        COLLECTION_STAGES,
+        CollectionDiagnostics,
+    )
+
+    collection = CollectionDiagnostics()
+    collection._counts = {
+        f"{lane}_{horizon}": {stage: rng.randint(0, 500000) for stage in sorted(COLLECTION_STAGES)}
+        for lane in ("discovery", "policy")
+        for horizon in (60, 300, 600, 900, 1200)
+    }
+    collection_events = collection.events()
+    collection_events[-1]["reserve_validation"] = [117, 126, 109, 106]
+    collection_events[-1]["dispatch_since_boot"] = {
+        "due": 9387174330183937,
+        "not_due": 7713934783073829,
+    }
+    collection_events[-1]["wait_seconds_since_boot"] = {
+        "dispatch": 713491.8271973,
+        "resume": 428339.0291447,
+    }
+    collection_events[0]["rejections_since_boot"] = {
+        reason: rng.randint(0, 500000)
+        for reason in (
+            "route_identity",
+            "slot_or_time",
+            "fees",
+            "reserves",
+            "unsupported_route",
+            "account_validation",
+        )
+    }
+    value["events"] = [{"kind": "proof", **item} for item in skills[:6]] + collection_events
+    if include_layout:
+        # Actual admission leaves room for two collection events and at most five queued proof
+        # events. Exercise the combined raw-input and compressed store bounds, not only each
+        # event in isolation. Distinct sample digests avoid unrealistic compression gains.
+        value["events"][5] = {
+            "kind": "reserve_layout",
+            "version": 1,
+            "at": value["end"],
+            "scope": collection.scope,
+            "reserve_validation": [117, 126, 109, 106],
+            "layouts": [
+                {
+                    "account_bytes": 10000 + index,
+                    "sample_bytes": 4096,
+                    "reviewed_bytes": 1054,
+                    "unreviewed_bytes": 8946 + index,
+                    "sample_sha256": f"{rng.getrandbits(256):064x}",
+                }
+                for index in range(4)
+            ],
+        }
     recorder = DiagnosticsRecorder(tmp_path)
     for event in value["events"]:
         recorder.event(event)
@@ -1002,7 +1058,7 @@ def test_full_operational_interval_and_six_proof_events_fit(tmp_path, all_curren
     later = {**value, "seq": 6001, "start": value["end"], "end": value["end"] + 60}
     assert store.append(later)
     assert read_page(tmp_path, tier=0, before=2e9)[0]["record"]["skills"] == skills
-    assert len(read_events(tmp_path, before=2e9)) == 12
+    assert len(read_events(tmp_path, before=2e9)) == 16
     assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     store.close()
 
