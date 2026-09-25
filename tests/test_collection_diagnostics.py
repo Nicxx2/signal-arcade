@@ -205,13 +205,13 @@ def test_collection_events_wait_for_space_without_displacing_proof(settings):
         engine._record_collection_diagnostics()
         assert not engine.diagnostics.events
         engine.diagnostics.enabled = True
-        for index in range(7):
+        for index in range(8):
             engine.diagnostics.event({"kind": "proof", "id": str(index)})
         before = list(engine.diagnostics.events)
         engine._record_collection_diagnostics()
         assert list(engine.diagnostics.events) == before
         assert engine.diagnostics.dropped == 0
-        engine.diagnostics.events.clear()
+        engine.diagnostics._take_events(0)
         engine._record_collection_diagnostics()
         assert len(engine.diagnostics.events) == 2
         assert (
@@ -322,27 +322,25 @@ def test_cancellation_after_rpc_does_not_apply_evidence_or_release_another_lock(
 
 
 def test_diagnostic_cadence_uses_monotonic_time_and_new_scope_does_not_wait(settings, monkeypatch):
-    from types import SimpleNamespace
-
-    import signal_arcade.orchestrator as orchestration
+    import signal_arcade.diagnostics as diagnostics
 
     engine = Orchestrator(settings)
     engine.diagnostics.enabled = True
     engine.learning.collection_diagnostics.record("policy", 300, "expired")
     clock = [1000.0]
-    monkeypatch.setattr(orchestration, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(diagnostics.time, "monotonic", lambda: clock[0])
     try:
         engine._record_collection_diagnostics()
         assert len(engine.diagnostics.events) == 2
         first_scope = engine.diagnostics.events[0]["scope"]
-        engine.diagnostics.events.clear()
+        engine.diagnostics._take_events(0)
         clock[0] += 299.999
         engine._record_collection_diagnostics()
         assert not engine.diagnostics.events
         clock[0] = 1300.0
         engine._record_collection_diagnostics()
         assert len(engine.diagnostics.events) == 2
-        engine.diagnostics.events.clear()
+        engine.diagnostics._take_events(0)
         engine.learning.collection_diagnostics = CollectionDiagnostics()
         engine.learning.collection_diagnostics.record("policy", 300, "expired")
         engine._record_collection_diagnostics()

@@ -15,6 +15,8 @@ from typing import Any
 
 from .diagnostics_store import MAX_INPUT, DiagnosticsStore
 
+WRITER_WAIT_REASONS = ("admission", "market_yield", "storage", "maintenance", "training", "guard")
+
 
 def error_code(error: Exception) -> str:
     known = {
@@ -37,9 +39,20 @@ def error_code(error: Exception) -> str:
 
 
 class DiagnosticsWriter:
-    def __init__(self, directory: Path, can_write: Callable[[], bool] | None = None) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        can_write: Callable[[], bool] | None = None,
+        blocked_reason: Callable[[], str | None] | None = None,
+    ) -> None:
         self.directory = directory
         self.can_write = can_write or (lambda: True)
+        self.blocked_reason = blocked_reason
+        self._wait_lock = threading.Lock()
+        self._wait_reason: str | None = None
+        self._wait_started = 0.0
+        self._wait_counts = dict.fromkeys(WRITER_WAIT_REASONS, 0)
+        self._wait_seconds = dict.fromkeys(WRITER_WAIT_REASONS, 0.0)
         self.messages: Queue[bytes | None] = Queue(maxsize=1)
         self.stopping = threading.Event()
         self.allowed = threading.Event()
@@ -48,6 +61,46 @@ class DiagnosticsWriter:
         self.last_ack_monotonic: float | None = None
         self.status: dict[str, Any] = {"state": "starting"}
         self.thread = threading.Thread(target=self._run, name="diagnostics-io", daemon=True)
+
+    def _observe_wait(self, reason: str | None) -> None:
+        with self._wait_lock:
+            if reason == self._wait_reason:
+                return
+            now = time.monotonic()
+            if self._wait_reason is not None:
+                prior = self._wait_reason
+                self._wait_seconds[prior] = min(
+                    1e12, self._wait_seconds[prior] + max(0.0, now - self._wait_started)
+                )
+            self._wait_reason, self._wait_started = reason, now
+            if reason is not None:
+                self._wait_counts[reason] = min(2**53 - 1, self._wait_counts[reason] + 1)
+
+    def wait_status(self) -> dict[str, Any]:
+        """Sampled writer waits, separate from collector admission and SQLite write time."""
+        with self._wait_lock:
+            age = max(0.0, time.monotonic() - self._wait_started) if self._wait_reason else 0.0
+            seconds = dict(self._wait_seconds)
+            if self._wait_reason is not None:
+                seconds[self._wait_reason] = min(1e12, seconds[self._wait_reason] + age)
+            return {
+                "reason": self._wait_reason,
+                "reason_age_seconds": round(min(1e12, age), 6),
+                "episodes_since_boot": dict(self._wait_counts),
+                "seconds_since_boot": {key: round(value, 6) for key, value in seconds.items()},
+            }
+
+    def _record_blocked_wait(self, admission: bool) -> None:
+        # These observations cannot grant write permission or break the writer. A reason
+        # sampled after a guard denial may already have changed; retain "guard" honestly.
+        reason = "admission" if not admission else "guard"
+        with suppress(Exception):
+            if admission and self.blocked_reason is not None:
+                observed = self.blocked_reason()
+                if isinstance(observed, str) and observed in WRITER_WAIT_REASONS:
+                    reason = observed
+        with suppress(Exception):
+            self._observe_wait(reason)
 
     def offer(self, raw: bytes) -> bool:
         if len(raw) > MAX_INPUT or not self.thread.is_alive():
@@ -92,8 +145,12 @@ class DiagnosticsWriter:
                             break
                         self.busy = True
                         while not self.stopping.is_set():
-                            if self.allowed.is_set() and self.can_write():
+                            admission = self.allowed.is_set()
+                            if admission and self.can_write():
+                                with suppress(Exception):
+                                    self._observe_wait(None)
                                 break
+                            self._record_blocked_wait(admission)
                             self.stopping.wait(0.1)
                         if self.stopping.is_set():
                             break
@@ -127,6 +184,9 @@ class DiagnosticsWriter:
                     store.close()
         except Exception as error:
             self.status = {**self.status, "state": "unavailable", "error": error_code(error)}
+        finally:
+            with suppress(Exception):
+                self._observe_wait(None)
 
     def request_stop(self) -> None:
         self.stopping.set()

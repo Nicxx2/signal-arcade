@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.10.10
+# 🧠 Signal Arcade v1.10.11
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach observes the same saved outcomes outside the trading decision path.
 No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Release](https://img.shields.io/badge/release-v1.10.10-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Version](https://img.shields.io/badge/version-v1.10.11-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -18,7 +18,263 @@ No wallet keys, live orders, paid provider or cloud AI are required.
 
 ---
 
-## What changed in v1.10.10
+## What changed in v1.10.11
+
+**Release status (25 September):** local regression and upgrade checks passed. The completed
+six-hour live review preserved all 119 observed training/proof publication groups and reduced
+retention debt overall, but burst expiry, diagnostic gaps and uneven cleanup recovery still
+exceeded parts of the runtime acceptance criteria. Use this version with monitoring;
+weeks or months of unattended reliability have **not** been established. See the
+[six-hour review and remaining limits](docs/V1_10_11_VALIDATION.md#six-hour-runtime-and-source-publication-review--25-september-2026).
+
+- **Fairer market processing and catch-up work:** the market worker yields between complete
+  events after a short processing slice, preserving committed persistence, urgent-work priority
+  and season boundaries. History cleanup can proceed independently of an unavailable capacity
+  reading, and indexed decision retention avoids repeated selection work. Training workspace
+  release and response-local population reuse reduce avoidable background work. Learning,
+  trading, proof and provider rules remain unchanged. The final local comparison passed its
+  latency/retention gates; sustained live recovery remains a separate acceptance requirement.
+  See the [final scheduling checks](docs/V1_10_11_VALIDATION.md#final-cooperative-scheduling-validation--24-september-2026).
+- **Clearer storage status and safer saves:** the storage card shows separate capacity/history
+  measurement ages and reports overdue history without assuming cleanup is catching up.
+  The live-data budget is a cleanup target, not a hard limit on the database file or WAL.
+  Current browser saves detect conflicting edits, preserve drafts and distinguish an acknowledged
+  save from an interrupted request. This local polish is validated separately from runtime
+  retention recovery; see the [storage checks](docs/V1_10_11_VALIDATION.md#storage-status-and-save-safety--24-september-2026).
+- **Less repeated SQLite work:** budget cleanup skips the second retained-cohort scan when
+  an old chunk is strictly before the protected boundary, keeping exact timestamp ties and
+  protected records intact. Large event batches use bounded multi-row statements inside the
+  same atomic transaction. Maintenance diagnostics distinguish admission, setup, read work and
+  restoration from worker dispatch/resumption. These changes were **deployed locally through
+  Settings preparation on 24 September**; sustained burst/retention recovery and runtime
+  acceptance remain pending. See the
+  [rollout checks](docs/V1_10_11_VALIDATION.md#sqlite-work-reduction-rollout--24-september-2026).
+- **Assessment saves and retention attribution:** optional AI assessment writes run on joined
+  workers, with committed outcomes registered before cancellation or an upgrade can finish.
+  Same-token outcome ticks wait for that registration; queued and prefetched ticks receive
+  their current priority before newer ticks can overtake them. Cleanup separates SQL execution from
+  transaction exit, so slow fixed commit overhead alone does not shrink its chunks toward one
+  row; growth still requires a fast complete transaction. Bounded timings distinguish worker
+  execution from event-loop resumption. These preserve existing evidence and authority rules;
+  this candidate was **deployed locally through Settings preparation on 24 September**.
+  Sustained runtime acceptance remains pending; see the
+  [rollout checks](docs/V1_10_11_VALIDATION.md#assessment-handoff-live-rollout--24-september-2026).
+- **Bounded optional housekeeping:** resolved incident and AI-audit cleanup now uses small,
+  cancellable transactions with an original deadline that includes dispatch and lock waits.
+  Paced retries rotate categories without rerunning settled primary cleanup; unresolved records
+  and retained evidence stay protected. Optional retries yield to in-flight learning requests.
+  A resolved-incident index avoids repeated backlog sorting.
+  Diagnostics distinguish actual writer waits from collector admission without loosening either
+  guard. These are reliability changes; sustained runtime acceptance remains required.
+- **Less repeated processing work:** fresh ledger reads use a covering account index, and
+  each entry assessment reuses its own cash valuation. Feature validation keeps the same
+  fields, short-circuit order and proof decisions with less traversal overhead. Compact token
+  views construct only displayed values while preserving rolling calculations and cache behavior.
+  Cleanup reads related page counters in one statement. Bounded candidate/governance timings
+  help attribute remaining pressure. Trading rules, Champion checks, coverage requirements and
+  training windows are unchanged; isolated savings do not certify sustained burst recovery.
+- **Delayed-response safety:** enrichment preparation and completed metadata/route replies use
+  joined workers under the market boundary, with provider calls outside it. Replies cannot cross
+  an engine, token, source or requested-pool change, overwrite newer route verification, or change
+  a replacement token's retry state. Maintenance reads recheck cancellation and the original
+  deadline after setup. Bounded diagnostics distinguish candidate/enrichment CPU from dispatch,
+  worker elapsed and event-loop resumption. These fixes preserve trading and learning rules;
+  sustained burst and retention acceptance still require runtime evidence.
+- **Evidence reads and pressure diagnostics:** broker evidence readers use indexed decision/fill
+  references while preserving chronological and duplicate selection. Cleanup rechecks its original
+  deadline after connection setup; additional timings separate setup/restoration and worker CPU
+  from elapsed SQL/commit time. When detailed diagnostics are delayed, a bounded reduced capture
+  can retain pipeline counters and complete publication groups without database I/O. Writer
+  pressure guards remain unchanged; reduced detail and remaining gaps stay explicit. Retention
+  samples retain their actual measurement timestamps. See the
+  [final reliability checks and limits](docs/V1_10_11_VALIDATION.md#final-evidence-and-continuity-review--23-september-2026).
+- **Community presentation and cleanup polish:** the actual-entry disclosure
+  stays inside Champion impact, and Results shows loading/retry feedback beside the selected
+  sort while identifying the order of any retained rows. Bounded history cleanup rotates the
+  first category so a slow raw-trade query cannot always exclude old non-entry decisions and
+  equity samples. Per-category diagnostics preserve the existing deadlines and record limits.
+  Maintenance reader admission also yields at its deadline; optional counts offer cancellation
+  during their scan and run after core cleanup, when market pressure allows. Unavailable capacity
+  stays explicitly unknown, and retained measurements keep their actual ages. Saved dashboard
+  age includes assembly time. Deployed locally through Settings preparation on 21 September;
+  sustained burst recovery, diagnostic continuity and retention catch-up remain under observation.
+  The fixed Manipulation study remains separate research
+  and does not authorize a trading change. See the
+  [rollout checks](docs/V1_10_11_VALIDATION.md#maintenance-polish-live-rollout--21-september-2026)
+  and [final source review and remaining limits](docs/V1_10_11_VALIDATION.md#final-community-readiness-review--21-september-2026).
+- **Champion selectivity follow-up:** passive reporting separates original
+  supported entries/vetoes from actual Baseline fallback fills and their matched results. A
+  bounded RPC handoff can preserve a fetched learning batch across a brief storage chunk while
+  retaining all freshness and priority guards. A separate offline shadow screen compares a
+  fixed Manipulation hypothesis with incumbent, Baseline and cash; trading changes remain
+  conditional on fresh evidence. The engineering changes were deployed locally through Settings
+  preparation on 21 September; sustained performance remains under observation. The completed
+  fixed-window study did not support activating its candidate rule. See
+  [study boundaries and results](docs/SUPPORT_EVALUATION.md).
+- **Release reliability follow-up:** completed bounded cleanup passes
+  keep their catch-up cadence when only optional housekeeping yields to market traffic. HTTP 413
+  responses use an already configured provider fallback and bounded backoff. Baseline size,
+  evaluation and entry-permission preparation share one joined worker dispatch, preserving the
+  same checks and original measurement clocks. Deployed locally through Settings preparation on
+  21 September; sustained burst and retention improvement still need normal-traffic validation.
+  See the [rollout checks](docs/V1_10_11_VALIDATION.md#release-reliability-live-rollout--21-september-2026).
+- **Durable enrollment activity evidence:** compact
+  records preserve each newly enrolled Discovery/Policy opportunity's original activity and
+  integrity assessment through decision-history cleanup. They stay outside model inputs and
+  never change buying, exits or Champion permissions. A bounded offline research report can
+  compare future matched outcomes; buying changes still require prospective evidence. See
+  [capture and research limits](docs/ACTIVITY_EVALUATION.md#durable-enrollment-evidence).
+  The research reader extracts a bounded private study period without copying the whole
+  database, preserves first-opportunity identities and reports missing evidence explicitly.
+  Enrollment capture was deployed locally through Settings preparation on 20 September;
+  the standalone reader runs separately. The first six-hour prospective study completed with
+  insufficient fresh inputs and zero pattern matches: **inconclusive**, with no buying-rule
+  activation. See the [completed study and limits](docs/ACTIVITY_EVALUATION.md#first-prospective-study-result).
+- **Clearer saved entry evidence:** skill receipts explain an applied veto versus an
+  unsupported proposal, record the first failing support feature when available, and link later
+  attempts to the original independent Policy opportunity. Decision evidence ages use the original
+  measurement and decision clocks. This follow-up was deployed locally on **21 September**;
+  the completed study retains its original archived evaluator and unchanged buying rules.
+- **Bounded dashboard action reads:** ENTER/WATCH history uses an action/time index and a
+  bounded merge, retaining timestamp ties and season isolation. Optional diagnostics separate
+  token assembly from decision reads. Dashboard evidence age includes assembly time.
+- **Trade count and value evidence:** new saved decision details distinguish buy-count share
+  from buy-volume share, signed net flow and trades/wallets meeting a descriptive 0.01 SOL
+  cutoff. Missing evidence stays unknown. These additional measurements do not change scores,
+  model inputs or Champion requirements. Position percentages are labelled **hold score**,
+  not profit odds. See the [evaluation boundary](docs/ACTIVITY_EVALUATION.md).
+  Deployed locally through Settings preparation on 20 September; see the
+  [rollout checks and limits](docs/V1_10_11_VALIDATION.md#activity-evidence-live-rollout--20-september-2026).
+  Longer normal-traffic validation remains necessary.
+- **Provider recovery and clearer collection diagnostics:** the latest local follow-up isolates
+  in-flight RPC results from provider settings changes and resets ordinary reconnect backoff
+  after acknowledged, stable stream activity. Bounded reports distinguish HTTP, transport and
+  protocol failures without saving provider text or URLs, and show selected/unselected deadline
+  bands. Learning gates, batch limits and scheduling are unchanged. This follow-up was **deployed
+  locally through Settings preparation on 19 September**; see [rollout checks and remaining limits](docs/V1_10_11_VALIDATION.md#provider-recovery-live-rollout--19-september-2026).
+- **Clearer saved learning evidence:** each Entry family lists its coverage-freshness check
+  once. Expanded artifact details distinguish actual training, validation and chronology counts,
+  saved evidence periods and the validation boundary. Sizing, contextual Exit and Coach keep
+  their different population meanings; unavailable historical details stay unavailable.
+  The Entry window remains at most 1,000 eligible resolved observations, not 1,000 fitted rows;
+  see [training-window and saved-evidence details](docs/LEARNING.md#retention-training-windows-and-saved-evidence).
+  Optional diagnostic losses now identify a fixed set of event types within the existing
+  limits. Deployed locally through Settings preparation on 19 September; community publication
+  remains pending. See [validation and rollout limits](docs/V1_10_11_VALIDATION.md#community-presentation-and-diagnostic-polish--19-september-2026).
+- **Optional learning coverage requirement:** Settings → Learning requirements offers **70%
+  (default), 65%, 60% or 55%** for native Entry (Linear/XGBoost), Manipulation, Sizing and Exit.
+  Lower values accept less complete evidence; they do not improve measured coverage, accuracy or
+  profit. Other proof, sample and permission checks still apply. Existing generations retain
+  their recorded requirement and new generations need validation after the setting change.
+  Coach-derived support stays at 70%. See [scope and transition rules](docs/LEARNING.md#configurable-skill-coverage-v11011).
+  The original 70/65/60 choices were deployed locally through Settings preparation on 19 September;
+  that initial rollout preserved 70%. The **55% extension was deployed locally on 20 September**,
+  preserving the existing 60% selection; 55% was not selected during the upgrade.
+  It also applies to eligible new native health/recovery proof, subject to stricter saved requirements.
+  See the [55% checks and evaluation limits](docs/V1_10_11_VALIDATION.md#optional-55-coverage--20-september-2026).
+- **Recovery after a drained burst:** historical lag no longer blocks diagnostics indefinitely
+  once all admitted market work has drained. Local training/publication can recover after five
+  quiet seconds following a successful batch, with pressure, job-validity and priority checks
+  still applied. RPC freshness and qualification gates are unchanged.
+- **More useful slow-work evidence:** bounded collector deferral counters and coherent samples
+  connect a slow storage, heartbeat or event-persistence operation with its own phase timings.
+  Optional reporting retains existing limits and yields to saved learning/proof reports.
+- **Replayable new fill fees:** new paper receipts retain optional fee-rounding provenance for
+  an arithmetic audit. Fill formulas and balances are unchanged; older receipts remain readable
+  and missing provenance is reported as unavailable.
+- **Bounded position-probe retention:** existing heartbeat and watchdog passes remove probes
+  for closed or replaced holdings. Current-position proof and saved terminal evidence remain
+  intact. A late request for an old position cannot overwrite a new holding's probe in the
+  same mint. This reduces unnecessary retained data and dashboard payload growth.
+- **More precise performance diagnostics:** bounded cumulative detail separates dashboard
+  portfolio, history, learning, advisory and remaining assembly work, plus collection request,
+  lock-wait and apply time. Post-fetch discard reasons identify the fetched batches within
+  aggregate guard deferrals.
+  Detail yields to proof events and uses the existing byte and retention limits.
+- **Better diagnostics under pressure:** a bounded backlog keeps up to four publication report
+  groups through short collection delays. Original report times and group membership survive;
+  each saved interval still contains at most eight events. Pending reports are visible separately
+  from writer handoff, and overload, malformed reports and writer losses remain explicit.
+  Collection yields to market pressure and never grants a model permission to act.
+- **Collection selection visibility:** sampled lane/horizon counts distinguish eligible work,
+  fresh cached routes, excluded identities, missing state and already-expired windows. Unique
+  route counts and remaining-deadline bands help investigate capacity without changing selection.
+  Unclassifiable clocks on already-excluded records are reported separately without interrupting
+  normal selection.
+- **More useful local-work attribution:** optional worker timings separate broker valuation,
+  assessment and persistence; decision serialization, lock, SQL and commit work; and collection
+  validation, checkpoint persistence and governance. Timing is observational and does not change
+  outcomes, model gates or order execution. See [measurement limits](docs/DIAGNOSTICS_HISTORY.md).
+  Bounded equity detail and a coherent slow-broker sample distinguish portfolio reads, equity
+  writes and commit waits without adding database reads or changing execution.
+- **Bounded cleanup coordination:** routine cleanup briefly yields to an admitted learning
+  request when a recent capacity check permits it. Urgent or unknown storage pressure still
+  proceeds. History categories adjust their own bounded chunks, so an expensive equity or
+  decision query cannot shrink fast raw-event cleanup. Maintenance SQLite contention yields
+  without changing ordinary trading timeouts, and dispatch waits consume the original deadline.
+  Budget cleanup alternates raw/decision work and uses indexed raw retention boundaries while
+  preserving exact timestamp ties, protected evidence and post-fetch validation. Sustained
+  catch-up and burst performance still require live observation.
+- **Dashboard refresh continuity:** an expired cached view queues one shared refresh through
+  storage activity. Waiting does not hold the market lock; stale responses retain their real
+  timestamp. Additional assembly timing supports further investigation without caching authority.
+- **Clearer coverage wording:** the default 70% means usable outcome coverage, not accuracy or win rate.
+  Operational coverage and a fitted model's coverage can differ. Qualification still requires
+  every applicable performance check, and a Champion needs separate permission and activation proof.
+- **Fitted-cohort explanations:** new Entry Linear/XGBoost and Manipulation
+  artifacts retain small counts for usable outcomes, recorded quote failures and missing
+  checkpoints. Entry's family panels explain their own saved generation; older or inconsistent
+  reports remain unavailable. These counts do not change fitting, payloads or proof gates.
+- **Indexed order evidence:** a non-unique decision lookup index avoids
+  scanning Policy JSON for each order update. Order and evidence linkage still commit together;
+  diagnostics separate lookup time from writer-lock admission.
+- **Less unnecessary proof sorting:** Policy selection filters ineligible records before sorting
+  the remaining evidence. Chronology, identity reservations, missing/negative outcomes and
+  immediate Champion health checks are preserved.
+- **Conservative collection changes:** scheduling priorities, batch defaults, fixed deadlines,
+  real quote failures and post-fetch safety guards are preserved. Larger existing batch options
+  are tested at slow-response and exact-deadline boundaries; this is not a live coverage forecast.
+
+The subsequent burst follow-up was **deployed locally through Settings preparation on 19 September**.
+Optional diagnostic cadence now follows collection rather than queue admission, slow market-batch and dashboard
+samples retain coherent timings, and future-only Local AI outcome work avoids unnecessary
+executor calls while preserving cooperative scheduling. See the
+[staged checks and limits](docs/V1_10_11_VALIDATION.md#burst-diagnostics-and-ai-dispatch-follow-up--19-september-2026)
+and [live rollout checks](docs/V1_10_11_VALIDATION.md#burst-follow-up-live-rollout--19-september-2026).
+These changes do not alter learning requirements, outcome validity or Champion permissions.
+
+The preceding saved-evidence presentation and diagnostic-loss polish provides the earlier baseline.
+See its [build and rollout checks](docs/V1_10_11_VALIDATION.md#learning-presentationdiagnostic-polish-live-rollout--19-september-2026)
+and the [17:58 BST follow-up](docs/V1_10_11_VALIDATION.md#post-rollout-read-only-edge-review--19-september-2026).
+The short sample does not establish sustained burst performance; earlier candidate losses and
+limited host disk space remain open concerns. Community publication remains pending.
+
+The earlier idle-recovery, slow-work evidence and receipt-audit additions were **deployed locally
+through Settings preparation on 19 September**. See [their rollout and limits](docs/V1_10_11_VALIDATION.md#idle-recovery-and-audit-live-rollout--19-september-2026).
+The [local validation](docs/V1_10_11_VALIDATION.md#idle-recovery-and-audit-follow-up--19-september-2026)
+and short startup review do not establish sustained performance or improved learning.
+
+The earlier 19 September publication-backlog, selection-visibility and proof-sorting follow-up is
+deployed locally through Settings upgrade preparation. Packaged checks, state continuity,
+backup verification and the limits of the short live observation are recorded in
+[the rollout record](docs/V1_10_11_VALIDATION.md#publication-retention-live-rollout--19-september-2026).
+Its [staged validation](docs/V1_10_11_VALIDATION.md#publication-retention-and-selection-follow-up--19-september-2026)
+remains separate from evidence of sustained live improvement.
+
+The previously deployed local v1.10.11 app, including diagnostics, cleanup, dashboard,
+publication-boundary collection, worker-detail timing, order-lookup and fitted-cohort changes, was
+upgraded through Settings preparation on
+18 September 2026. See the
+[v1.10.11 validation record](docs/V1_10_11_VALIDATION.md#coverage-and-order-lookup-live-rollout--18-september-2026)
+for the exact deployed build, checks and remaining limits. Community publication remains on
+hold for longer natural-traffic validation; the public v1.10.11 image has not been published.
+New fitted-cohort reports appear with natural refits; existing artifacts retain their original
+metrics and show an unavailable breakdown. Longer natural-traffic validation remains necessary.
+The [post-burst candidate checks](docs/V1_10_11_VALIDATION.md#post-burst-local-candidate--18-september-2026)
+remain separate from live observations; passing tests does not establish sustained burst capacity.
+
+<details>
+<summary><strong>Earlier v1.10.10 improvements retained</strong></summary>
 
 - **Honest Entry ranking:** equal predictions share the top-group boundary equally; later
   returns cannot break prediction ties. Linear and XGBoost use the same versioned validation.
@@ -92,11 +348,13 @@ The contextual Exit, suspended-skill comparison and burst-performance improvemen
 [v1.10.9](CHANGELOG.md#1109---2026-09-08), together with the earlier Coach and recovery fixes,
 remain in place. Collection deadlines, scheduler priorities and live batch settings are unchanged.
 
+</details>
+
 **Operational limits:** busy periods can still delay processing or expire candidate events. Zero
 event losses do not mean zero lag, and a recovered queue does not restore lost evidence or prove
 sustained peak-load capacity. Check retained critical-lag peaks, recent losses and worker health
 in Settings diagnostics, and monitor host disk space during extended operation. See the
-[v1.10.10 validation results and remaining limits](docs/V1_10_10_VALIDATION.md).
+[v1.10.11 validation results and remaining limits](docs/V1_10_11_VALIDATION.md).
 
 <details>
 <summary><strong>Release details and verification</strong></summary>
@@ -107,7 +365,9 @@ Champion still needs current Baseline/composition proof. Permission is remembere
 changed dependencies or failed health checks remove affected support until proof is valid again.
 **Pause learning & support** stops new observations and influence while retaining models and the
 permission preference. Baseline entry approval, executable routes, size limits and hard exits remain
-in force. The 70% coverage requirement and existing uncertainty and harm gates are unchanged.
+in force. Coverage defaults to 70%; native skills follow the selected and saved requirements
+described in [Learning requirements](docs/LEARNING.md#configurable-skill-coverage-v11011).
+Existing uncertainty and harm gates remain unchanged.
 
 **Coach contribution has its own permission.** Learning → AI Coach → **Allow when ready** lets
 proved research ideas enter future Challenger battles. It preserves paused learning and research;
@@ -144,10 +404,10 @@ read contention and report specific failures; check for an `export_complete` tra
 a download as complete history. See
 [diagnostics history and its limits](docs/DIAGNOSTICS_HISTORY.md).
 
-The [v1.10.10 release notes](CHANGELOG.md#11010---2026-09-09) describe the latest fixes. Entry's
-70% coverage and independent proof requirements remain.
+The [v1.10.11 release notes](CHANGELOG.md#11011---2026-09-18) describe the latest fixes. Entry still
+needs its applicable coverage requirement (70% by default) and independent performance proof.
 
-**Upgrade:** v1.10.10 retains database schema 16. Saved Exit plans, Policy identities and fill
+**Upgrade:** v1.10.11 retains database schema 16. Saved Exit plans, Policy identities and fill
 indexes remain in place. Native Entry artifacts with the old ranking-validation contract remain
 historical records but need a fresh, corrected fit before supporting trades. Unfinished legacy
 Coach studies close once as inconclusive with their evidence preserved; new proposals collect
@@ -243,9 +503,9 @@ short evidence-driven exchanges and Champion ceremonies.** Open Learning → Cha
   Chest marks identify family (Linear bars, XGBoost branches, deterministic shield outline);
   XGBoost also has branched antennae. Decorative armor and handheld shields can appear in any family.
 
-The [v1.10.10 verification record](docs/V1_10_10_VALIDATION.md) summarizes regression checks,
-the isolated capacity comparison and remaining live-validation limits. Earlier implementation
-records remain available for [v1.10.9](docs/V1_10_9_VALIDATION.md),
+The [v1.10.11 verification record](docs/V1_10_11_VALIDATION.md) summarizes regression checks,
+the isolated deadline/batch checks and remaining live-validation limits. Earlier implementation
+records remain available for [v1.10.10](docs/V1_10_10_VALIDATION.md), [v1.10.9](docs/V1_10_9_VALIDATION.md),
 [v1.10.8](docs/V1_10_8_VALIDATION.md), [v1.10.7](docs/V1_10_7_VALIDATION.md),
 [v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
 [quote recovery](docs/V1_10_5_QUOTE_RECOVERY.md),
@@ -294,8 +554,9 @@ and [Entry model profile](docs/screenshots/v1.10.7-live-2026-09-07/16-entry-prof
   and pending artifacts remain available; older payloads may be archived with their audit metadata.
   Status shows the terminal-evidence phase and warns when progress information is delayed.
 
-The 70% executable-outcome requirement, unknown-outcome denominator and activation consent stay
-unchanged. The changes improve evidence and reliability; sustained forward results are still needed
+These inherited v1.10.4 changes preserved the original 70% executable-outcome requirement,
+unknown-outcome denominator and activation consent. v1.10.11 adds the optional native-skill
+coverage setting described above. Sustained forward results are still needed
 to establish useful Champions. They do not establish profitability. A prospective portfolio
 experiment remains a separately versioned follow-on, as specified in the improvement plan.
 
@@ -404,7 +665,7 @@ before supporting Baseline.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.10.10 |
+| Player | What it does | Influence in v1.10.11 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | Optional automatic support lets each qualified skill join after its own Baseline/composition proof; influence remains monitored and reversible |
@@ -448,6 +709,16 @@ before supporting Baseline.
   per-token causal cursor prevents priority scheduling from reversing execution or learning time.
   Storage cleanup runs in small committed chunks, yields to protected market work and avoids
   routine full-journal counts, reducing contention with market processing.
+  Settings shows when capacity and raw-history measurements were taken. Its live-data budget is
+  a soft cleanup target: protected records, allocated/reusable pages and the WAL can exceed it.
+  Raising this budget does not itself increase processing throughput or prove retention catch-up.
+  Bounded age-based cleanup can proceed when capacity refresh is unavailable, while capacity-driven
+  deletion still requires a fresh measurement. Unknown capacity never grants cleanup extra priority.
+  Decision-history cleanup preserves its exact recent cohort and protected entries; its additive
+  index is created on upgrade and preserved across season changes. Large existing histories may
+  require additional startup time for that one-time index build.
+  Browser saves preserve edits if another session changes the policy; refresh and review before
+  retrying. A confirmed save schedules background work without waiting for cleanup to finish.
 - 🔌 **Keyless and local by default** — Public Solana RPC and DEX Screener work without accounts;
   guided or custom providers and the private Ollama companion are optional. Helius Economy can
   reserve the key for paced HTTP safety lookups while retaining the default live stream.
@@ -460,6 +731,11 @@ before supporting Baseline.
 
 Only Docker with Compose support and one admin password are required. Provider keys and local AI
 models are optional and can be configured later from the web UI.
+
+The example below pins the published v1.10.10 image. This checkout contains v1.10.11;
+its public Docker Hub/GitHub release has not been published as part of this local update.
+The target public tag is `nicxx2/signal-arcade:1.10.11`; it is not available from this local build.
+Use a local source build for these changes until the versioned public image is available.
 
 ### 1. Create `.env`
 
@@ -577,19 +853,25 @@ rather than treating update downtime as market evidence. If preparation cannot f
 normal operation and reports the reason. Users who deliberately prefer a rolling tag can use
 `nicxx2/signal-arcade:latest` instead.
 
-Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.10 preserves the bankroll, open
+After restart, new learning rows wait for five minutes of uninterrupted provider history.
+Those rows then need their own five-minute outcomes before they can advance the retraining
+counter; retained pending evidence may progress sooner. A running trainer can therefore be
+correctly waiting for evidence. Check outcome progress and diagnostic timestamps rather than
+expecting a new model immediately. See [learning continuity](docs/LEARNING.md#training-and-validation).
+
+Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.11 preserves the bankroll, open
 positions, pending-order accounting, seasons, settings, learning evidence and Champion history in
 the same data volume. For an upgrade from v1.10.6 or v1.10.7, Baseline stays on v1.5, existing learning
 records remain available and no new paper season is required. Evidence selection enforces the
 current contract and durable identity rules. Restarts revalidate current activation receipts;
 older artifacts remain available for audit but cannot gain authority under a different feature schema.
 
-**v1.10.10 retains schema 16.** Upgrading from published v1.10.7, v1.10.8 or v1.10.9 adds no
+**v1.10.11 retains schema 16.** Upgrading from published v1.10.7 through v1.10.10 adds no
 evidence migration or reset. Contextual Exit timing introduced in v1.10.9 uses optional
 position/order JSON, not a new table.
 Existing positions use Baseline timing when a contextual Champion has no original saved plan.
 The existing fixed timing family remains available.
-An ongoing Entry/Manipulation comparison crossing this release's scoring correction starts a
+An ongoing Entry/Manipulation comparison crossing v1.10.10's scoring correction starts a
 partial replay; completed histories stay unchanged. Collection diagnostic counters begin a new
 scope on restart without reconstructing older attempts or changing retained learning evidence.
 The earlier v1.10.7 migration adds compact Policy identity records and fill indexes.
@@ -617,15 +899,26 @@ image together. Published v1.10.4/v1.10.5 images use schema 14 and cannot open s
 A v1.10.3 image also cannot open schema 14. Never copy only a running SQLite database file while
 leaving its WAL behind.
 
-v1.10.10 and published v1.10.7 through v1.10.9 use schema 16. A code rollback can retain the current data
-volume; routinely restoring an older backup would discard newer evidence. Older builds cannot
-read the new Coach forward-study fields and restore the old Entry tie scoring, so research and
-support state must be checked explicitly after rollback. Returning to v1.10.9 also restores its
-unsupported-veto scoring defect. Releases before v1.10.9 do not implement
-contextual Exit plans. The versioned contextual activation receipt cannot restore that authority
-on v1.10.8; existing Baseline safeguards remain. Take a consistent backup before rollback as well,
-and verify support and position state after changing builds. Old builds may discard unknown
-optional plan fields when rewriting positions; upgrading again cannot reconstruct those choices.
+v1.10.11 and published v1.10.7 through v1.10.10 use schema 16, but matching the database schema is
+not sufficient for rollback. Once a changed Learning requirement has created versioned policy
+records, use only a build that understands their saved proof and authority contracts. Returning
+the setting to 70% does not remove that history. A compatible coverage-policy-aware build can
+retain the current data volume; see [coverage transition rules](docs/LEARNING.md#configurable-skill-coverage-v11011).
+After 55% has been saved or recorded in proof, the rollback build must also understand 55%.
+Earlier builds accepting only 70/65/60 reject those records; switching the setting back does not
+make their historical proof compatible. Do not rewrite saved proof to work around this restriction.
+To return to an image predating those contracts, preserve the current data separately and restore
+the matching pre-feature data and image together. Restoring an older backup loses newer evidence
+from the active app; it is not a routine way to change the coverage setting.
+
+Earlier builds also have independent limitations: v1.10.10 restores its probe-retention behaviour
+and omits the new diagnostic detail; builds before it lack the new Coach forward-study fields
+and restore the old Entry tie scoring. v1.10.9 restores its unsupported-veto scoring defect,
+and releases before v1.10.9 do not implement contextual Exit plans. The versioned contextual
+activation receipt cannot restore that authority on v1.10.8; existing Baseline safeguards remain.
+Take a consistent backup before rollback and verify support and position state after changing
+builds. Old builds may discard unknown optional plan fields when rewriting positions; upgrading
+again cannot reconstruct those choices.
 
 > Portainer users can paste the same Compose file into the Web editor and define
 > `SIGNAL_ARCADE_ADMIN_PASSWORD` as a stack environment variable.
@@ -674,7 +967,8 @@ evidence may extend a winner past its normal review point, but it cannot remove 
   promotions or profit claims.
 - **Allow when qualified** saves an explicit automatic-support preference. Entry is not required
   for Manipulation, Sizing or Exit to be first, but each needs its own qualification plus at least
-  30 fresh usable outcomes, 70% coverage, positive conservative value and the existing harm guard
+  30 fresh usable outcomes, the applicable saved/current coverage requirement (70% by default),
+  positive conservative value and the existing harm guard
   against the exact Baseline or skill combination it would join. Permission alone changes no trade.
 - **Pause learning & support** stops new learning observations and Champion influence. Saved models
   and the automatic-support preference remain; already queued work may finish. Resume learning
@@ -891,6 +1185,9 @@ Technical documentation:
 
 ## ⚠️ Important limitations
 
+- v1.10.11 still needs monitoring under sustained market pressure. Candidate events can expire,
+  diagnostic intervals can be delayed, and retention can temporarily fall behind; see the
+  [runtime review](docs/V1_10_11_VALIDATION.md#six-hour-runtime-and-source-publication-review--25-september-2026).
 - Paper results are not evidence that a strategy will be profitable live.
 - Latency, MEV, failed transactions, RPC gaps and adversarial tokens can be worse than any paper
   model.

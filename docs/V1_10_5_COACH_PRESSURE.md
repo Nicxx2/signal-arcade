@@ -280,7 +280,7 @@ Cutover completed at 20:19 UTC on 5 September under maintenance operation
 `f82e6706e2f447b6b82df31306dae01e`.
 
 The active `/data` mount is now Docker volume `solana-signal-arcade_signal-arcade-data`. The original
-`E:/codex/paper-trading/solana-signal-arcade/data` folder is preserved as the cutover recovery
+host data directory is preserved privately outside the repository as the cutover recovery
 snapshot. Physical E: headroom was about 23.1 GB after cutover. Only the ignored local data-source
 line changed. The deployed image remains `64afc62aac9f…` with build fingerprint `26901a7fb3ab…`;
 all backend source, UI assets, README and changelog hashes matched the working v1.10.5 release.

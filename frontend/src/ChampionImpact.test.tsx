@@ -4,6 +4,34 @@ import { ChampionImpact } from "./ChampionImpact";
 import type { ChampionImpactComparison, ChampionImpactReport, ChallengerSkillStatus, LearningStatus } from "./types";
 
 afterEach(cleanup);
+
+test("selectivity and actual fallback results remain separate from quoted impact", () => {
+  const value = props();
+  value.learning.active_skill_versions = { manipulation: "m1" };
+  const r = value.learning.champion_impact!;
+  r.versions = { manipulation: "m1" };
+  r.comparisons = [{ ...comparison, subject: "manipulation", state: "uncertain",
+    actions: { supported_entry: 0, supported_veto: 55, fallback: 3, unavailable: 2 }, cash_reference_mean: 0 }];
+  r.execution_sample = { state: "available", sample_limit: 30, unlinked_entries: 1, skills: [{
+    skill: "manipulation", observed_count: 2, supported_entry: 0, fallback: 1, unknown: 1, later_fallback: 1,
+    outcomes: [{ category: "fallback", currency: "USDC", decimals: 6, closed_count: 1, unresolved_count: 0, net_minor: -2000000, winning_count: 0 }],
+  }] };
+  render(<ChampionImpact {...value} />);
+  fireEvent.click(screen.getByRole("button", { name: "Manipulation" }));
+  expect(screen.getByText(/55 supported vetoes/)).toBeInTheDocument();
+  expect(screen.getByText(/does not demonstrate selective entry/)).toBeInTheDocument();
+  expect(screen.getByText(/-2.0000 USDC after costs/)).toBeInTheDocument();
+  expect(screen.getByText(/does not prove an earlier veto/)).toBeInTheDocument();
+});
+
+test("inconsistent action counts and unavailable execution data cannot imply healthy zeroes", () => {
+  const value = props();
+  value.learning.champion_impact!.comparisons[0]!.actions = { supported_entry: 100, supported_veto: 0, fallback: 0, unavailable: 0 };
+  value.learning.champion_impact!.execution_sample = { state: "unavailable" };
+  render(<ChampionImpact {...value} />);
+  expect(screen.queryByText(/Original opportunities:/)).not.toBeInTheDocument();
+  expect(screen.getByText(/Actual-entry reporting is unavailable/)).toBeInTheDocument();
+});
 const at = "2026-09-13T10:00:00Z";
 const comparison: ChampionImpactComparison = {
   subject: "sizing", state: "positive", observed_count: 60, usable_count: 45, pending_count: 3, not_reached_count: 0,

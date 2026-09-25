@@ -47,9 +47,11 @@ from ..models import (
 from ..paper.curve_math import quote_buy, quote_sell
 from ..season_strategy import champion_codename as _challenger_codename
 from ..strategy import BASELINE_VERSION, LEARNABLE_BASELINE_VERSIONS
-from . import exit_context
+from ..work_timing import timed_work
+from . import coverage_policy, exit_context
 from .champion_impact import build_impact
 from .collection_diagnostics import CollectionDiagnostics, CollectionTargets
+from .coverage import coverage_breakdown, fitted_coverage_metrics, freeze_quote_failures
 from .features import NATIVE_SOL_MINT, WRAPPED_SOL_MINT, TokenState
 from .nonlinear import (
     XGBOOST_IMPLEMENTATION_VERSION,
@@ -71,6 +73,7 @@ from .training_job import (
     TrainingOutput,
     TrainingReader,
     freeze_training_inputs,
+    observe_training_gc,
     thaw_training_inputs,
 )
 
@@ -542,6 +545,20 @@ class LearningEngine:
         self.database = database
         self._status_policy_cache = threading.local()
         self.settings = settings
+        self.coverage_policy_error: str | None = None
+        try:
+            saved_coverage = database.get_setting(coverage_policy.SETTING_KEY, None)
+            if saved_coverage is not None and (
+                not isinstance(saved_coverage, dict)
+                or set(saved_coverage) != coverage_policy.POLICY_KEYS
+            ):
+                raise ValueError("invalid saved coverage setting")
+            self.coverage_policy = coverage_policy.read_policy(saved_coverage or {})
+        except (ValueError, TypeError, OverflowError):
+            self.coverage_policy = coverage_policy.CoveragePolicy()
+            self.coverage_policy_error = (
+                "Saved coverage setting is invalid; save a requirement to repair it."
+            )
         self.configuration_fingerprint = configuration_fingerprint or (lambda: None)
         # A locked predecessor season must finish on its own strategy generation after an
         # upgrade. Keeping the active Baseline callback beside the configuration fingerprint lets
@@ -566,6 +583,7 @@ class LearningEngine:
         self._training_last_phases: dict[str, float] = {}
         self._training_last_fit: dict[str, Any] | None = None
         self._training_output: TrainingOutput | None = None
+        self._coverage_quote_failures: dict[str, str] | None = None
         self._training_discarded = 0
         try:
             self.current_risk_mode = RiskMode(
@@ -841,6 +859,7 @@ class LearningEngine:
                 return 0
         return 1
 
+    @timed_work("govern_retrain")
     def request_retraining(
         self,
         *,
@@ -865,11 +884,245 @@ class LearningEngine:
         with self._training_request_lock:
             return bool(self._training_requests)
 
+    def coverage_settings_status(self) -> dict[str, Any]:
+        return {
+            "percent": self.coverage_policy.percent,
+            "revision": self.coverage_policy.revision,
+            "effective_at": (
+                self.coverage_policy.effective_at.isoformat()
+                if self.coverage_policy.effective_at
+                else None
+            ),
+            "options": list(coverage_policy.PERCENTAGES),
+            "error": self.coverage_policy_error,
+            "coach_percent": 70,
+        }
+
+    def _coverage_minimum(
+        self,
+        artifact: ChallengerSkillArtifact | LearningModel | None = None,
+    ) -> float:
+        # Lower settings apply prospectively. Existing artifacts keep their stricter contract.
+        return max(
+            self.coverage_policy.fraction,
+            coverage_policy.artifact_minimum(artifact) if artifact is not None else 0,
+        )
+
+    def _skill_eligible(self, artifact: ChallengerSkillArtifact) -> bool:
+        return bool(
+            self.coverage_policy_error is None
+            and _skill_qualified(artifact)
+            and coverage_policy.meets_current(artifact, self.coverage_policy.fraction)
+        )
+
+    def _support_coverage_minimum(
+        self, artifact: ChallengerSkillArtifact, state: ChallengerSkillState | None
+    ) -> float:
+        # A later setting change cannot relax the contract of an existing activation.
+        proof = state.activation_proof if state is not None else {}
+        return max(
+            self._coverage_minimum(artifact),
+            coverage_policy.saved_minimum(proof)
+            if proof.get("artifact_version") == artifact.version
+            else 0,
+        )
+
+    def _coverage_receipt(
+        self,
+        artifact: ChallengerSkillArtifact,
+        *,
+        floor: float = 0,
+        prospective: bool = False,
+    ) -> dict[str, Any]:
+        minimum = max(
+            floor,
+            self.coverage_policy.fraction,
+            0.70
+            if coverage_policy.is_coach(artifact)
+            else 0
+            if prospective
+            else coverage_policy.artifact_minimum(artifact),
+        )
+        if not math.isfinite(minimum):
+            return {"coverage_policy_version": "invalid"}
+        return coverage_policy.CoveragePolicy(
+            round(minimum * 100),
+            self.coverage_policy.revision,
+            datetime.now(UTC)
+            if prospective and self.coverage_policy.revision
+            else self.coverage_policy.effective_at,
+        ).metadata()
+
+    def _current_coverage_gates(
+        self, artifact: ChallengerSkillArtifact | None, gates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if artifact is not None and (
+            self.coverage_policy_error is not None
+            or self.coverage_policy.fraction > coverage_policy.artifact_minimum(artifact)
+        ):
+            passed = self.coverage_policy_error is None and coverage_policy.meets_current(
+                artifact, self.coverage_policy.fraction
+            )
+            gates.append(
+                {
+                    "id": f"{artifact.skill.value}_current_coverage_policy",
+                    "label": "Current coverage requirement",
+                    "current": passed,
+                    "target": True,
+                    "comparison": "=",
+                    "state": "passed" if passed else "not_met",
+                    "unit": "boolean",
+                    "detail": self.coverage_policy_error
+                    or (
+                        f"The current {self.coverage_policy.percent}% setting also applies to "
+                        "eligibility. The saved generation's original checks remain unchanged."
+                    ),
+                }
+            )
+        return gates
+
+    def _entry_coverage_ready(self, artifact: ChallengerSkillArtifact | LearningModel) -> bool:
+        report = self.entry_outcome_availability()
+        required = self._coverage_minimum(artifact)
+        return bool(
+            report["qualified"]
+            and (
+                required <= self.coverage_policy.fraction
+                or report.get("availability_fraction", 0) >= required
+            )
+        )
+
+    def set_coverage_policy(self, percent: int, expected_revision: int) -> None:
+        """Commit settings and any authority revocations together at the event boundary."""
+        if type(percent) is not int or percent not in coverage_policy.PERCENTAGES:
+            raise ValueError("coverage must be 70, 65, 60 or 55 percent")
+        if type(expected_revision) is not int or expected_revision != self.coverage_policy.revision:
+            raise ValueError("coverage settings changed; refresh before saving")
+        if percent == self.coverage_policy.percent and self.coverage_policy_error is None:
+            return
+        self._persist_revoked_authority()
+        now = datetime.now(UTC)
+        policy = coverage_policy.CoveragePolicy(percent, expected_revision + 1, now)
+        staged = copy.copy(self)
+        staged.coverage_policy = policy
+        staged.coverage_policy_error = None
+        staged.skill_states = {
+            key: state.model_copy(deep=True) for key, state in self.skill_states.items()
+        }
+        versions = dict(self.active_skill_versions)
+        changed: dict[tuple[str, ChallengerSkill], ChallengerSkillState] = {}
+        order = (
+            ChallengerSkill.ENTRY,
+            ChallengerSkill.MANIPULATION,
+            ChallengerSkill.SIZING,
+            ChallengerSkill.EXIT,
+        )
+        # A stricter policy closes a less strict attempt; never reset it for another try.
+        for key, state in staged.skill_states.items():
+            if state.testing_version and policy.fraction > coverage_policy.saved_minimum(
+                state.last_tournament
+            ):
+                state.rejected_versions = [
+                    *state.rejected_versions,
+                    state.testing_version,
+                ][-MAX_MODEL_VERSIONS:]
+                state.last_tournament = {
+                    **state.last_tournament,
+                    "result": "coverage_policy_changed",
+                }
+                state.testing_version = None
+                changed[key] = state
+            recovery = state.activation_proof.get("recovery")
+            if (
+                isinstance(recovery, dict)
+                and recovery.get("status") in {"collecting", "passed"}
+                and policy.fraction > coverage_policy.saved_minimum(recovery)
+            ):
+                recovery["status"] = "policy_changed"
+                recovery["ready"] = False
+                changed[key] = state
+        for skill in order:
+            version = versions.get(skill.value)
+            if version is None:
+                continue
+            artifact = self.skill_artifacts.get(version)
+            # Lowering cannot relabel an existing Champion's health or revive a suspension.
+            if (
+                artifact is not None
+                and staged._skill_eligible(artifact)
+                and (
+                    policy.fraction <= self._coverage_minimum(artifact)
+                    or staged._skill_health(skill, version)["state"]
+                    not in {"unverifiable", "degraded", "suspended"}
+                )
+            ):
+                continue
+            for affected in order[order.index(skill) :]:
+                removed = versions.pop(affected.value, None)
+                affected_state = staged._current_skill_state(affected)
+                if removed is None or affected_state is None:
+                    continue
+                affected_state.active_version = None
+                affected_state.active_dependencies = {}
+                if affected == skill:
+                    affected_state.suspended_version = removed
+                    affected_state.suspended_at = now
+                    affected_state.suspension_reason = "coverage_policy_changed"
+                changed[(affected_state.cohort_key, affected_state.skill)] = affected_state
+            break
+        legacy_revoked = bool(
+            self.active_model is not None
+            and (
+                not staged._model_is_eligible(
+                    self.active_model, require_newer_than_suspension=False
+                )
+                or (
+                    policy.fraction > self._coverage_minimum(self.active_model)
+                    and staged.active_model_health()["state"] in {"degraded", "unverifiable"}
+                )
+            )
+        )
+        disabled = set(self.disabled_model_versions)
+        if legacy_revoked and self.active_model is not None:
+            disabled.add(self.active_model.version)
+        mode = self.mode
+        if (
+            mode == LearningMode.ACTIVE
+            and not versions
+            and (self.active_model is None or legacy_revoked)
+        ):
+            mode = LearningMode.SHADOW
+        settings_update: dict[str, Any] = {coverage_policy.SETTING_KEY: policy.record()}
+        if legacy_revoked:
+            settings_update["disabled_learning_models"] = sorted(disabled)
+        for state in changed.values():
+            state.updated_at = now
+        self.database.save_challenger_authority(
+            list(changed.values()),
+            versions,
+            mode=mode.value,
+            clear_legacy_model=legacy_revoked,
+            coverage_settings=settings_update,
+        )
+        # No memory or dashboard state changes until the transaction succeeds.
+        self.coverage_policy = policy
+        self.coverage_policy_error = None
+        self.skill_states.update(changed)
+        self.active_skill_versions = versions
+        self.disabled_model_versions = disabled
+        self.mode = mode
+        if legacy_revoked:
+            self.active_model = None
+        self._invalidate_timing_validation()
+        self.request_current_training()
+
     def _training_authority_context(self) -> tuple[Any, ...]:
         return (
             self.current_risk_mode,
             self.configuration_fingerprint(),
             self.baseline_version(),
+            self.coverage_policy,
+            self.coverage_policy_error,
             self.mode,
             self.consent_granted,
             self.auto_participation,
@@ -919,16 +1172,18 @@ class LearningEngine:
                     }
                 return None
             workspace = copy.copy(self)
+            requested_observations = [
+                item
+                for item in self.observations.values()
+                if (item.risk_mode, item.configuration_fingerprint) == key
+            ]
+            workspace._coverage_quote_failures = freeze_quote_failures(requested_observations)
             # Serialize while the event boundary owns the inputs. Reconstructing thousands of
             # nested Pydantic objects belongs to the fitting thread, not the market lock.
             # Only the requested risk/configuration can contribute to this fit or its policy twin.
             frozen_inputs = freeze_training_inputs(
                 (
-                    [
-                        item
-                        for item in self.observations.values()
-                        if (item.risk_mode, item.configuration_fingerprint) == key
-                    ],
+                    requested_observations,
                     [
                         item
                         for item in self.evidence_episodes.values()
@@ -983,7 +1238,13 @@ class LearningEngine:
     @staticmethod
     def fit_training_job(job: TrainingJob) -> None:
         started = time.monotonic()
-        observations, episodes, models, artifacts, states = thaw_training_inputs(job.frozen_inputs)
+        started_cpu = time.thread_time()
+        with observe_training_gc(
+            job.phase_seconds, enabled=job.workspace.settings.diagnostics_enabled
+        ):
+            observations, episodes, models, artifacts, states = thaw_training_inputs(
+                job.frozen_inputs
+            )
         # The isolated objects now own the inputs. Do not retain a second serialized copy
         # throughout fitting/publication or while the trainer waits for another cohort.
         job.frozen_inputs = ()
@@ -998,9 +1259,12 @@ class LearningEngine:
         workspace.skill_artifacts = {item.version: item for item in artifacts}
         workspace.skill_states = {(item.cohort_key, item.skill): item for item in states}
         job.phase_seconds["reconstruct_seconds"] = time.monotonic() - started
+        job.phase_seconds["reconstruct_cpu_seconds"] = time.thread_time() - started_cpu
         started = time.monotonic()
+        started_cpu = time.thread_time()
         job.workspace._retrain_if_ready(target_mode=job.key[0], target_configuration=job.key[1])
         job.phase_seconds["fit_seconds"] = time.monotonic() - started
+        job.phase_seconds["fit_cpu_seconds"] = time.thread_time() - started_cpu
 
     def training_job_stale(self, job: TrainingJob, runtime_context: tuple[Any, ...]) -> bool:
         """The same validity fence applies before and after a deferred publication."""
@@ -1116,6 +1380,7 @@ class LearningEngine:
         with self._training_request_lock:
             active = self._training_active
             return {
+                "coverage_policy": self.coverage_settings_status(),
                 "state": "running"
                 if active is not None
                 else "queued"
@@ -1422,7 +1687,9 @@ class LearningEngine:
             self._evidence_episode_ids_by_mint.setdefault(episode.mint, []).append(
                 episode.episode_id
             )
-            self.database.save_learning_evidence_episode(episode)
+            self.database.save_learning_evidence_episode(
+                episode, activity_decision=decision, activity_quote=state.quote_mint
+            )
             if (identity := _policy_identity(episode)) is not None:
                 self.database.remember_policy_identities([identity])
                 self._policy_identities.update(self.database.policy_identities({identity[0]}))
@@ -1434,7 +1701,9 @@ class LearningEngine:
             if key not in self._policy_identities:
                 self._policy_identities.update(self.database.policy_identities({key}))
             self.observations[state.mint] = observation
-            self.database.save_learning_observation(observation)
+            self.database.save_learning_observation(
+                observation, activity_decision=decision, activity_quote=state.quote_mint
+            )
             self.collection_diagnostics.enrolled("discovery", observation.observation_id)
             created = True
         return created
@@ -1745,6 +2014,7 @@ class LearningEngine:
                 self.database.save_learning_evidence_episode(episode)
         return changed, primary_cohorts, completed
 
+    @timed_work("checkpoint_govern")
     def _advance_primary_outcomes(
         self,
         cohorts: set[tuple[RiskMode, str | None]],
@@ -1861,6 +2131,8 @@ class LearningEngine:
         excluded_mints: set[str] | None = None,
         diagnostics: CollectionDiagnostics | None = None,
         selection: dict[str, list[tuple[str, int]]] | None = None,
+        measure_selection: bool = False,
+        selection_guards_passed: bool = False,
     ) -> list[str]:
         """Bound acquisition fairly: three Policy turns, one Discovery turn, with rotation.
 
@@ -1872,6 +2144,15 @@ class LearningEngine:
         lanes: dict[str, dict[str, datetime]] = {"policy": {}, "discovery": {}}
         targets = CollectionTargets()
         channel = "cache" if fresh else "rpc"
+        sample = (
+            {lane: [[0] * 5 for _ in LEARNING_HORIZONS_SECONDS] for lane in lanes}
+            if measure_selection
+            and diagnostics is not None
+            and not fresh
+            and diagnostics.selection_sample_due()
+            else None
+        )
+        clock_unclassified = {lane: 0 for lane in lanes} if sample is not None else {}
         items = [
             (
                 "discovery",
@@ -1889,13 +2170,12 @@ class LearningEngine:
             and item.status == LearningEvidenceStatus.PENDING
         ]
         for lane, mint, entered_at, checkpoints, trajectory_id in items:
-            if not fresh and excluded_mints is not None and mint in excluded_mints:
-                continue
+            excluded = not fresh and excluded_mints is not None and mint in excluded_mints
             state = states.get(mint)
-            if state is None:
-                continue
             is_fresh = (
-                _checkpoint_route_missing_reason(
+                state is not None
+                and not excluded
+                and _checkpoint_route_missing_reason(
                     state,
                     now,
                     stale_after_seconds=self.settings.stale_market_seconds,
@@ -1903,13 +2183,44 @@ class LearningEngine:
                 )
                 is None
             )
-            if is_fresh != fresh:
+            if excluded or state is None or is_fresh != fresh:
+                if sample is not None:
+                    unresolved = [
+                        (index, horizon)
+                        for index, horizon in enumerate(LEARNING_HORIZONS_SECONDS)
+                        if str(horizon) not in checkpoints
+                    ]
+                    if unresolved:
+                        # These records were already excluded from selection. Optional
+                        # telemetry must not make their clocks fail the admitted pass.
+                        try:
+                            elapsed = now - entered_at
+                        except (TypeError, OverflowError):
+                            clock_unclassified[lane] += 1
+                        else:
+                            for horizon_index, horizon in unresolved:
+                                if elapsed < timedelta(seconds=horizon):
+                                    continue
+                                reason = (
+                                    4
+                                    if elapsed
+                                    > timedelta(seconds=horizon + CHECKPOINT_GRACE_SECONDS)
+                                    else 2
+                                    if excluded
+                                    else 3
+                                    if state is None
+                                    else 1
+                                )
+                                sample[lane][horizon_index][reason] += 1
                 continue
-            for horizon in LEARNING_HORIZONS_SECONDS:
+            for horizon_index, horizon in enumerate(LEARNING_HORIZONS_SECONDS):
                 due_at = entered_at + timedelta(seconds=horizon)
-                if str(horizon) not in checkpoints and due_at <= now <= due_at + timedelta(
-                    seconds=CHECKPOINT_GRACE_SECONDS
-                ):
+                if str(horizon) not in checkpoints and due_at <= now:
+                    expired = now > due_at + timedelta(seconds=CHECKPOINT_GRACE_SECONDS)
+                    if sample is not None:
+                        sample[lane][horizon_index][4 if expired else 0] += 1
+                    if expired:
+                        continue
                     lanes[lane][mint] = min(lanes[lane].get(mint, due_at), due_at)
                     if diagnostics is not None:
                         diagnostics.track(lane, horizon, trajectory_id)
@@ -1919,6 +2230,16 @@ class LearningEngine:
                         targets.identities.setdefault(mint, []).append(
                             (lane, horizon, trajectory_id)
                         )
+        route_sample = {lane: [0, 0, 0, 0] for lane in lanes}
+        route_bands: dict[str, dict[str, int]] = {lane: {} for lane in lanes}
+        selected_bands = {lane: [0, 0, 0] for lane in lanes}
+        if sample is not None:
+            for lane, mints in lanes.items():
+                for mint, due_at in mints.items():
+                    remaining = CHECKPOINT_GRACE_SECONDS - (now - due_at).total_seconds()
+                    band = 0 if remaining <= 5 else 1 if remaining <= 15 else 2
+                    route_sample[lane][band] += 1
+                    route_bands[lane][mint] = band
         for mint, policy_due in lanes["policy"].items():
             discovery_due = lanes["discovery"].pop(mint, None)
             if discovery_due is not None:
@@ -1959,6 +2280,20 @@ class LearningEngine:
             self._checkpoint_turn[channel] = turn + 1
         if diagnostics is not None:
             diagnostics.record_targets(targets, channel + "_selected", selected)
+            if sample is not None:
+                for mint in selected:
+                    for lane in {lane for lane, _ in targets[mint]}:
+                        route_sample[lane][3] += 1
+                        selected_bands[lane][route_bands[lane][mint]] += 1
+                diagnostics.selection_sample(
+                    now,
+                    sample,
+                    route_sample,
+                    [max(0, limit), len(pending), len(selected)],
+                    clock_unclassified=clock_unclassified,
+                    selected_bands=selected_bands,
+                    guards_passed=selection_guards_passed,
+                )
         if selection is not None:
             selection.update({mint: targets[mint] for mint in selected})
             if isinstance(selection, CollectionTargets):
@@ -2181,6 +2516,7 @@ class LearningEngine:
         blockers = list(decision.blockers)
         action = decision.action
         planned_size = decision.planned_order_size_sol
+        policy_origin = self._decision_policy_origin(decision)
         legacy_assessment: LearningAssessment | None = None
         for skill in (
             ChallengerSkill.ENTRY,
@@ -2203,7 +2539,7 @@ class LearningEngine:
                 or artifact.risk_mode != decision.risk_mode
                 or artifact.configuration_fingerprint != decision.configuration_fingerprint
                 or artifact.baseline_version != decision.model_version.split("+", maxsplit=1)[0]
-                or not _skill_qualified(artifact)
+                or not self._skill_eligible(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -2288,6 +2624,8 @@ class LearningEngine:
                 baseline_actionable=baseline_actionable,
                 parameters={
                     "applied": applied,
+                    **self._support_evidence(artifact, features, supported=supported),
+                    **policy_origin,
                     **(
                         {
                             "selected_multiplier": selected,
@@ -2319,6 +2657,119 @@ class LearningEngine:
                 "challenger_assessments": assessments,
             }
         )
+
+    def _decision_policy_origin(
+        self, decision: Decision
+    ) -> dict[str, float | int | bool | str | None]:
+        """Link retained receipts without a history scan, new query or proof reservation.
+
+        Missing cache entries stay unknown. The durable first identity still controls proof;
+        this annotation grants no authority and never substitutes a later retry for it.
+        """
+        key = _policy_identity_digest(
+            LEARNING_EVIDENCE_SCHEMA_VERSION,
+            decision.mint,
+            decision.risk_mode.value,
+            decision.configuration_fingerprint,
+            decision.model_version.split("+", maxsplit=1)[0],
+            FEATURE_SCHEMA_VERSION,
+        )
+        identity = self._policy_identities.get(key)
+        if identity is None or not identity[1]:
+            return {"policy_origin_status": "unavailable"}
+        try:
+            first_at = datetime.fromisoformat(identity[0])
+        except ValueError:
+            return {"policy_origin_status": "invalid_clock"}
+        if (
+            first_at.utcoffset() is None
+            or decision.created_at.utcoffset() is None
+            or first_at > decision.created_at
+        ):
+            return {"policy_origin_status": "invalid_clock"}
+        original = self.evidence_episodes.get(identity[1])
+        # An episode ID can be reused after pruning; require the original clock too.
+        same_decision = bool(
+            original is not None
+            and _matches_policy_identity(original, identity)
+            and original.decision_id == decision.decision_id
+        )
+        relation = "same_time_unconfirmed"
+        if same_decision:
+            relation = "original_decision"
+        elif first_at < decision.created_at:
+            relation = "later_attempt"
+        return {
+            "policy_origin_status": "recorded",
+            "policy_origin_episode_id": identity[1],
+            "policy_origin_at": first_at.isoformat(),
+            "policy_origin_relation": relation,
+        }
+
+    def _support_evidence(
+        self,
+        artifact: ChallengerSkillArtifact,
+        features: dict[str, float],
+        *,
+        supported: bool,
+    ) -> dict[str, float | int | bool | str | None]:
+        """Explain the existing verdict only. No model load, new fit or authority change."""
+        detail: dict[str, float | int | bool | str | None] = {"support_evidence_version": 1}
+        if supported:
+            return {**detail, "support_reason": "within_support"}
+        if isinstance(artifact.parameters.get("coach_policy"), dict):
+            return {**detail, "support_reason": "coach_support_unavailable"}
+        # Reuse native validation before attributing a failure to a feature. An invalid
+        # linear payload must not be presented as a merely unfamiliar market.
+        if artifact.model_family != StatisticalModelFamily.XGBOOST:
+            parts = _skill_artifact_parts(artifact)
+            if parts is None:
+                return {**detail, "support_reason": "invalid_support_parameters"}
+            means, scales, _ = parts
+        else:
+            try:
+                means = [float(value) for value in artifact.parameters["means"]]
+                scales = [float(value) for value in artifact.parameters["scales"]]
+            except (KeyError, TypeError, ValueError):
+                return {**detail, "support_reason": "invalid_support_parameters"}
+            if (
+                tuple(artifact.feature_names)
+                not in {FEATURE_NAMES, MANIPULATION_FEATURE_NAMES, SIZING_FEATURE_NAMES}
+                or len(means) != len(artifact.feature_names)
+                or len(scales) != len(artifact.feature_names)
+                or any(not math.isfinite(value) for value in means)
+                or any(not math.isfinite(value) or value <= 0 for value in scales)
+            ):
+                return {**detail, "support_reason": "invalid_support_parameters"}
+        failures = 0
+        for name, mean, scale in zip(artifact.feature_names, means, scales, strict=True):
+            value = features.get(name, 0.0)
+            z_score = (value - mean) / max(scale, 1e-6)
+            if abs(z_score) <= MODEL_SUPPORT_Z_SCORE:
+                continue
+            failures += 1
+            if failures == 1:
+                detail.update(
+                    {
+                        "support_feature": name,
+                        "support_feature_value": value if math.isfinite(value) else None,
+                        "support_feature_present": name in features,
+                        "support_feature_mean": mean,
+                        "support_feature_scale": scale,
+                        "support_feature_z": z_score if math.isfinite(z_score) else None,
+                    }
+                )
+        reason = "support_unavailable"
+        if failures:
+            reason = "outside_feature_support"
+        elif artifact.model_family == StatisticalModelFamily.XGBOOST:
+            reason = "nonlinear_payload_unavailable"
+        return {
+            **detail,
+            "support_reason": reason,
+            "support_failed_feature_count": failures,
+            "support_z_limit": MODEL_SUPPORT_Z_SCORE,
+        }
 
     def _cache_nonlinear_model(self, version: str, model: Any | None) -> None:
         # Only decoded runtime objects are evicted. Durable artifacts and Champion receipts
@@ -2394,12 +2845,15 @@ class LearningEngine:
         # feature-vector validation and Policy selection within this thread/response;
         # outcomes, reservations, health and qualification are still checked by each caller.
         previous = getattr(self._status_policy_cache, "features", None)
+        previous_twins = getattr(self._status_policy_cache, "twins", None)
         self._status_policy_cache.features = {}
+        self._status_policy_cache.twins = {}
         try:
             with self._policy_selection_scope():
                 return self._status(demo_mode=demo_mode, impact_context=impact_context)
         finally:
             self._status_policy_cache.features = previous
+            self._status_policy_cache.twins = previous_twins
 
     def _complete_discovery_features(self, observation: LearningObservation) -> bool:
         checks: dict[int, bool] | None = getattr(self._status_policy_cache, "features", None)
@@ -2515,6 +2969,7 @@ class LearningEngine:
             "retained_observation_limit": MAX_COMPLETED_OBSERVATIONS,
             "retained_model_limit": MAX_MODEL_VERSIONS,
             "model_window_observations": MODEL_WINDOW_OBSERVATIONS,
+            "coverage_policy": self.coverage_settings_status(),
             "entry_outcome_availability": entry_availability,
             "outcomes_until_next_training": next_training,
             "challenger_interval_outcomes": RETRAIN_SAMPLE_INTERVAL,
@@ -2574,7 +3029,7 @@ class LearningEngine:
                 ),
             },
             "challenger_common_forward_minimum": TOURNAMENT_MINIMUM_COMMON_OUTCOMES,
-            "challenger_minimum_availability": TOURNAMENT_MINIMUM_AVAILABILITY,
+            "challenger_minimum_availability": self.coverage_policy.fraction,
             "qualification_gates": qualification_gates,
             "qualification_passed": sum(gate["state"] == "passed" for gate in qualification_gates),
             "qualification_total": len(qualification_gates),
@@ -2593,7 +3048,9 @@ class LearningEngine:
                 "Sizing stays inside Baseline impact, exposure, cash, and integrity limits",
                 "Uses forward outcomes after modeled entry, exit, protocol, and network costs",
                 "Missing exit liquidity lowers a horizon's utility without inventing a sale price",
-                "Entry activation requires at least 70% recent executable outcome availability",
+                f"Entry activation requires at least {self.coverage_policy.percent}% "
+                "recent executable "
+                "outcome availability; older and Coach proof can require more",
                 "Hold timing needs its own chronological validation before it can shorten a review",
                 "Learned timing cannot postpone a review or bypass the absolute exit ceiling",
                 "Outcome overlap is embargoed before every chronological validation section",
@@ -2983,7 +3440,14 @@ class LearningEngine:
                     "common_forward_count": (
                         state.common_forward_count if state is not None else 0
                     ),
-                    "tournament": dict(state.last_tournament) if state is not None else {},
+                    "tournament": {
+                        **state.last_tournament,
+                        "minimum_availability_fraction": _finite_coverage(
+                            coverage_policy.saved_minimum(state.last_tournament)
+                        ),
+                    }
+                    if state is not None
+                    else {},
                     "health": health,
                     "suspension": self.skill_suspension_summary(state) if state else None,
                     "latest_policy_unchanged": bool(
@@ -2992,7 +3456,9 @@ class LearningEngine:
                         and self._redundant_exit_candidate(state, latest)
                         and latest.version != state.champion_version
                     ),
-                    "gates": _skill_qualification_gates(skill, gate_artifact),
+                    "gates": self._current_coverage_gates(
+                        gate_artifact, _skill_qualification_gates(skill, gate_artifact)
+                    ),
                     "gate_artifact_version": gate_artifact.version if gate_artifact else None,
                     "gate_subject": "testing_candidate"
                     if testing is not None
@@ -3024,6 +3490,9 @@ class LearningEngine:
             "usable_count": recovery.get("usable_count", 0),
             "availability_fraction": recovery.get("availability_fraction", 0.0),
             "window_size": ACTIVE_HEALTH_WINDOW,
+            "minimum_availability_fraction": _finite_coverage(
+                coverage_policy.saved_minimum(recovery or state.activation_proof)
+            ),
             "restored_at": recovery.get("restored_at"),
             # Report recorded terminal checks only; never recompute proof from later markets.
             "failed_checks": recovery.get("failed_checks"),
@@ -3238,7 +3707,7 @@ class LearningEngine:
                 "collecting"
                 if artifact is None
                 else "qualified"
-                if _skill_qualified(artifact)
+                if self._skill_eligible(artifact)
                 else "proof_not_met"
             )
             if state is not None and artifact is not None:
@@ -3279,7 +3748,9 @@ class LearningEngine:
                     "family": family.value,
                     "artifact": _skill_artifact_summary(artifact),
                     "state": role,
-                    "gates": _entry_family_proof_gates(artifact, source=source),
+                    "gates": self._current_coverage_gates(
+                        artifact, _entry_family_proof_gates(artifact, source=source)
+                    ),
                 }
             )
 
@@ -3309,6 +3780,14 @@ class LearningEngine:
             in {"current_outcome_availability", "current_observed_outcomes", "activation_ready"}
         ]
         for gate in activation_gates:
+            if gate["id"] == "current_outcome_availability" and subject is not None:
+                required = self._coverage_minimum(subject)
+                gate["target"] = _finite_coverage(required)
+                gate["state"] = (
+                    "passed"
+                    if (isinstance(gate["current"], int | float) and gate["current"] >= required)
+                    else "not_met"
+                )
             if gate["id"] == "activation_ready":
                 gate["detail"] = (
                     "The engine checks the eligible Entry artifact, current context, coverage, "
@@ -3404,7 +3883,7 @@ class LearningEngine:
                 )
             elif state is not None and latest_nonlinear.version in state.rejected_versions:
                 status = "linear_retained"
-            elif _skill_qualified(latest_nonlinear):
+            elif self._skill_eligible(latest_nonlinear):
                 status = "qualified"
             else:
                 status = "proof_not_met"
@@ -3648,7 +4127,7 @@ class LearningEngine:
             return None
         if (
             artifact is not None
-            and _skill_qualified(artifact)
+            and self._skill_eligible(artifact)
             and artifact.skill == ChallengerSkill.EXIT
             and artifact.risk_mode == mode
             and artifact.configuration_fingerprint == self.configuration_fingerprint()
@@ -3752,6 +4231,8 @@ class LearningEngine:
             selected != baseline
             and selected_training >= baseline_training + HOLD_TIMING_MINIMUM_UPLIFT
             and validation_uplift_lower >= HOLD_TIMING_MINIMUM_UPLIFT
+            # This is the legacy learner's non-artifact timing fallback. Native Exit
+            # candidates carry their own configurable, immutable qualification policy.
             and validation_available >= HOLD_TIMING_MINIMUM_AVAILABILITY
         )
         result = {
@@ -3842,11 +4323,11 @@ class LearningEngine:
             uplift_upper = uplift
         enough_evidence = bool(
             usable_count >= ACTIVE_HEALTH_MINIMUM_SAMPLES
-            and availability >= ACTIVE_HEALTH_MINIMUM_AVAILABILITY
+            and availability >= self._coverage_minimum(model)
         )
         unverifiable = bool(
             observed_count >= ACTIVE_HEALTH_MINIMUM_SAMPLES
-            and availability < ACTIVE_HEALTH_MINIMUM_AVAILABILITY
+            and availability < self._coverage_minimum(model)
         )
         degraded = bool(
             enough_evidence
@@ -3865,6 +4346,7 @@ class LearningEngine:
         return {
             "state": state,
             "model_version": model.version,
+            "minimum_availability_fraction": self._coverage_minimum(model),
             "observed_count": observed_count,
             "usable_count": usable_count,
             "minimum_samples": ACTIVE_HEALTH_MINIMUM_SAMPLES,
@@ -3885,6 +4367,7 @@ class LearningEngine:
         self,
         mode: RiskMode | None = None,
         configuration_fingerprint: str | None = None,
+        minimum: float | None = None,
     ) -> dict[str, Any]:
         """Measure recent primary-label observability without inventing missing returns."""
 
@@ -3899,6 +4382,7 @@ class LearningEngine:
             if configuration_fingerprint is None
             else configuration_fingerprint
         )
+        required = self.coverage_policy.fraction if minimum is None else minimum
         key = str(PRIMARY_HORIZON_SECONDS)
         discovery_resolved = [
             observation
@@ -3943,10 +4427,11 @@ class LearningEngine:
             "observed_count": observed_count,
             "available_count": available_count,
             "availability_fraction": fraction,
-            "minimum_fraction": ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+            "minimum_fraction": required,
             "qualified": bool(
                 observed_count >= MINIMUM_TRAINING_SAMPLES
-                and fraction >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+                and fraction >= required
+                and self.coverage_policy_error is None
             ),
         }
 
@@ -4053,6 +4538,9 @@ class LearningEngine:
                     in_distribution=in_distribution,
                     proposed_action=proposed_action,
                     baseline_actionable=observation.baseline_actionable,
+                    parameters=self._support_evidence(
+                        artifact, observation.features, supported=in_distribution
+                    ),
                 )
 
     def _coach_evaluation_context(
@@ -4145,6 +4633,7 @@ class LearningEngine:
         evidence_ended_at: datetime | None,
         defer_tournament: bool = False,
         policy_evidence_cohort: str | None = None,
+        coverage_metrics: dict[str, int] | None = None,
     ) -> None:
         configuration = model.configuration_fingerprint
         if (
@@ -4196,6 +4685,7 @@ class LearningEngine:
                 "policy_evidence_cohort": policy_evidence_cohort,
             },
             metrics={
+                **(coverage_metrics or {}),
                 "validation_rmse": model.validation_rmse,
                 "naive_rmse": model.naive_rmse,
                 "rank_fit": model.learner_correlation,
@@ -4234,6 +4724,7 @@ class LearningEngine:
         training: list[tuple[LearningObservation, float]],
         validation: list[tuple[LearningObservation, float]],
         embargoed_count: int,
+        coverage_metrics: dict[str, int] | None = None,
     ) -> ChallengerSkillArtifact | None:
         """Fit the predeclared nonlinear family and submit it to the same proof path."""
 
@@ -4343,14 +4834,14 @@ class LearningEngine:
         )
         qualified = bool(
             complexity_earned
-            and outcome_availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            and outcome_availability >= self.coverage_policy.fraction
             and learner_rmse <= naive_rmse * (1 - ENTRY_MINIMUM_RMSE_RELATIVE_IMPROVEMENT)
             and learner_correlation >= max(0.10, baseline_correlation + 0.03)
             and learner_top_mean >= ENTRY_MINIMUM_TOP_RETURN
             and learner_top_mean >= baseline_top_mean + ENTRY_MINIMUM_TOP_UPLIFT
             and in_distribution_fraction >= ENTRY_MINIMUM_IN_DISTRIBUTION_FRACTION
             and len(policy_rows) >= ENTRY_MINIMUM_POLICY_SAMPLES
-            and policy_outcome_availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            and policy_outcome_availability >= self.coverage_policy.fraction
             and policy_supported_count >= ENTRY_MINIMUM_POLICY_SUPPORTED
             and policy_veto_count >= ENTRY_MINIMUM_POLICY_VETOES
             and policy_winner_veto_fraction <= ENTRY_MAXIMUM_WINNER_VETO_FRACTION
@@ -4400,6 +4891,7 @@ class LearningEngine:
             feature_names=list(FEATURE_NAMES),
             parameters=parameters,
             metrics={
+                **(coverage_metrics or {}),
                 "validation_rmse": learner_rmse,
                 "linear_validation_rmse": linear_model.validation_rmse,
                 "complexity_earned": complexity_earned,
@@ -4444,6 +4936,7 @@ class LearningEngine:
         validation: list[tuple[LearningObservation, float]],
         resolved_count: int,
         embargoed_count: int,
+        coverage_metrics: dict[str, int] | None = None,
     ) -> None:
         if (
             not configuration_fingerprint
@@ -4519,10 +5012,10 @@ class LearningEngine:
         policy_availability = len(policy_rows) / len(policy_observed) if policy_observed else 0.0
         winner_veto_fraction = winner_vetoes / policy_vetoes if policy_vetoes else 0.0
         qualified = bool(
-            outcome_availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            outcome_availability >= self.coverage_policy.fraction
             and in_distribution_fraction >= MANIPULATION_MINIMUM_IN_DISTRIBUTION_FRACTION
             and len(policy_rows) >= ENTRY_MINIMUM_POLICY_SAMPLES
-            and policy_availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            and policy_availability >= self.coverage_policy.fraction
             and policy_supported >= ENTRY_MINIMUM_POLICY_SUPPORTED
             and policy_vetoes >= ENTRY_MINIMUM_POLICY_VETOES
             and uplift_lower is not None
@@ -4570,6 +5063,7 @@ class LearningEngine:
             feature_names=list(MANIPULATION_FEATURE_NAMES),
             parameters=parameters,
             metrics={
+                **(coverage_metrics or {}),
                 "validation_rmse": rmse,
                 "naive_rmse": naive_rmse,
                 "outcome_availability": outcome_availability,
@@ -4665,7 +5159,7 @@ class LearningEngine:
         uplift_lower = _mean_lower_bound(policy_deltas, z_score=ENTRY_POLICY_Z_SCORE)
         qualified = bool(
             len(policy_rows) >= ENTRY_MINIMUM_POLICY_SAMPLES
-            and availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            and availability >= self.coverage_policy.fraction
             and in_distribution_fraction >= MANIPULATION_MINIMUM_IN_DISTRIBUTION_FRACTION
             and changes >= SIZING_MINIMUM_POLICY_CHANGES
             and uplift_lower is not None
@@ -4801,7 +5295,7 @@ class LearningEngine:
             >= training_utilities[baseline_horizon] + HOLD_TIMING_MINIMUM_UPLIFT
             and uplift_lower is not None
             and uplift_lower >= HOLD_TIMING_MINIMUM_UPLIFT
-            and availability >= HOLD_TIMING_MINIMUM_AVAILABILITY
+            and availability >= self.coverage_policy.fraction
         )
         parameters = {
             "selected_horizon_seconds": selected,
@@ -4947,10 +5441,10 @@ class LearningEngine:
             "contextual_training_value": bool(training_deltas)
             and fmean(training_deltas) >= HOLD_TIMING_MINIMUM_UPLIFT,
             "contextual_usable_outcomes": len(deltas) >= MINIMUM_VALIDATION_SAMPLES,
-            "contextual_coverage": availability >= HOLD_TIMING_MINIMUM_AVAILABILITY,
+            "contextual_coverage": availability >= self.coverage_policy.fraction,
             "contextual_advantage": lower is not None and lower >= HOLD_TIMING_MINIMUM_UPLIFT,
             "contextual_reference_coverage": reference_availability
-            >= HOLD_TIMING_MINIMUM_AVAILABILITY,
+            >= self.coverage_policy.fraction,
             "contextual_reference_advantage": reference_lower is not None
             and reference_lower >= HOLD_TIMING_MINIMUM_UPLIFT,
             "contextual_familiar_evidence": familiar >= 0.90,
@@ -4980,6 +5474,17 @@ class LearningEngine:
         payload: bytes | None = None,
         defer_tournament: bool = False,
     ) -> None:
+        if (
+            not coverage_policy.is_coach(artifact)
+            and self.coverage_policy.revision
+            and not coverage_policy.POLICY_KEYS.intersection(artifact.hyperparameters)
+        ):
+            artifact.hyperparameters.update(self.coverage_policy.metadata())
+            fresh = self.coverage_policy.fresh(artifact.training_cutoff_at)
+            artifact.hyperparameters["coverage_fresh_validation"] = fresh
+            if not fresh or self.coverage_policy_error is not None:
+                artifact.qualified = False
+                artifact.qualification_reasons.append("coverage_requirement_needs_fresh_validation")
         if artifact.model_family == StatisticalModelFamily.XGBOOST and payload is None:
             raise ValueError("XGBoost challenger artifact requires its verified payload")
         if artifact.model_family != StatisticalModelFamily.XGBOOST and payload is not None:
@@ -5005,7 +5510,7 @@ class LearningEngine:
             feature_schema_version=artifact.feature_schema_version,
         )
         state.latest_candidate_version = artifact.version
-        if _skill_qualified(artifact) and not self._redundant_exit_candidate(state, artifact):
+        if self._skill_eligible(artifact) and not self._redundant_exit_candidate(state, artifact):
             # Retain one waiting native generation per family and one Coach proposal. Newer
             # immutable cutoff and supersedes an untested older one; the active tournament is never
             # replaced. This bounds backlog without letting job completion order crown a winner.
@@ -5059,7 +5564,15 @@ class LearningEngine:
             )
         ):
             return False
-        return all(
+
+        def same_recipe(item: ChallengerSkillArtifact) -> dict[str, Any]:
+            return {
+                key: value
+                for key, value in item.hyperparameters.items()
+                if key not in coverage_policy.POLICY_KEYS | {"coverage_fresh_validation"}
+            }
+
+        return same_recipe(candidate) == same_recipe(champion) and all(
             getattr(candidate, field) == getattr(champion, field)
             for field in (
                 "skill",
@@ -5076,7 +5589,6 @@ class LearningEngine:
                 "feature_names",
                 "parameters",
                 "dependency_versions",
-                "hyperparameters",
             )
         )
 
@@ -5096,7 +5608,7 @@ class LearningEngine:
             self.skill_artifacts[version]
             for version in state.pending_versions
             if version in self.skill_artifacts
-            and _skill_qualified(self.skill_artifacts[version])
+            and self._skill_eligible(self.skill_artifacts[version])
             and (
                 state.skill != ChallengerSkill.EXIT
                 or _exit_artifact_available(self.skill_artifacts[version])
@@ -5119,7 +5631,10 @@ class LearningEngine:
         candidates = [
             item
             for item in candidates
-            if item.evidence_cohort_digest == oldest.evidence_cohort_digest
+            if coverage_policy.artifact_minimum(item) == coverage_policy.artifact_minimum(oldest)
+            and item.hyperparameters.get("coverage_revision", 0)
+            == oldest.hyperparameters.get("coverage_revision", 0)
+            and item.evidence_cohort_digest == oldest.evidence_cohort_digest
             and item.training_cutoff_at == oldest.training_cutoff_at
             and item.training_count == oldest.training_count
             and item.validation_count == oldest.validation_count
@@ -5216,9 +5731,17 @@ class LearningEngine:
             state.pending_versions = [
                 version for version in state.pending_versions if version != selected
             ]
+        candidate = self.skill_artifacts[selected]
+        champion = self.skill_artifacts[state.champion_version]
+        tournament_policy = self._coverage_receipt(
+            candidate,
+            floor=0.70 if coverage_policy.is_coach(champion) else 0.0,
+            prospective=True,
+        )
         state.testing_version = selected
         state.common_forward_count = 0
         state.last_tournament = {
+            **tournament_policy,
             "result": "collecting",
             "candidate_version": selected,
             "champion_version": state.champion_version,
@@ -5229,8 +5752,16 @@ class LearningEngine:
                 else {}
             ),
         }
-        start_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY)
-        record_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY)
+        start_replay(
+            state,
+            TOURNAMENT_MINIMUM_COMMON_OUTCOMES,
+            coverage_policy.saved_minimum(state.last_tournament),
+        )
+        record_replay(
+            state,
+            TOURNAMENT_MINIMUM_COMMON_OUTCOMES,
+            coverage_policy.saved_minimum(state.last_tournament),
+        )
 
     def seed_coach_candidate(
         self,
@@ -5387,6 +5918,7 @@ class LearningEngine:
             ),
         ]
 
+    @timed_work("govern_tournament")
     def _advance_entry_tournaments(self) -> None:
         """Compare contender and champion only on predictions both froze in advance."""
 
@@ -5472,6 +6004,11 @@ class LearningEngine:
                 state.updated_at = datetime.now(UTC)
                 self.database.save_challenger_skill_state(state)
                 continue
+            try:
+                trial_policy = coverage_policy.read_policy(state.last_tournament)
+            except (ValueError, TypeError, OverflowError):
+                # Invalid trial metadata cannot be repaired by silently assuming a looser rule.
+                continue
             resolved: list[LearningEvidenceEpisode] = []
             contract = (state.risk_mode, state.configuration_fingerprint, state.baseline_version)
             if contract not in policy_rows:
@@ -5482,7 +6019,11 @@ class LearningEngine:
                 )
             for observation in policy_rows[contract]:
                 if (
-                    observation.risk_mode != state.risk_mode
+                    (
+                        trial_policy.effective_at is not None
+                        and not trial_policy.fresh(observation.created_at)
+                    )
+                    or observation.risk_mode != state.risk_mode
                     or observation.configuration_fingerprint != state.configuration_fingerprint
                     or observation.baseline_version != state.baseline_version
                     or observation.feature_schema_version != state.feature_schema_version
@@ -5513,6 +6054,12 @@ class LearningEngine:
                     and _tournament_policy_value(observation, champion_receipt) is not None
                 ):
                     usable.append(observation)
+            proof_contract = {
+                key: state.last_tournament[key]
+                for key in coverage_policy.POLICY_KEYS
+                if key in state.last_tournament
+            }
+            minimum_coverage = coverage_policy.saved_minimum(proof_contract)
             observed_count = len(resolved)
             usable_count = len(usable)
             availability = usable_count / observed_count if observed_count else 0.0
@@ -5543,7 +6090,7 @@ class LearningEngine:
             upper = _mean_upper_bound(deltas, z_score=TOURNAMENT_Z_SCORE)
             enough = bool(
                 usable_count >= TOURNAMENT_MINIMUM_COMMON_OUTCOMES
-                and availability >= TOURNAMENT_MINIMUM_AVAILABILITY
+                and availability >= minimum_coverage
             )
             winner_veto_guard = candidate_winner_vetoes <= champion_winner_vetoes + max(
                 1, usable_count // 20
@@ -5582,6 +6129,8 @@ class LearningEngine:
                 else "collecting"
             )
             state.last_tournament = {
+                **proof_contract,
+                "minimum_availability_fraction": minimum_coverage,
                 "result": result,
                 "proof_version": TOURNAMENT_PROOF_VERSION,
                 **(
@@ -5602,9 +6151,7 @@ class LearningEngine:
                 "candidate_harm_count": candidate_harm_count,
                 "maximum_common_observed": TOURNAMENT_MAXIMUM_COMMON_OBSERVED,
             }
-            record_replay(
-                state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, TOURNAMENT_MINIMUM_AVAILABILITY
-            )
+            record_replay(state, TOURNAMENT_MINIMUM_COMMON_OUTCOMES, minimum_coverage)
             if promoted:
                 state.champion_version = candidate_version
                 state.testing_version = None
@@ -5665,14 +6212,14 @@ class LearningEngine:
         return (
             artifact
             if artifact is not None
-            and _skill_qualified(artifact)
+            and self._skill_eligible(artifact)
             and (
                 artifact.model_family != StatisticalModelFamily.XGBOOST
                 or self._load_nonlinear_artifact(artifact) is not None
             )
             and state is not None
             and (state.suspended_version != artifact.version or recovering)
-            and self.entry_outcome_availability()["qualified"]
+            and self._entry_coverage_ready(artifact)
             and (
                 artifact.schema_version != "challenger-skill-coach-v1"
                 or recovering
@@ -5695,7 +6242,7 @@ class LearningEngine:
         if (
             state is None
             or state.champion_version != artifact.version
-            or not _skill_qualified(artifact)
+            or not self._skill_eligible(artifact)
             or (artifact.skill == ChallengerSkill.EXIT and not _exit_artifact_available(artifact))
             or (
                 artifact.model_family == StatisticalModelFamily.XGBOOST
@@ -5760,6 +6307,7 @@ class LearningEngine:
         }
         state.activation_proof = (
             {
+                **self._coverage_receipt(artifact),
                 **activation_proof,
                 "policy": "coach-independent-v2"
                 if is_coach
@@ -5770,6 +6318,8 @@ class LearningEngine:
                 "dependencies": dict(state.active_dependencies),
             }
             if independent
+            else {**self._coverage_receipt(artifact), "artifact_version": artifact.version}
+            if self.coverage_policy.revision
             else {}
         )
         state.joined_at = now
@@ -5840,7 +6390,8 @@ class LearningEngine:
             and self.mode != LearningMode.OFF
             and not self.database.get_setting("demo_mode", self.settings.demo_mode)
             and artifact
-            and _skill_qualified(artifact)
+            and self._skill_eligible(artifact)
+            and math.isfinite(self._support_coverage_minimum(artifact, state))
             and artifact.skill == state.skill
             and artifact.risk_mode == self.current_risk_mode
             and artifact.configuration_fingerprint == self.configuration_fingerprint()
@@ -5910,6 +6461,9 @@ class LearningEngine:
             recovery = state.activation_proof.get("recovery")
             if recovery is None:
                 recovery = {
+                    **self._coverage_receipt(
+                        artifact, floor=self._support_coverage_minimum(artifact, state)
+                    ),
                     "policy": "fixed-shadow-60-v1",
                     "artifact_version": artifact.version,
                     "suspended_at": state.suspended_at.isoformat() if state.suspended_at else None,
@@ -5964,6 +6518,7 @@ class LearningEngine:
             return empty
         if (
             recovery.get("policy") != "fixed-shadow-60-v1"
+            or not math.isfinite(coverage_policy.saved_minimum(recovery))
             or recovery.get("artifact_version") != state.champion_version
             or recovery.get("suspended_at") != state.suspended_at.isoformat()  # type: ignore[union-attr]
             or recovery.get("status") not in ("collecting", "passed")
@@ -6070,15 +6625,21 @@ class LearningEngine:
         lower = _mean_lower_bound(deltas, z_score=TOURNAMENT_Z_SCORE)
         harm = sum(value < 0 for value in deltas)
         complete = observed == ACTIVE_HEALTH_WINDOW
+        minimum_coverage = max(
+            self._support_coverage_minimum(artifact, state),
+            coverage_policy.saved_minimum(recovery),
+        )
         ready = bool(
             complete
             and len(deltas) >= TOURNAMENT_MINIMUM_COMMON_OUTCOMES
-            and availability >= TOURNAMENT_MINIMUM_AVAILABILITY
+            and availability >= minimum_coverage
             and lower is not None
             and lower > 0
             and harm / len(deltas) <= SIZING_MAXIMUM_HARM_FRACTION
         )
         proof = {
+            **{key: recovery[key] for key in coverage_policy.POLICY_KEYS if key in recovery},
+            "minimum_availability_fraction": minimum_coverage,
             "ready": ready,
             "observed_count": observed,
             "usable_count": len(deltas),
@@ -6092,7 +6653,10 @@ class LearningEngine:
                     name
                     for name, passed in (
                         ("usable_outcomes", len(deltas) >= TOURNAMENT_MINIMUM_COMMON_OUTCOMES),
-                        ("coverage", availability >= TOURNAMENT_MINIMUM_AVAILABILITY),
+                        (
+                            "coverage",
+                            availability >= minimum_coverage,
+                        ),
                         ("advantage", lower is not None and lower > 0),
                         (
                             "harm",
@@ -6188,7 +6752,8 @@ class LearningEngine:
             if (
                 artifact is None
                 or state is None
-                or not _skill_qualified(artifact)
+                or not self._skill_eligible(artifact)
+                or not math.isfinite(self._support_coverage_minimum(artifact, state))
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6233,6 +6798,7 @@ class LearningEngine:
         self.active_skill_versions = restored
         self.database.set_setting("active_challenger_skills", restored)
 
+    @timed_work("govern_health")
     def _skill_health(
         self,
         skill: ChallengerSkill,
@@ -6260,9 +6826,14 @@ class LearningEngine:
                 or exit_context.is_contextual(artifact)
             )
         )
-        state = self._current_skill_state(skill) if independent else None
+        state = self._current_skill_state(skill)
+        minimum_coverage = (
+            self._support_coverage_minimum(artifact, state) if artifact is not None else math.inf
+        )
         if (
             artifact is None
+            or not self._skill_eligible(artifact)
+            or not math.isfinite(minimum_coverage)
             or (skill == ChallengerSkill.EXIT and not _exit_artifact_available(artifact))
             or (
                 independent
@@ -6361,12 +6932,10 @@ class LearningEngine:
         uplift = fmean(deltas) if deltas else None
         upper = _mean_upper_bound(deltas, z_score=ACTIVE_HEALTH_Z_SCORE)
         enough = bool(
-            usable_count >= ACTIVE_HEALTH_MINIMUM_SAMPLES
-            and availability >= ACTIVE_HEALTH_MINIMUM_AVAILABILITY
+            usable_count >= ACTIVE_HEALTH_MINIMUM_SAMPLES and availability >= minimum_coverage
         )
         unverifiable = bool(
-            observed_count >= ACTIVE_HEALTH_MINIMUM_SAMPLES
-            and availability < ACTIVE_HEALTH_MINIMUM_AVAILABILITY
+            observed_count >= ACTIVE_HEALTH_MINIMUM_SAMPLES and availability < minimum_coverage
         )
         degraded = bool(enough and upper is not None and upper < -ACTIVE_HEALTH_HARM_MARGIN)
         return {
@@ -6383,6 +6952,7 @@ class LearningEngine:
             "observed_count": observed_count,
             "usable_count": usable_count,
             "minimum_samples": ACTIVE_HEALTH_MINIMUM_SAMPLES,
+            "minimum_availability_fraction": minimum_coverage,
             "availability_fraction": availability,
             "estimated_uplift": uplift,
             "uplift_upper_bound": upper,
@@ -6412,6 +6982,7 @@ class LearningEngine:
                 return False
         return True
 
+    @timed_work("govern_join")
     def _skill_join_evidence(
         self,
         artifact: ChallengerSkillArtifact,
@@ -6535,12 +7106,14 @@ class LearningEngine:
         ready = bool(
             coach_context_valid
             and len(deltas) >= TOURNAMENT_MINIMUM_COMMON_OUTCOMES
-            and availability >= TOURNAMENT_MINIMUM_AVAILABILITY
+            and availability >= self._coverage_minimum(artifact)
             and lower is not None
             and lower > 0
             and harm_fraction <= SIZING_MAXIMUM_HARM_FRACTION
         )
         return {
+            **self._coverage_receipt(artifact),
+            "minimum_availability_fraction": self._coverage_minimum(artifact),
             "ready": ready,
             "observed_count": len(observed),
             "usable_count": len(deltas),
@@ -6587,6 +7160,7 @@ class LearningEngine:
         self.active_model = None
         self._persist_revoked_authority()
 
+    @timed_work("govern_skills")
     def _govern_skill_ensemble(self) -> None:
         self._persist_revoked_authority()
         if self.auto_participation:
@@ -6626,7 +7200,7 @@ class LearningEngine:
             if (
                 state is None
                 or artifact is None
-                or not _skill_qualified(artifact)
+                or not self._skill_eligible(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6642,8 +7216,8 @@ class LearningEngine:
                 self._activate_skill(artifact)
                 return
 
-    @staticmethod
     def _valid_activation_proof(
+        self,
         state: ChallengerSkillState,
         artifact: ChallengerSkillArtifact,
         dependencies: dict[str, str],
@@ -6664,10 +7238,11 @@ class LearningEngine:
             or proof.get("dependencies") != dependencies
             or state.active_dependencies != dependencies
             or state.joined_at is None
+            or not math.isfinite(coverage_policy.saved_minimum(proof))
         ):
             return False
         if artifact.skill == ChallengerSkill.ENTRY and not is_coach:
-            return not dependencies
+            return not dependencies and self._skill_eligible(artifact)
 
         def finite(name: str) -> bool:
             value = proof.get(name)
@@ -6693,7 +7268,9 @@ class LearningEngine:
             and TOURNAMENT_MINIMUM_COMMON_OUTCOMES
             <= proof["usable_count"]
             <= proof["observed_count"]
-            and TOURNAMENT_MINIMUM_AVAILABILITY <= proof["availability_fraction"] <= 1
+            and max(self._coverage_minimum(artifact), coverage_policy.saved_minimum(proof))
+            <= proof["availability_fraction"]
+            <= 1
             and math.isclose(
                 proof["availability_fraction"], proof["usable_count"] / proof["observed_count"]
             )
@@ -6729,7 +7306,7 @@ class LearningEngine:
                 artifact is None
                 or state is None
                 or state.champion_version != version
-                or not _skill_qualified(artifact)
+                or not self._skill_eligible(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6764,7 +7341,7 @@ class LearningEngine:
             if (
                 state is None
                 or artifact is None
-                or not _skill_qualified(artifact)
+                or not self._skill_eligible(artifact)
                 or (
                     artifact.skill == ChallengerSkill.EXIT
                     and not _exit_artifact_available(artifact)
@@ -6808,6 +7385,9 @@ class LearningEngine:
     ) -> bool:
         return bool(
             model.qualified
+            and self.coverage_policy_error is None
+            and coverage_policy.validation_current(model)
+            and coverage_policy.meets_current(model, self.coverage_policy.fraction)
             and _entry_validation_current(model)
             and model.version.startswith(LEARNER_VERSION_PREFIX)
             and _model_shape_valid(model)
@@ -6817,7 +7397,7 @@ class LearningEngine:
             and model.qualification_evidence_schema_version == LEARNING_EVIDENCE_SCHEMA_VERSION
             and model.policy_validation_count >= ENTRY_MINIMUM_POLICY_SAMPLES
             and model.policy_observed_count >= ENTRY_MINIMUM_POLICY_SAMPLES
-            and model.policy_outcome_availability_fraction >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            and model.policy_outcome_availability_fraction >= self._coverage_minimum(model)
             and model.policy_supported_count >= ENTRY_MINIMUM_POLICY_SUPPORTED
             and model.policy_veto_count >= ENTRY_MINIMUM_POLICY_VETOES
             and model.policy_winner_veto_fraction <= ENTRY_MAXIMUM_WINNER_VETO_FRACTION
@@ -6836,7 +7416,7 @@ class LearningEngine:
             latest
             if latest is not None
             and self._model_is_eligible(latest)
-            and self.entry_outcome_availability()["qualified"]
+            and self._entry_coverage_ready(latest)
             else None
         )
 
@@ -6864,6 +7444,7 @@ class LearningEngine:
         self.database.set_setting("learning_reactivation_after_outcomes", 0)
         self.database.set_setting("learning_last_suspension", None)
 
+    @timed_work("govern_model")
     def _govern_active_model(self) -> None:
         if self.mode != LearningMode.ACTIVE or self.active_model is None:
             return
@@ -6898,6 +7479,7 @@ class LearningEngine:
         ):
             self._activate_model(candidate)
 
+    @timed_work("govern_training_rows")
     def _training_rows(
         self,
         *,
@@ -6946,6 +7528,19 @@ class LearningEngine:
     def _observation_has_policy_twin(self, observation: LearningObservation) -> bool:
         """Return whether this Discovery mint is reserved for exact-cohort Policy proof."""
 
+        # Only status() enables this response-local reuse under the market boundary.
+        # Live fitting, enrollment and governance always read current identity/evidence.
+        checks: dict[int, bool] | None = getattr(self._status_policy_cache, "twins", None)
+        if checks is None:
+            return self._current_observation_has_policy_twin(observation)
+        key = id(observation)
+        if key not in checks:
+            checks[key] = self._current_observation_has_policy_twin(observation)
+        return checks[key]
+
+    def _current_observation_has_policy_twin(self, observation: LearningObservation) -> bool:
+        """Read the current population; never retain authority or an outcome conclusion."""
+
         return _policy_identity_key(observation) in self._policy_identities or any(
             episode.lane == LearningEvidenceLane.POLICY
             and episode.evidence_schema_version == LEARNING_EVIDENCE_SCHEMA_VERSION
@@ -6991,6 +7586,7 @@ class LearningEngine:
             episode for episode in selected if not_before is None or episode.entry_at >= not_before
         ][-MODEL_WINDOW_OBSERVATIONS:]
 
+    @timed_work("govern_policy_select")
     def _select_policy_evidence(
         self,
         *,
@@ -7000,15 +7596,9 @@ class LearningEngine:
     ) -> list[LearningEvidenceEpisode]:
         eligible = [
             episode
-            for episode in sorted(
-                (
-                    item
-                    for item in self.evidence_episodes.values()
-                    if item.entry_at.utcoffset() is not None
-                ),
-                key=lambda item: (item.entry_at, item.episode_id),
-            )
-            if episode.lane == LearningEvidenceLane.POLICY
+            for episode in self.evidence_episodes.values()
+            if episode.entry_at.utcoffset() is not None
+            and episode.lane == LearningEvidenceLane.POLICY
             and episode.evidence_schema_version == LEARNING_EVIDENCE_SCHEMA_VERSION
             and episode.qualification_eligible
             and not episode.synthetic
@@ -7022,6 +7612,10 @@ class LearningEngine:
             and episode.baseline_actionable
             and _evidence_features_complete(episode)
         ]
+        # Filter before sorting: Execution and other contracts cannot contribute to
+        # this proof population. Keep the exact chronological tie-break and every
+        # eligible missing/negative outcome; authority is still checked below.
+        eligible.sort(key=lambda item: (item.entry_at, item.episode_id))
         independent: dict[str, LearningEvidenceEpisode] = {}
         for episode in eligible:
             identity = self._policy_identities.get(_policy_identity_key(episode))
@@ -7171,14 +7765,14 @@ class LearningEngine:
             len(policy_rows) / len(policy_observed) if policy_observed else 0.0
         )
         qualified = bool(
-            outcome_availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            outcome_availability >= self.coverage_policy.fraction
             and learner_rmse <= naive_rmse * (1 - ENTRY_MINIMUM_RMSE_RELATIVE_IMPROVEMENT)
             and learner_correlation >= max(0.10, baseline_correlation + 0.03)
             and learner_top_mean >= ENTRY_MINIMUM_TOP_RETURN
             and learner_top_mean >= baseline_top_mean + ENTRY_MINIMUM_TOP_UPLIFT
             and in_distribution_fraction >= ENTRY_MINIMUM_IN_DISTRIBUTION_FRACTION
             and len(policy_rows) >= ENTRY_MINIMUM_POLICY_SAMPLES
-            and policy_outcome_availability >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY
+            and policy_outcome_availability >= self.coverage_policy.fraction
             and policy_supported_count >= ENTRY_MINIMUM_POLICY_SUPPORTED
             and policy_veto_count >= ENTRY_MINIMUM_POLICY_VETOES
             and policy_winner_veto_fraction <= ENTRY_MAXIMUM_WINNER_VETO_FRACTION
@@ -7206,6 +7800,12 @@ class LearningEngine:
             implementation_version=LINEAR_IMPLEMENTATION_VERSION,
             recipe_version=LINEAR_RECIPE_VERSION,
             hyperparameters={
+                **self.coverage_policy.metadata(),
+                **(
+                    {"coverage_fresh_validation": self.coverage_policy.fresh(validation_start)}
+                    if self.coverage_policy.revision
+                    else {}
+                ),
                 "entry_validation_version": ENTRY_VALIDATION_VERSION,
                 "intercept_ridge": 1e-6,
                 "feature_ridge": 2.0,
@@ -7249,7 +7849,9 @@ class LearningEngine:
             policy_mean_uplift=policy_mean_uplift,
             policy_uplift_lower_bound=policy_uplift_lower,
             qualification_evidence_schema_version=LEARNING_EVIDENCE_SCHEMA_VERSION,
-            qualified=qualified,
+            qualified=qualified
+            and self.coverage_policy_error is None
+            and self.coverage_policy.fresh(validation_start),
         )
         self.models.append(model)
         if self._training_output is None:
@@ -7263,6 +7865,7 @@ class LearningEngine:
             and baseline_version == self.baseline_version()
         )
         if feature_schemas == {FEATURE_SCHEMA_VERSION} and current_authority_context:
+            coverage_metrics = fitted_coverage_metrics(resolved, self._coverage_quote_failures)
             self._publish_entry_artifact(
                 model,
                 baseline_version=baseline_version,
@@ -7270,9 +7873,11 @@ class LearningEngine:
                 evidence_ended_at=rows[-1][0].created_at,
                 defer_tournament=True,
                 policy_evidence_cohort=_policy_evidence_cohort(policy_observed),
+                coverage_metrics=coverage_metrics,
             )
             self._publish_nonlinear_entry_artifact(
                 linear_model=model,
+                coverage_metrics=coverage_metrics,
                 baseline_version=baseline_version,
                 rows=rows,
                 resolved_count=len(resolved),
@@ -7296,6 +7901,7 @@ class LearningEngine:
                 entry_state.updated_at = datetime.now(UTC)
                 self.database.save_challenger_skill_state(entry_state)
             self._publish_manipulation_artifact(
+                coverage_metrics=coverage_metrics,
                 risk_mode=target_mode,
                 configuration_fingerprint=target_configuration,
                 baseline_version=baseline_version,
@@ -7359,6 +7965,7 @@ class LearningEngine:
         )
         self.database.set_setting("learning_context_outcomes_seen", self.context_outcome_counts)
 
+    @timed_work("checkpoint_prune")
     def _prune_complete_history(self) -> None:
         removed = False
         for mint in self.database.prune_learning_observations(MAX_COMPLETED_OBSERVATIONS):
@@ -7922,16 +8529,24 @@ def _feature_vector(decision: Decision) -> dict[str, float] | None:
 
 
 def _observation_features_complete(observation: LearningObservation) -> bool:
-    return all(
-        name in observation.features and math.isfinite(observation.features[name])
-        for name in FEATURE_NAMES
-    )
+    return _features_complete(observation.features)
 
 
 def _evidence_features_complete(episode: LearningEvidenceEpisode) -> bool:
-    return all(
-        name in episode.features and math.isfinite(episode.features[name]) for name in FEATURE_NAMES
-    )
+    return _features_complete(episode.features)
+
+
+def _features_complete(features: dict[str, float]) -> bool:
+    """Validate each current value once, in the same order, without retaining a result.
+
+    Policy selection visits many rows on every outcome boundary. Bound built-ins avoid
+    repeated model-attribute access and generator dispatch for each field. Missing fields
+    still short-circuit at their original position; malformed present values still fail.
+    """
+    try:
+        return all(map(math.isfinite, map(features.__getitem__, FEATURE_NAMES)))
+    except KeyError:
+        return False
 
 
 def _clamp(value: float) -> float:
@@ -8115,7 +8730,12 @@ def _entry_validation_current(value: LearningModel | ChallengerSkillArtifact) ->
 
 
 def _skill_qualified(artifact: ChallengerSkillArtifact) -> bool:
-    return artifact.qualified and _entry_validation_current(artifact)
+    return (
+        artifact.qualified
+        and _entry_validation_current(artifact)
+        and math.isfinite(coverage_policy.artifact_minimum(artifact))
+        and coverage_policy.validation_current(artifact)
+    )
 
 
 def _top_mean(predictions: list[float], outcomes: list[float]) -> float:
@@ -8156,6 +8776,9 @@ def _model_summary(model: LearningModel | None) -> dict[str, Any] | None:
         "configuration_fingerprint": model.configuration_fingerprint,
         "sample_count": model.sample_count,
         "resolved_count": model.resolved_count,
+        "minimum_outcome_coverage": coverage_policy.artifact_minimum(model)
+        if math.isfinite(coverage_policy.artifact_minimum(model))
+        else None,
         "outcome_availability_fraction": model.outcome_availability_fraction,
         "training_count": model.training_count,
         "validation_count": model.validation_count,
@@ -8190,7 +8813,14 @@ def _skill_artifact_summary(
     return {
         "version": artifact.version,
         "codename": _challenger_codename(artifact.version, artifact.skill),
+        "schema_version": artifact.schema_version,
         "created_at": artifact.created_at.isoformat(),
+        "evidence_started_at": (
+            artifact.evidence_started_at.isoformat() if artifact.evidence_started_at else None
+        ),
+        "evidence_ended_at": (
+            artifact.evidence_ended_at.isoformat() if artifact.evidence_ended_at else None
+        ),
         "model_family": artifact.model_family.value,
         "implementation_version": artifact.implementation_version,
         "recipe_version": artifact.recipe_version,
@@ -8206,8 +8836,12 @@ def _skill_artifact_summary(
         "training_count": artifact.training_count,
         "validation_count": artifact.validation_count,
         "embargoed_count": artifact.embargoed_count,
+        "minimum_outcome_coverage": coverage_policy.artifact_minimum(artifact)
+        if math.isfinite(coverage_policy.artifact_minimum(artifact))
+        else None,
         "qualified": _skill_qualified(artifact),
         "metrics": dict(artifact.metrics),
+        "coverage_breakdown": coverage_breakdown(artifact.metrics, artifact.sample_count),
         "parameters": dict(artifact.parameters),
     }
 
@@ -8231,6 +8865,44 @@ def _champion_event_generations(
 def _champion_generation(state: ChallengerSkillState) -> int | None:
     generations = _champion_event_generations(state)
     return generations[-1][1] if generations else None
+
+
+def _finite_coverage(value: float) -> float | None:
+    return value if math.isfinite(value) else None
+
+
+def _coverage_proof_gates(
+    artifact: ChallengerSkillArtifact | LearningModel,
+    gates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if coverage_policy.POLICY_KEYS.intersection(artifact.hyperparameters):
+        fresh = coverage_policy.validation_current(artifact)
+        skill = artifact.skill.value if isinstance(artifact, ChallengerSkillArtifact) else "entry"
+        gates.append(
+            {
+                "id": f"{skill}_coverage_fresh_validation",
+                "label": "Validation after requirement change",
+                "current": fresh,
+                "target": True,
+                "comparison": "=",
+                "state": "passed" if fresh else "not_met",
+                "unit": "boolean",
+                "detail": "The validation window must start after this coverage "
+                "requirement was saved.",
+            }
+        )
+    return _finite_proof_gates(gates)
+
+
+def _finite_proof_gates(gates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep explanatory gates JSON-safe without adding checks or changing proof."""
+    for gate in gates:
+        for key in ("current", "target"):
+            value = gate.get(key)
+            if isinstance(value, float) and not math.isfinite(value):
+                gate[key] = None
+                gate["state"] = "not_met"
+    return gates
 
 
 def _skill_qualification_gates(
@@ -8282,7 +8954,13 @@ def _skill_qualification_gates(
     specifications: tuple[tuple[str, str, float | int, str, str], ...]
     if skill == ChallengerSkill.ENTRY:
         specifications = (
-            ("policy_outcome_availability", "Executable coverage", 0.70, ">=", "fraction"),
+            (
+                "policy_outcome_availability",
+                "Executable coverage",
+                coverage_policy.artifact_minimum(artifact),
+                ">=",
+                "fraction",
+            ),
             ("policy_samples", "Policy outcomes", 20, ">=", "count"),
             ("policy_supported", "Supported cases", 10, ">=", "count"),
             ("policy_vetoes", "Tested vetoes", 5, ">=", "count"),
@@ -8297,7 +8975,13 @@ def _skill_qualification_gates(
         )
     elif skill == ChallengerSkill.MANIPULATION:
         specifications = (
-            ("outcome_availability", "Executable coverage", 0.70, ">=", "fraction"),
+            (
+                "outcome_availability",
+                "Executable coverage",
+                coverage_policy.artifact_minimum(artifact),
+                ">=",
+                "fraction",
+            ),
             ("in_distribution_fraction", "Familiar evidence", 0.90, ">=", "fraction"),
             ("policy_samples", "Policy outcomes", 20, ">=", "count"),
             ("policy_vetoes", "Tested vetoes", 5, ">=", "count"),
@@ -8312,7 +8996,13 @@ def _skill_qualification_gates(
         )
     elif skill == ChallengerSkill.SIZING:
         specifications = (
-            ("outcome_availability", "Executable coverage", 0.70, ">=", "fraction"),
+            (
+                "outcome_availability",
+                "Executable coverage",
+                coverage_policy.artifact_minimum(artifact),
+                ">=",
+                "fraction",
+            ),
             ("in_distribution_fraction", "Familiar evidence", 0.90, ">=", "fraction"),
             ("policy_samples", "Policy outcomes", 20, ">=", "count"),
             ("policy_changes", "Tested size changes", 5, ">=", "count"),
@@ -8324,7 +9014,7 @@ def _skill_qualification_gates(
             (
                 "validation_availability_fraction",
                 "Executable coverage",
-                0.70,
+                coverage_policy.artifact_minimum(artifact),
                 ">=",
                 "fraction",
             ),
@@ -8341,7 +9031,13 @@ def _skill_qualification_gates(
         specifications += (
             ("selected_training_uplift", "Training timing value", 0.01, ">=", "fraction"),
             ("usable_validation_count", "Usable validation outcomes", 20, ">=", "count"),
-            ("reference_availability_fraction", "Fixed-reference coverage", 0.70, ">=", "fraction"),
+            (
+                "reference_availability_fraction",
+                "Fixed-reference coverage",
+                coverage_policy.artifact_minimum(artifact),
+                ">=",
+                "fraction",
+            ),
             ("reference_uplift_lower_bound", "Advantage over fixed timing", 0.01, ">=", "fraction"),
             ("in_distribution_fraction", "Familiar entry context", 0.90, ">=", "fraction"),
             ("policy_changes", "Earlier reviews tested", 5, ">=", "count"),
@@ -8371,7 +9067,7 @@ def _skill_qualification_gates(
             "boolean",
         )
     )
-    return gates
+    return _coverage_proof_gates(artifact, gates)
 
 
 def _entry_family_proof_gates(
@@ -8412,7 +9108,7 @@ def _entry_family_proof_gates(
         (
             "outcome_availability",
             "Model outcome coverage",
-            ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+            coverage_policy.artifact_minimum(artifact),
             ">=",
             "fraction",
             "Usable, fee-inclusive outcomes in this artifact's fitted cohort.",
@@ -8514,7 +9210,9 @@ def _entry_family_proof_gates(
                 "Passing individual displayed checks alone does not award a crown."
             )
         gates.append(gate)
-    return gates
+    # The skill list already includes coverage freshness. Only sanitize the final
+    # combined list here, including unavailable targets from malformed policy metadata.
+    return _finite_proof_gates(gates)
 
 
 def _entry_qualification_gates(
@@ -8525,6 +9223,12 @@ def _entry_qualification_gates(
     activation_available: bool,
 ) -> list[dict[str, Any]]:
     """Describe existing learner gates without making the UI reimplement policy."""
+
+    saved_requirement = (
+        coverage_policy.artifact_minimum(model)
+        if model is not None
+        else float(current_availability["minimum_fraction"])
+    )
 
     def gate(
         gate_id: str,
@@ -8564,7 +9268,7 @@ def _entry_qualification_gates(
             (
                 "model_outcome_availability",
                 "Model outcome coverage",
-                ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                saved_requirement,
                 "fraction",
             ),
             ("validation_error", "Validation error", 0.0, "number"),
@@ -8581,7 +9285,7 @@ def _entry_qualification_gates(
             (
                 "policy_outcome_availability",
                 "Policy outcome coverage",
-                ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                saved_requirement,
                 "fraction",
             ),
             (
@@ -8633,9 +9337,9 @@ def _entry_qualification_gates(
                     "model_outcome_availability",
                     "Model outcome coverage",
                     model.outcome_availability_fraction,
-                    ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                    saved_requirement,
                     ">=",
-                    model.outcome_availability_fraction >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                    model.outcome_availability_fraction >= saved_requirement,
                     "fraction",
                     "Enough modeled entries had executable, fee-inclusive outcomes.",
                 ),
@@ -8704,10 +9408,9 @@ def _entry_qualification_gates(
                     "policy_outcome_availability",
                     "Policy outcome coverage",
                     model.policy_outcome_availability_fraction,
-                    ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                    saved_requirement,
                     ">=",
-                    model.policy_outcome_availability_fraction
-                    >= ENTRY_MINIMUM_OUTCOME_AVAILABILITY,
+                    model.policy_outcome_availability_fraction >= saved_requirement,
                     "fraction",
                     "Missing or stale exits stay unknown and reduce proof coverage.",
                 ),
@@ -8792,7 +9495,7 @@ def _entry_qualification_gates(
             "The newest artifact, context, suspension history, and all proof gates agree.",
         )
     )
-    return gates
+    return _coverage_proof_gates(model, gates) if model is not None else gates
 
 
 def _lessons(model: LearningModel | None) -> list[dict[str, Any]]:

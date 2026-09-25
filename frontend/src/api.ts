@@ -1,4 +1,4 @@
-import type { AiDecisionMode, AiLabStatus, AiModelDownload, BattleReplayResponse, ChallengerJourneyPage, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
+import type { CoverageSettings, AiDecisionMode, AiLabStatus, AiModelDownload, BattleReplayResponse, ChallengerJourneyPage, CoachStatus, Decision, DrawdownPolicy, HealthStatus, Leaderboard, LearningMode, LearningStatus, MaintenanceOperation, ProfileTransitionStrategy, ProviderSettings, ProviderSettingsUpdate, QuoteCurrency, RiskMode, SeasonAutomation, SeasonOperation, Seasons, Snapshot, StorageStatus } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) { super(message); this.name = "ApiError"; }
@@ -64,6 +64,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ mode }),
     }),
+  setCoverage: (percent: CoverageSettings["percent"], expected_revision: number) =>
+    request<CoverageSettings>("/api/v1/learning/coverage", {
+      method: "PUT", body: JSON.stringify({ percent, expected_revision }),
+    }),
   setChampionParticipation: (enabled: boolean) =>
     request<LearningStatus>("/api/v1/learning/participation", { method: "PUT", body: JSON.stringify({ enabled }) }),
   championJourney: (cursor?: string, signal?: AbortSignal, limit = 8) => request<ChallengerJourneyPage>(
@@ -114,10 +118,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
-  updateStorageSettings: (max_database_gb: number, raw_trade_retention_hours: number) =>
+  updateStorageSettings: (max_database_gb: number, raw_trade_retention_hours: number, expected_revision: number) =>
     request<StorageStatus>("/api/v1/storage-settings", {
       method: "PUT",
-      body: JSON.stringify({ max_database_gb, raw_trade_retention_hours }),
+      body: JSON.stringify({ max_database_gb, raw_trade_retention_hours, expected_revision }),
     }),
   leaderboard: (sort: "profit" | "loss" | "recent", signal?: AbortSignal) =>
     request<Leaderboard>(`/api/v1/leaderboard?sort=${sort}`, { signal }),

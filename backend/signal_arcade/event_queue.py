@@ -44,6 +44,17 @@ class SeasonEventQueue(asyncio.PriorityQueue[QueuedEvent]):
         with self._boundary_lock:
             return self.boundary is not None
 
+    @property
+    def has_admitted_work(self) -> bool:
+        """Include producers and dequeued receipts, even before their worker resumes."""
+        with self._boundary_lock:
+            return bool(self._pending_sequences)
+
+    @property
+    def has_dequeued_work(self) -> bool:
+        with self._boundary_lock:
+            return bool(self._dequeued_sequences)
+
     def forget(self, sequence: int) -> None:
         with self._boundary_lock:
             self._pending_sequences.discard(sequence)
@@ -109,6 +120,21 @@ class SeasonEventQueue(asyncio.PriorityQueue[QueuedEvent]):
         """Inspect admitted priority without consuming or scanning the heap."""
         with self._boundary_lock:
             return not self.empty() and self._queue[0][1] < priority
+
+    def promote_mint(self, mint: str) -> int:
+        """Refresh a newly critical mint once, preserving sequence and season receipts."""
+        changed = 0
+        with self._boundary_lock:
+            # Admission priorities do not otherwise change inside the heap. Without this
+            # bounded transition scan, a newer critical tick could overtake older ticks
+            # for the same mint that were admitted before its outcome became pending.
+            for index, (later, priority, sequence, event) in enumerate(self._queue):
+                if priority > 0 and event.mint == mint:
+                    self._queue[index] = (later, 0, sequence, event)
+                    changed += 1
+            if changed:
+                heapq.heapify(self._queue)
+        return changed
 
     def task_done(self) -> None:
         super().task_done()

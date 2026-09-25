@@ -21,6 +21,55 @@ function learning(): LearningStatus {
 }
 const show = (value = learning()) => render(<EntryProof learning={value} renderGates={renderGates} />);
 
+const coverage = { schema: 1, resolved: 1000, usable: 430, quote_liquidity: 305, quote_fees: 8, quote_other: 0, stale_route: 251, window_elapsed: 6, other_missing: 0 };
+
+test.each([[undefined, "70%"], [0.65, "65%"], [0.55, "55%"], [null, "unknown"]] as const)("fitted proof uses its recorded requirement: %s", (minimum, expected) => {
+  const value = learning();
+  value.challenger_minimum_availability = .6;
+  const model = value.entry_proof!.families[0]!.artifact!;
+  model.coverage_breakdown = coverage; model.sample_count = 430; model.metrics.outcome_availability = .43;
+  model.minimum_outcome_coverage = minimum;
+  show(value);
+  expect(screen.getByText(/The requirement for this generation/)).toHaveTextContent(`requirement for this generation is ${expected}.`);
+});
+
+test("coverage counts belong to each fitted generation and never borrow current collection", () => {
+  const value = learning();
+  const linear = value.entry_proof!.families[0]!.artifact!;
+  const xgb = value.entry_proof!.families[1]!.artifact!;
+  linear.coverage_breakdown = coverage; linear.sample_count = 430; linear.metrics.outcome_availability = .43;
+  xgb.coverage_breakdown = { ...coverage, usable: 425, other_missing: 5 }; xgb.sample_count = 425; xgb.metrics.outcome_availability = .425;
+  show(value);
+  const linearPanel = screen.getByText("Linear proof").closest("details")!;
+  const xgbPanel = screen.getByText("XGBoost proof").closest("details")!;
+  expect(within(linearPanel).getByText("430 / 1,000 usable outcomes · 43.0%")).toBeInTheDocument();
+  expect(within(xgbPanel).getByText("425 / 1,000 usable outcomes · 42.5%")).toBeInTheDocument();
+  expect(within(linearPanel).getByText("Quote failed: insufficient real reserves: 305")).toBeInTheDocument();
+  expect(within(linearPanel).getByText(/missed checkpoints are not guaranteed recoverable/)).toBeInTheDocument();
+  expect(within(xgbPanel).getByText("1 / 2 checks passing")).toBeInTheDocument();
+});
+
+test.each([undefined, null, {}, { ...coverage, schema: 2 }, { ...coverage, usable: 429 }, { ...coverage, other_missing: 1 }, { ...coverage, quote_fees: -8 }, { ...coverage, quote_fees: "8" }, { ...coverage, resolved: 0 }])("missing or invalid cohort metadata stays unknown: %j", report => {
+  const value = learning();
+  const model = value.entry_proof!.families[0]!.artifact!;
+  model.sample_count = 430; model.metrics.outcome_availability = .43;
+  model.coverage_breakdown = report as typeof model.coverage_breakdown;
+  show(value);
+  expect(screen.getAllByText("Coverage breakdown unavailable for this generation.")).toHaveLength(2);
+  expect(screen.queryByRole("region", { name: "Fitted cohort coverage" })).toBeNull();
+  expect(screen.getByText("Linear validation: false")).toBeInTheDocument();
+});
+
+test.each([undefined, null])("an incomplete artifact with missing metrics keeps its gates readable: %j", metrics => {
+  const value = learning();
+  const model = value.entry_proof!.families[0]!.artifact!;
+  model.sample_count = 430; model.coverage_breakdown = coverage;
+  model.metrics = metrics as unknown as typeof model.metrics;
+  show(value);
+  expect(screen.getAllByText("Coverage breakdown unavailable for this generation.")).toHaveLength(2);
+  expect(screen.getByText("Linear validation: false")).toBeInTheDocument();
+});
+
 test("family evidence stays with its named generation while activation uses the older Champion", () => {
   show();
   const linear = screen.getByText("Linear proof").closest("details")!;

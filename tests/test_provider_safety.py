@@ -211,7 +211,8 @@ def test_rpc_error_redacts_credentials_and_query() -> None:
     safe = provider._safe_error(RuntimeError(f"connection failed for {url}"))
     assert "rpc-password" not in safe
     assert "top-secret" not in safe
-    assert "rpc.example" in safe
+    assert "rpc.example" not in safe
+    assert safe == "primary stream: other"
 
 
 def test_solana_rate_limit_backoff_honors_retry_after_and_uses_long_cap() -> None:

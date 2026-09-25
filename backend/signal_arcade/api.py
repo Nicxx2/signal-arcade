@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.gzip import GZipMiddleware
@@ -143,6 +143,19 @@ class ParticipationRequest(BaseModel):
     enabled: bool
 
 
+class CoveragePolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    percent: Literal[70, 65, 60, 55]
+    expected_revision: int = Field(ge=0)
+
+    @field_validator("percent", mode="before")
+    @classmethod
+    def require_integer(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("coverage percentage must be an integer")
+        return value
+
+
 class AiDecisionModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -204,6 +217,8 @@ class StorageSettingsRequest(BaseModel):
 
     max_database_gb: float = Field(ge=0.5, le=100)
     raw_trade_retention_hours: int = Field(ge=1, le=720)
+    # Optional for older API clients; the current UI always sends this precondition.
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
 
 
 ProviderSecretKey = Literal[
@@ -558,6 +573,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.put("/api/v1/storage-settings", dependencies=[Depends(normal_operation)])
     async def update_storage_settings(body: StorageSettingsRequest) -> dict[str, Any]:
+        if (
+            body.expected_revision is not None
+            and body.expected_revision != orchestrator.storage_policy()["policy_revision"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Storage settings changed elsewhere. Review the current settings before saving."
+                ),
+            )
         result = await orchestrator.configure_storage(
             int(body.max_database_gb * 1024**3),
             body.raw_trade_retention_hours,
@@ -656,6 +681,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         orchestrator.invalidate_snapshot_cache()
         return orchestrator.learning.status(demo_mode=orchestrator.demo_mode)
+
+    @app.put("/api/v1/learning/coverage", dependencies=[Depends(normal_operation)])
+    async def set_coverage(body: CoveragePolicyRequest) -> dict[str, Any]:
+        try:
+            return await orchestrator.set_learning_coverage(body.percent, body.expected_revision)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/v1/ai-lab")
     async def ai_lab() -> dict[str, Any]:

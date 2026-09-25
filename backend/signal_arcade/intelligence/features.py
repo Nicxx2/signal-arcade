@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any
 
 from ..models import DataValue, EventKind, FeatureSnapshot, MarketEvent, Side
+from .activity import ACTIVITY_UNITS, ActivityMetric, activity_metrics
 
 LAMPORTS_PER_SOL = 1_000_000_000
 PUMP_TOKEN_DECIMALS = 1_000_000
@@ -66,6 +67,7 @@ class RollingTradeMetrics:
     repeated_amount_ratio: float
     same_slot_ratio: float
     integrity: dict[str, IntegrityMetric]
+    activity: dict[str, ActivityMetric] | None
     window_span_seconds: float
     buffer_saturated: bool
     momentum_1m: float
@@ -481,12 +483,16 @@ class FeatureEngine:
                 self.tokens.pop(mint, None)
             return len(stale)
 
-    def snapshot(self, mint: str, now: datetime | None = None) -> FeatureSnapshot | None:
+    def snapshot(
+        self, mint: str, now: datetime | None = None, *, include_activity: bool = True
+    ) -> FeatureSnapshot | None:
         with self._lock:
             state = self.tokens.get(mint)
             if state is None:
                 return None
-            return self._snapshot_state(state, now or datetime.now(UTC))
+            return self._snapshot_state(
+                state, now or datetime.now(UTC), include_activity=include_activity
+            )
 
     def position_snapshot(
         self,
@@ -674,6 +680,8 @@ class FeatureEngine:
         now: datetime,
         *,
         position_mark: bool = False,
+        include_activity: bool = False,
+        value_names: frozenset[str] | None = None,
     ) -> FeatureSnapshot:
         last_event = state.last_event_at or state.created_at or now
         freshness = max(0.0, (now - last_event).total_seconds())
@@ -767,6 +775,7 @@ class FeatureEngine:
             "drawdown_5m",
             "volume_5m_sol",
             *integrity,
+            *ACTIVITY_UNITS,
         }
 
         def put(
@@ -780,6 +789,8 @@ class FeatureEngine:
             item_as_of: datetime | None = None,
             missing_reason: str | None = None,
         ) -> None:
+            if value_names is not None and key not in value_names:
+                return
             values[key] = DataValue(
                 value=value,
                 unit=unit,
@@ -812,6 +823,16 @@ class FeatureEngine:
         put("buys_5m", buys_5m, "count")
         put("sells_5m", sells_5m, "count")
         put("buy_ratio_5m", buy_ratio, "fraction")
+        if include_activity:
+            # Full decision evidence only. Compact dashboard cards and held-position
+            # marking never use these fields and must not pay for another window scan.
+            if rolling.activity is None:
+                rolling.activity = activity_metrics(rolling.trades_5m, rolling.computed_at)
+            for name, unit in ACTIVITY_UNITS.items():
+                value, quality, reason = rolling.activity[name]
+                if state.quote_mint not in {NATIVE_SOL_MINT, WRAPPED_SOL_MINT}:
+                    value, quality, reason = None, 0.0, "unsupported_quote_mint"
+                put(name, value, unit, quality=quality, missing_reason=reason)
         put("unique_wallets_5m", len(users), "count")
         put("wallet_volume_hhi", hhi, "fraction")
         put("repeated_amount_ratio", repeated_ratio, "fraction")
@@ -974,7 +995,9 @@ class FeatureEngine:
             hard_flags=hard_flags,
         )
 
-    def list_snapshots(self, limit: int = 50) -> list[FeatureSnapshot]:
+    def list_snapshots(
+        self, limit: int = 50, *, value_names: frozenset[str] | None = None
+    ) -> list[FeatureSnapshot]:
         with self._lock:
             oldest = datetime.min.replace(tzinfo=UTC)
             states = sorted(
@@ -983,7 +1006,9 @@ class FeatureEngine:
                 reverse=True,
             )[:limit]
             now = datetime.now(UTC)
-            return [self._snapshot_state(state, now) for state in states]
+            # Keep rolling calculations/cache warming identical to the full path. The
+            # dashboard only avoids constructing values it would immediately discard.
+            return [self._snapshot_state(state, now, value_names=value_names) for state in states]
 
 
 def _rolling_trade_metrics(state: TokenState, now: datetime) -> RollingTradeMetrics:
@@ -1043,6 +1068,7 @@ def _rolling_trade_metrics(state: TokenState, now: datetime) -> RollingTradeMetr
         repeated_amount_ratio=repeated_ratio,
         same_slot_ratio=same_slot_ratio,
         integrity=_stream_integrity_metrics(list(trades_5m)),
+        activity=None,
         window_span_seconds=span,
         buffer_saturated=buffer_saturated,
         momentum_1m=_momentum(trades_1m),

@@ -192,7 +192,7 @@ def test_large_expiry_counts_split_without_loss_and_each_part_can_resume(setting
     delivered = []
     try:
         for _ in range(len(events)):
-            engine.diagnostics.events.clear()
+            engine.diagnostics._take_events(0)
             for _ in range(7):
                 engine.diagnostics.event({"kind": "proof"})
             engine._record_collection_detail_diagnostics()
@@ -228,7 +228,7 @@ def test_detail_exports_fit_storage_and_yield_to_proof(settings, tmp_path):
         engine._record_collection_detail_diagnostics()
         assert all(event["kind"] == "proof" for event in recorder.events)
         assert recorder.dropped == 0
-        recorder.events.clear()
+        recorder._take_events(0)
         engine._collect_diagnostics()
         store = DiagnosticsStore(tmp_path / "readback")
         try:
@@ -238,7 +238,7 @@ def test_detail_exports_fit_storage_and_yield_to_proof(settings, tmp_path):
             events = [row["record"] for row in read_events(tmp_path / "readback", before=2e9)]
             assert len([e for e in events if e["kind"] == "collection_expiry"]) == 2
             assert len([e for e in events if e["kind"] == "heartbeat_work"]) == 1
-            recorder.events.clear()
+            recorder._take_events(0)
             engine._record_collection_detail_diagnostics()
             assert not recorder.events
         finally:

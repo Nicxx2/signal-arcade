@@ -3,6 +3,32 @@ import { contextFor, freshness, makeFighter, percentage, recordedDate, readQuali
 import { eventFixture, snapshotFixture } from "./fixtures";
 
 describe("authoritative arena mapping", () => {
+  test("a saved 55% battle uses its own coverage and still requires enough usable evidence", () => {
+    const snapshot = snapshotFixture();
+    const trial = snapshot.learning.skills![0]!.tournament;
+    Object.assign(trial, { minimum_availability_fraction: .55, common_observed_count: 60, common_usable_count: 33, availability_fraction: .55, uplift_lower_bound: .02 });
+    expect(viewForSkill(snapshot, "entry")!.minimumCoverage).toBe(.55);
+    expect(viewForSkill(snapshot, "entry")!.momentum).toBe("right");
+    expect(viewForSkill(snapshot, "entry")!.outcome).toBeNull();
+    Object.assign(trial, { common_usable_count: 32, availability_fraction: 32 / 60 });
+    expect(viewForSkill(snapshot, "entry")!.momentum).toBe("neutral");
+    Object.assign(trial, { common_observed_count: 40, common_usable_count: 22, availability_fraction: .55 });
+    expect(viewForSkill(snapshot, "entry")!.momentum).toBe("neutral");
+  });
+  test("current selection cannot relabel an ongoing battle's recorded requirement", () => {
+    const snapshot = snapshotFixture();
+    snapshot.learning.challenger_minimum_availability = .6;
+    const trial = snapshot.learning.skills![0]!.tournament;
+    Object.assign(trial, { common_observed_count: 60, common_usable_count: 39, availability_fraction: .65, uplift_lower_bound: .02 });
+    expect(viewForSkill(snapshot, "entry")!.minimumCoverage).toBe(.7);
+    expect(viewForSkill(snapshot, "entry")!.momentum).toBe("neutral");
+    trial.minimum_availability_fraction = .65;
+    expect(viewForSkill(snapshot, "entry")!.minimumCoverage).toBe(.65);
+    expect(viewForSkill(snapshot, "entry")!.momentum).toBe("right");
+    trial.minimum_availability_fraction = null;
+    expect(viewForSkill(snapshot, "entry")!.minimumCoverage).toBeNull();
+    expect(viewForSkill(snapshot, "entry")!.momentum).toBe("neutral");
+  });
   test("keeps active influence and the actual testing pair separate from the newest candidate", () => {
     const view = viewForSkill(snapshotFixture(), "entry")!;
     expect([view.mode, view.left?.id, view.left?.influence, view.right?.id]).toEqual(["battle", "champion", "Active", "candidate"]);

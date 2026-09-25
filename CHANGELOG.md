@@ -4,6 +4,284 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.10.11 - 2026-09-25
+
+- Complete the six-hour runtime review and document remaining limits: 119 complete saved
+  training/proof groups, overall retention-debt reduction, but failed burst-expiry and
+  diagnostic-gap comparison gates and uneven final-block cleanup recovery. Local validation
+  supports monitored paper use, not a claim of proven unattended reliability.
+- Yield cooperatively between complete market events after a nominal 25-millisecond slice.
+  Keep persistence atomic, retain in-flight receipts, and recheck priority before continuing;
+  urgent arrivals cannot cross a finite season boundary. The slice is not a hard latency
+  guarantee. The final local repeated comparison passed its unchanged latency/retention gates;
+  sustained live burst recovery remains required before an unattended-use claim.
+- Let independently eligible history cleanup continue after an unavailable capacity read,
+  retaining ordinary priority, original deadlines and unknown capacity. Stop further chunks
+  when the storage-policy revision changes. Use a non-entry timestamp index and exact
+  transaction-local boundary selection for decision retention, including season rotation;
+  keep age-selection ties and protected ENTER decisions intact. Release private training
+  workspaces on a joined worker, record bounded major-GC timing during reconstruction, and
+  reuse Policy-twin population checks only within one coherent dashboard response. Proof,
+  model recipes, trading rules, provider demand and SQLite durability are unchanged.
+  These changes require the same runtime recovery/retention acceptance before an unattended-use claim.
+- Show separate saved capacity/history measurement ages, keep cached capacity values paired
+  with their timestamp, and describe overdue history without claiming catch-up. Clarify the
+  soft live-data budget. Add atomic storage-policy revisions and guarded browser saves;
+  preserve drafts on conflicts, fractional budgets, unknown measurements and honest timeout
+  status. Keep durable/in-memory policy updates joined through cancellation. Existing API
+  clients remain compatible; schema, cleanup rules and learning/trading semantics are unchanged.
+- Avoid a repeated newest-cohort count when budget cleanup removes an older raw-event chunk;
+  retain exact timestamp/identifier ordering within each transaction. Use bounded multi-row
+  inserts for larger event batches while preserving whole-batch atomicity and duplicate IDs.
+  Distinguish maintenance reader admission/setup/read work/restoration in bounded diagnostics.
+  Durability, schema, learning/trading semantics and provider demand are unchanged. These
+  latest candidates still require production-scale recovery and live acceptance.
+- Move optional AI assessment saves to joined workers, retaining ownership through both durable
+  save and pending-outcome registration. Preserve same-token tick ordering and make Settings
+  upgrade preparation wait for the handoff after inference ends. Join optional incident and
+  qualification work during shutdown. Refresh the newly protected token's queued priority and
+  bounded prefetched batch after registration, preserving older-before-newer processing, season
+  receipts and the unchanged chronology guard. No inference, qualification or trading rule changes.
+- Separate cleanup statement execution/CPU from transaction exit and count only committed rows.
+  Keep row adaptation from repeatedly shrinking solely because transaction exit is slow; retain
+  total transaction time as the growth guard, existing row limits and cooperative deadlines.
+  Add bounded synchronous feature/assessment and capacity dispatch/worker/resume attribution
+  without enlarging diagnostic records or adding provider requests. Controlled mechanism results
+  are separate from production-scale and live-soak acceptance.
+- Bound optional incident/AI-audit cleanup by the original dispatch deadline, short writer-lock
+  admission and cooperative SQLite interruption. Preserve unresolved evidence and the existing
+  retained cohorts. Rotate paced category retries independently of settled primary cleanup.
+  Optional retries yield to in-flight learning requests. Add a resolved-incident ordering index
+  to avoid repeated full-backlog sorts. Report completed versus deferred attempts and committed
+  row counts separately. Add fixed-size writer-wait
+  reasons/durations, with existing pressure guards, proof priority and recording limits unchanged.
+- Reduce accounting-read overhead with an additive covering ledger index and reuse the cash
+  valuation within one synchronous entry assessment. Preserve fresh submission/fill checks,
+  integer accounting order, drawdown watermark persistence and transaction visibility. Traverse
+  current learning feature values with bounded built-ins without caching health or delaying
+  governance. Project compact dashboard values before constructing discarded objects while
+  retaining identical rolling-feature cache effects. Read related SQLite page counters in one
+  statement. Add bounded candidate/governance work detail; runtime acceptance remains separate.
+- Recheck maintenance-read admission after connection setup, including short queries and
+  cancellation, and restore connection settings on exceptional cleanup. Move enrichment
+  preparation and metadata/route application onto joined workers under the market boundary.
+  Bind delayed route responses and retry bookkeeping to the original engine, token, source,
+  provider generation and requested pool; preserve newer accepted verification. Keep normal
+  trade updates on an unchanged pool valid. Add bounded candidate/enrichment work attribution
+  and training reconstruction/fit CPU timings without changing proof or trading rules.
+- Use indexed broker evidence reads while preserving chronological selection, duplicate references
+  and preceding-build rollback traversal. Recheck cleanup deadlines after connection setup and
+  report setup/restoration and worker CPU separately. Add reduced in-memory diagnostic captures
+  during detail deferral, keeping bounded queues, complete publication groups and existing writer
+  pressure guards. Retention measurements keep their original timestamps in a bounded optional
+  event. Trading rules, proof requirements and training windows are unchanged; sustained runtime
+  acceptance remains separate from isolated tests.
+- Bound maintenance SQLite busy waits and include worker dispatch in cleanup deadlines; restore
+  normal trading connection settings after every exit. Separate history-category batch adjustment,
+  alternate budget-cleanup lanes and use indexed raw-event boundary lookup without changing the
+  exact recent cohort or protected evidence. Add bounded equity timing and coherent slow-broker
+  samples. Packaging/restart checks passed and the changes were deployed locally through Settings
+  preparation on 21 September. Sustained-performance acceptance remains under observation;
+  trading rules and learning requirements are unchanged.
+- Record the completed prospective Manipulation selectivity screen: 298 matching opportunities,
+  284 usable outcomes and one changed usable action with a negative fee-inclusive quoted outcome.
+  The frozen candidate failed support/economic requirements and remains inactive; retain the
+  incumbent rule.
+- Keep the actual-entry disclosure inside Champion impact without inheriting the footer help
+  control's absolute positioning. Show Results sort progress/retries beside the controls and
+  identify the retained table's actual order; preserve server ranking and request cancellation.
+- Bound maintenance reader admission using the original deadline, including capacity and retired
+  catalog reads. Stop before maintenance work during upgrade preparation. Make optional counts
+  cooperatively interruptible during large scans and run them after core cleanup when pressure
+  allows. Rotate the next count attempt so an oversized table cannot starve smaller counters.
+  Preserve completed deletions, stale counter timestamps and explicit unknown capacity.
+  Record count/oldest-trade timing and residual elapsed work. Saved snapshot age now includes
+  dashboard assembly and remains valid after cache invalidation. Deployed locally through Settings
+  preparation on 21 September; OS scheduling/filesystem stalls remain outside hard time guarantees.
+- Rotate first admission among raw-trade, non-entry-decision and equity-history cleanup queries
+  under the same shared deadline. Record bounded per-category query/lock detail and the chunk
+  used for that pass. Protected evidence, adaptive chunk limits and trading rules are unchanged.
+  These community-polish changes are deployed locally; sustained throughput, diagnostic continuity
+  and retention improvement remain under observation.
+- Add passive Champion entry/veto/fallback counts and a bounded actual-entry audit, keeping
+  matched paper results separate from original Policy proof. Preserve unknown receipts and
+  unresolved closes; use exact indexed provenance and current context.
+- Allow one already-fetched learning RPC batch up to 0.5 seconds of lock-free waiting for an
+  active storage chunk. Recheck every guard, route and original freshness deadline; preserve
+  cleanup/held-position priority and report wait outcomes separately from accepted checkpoints.
+  Keep interval payloads unchanged and split oversized optional runtime detail into finite lanes
+  within the existing byte limit and proof-priority rules.
+- Add a standalone prospective Manipulation selectivity screen against incumbent, Baseline and
+  cash, with fixed contexts, chronological receipts, missingness and retention limits. Keep the
+  fallback-transition feasibility study separate. No experimental buying rule or Champion
+  permission changes. The engineering follow-up was deployed locally through Settings preparation
+  on 21 September; sustained performance remains under observation. The completed study's
+  unfavorable/insufficient result is recorded in `docs/SUPPORT_EVALUATION.md`.
+- Keep the normal bounded catch-up delay after a completed core cleanup pass when only optional
+  housekeeping yields to market traffic. Actual admission deferrals retain their longer delay;
+  transaction deadlines, chunk bounds, cancellation and protected records are unchanged.
+- Recover from provider HTTP 413 responses using only an already configured fallback and
+  bounded endpoint/reconnect backoff. Honor bounded Retry-After values without splitting account
+  requests or relaxing slot, generation, subscription or route validation.
+- Join Baseline sizing, evaluation and entry-permission preparation in one worker dispatch.
+  Preserve evaluation order, original clocks, cancellation ownership and pre-veto Policy enrollment.
+  These reliability changes were deployed locally through Settings preparation on 21 September;
+  sustained live benefit remains unverified.
+- Record the completed first prospective activity study as inconclusive: 273 independent exact-
+  context opportunities, 205 fresh inputs, 261 usable outcomes and zero pattern matches. Keep
+  the frozen recipe and original evidence intact; no experimental buying filter is activated.
+- Explain skill support failures without changing their verdicts: add bounded scalar receipt
+  metadata for the first failing feature, distinguish invalid/unavailable models, and link later
+  attempts to cached first-Policy identities without querying history or granting extra proof.
+  Show applied versus unapplied skill influence separately from fills and integrity conclusions.
+  Correct saved evidence ages to use measurement-to-decision time instead of snapshot freshness.
+  This follow-up was deployed locally on 21 September; the completed study's archived evaluator
+  and specification remain unchanged.
+- Scope standalone activity research reads to a declared period using one bounded read-only
+  snapshot and persistent first-Policy identities. Support compact private export/replay with
+  digest checks and atomic non-overwriting output. Make retention uncertainty, stale inputs and
+  insufficient pattern matches explicit; preserve the hypothesis, native selector and trading rules.
+- Preserve optional, versioned activity evidence alongside newly enrolled Discovery and Policy
+  parents, with a 4 KiB cap, atomic first insertion, immutable original clocks and indexed
+  parent-retention cascades. Keep learning JSON, training copies, selection, models and trading
+  authority unchanged. Add commit-aware aggregate diagnostics and an offline, read-only research
+  screen that distinguishes missing evidence, missed winners and avoided losses. Deployed
+  locally through Settings preparation on 20 September; no prospective strategy result or
+  new entry rule is claimed.
+- Bound dashboard action-history selection with indexed per-action limits and a single read
+  snapshot. Preserve timestamp ties, transactional season rotation and rollback. Add token and
+  decision section timings; displayed snapshot age includes worker assembly time.
+- Record observational buy-volume share, signed net flow, trades of at least 0.01 SOL and
+  corresponding wallet counts from the existing bounded stream window. Require complete observed
+  amounts for numeric value-flow evidence and complete wallet identities for wallet counts.
+  Preserve unknowns, cached observation times, venue boundaries and buffer/continuity warnings.
+  Show the breakdown in saved decision details and clarify hold-score wording. Keep Baseline,
+  learned features, qualification and exit policies unchanged pending prospective evaluation.
+  Deployed locally through Settings preparation on 20 September; sustained performance and
+  prospective trading effects remain unverified.
+- Extend the optional native-skill coverage choices to **55%**, with 70% still the default and
+  no lower choice. Keep fitted recipes, sample minima, all non-coverage proof, existing stricter
+  receipts, chronology and permissions unchanged. Use the server's advertised Settings choices
+  and reject unsupported drafts. Include 55% activation, health, recovery, restart and bounded
+  contender checks. Deployed locally through Settings preparation on 20 September, preserving
+  the existing 60% selection. A lower requirement accepts less complete evidence and is not
+  established to improve trading. Rollback readers must
+  understand saved 55% records even after another setting change.
+- Isolate Solana HTTP operations by configuration generation, including changes during quota,
+  fallback and market-lock waits. Old results cannot change a new endpoint's cooldown or update
+  learning, held-position or candidate-safety evidence. Serialize settings changes with result
+  application. Reset ordinary WebSocket backoff only after both subscriptions acknowledge and
+  valid activity arrives at least 60 monotonic seconds later; preserve rate-limit handling and
+  five-minute learning continuity. Add bounded, text-free provider diagnostics and selected/
+  unselected deadline bands. Keep Discovery ordering and collection capacity unchanged after
+  alternatives failed safety counterexamples. Recheck shutdown/configuration between decoded
+  events in one notification, and retain the correct endpoint role for obsolete responses.
+  Deployed locally through Settings preparation on 19 September; sustained improvement remains unproven.
+- Follow up on burst diagnostics and optional AI dispatch. Start optional report cooldowns at
+  interval collection, retry samples evicted before collection, coalesce same-scope cumulative
+  summaries and fairly admit delayed streams within existing limits. Retain coherent slow
+  market-batch and dashboard samples, including bounded AI CPU/wait detail. Skip future-only
+  AI outcome executor calls while preserving event-loop yields, pending-token priority,
+  outcome deadlines, fees and failure semantics. Reject malformed slow-sample elapsed values
+  before queue comparison without interrupting valid reports. Deployed locally through Settings
+  preparation on 19 September; sustained burst improvement and new Champion readiness remain unproven.
+- Correct duplicate Entry coverage-freshness rows while retaining finite-value sanitization
+  and immutable qualification. Expand saved-generation evidence details with family-specific
+  counts, chronology exclusions and recorded periods, without reconstructing historical cohorts.
+  Missing or malformed dates, including impossible calendar dates, remain unavailable.
+  Keep the 1,000-observation window, fit recipes, proof and permissions unchanged. Add a fixed
+  optional-event-type loss breakdown within the existing diagnostic event budget. This latest
+  polish was deployed locally through Settings preparation on 19 September; community publication
+  remains pending.
+- Add a collapsed Learning requirements section in Settings with 70% (default), 65% and 60%
+  native skill coverage choices. Persist a versioned requirement independently of market/cohort
+  identity; freeze it in new fitted, battle, activation and recovery proof. Require prospective
+  validation after a change, fence in-flight fitting across changes, and atomically revoke
+  authority that cannot meet a raised requirement. Keep failed trials closed, all other proof
+  gates and fixed battle budgets intact, and Coach-derived support at 70%. Deployed locally
+  through Settings preparation on 19 September; community publication remains pending.
+  A lower requirement accepts less complete evidence, not better performance.
+- Recover diagnostic collection after historical lag when admitted market work has drained.
+  Admit local learning work after five quiet seconds following a successful batch, preserving
+  priority, maintenance/storage, job expiry and context rechecks. Account for dequeued work
+  during the consumer handoff; leave RPC freshness and Champion proof unchanged.
+- Add bounded collector admission counters, polling delay and coherent worst-operation samples
+  for storage, heartbeat and event persistence. Keep nested elapsed times distinct from CPU
+  time and retain existing diagnostic budgets, cadence and proof-event priority.
+- Store optional fee provenance on new paper receipts and provide a pure arithmetic replay
+  audit. Preserve execution formulas, ledger values and schema 16. Legacy or malformed optional
+  provenance cannot make historical holdings unreadable; missing evidence is not a passed audit.
+- Add a bounded four-publication diagnostic backlog, preserving original timestamps and group
+  indices while retaining the eight-event writer limit and existing cadence. Show pending
+  collection separately; retain honest overflow/error counters and valid malformed-report siblings.
+- Add opt-in admitted-RPC selection samples by lane/horizon, with explicit exclusion categories,
+  unique route budgets and deadline bands. Preserve selections, clocks, priorities and guards.
+  Isolate malformed or extreme clocks on already-excluded records from the optional sample;
+  report unclassifiable clocks separately without changing the selection result or evidence.
+- Filter ineligible Policy history before chronological sorting. Preserve independent earliest
+  identities, the proof window, missing/negative outcomes, immediate health checks and permissions.
+- Index order-to-Policy decision lookups without rewriting evidence or changing
+  schema 16. Preserve atomic order/link commits and deterministic legacy duplicate selection;
+  split writer-lock admission and lookup timings within existing diagnostic budgets.
+- Retain optional numeric coverage counts on newly fitted Entry and Manipulation
+  artifacts. Explain each Entry family's saved cohort, including valid quote failures and unknown
+  outcomes. Preserve the complete denominator, negative returns, chronological embargo, Policy
+  separation, payload hashes and every qualification/activation requirement. Historical counts
+  are not reconstructed from current collection, and RPC collection pressure is unchanged.
+- Prune obsolete in-memory position route probes at existing heartbeat/watchdog boundaries,
+  preserving current holdings and saved terminal evidence. Ignore late probe results for an
+  earlier position in the same mint.
+- Add bounded cumulative dashboard-section and learning-RPC timings, with precise post-fetch
+  discard reasons. Separate low-priority detail events preserve existing diagnostic byte limits
+  and proof priority; diagnostics never influence collection or qualification.
+- Clarify the difference between usable outcome coverage, prediction accuracy, fitted-generation
+  proof and permission to influence decisions.
+- Prioritize training/proof over optional diagnostic events within the existing eight slots;
+  attribute input losses and whole-interval losses with fixed counters. Compression omissions
+  remain separate. Keep the saved loss count and recording-gap flag consistent when the
+  background writer rejects an interval. Distinguish routine-storage guards from explicit
+  upgrade preparation.
+- Base retention chunk adaptation on measured SQLite query work, preserving absolute deadlines
+  across writer-lock waits. Briefly defer nonurgent cleanup for an admitted learning request
+  only when recent capacity evidence allows it, with an eight-second deferral bound.
+- Queue one shared dashboard refresh through storage activity, without holding the market lock
+  while waiting. Measure remaining snapshot assembly work without caching health or permissions.
+- Validate existing 5/10/20-route batches against slow replies, exact checkpoint deadlines,
+  stale results and all post-fetch guards. Keep collection settings and safety rules unchanged.
+- Preserve earlier diagnostic publication reports at an admitted boundary near the normal
+  collection deadline, sharing one bounded cadence with the regular collector. Recheck pressure
+  and job validity afterward; leave long catch-up and unavailable/full writers to normal recovery.
+- Add bounded worker-detail timings for broker operations, decision persistence and RPC outcome
+  application, with separate dispatch/resume measurements. Attribute collector/reporting exceptions
+  without changing transaction semantics, proof, event-slot limits or the diagnostic disk budget.
+- Retain schema 16, the default 70% requirement, chronological validation, evidence separation,
+  Champion permissions and fixed recovery windows. No new season or data reset is required;
+  changing the optional coverage setting requires prospective validation under its new revision.
+
+The latest saved-evidence presentation and diagnostic-loss polish was deployed locally on
+19 September. See the [build and rollout checks](docs/V1_10_11_VALIDATION.md#learning-presentationdiagnostic-polish-live-rollout--19-september-2026)
+and [bounded follow-up review](docs/V1_10_11_VALIDATION.md#post-rollout-read-only-edge-review--19-september-2026).
+The sample does not establish sustained burst performance; earlier losses and limited disk
+headroom remain open concerns.
+
+The earlier idle-recovery, slow-work evidence and receipt-audit additions were deployed locally
+through Settings preparation on 19 September. See their
+[rollout record](docs/V1_10_11_VALIDATION.md#idle-recovery-and-audit-live-rollout--19-september-2026)
+and [local validation](docs/V1_10_11_VALIDATION.md#idle-recovery-and-audit-follow-up--19-september-2026).
+
+The diagnostics/cleanup/dashboard follow-up and subsequent publication-boundary collection and
+worker-detail timings are deployed locally through Settings upgrade preparation. Community
+publication remains on hold for longer natural-traffic validation.
+The order-lookup and fitted-coverage changes were also deployed locally through Settings on
+18 September 2026; historical artifacts remain unchanged and new reports require natural refits.
+See [validation and rollout status](docs/V1_10_11_VALIDATION.md).
+The publication-backlog, selection-sampling and proof-sorting follow-up was deployed locally
+through Settings preparation on 19 September. The
+[rollout record](docs/V1_10_11_VALIDATION.md#publication-retention-live-rollout--19-september-2026)
+distinguishes packaged and continuity checks from short live observations and remaining limits.
+These changes do not promise
+70% coverage, a Champion, profitable trading or sustained burst capacity.
+
 ## 1.10.10 - 2026-09-09
 
 - Remove future-outcome tie breaking from Entry top-group validation. Use equal boundary-tie

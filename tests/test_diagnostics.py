@@ -543,6 +543,7 @@ def test_collector_keeps_every_supported_skill_family(settings):
 
 
 def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, monkeypatch):
+    import signal_arcade.diagnostics as diagnostics
     import signal_arcade.orchestrator as orchestration
 
     engine = Orchestrator(settings)
@@ -551,7 +552,12 @@ def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, m
     monkeypatch.setattr(
         orchestration,
         "time",
-        SimpleNamespace(monotonic=lambda: clock[0], process_time=time.process_time),
+        SimpleNamespace(monotonic=lambda: clock[0], time=time.time, process_time=time.process_time),
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], time=time.time),
     )
     waits = 0
 
@@ -563,7 +569,7 @@ def test_collector_lock_timeout_preserves_pipeline_for_next_interval(settings, m
         async def next_cycle(_delay):
             nonlocal waits
             waits += 1
-            clock[0] += 61
+            clock[0] += 61 if waits == 1 else 1
             if waits == 2:
                 # A busy core boundary skips collection, without consuming its counters.
                 assert engine.diagnostics.dropped == 0
@@ -862,6 +868,19 @@ def test_full_operational_interval_and_six_proof_events_fit(
         )
     if all_current_families:
         skills[4]["reference"] = {"coverage": 0.823567, "uplift_lower": 0.042351}
+        # New native fitted-cohort counts must also fit alongside every existing field.
+        # Families can retain different generations; do not rely on identical counts
+        # compressing together to meet the fixed interval budget.
+        for index, coverage in zip(
+            (0, 1, 5),
+            (
+                [1, 987, 643, 87, 19, 41, 117, 53, 27],
+                [1, 1000, 428, 213, 31, 56, 173, 42, 57],
+                [1, 1000, 487, 156, 23, 57, 178, 64, 35],
+            ),
+            strict=True,
+        ):
+            skills[index]["coverage"] = coverage
         for skill in skills:
             skill["suspension"] = {
                 "status": "failed",
@@ -1049,10 +1068,18 @@ def test_full_operational_interval_and_six_proof_events_fit(
             ],
         }
     recorder = DiagnosticsRecorder(tmp_path)
+    # High new counters must not enlarge the existing interval or hourly payload.
+    # Their separate detail-event budget is covered in test_diagnostics_priority.
+    for counters in (recorder.loss_reasons, recorder.lost_event_categories):
+        for key in counters:
+            counters[key] = rng.randrange(2**52, 2**53)
+    recorder.dropped = gauges["diagnostics_dropped"]
+    recorder.collection_deferred = gauges["diagnostics_deferred"]
     for event in value["events"]:
         recorder.event(event)
     recorder.collect(pipeline=pipeline, context=value["context"], gauges=gauges, skills=skills)
-    assert len(recorder.queue) == 1 and recorder.dropped == 0
+    assert len(recorder.queue) == 1 and recorder.dropped == gauges["diagnostics_dropped"]
+    assert json.loads(recorder.queue[-1])["gauges"] == gauges
     store = DiagnosticsStore(tmp_path)
     assert store.append(value)
     later = {**value, "seq": 6001, "start": value["end"], "end": value["end"] + 60}

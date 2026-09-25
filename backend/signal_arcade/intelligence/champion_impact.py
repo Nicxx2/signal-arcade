@@ -195,6 +195,18 @@ def _summary(
     upper = mean + margin if mean is not None and margin is not None else None
     coverage = len(pairs) / len(resolved) if resolved else 0.0
     enough = len(pairs) >= MINIMUM_PAIRS and coverage >= MINIMUM_COVERAGE
+    actions = None
+    if subject in ("entry", "manipulation"):
+        actions = dict.fromkeys(("supported_entry", "supported_veto", "fallback", "unavailable"), 0)
+        for row, _, _ in resolved:
+            receipt = _receipt(row, subject, versions)
+            if receipt is None or receipt.proposed_action not in ("support", "veto"):
+                actions["unavailable"] += 1
+            elif not receipt.in_distribution:
+                actions["fallback"] += 1
+            else:
+                key = "supported_veto" if receipt.proposed_action == "veto" else "supported_entry"
+                actions[key] += 1
     state = (
         "collecting"
         if not enough
@@ -206,6 +218,8 @@ def _summary(
     )
     return {
         "subject": subject,
+        "actions": actions,
+        "cash_reference_mean": 0.0 if pairs and subject in ("entry", "manipulation") else None,
         "state": state,
         "observed_count": len(resolved),
         "usable_count": len(pairs),

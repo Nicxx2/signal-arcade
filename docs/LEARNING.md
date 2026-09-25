@@ -4,7 +4,161 @@ Signal Arcade learns cautiously from its own live-paper observation history. The
 small, CPU-only challenger to the transparent V1 baseline—not a claim that the app can guarantee
 profit, discover a permanent edge, or safely trade real money.
 
+The v1.10.11 contention follow-up reduces current feature-vector traversal overhead without
+retaining validation or health results across outcomes. Checkpoint order, immediate governance,
+Champion dependency checks, negative/failed outcomes and training/proof separation are unchanged.
+Compact dashboard projection retains rolling-feature calculations and their cache effects; it
+only omits construction of values the dashboard would discard. These are processing optimizations,
+not a change to training populations, trading rules or evidence required for promotion.
+
+## Configurable skill coverage (v1.10.11)
+
+Settings → **Learning requirements** offers **70% (default), 65%, 60% and 55%**. The choice measures
+the minimum fraction of eligible resolved observations with usable fee-inclusive outcomes. It
+is not accuracy, win rate or a profit target. Lowering the requirement accepts more incomplete
+evidence, including in ongoing health checks; these choices are not empirically proven optimum
+cutoffs. No setting guarantees qualification or a Champion. **55% is the lowest supported choice**;
+with 1,000 resolved observations it requires 550 usable outcomes before the chronological split
+and embargo, not 550 training rows. Negative and zero returns count as usable outcomes.
+The original 70/65/60 choices were deployed locally through Settings preparation on 19 September,
+with 70% preserved during that initial rollout. The 55% extension was deployed locally through
+Settings preparation on 20 September, preserving the existing 60% selection. Adding it does not
+change an existing saved setting. Later selections are recorded separately
+and do not change the community default. See the [original deployment checks](V1_10_11_VALIDATION.md#configurable-coverage-live-rollout--19-september-2026)
+and [55% validation and limits](V1_10_11_VALIDATION.md#optional-55-coverage--20-september-2026).
+
+| Proof or check | Requirement |
+| --- | --- |
+| New native Entry Linear/XGBoost and Manipulation fits | Selected requirement for both fitted Discovery and separate Policy coverage |
+| New native Sizing and deterministic/contextual Exit fits | Selected requirement for applicable Policy/paired coverage, including contextual Exit's fixed reference |
+| Native skill activation, ongoing health and recovery | The stricter of the current setting and the artifact/proof's saved requirement |
+| A newly started native-versus-native battle | Current setting, frozen for both sides before new observations |
+| Coach research, Coach-derived support and either side of a battle involving Coach | 70% |
+| Legacy non-artifact hold-timing fallback and Champion-impact reporting | Their existing separate 70% requirement |
+
+All sample minima, positive-return/advantage checks, uncertainty, familiarity, harm limits,
+XGBoost complexity checks, fees, chronological embargoes and execution permissions remain in
+force. Missing outcomes and valid quote failures stay in their original denominators; losses
+and zero returns remain usable outcomes. Discovery, Policy, fitted coverage and operational
+coverage remain distinct populations. The choice does not change collection, deadlines, provider
+budgets, held-position priority, seasons, model features, fitting recipes or inference payloads.
+
+Saving increments a separate policy revision and timestamps it. New generations cannot qualify
+until their validation window starts at or after that change; existing historical training rows
+can still be used before that boundary. Natural training readiness still applies, so saving is
+not an immediate fit or promotion. In-flight jobs from an older revision cannot publish, even
+after toggling back to the same percentage. Existing artifacts, their proof and their failures
+are never rewritten. An old 70% artifact does not become a 65% artifact; a qualified new
+generation must earn its place through the normal process.
+
+Existing battles keep their frozen requirement when it is lowered. Raising it closes any
+less-strict unfinished attempt without clearing its evidence or allowing a retry of that
+candidate. Collecting or passed recovery trials below the raised requirement similarly remain
+closed after another toggle. Failed recovery never restarts. Active Champions are checked at
+the setting-save boundary; insufficient authority and dependent support step out atomically,
+with saved crowns and permission preferences retained. This does not sell held positions or
+enable support. Fresh proof for a replacement can still qualify normally.
+
+An artifact fitted under 65% can activate while the current setting is 70% if all its evidence
+passes. That activation keeps its 70% requirement for health and recovery even if the setting
+is later lowered. Automatic and manual native-skill activation both retain this receipt;
+malformed coverage metadata cannot authorize support.
+
+The battle budgets remain **120 usable / 172 resolved common observations**, including at 55%,
+60% and 65%. The minimum of 30 usable common outcomes also remains. Changing the threshold does
+not extend an inconclusive trial. Saved receipts and
+diagnostics retain their own requirement; the UI distinguishes it from a stricter current gate.
+Stale saves from another browser tab are rejected, a failed database commit keeps the previous
+setting and authority, and malformed saved policy blocks eligibility until repaired.
+
+Unless an exception is explicitly named above, numerical 70% descriptions below describe the
+default/legacy contract; new native proof uses its recorded selection. Previously deployed
+reliability changes and their validation records remain historical observations, not evidence
+that a lower requirement improves decisions.
+
+Rollback to a coverage-policy-aware build can retain current data when its evidence and authority
+contracts are compatible, including every recorded percentage. Once 55% has been saved or recorded
+in proof, a reader accepting only 70/65/60 is not compatible, even after returning to a higher
+setting. It rejects unsupported records rather than granting authority from them; do not relabel
+old proof to make it load. An image predating this feature cannot safely interpret versioned
+coverage proof, even if the setting has since returned to 70%. For that rollback, preserve the
+current data separately and restore the matching pre-feature data and image together; restoring
+an older backup loses newer evidence from the active app. See the [upgrade and rollback notes](../README.md#updating).
+
 ## What becomes a lesson
+
+### v1.10.11 reliability and coverage
+
+The 19 September idle-recovery follow-up fixes idle admission after a burst. Diagnostics may resume when
+all admitted market work has drained, including the dequeue-to-consumer handoff. Local fitting
+and publication may disregard a finite historical lag sample only after five monotonic seconds
+of quiet following a successfully completed market batch. Unknown clocks, failed/cancelled
+batches, newly admitted work, storage and maintenance still block recovery. Publication still
+checks urgent arrivals, context and job lifetime after collection; no old job gains extra time.
+The lag metric itself is retained. RPC and optional AI freshness guards are unchanged.
+
+Collector deferrals and coherent slow-operation samples improve investigation but are never
+training inputs. New paper receipts also carry optional fee provenance for arithmetic replay;
+this is separate from learning proof and does not change execution. A bounded review reproduced
+all 23 recorded quote failures in a sample of 60 completed observations (20 liquidity failures,
+three fee failures). It does not establish the cause of every missing outcome or justify
+reclassifying failures to pass the 70% gate.
+
+Obsolete position-route probes are removed from memory at existing heartbeat/watchdog
+boundaries. Current holdings and saved terminal evidence are preserved. Dashboard-section
+and RPC timings, with post-fetch discard reasons, help distinguish collection pressure from
+unavailable markets; these measurements never enter training or qualification.
+
+Near the regular diagnostic collection deadline, an already-admitted publication boundary may
+capture previous training/proof reports before the next publication. A bounded backlog now holds
+up to four publication groups through short collection delays, handing off whole groups within
+the unchanged eight-event interval limit. Original report times and missing indices remain
+visible; overflow is counted, and pending or handed-off reports are not proof of durable storage.
+Collection uses the same nominal minute cadence, requires writer handoff room, and yields
+to market pressure and pending sells. It never postpones a terminal job for reporting, relaxes a
+job's lifetime or reconstructs missed proof. The durable learning journal remains authoritative.
+
+Optional admitted-RPC selection samples show due checkpoint eligibility by lane and horizon,
+remaining deadline buckets, and the deduplicated route budget, measured at most once per minute.
+They describe one sampled pass,
+not unique lost outcomes or a cause of expiry. The measurement uses existing pending work and
+does not alter eligibility, route order, deadlines or the three-Policy/one-Discovery rotation.
+Blocked passes and cached-route selection are outside this measurement.
+
+Policy proof selection filters ineligible contracts before sorting. It retains the same
+chronological tie-break, durable identity reservations, earliest eligible observation per mint,
+missing and negative outcomes, and latest 1,000 independent rows. There is no shared outcome
+cache, new training evidence or deferred governance. The isolated speed measurement in the
+validation record does not establish live burst throughput.
+
+Optional worker detail separates local reserve validation, checkpoint persistence and immediate
+governance from worker scheduling delays. Governance still runs at each original outcome boundary;
+the app does not defer suspensions across an RPC batch. Equal-cohort 5/10/20 tests retain the same
+outcomes, including failed/deadline cases, but do not establish that larger live batches are safe.
+Batch defaults, request spacing, grace periods and qualification rules remain unchanged.
+
+The default 70% requirement measures usable outcome coverage, not accuracy or win rate. Current
+operational coverage and the cohort frozen into a fitted generation are distinct. Reaching
+70% does not waive positive-return, advantage, familiarity, harm or other applicable proof
+checks. A saved Champion still needs current activation proof and permission. Suspended
+Exit Champions can be replaced through the normal process; a failed fixed recovery trial
+cannot be restarted using more favourable later outcomes.
+
+Collection priorities, five checkpoint horizons, grace windows, quote validation and batch
+defaults are unchanged. Tests of larger existing batch options do not establish their effect
+on a live provider. See [v1.10.11 validation](V1_10_11_VALIDATION.md).
+
+The v1.10.11 follow-up allows routine storage cleanup to defer for an already admitted learning
+request, for at most eight seconds across successive checks. It requires a completed capacity
+check no more than 60 seconds old, a within-budget state and live pages at or below the cleanup target.
+Unknown/urgent capacity, upgrade preparation or expiry of that deferral bypasses it. Every
+existing post-fetch guard, route/context identity check, quote failure and checkpoint deadline
+still applies. This reduces one avoidable collision in controlled tests; it does not make all
+expired checkpoints recoverable. Held-position and Policy scheduling priorities are unchanged.
+
+Coach studies, enrollment limits, contracts, chronology and terminal results are unchanged.
+A prospective study spanning multiple meaningful seasons remains separate research work:
+its enrollment rules and rollback compatibility require review before implementation.
 
 ### v1.10.6 independent support and performance
 
@@ -73,9 +227,29 @@ maintenance. Guards are checked again after acquiring the market boundary. Every
 including discarded/unavailable responses and errors, retains the full configured wait after
 completion. Empty selections, disabled collection and demo mode also keep that wait. This does
 not change batch size, lane fairness, quota, checkpoint deadlines or the eight-second validity
-window. Fetched responses are still discarded if application is unsafe; no response buffer was
-introduced. Stopping new learning still allows already-enrolled evidence to finish under its
+window. The selectivity follow-up adds at most 0.5 seconds of lock-free scheduled waiting
+for an already active storage chunk after fetching one batch. It neither delays cleanup nor
+refreshes the response timestamp. Guards are rechecked during the wait and again at application;
+unsafe or stale results are discarded. There is no background response queue or repeat fetch.
+Handoff counters distinguish idle observed, timeout and interruption; none alone proves a
+checkpoint completed. Stopping new learning still allows already-enrolled evidence to finish under its
 existing rules, and held-position monitoring remains independent.
+
+The local provider follow-up also fences requests across explicit provider configuration changes.
+Old responses cannot impose or clear cooldowns on the replacement endpoint. Learning, held-position
+and candidate-safety application recheck the request's configuration generation after waiting for
+the market boundary. A changed learning context is a discarded batch within guard deferrals, not a
+failed quote, a zero return or a new usable outcome. Provider configuration changes serialize with
+threaded application; the existing settings/consent and historical evidence rules remain in force.
+
+Ordinary WebSocket retry escalation resets only after both required subscriptions acknowledge
+and a structurally valid notification arrives at least 60 monotonic seconds later. Merely opening
+a connection, duplicate acknowledgements or a quiet connection does not qualify. Rate limits still
+govern retry timing. This reconnect timer does **not** replace the five-minute clean-stream
+enrollment window or establish mark freshness. The follow-up leaves RPC batch size, attempt spacing,
+90-second grace, 3:1 Policy/Discovery rotation, fitted windows and all qualification checks unchanged.
+See [local validation](V1_10_11_VALIDATION.md#provider-recovery-and-discovery-follow-up--local-validation)
+and the [19 September rollout](V1_10_11_VALIDATION.md#provider-recovery-live-rollout--19-september-2026).
 
 Snapshots must validate current mint safety, program owners, curve/pool PDAs, native-SOL quote
 mapping, initialized unfrozen vaults, token-program extensions, fee configuration, slot fences and
@@ -166,15 +340,15 @@ Start the optional reserve worker in Shadow and compare recovered outcomes, unkn
 checkpoint deadlines, provider quota use and event lag across both lanes and venues. Its runtime
 status is included under the event pipeline's learning reserve refresh diagnostics. A 48–72 hour
 soak and later common-forward economic evidence are rollout validation, not results established by
-unit tests. Keep the 70% coverage gate and current activation consent. The separately versioned
+unit tests. Keep the selected coverage contract and current activation consent. The separately versioned
 prospective portfolio experiment from the improvement plan is not included in this release.
 
 Coverage is the usable fraction of a moving evidence window, not progress that inevitably reaches
 100% with time. Broad Discovery model coverage and actionable Policy proof coverage have different
 populations. Faster collection may recover stale checkpoints, but cannot make an illiquid route
 executable. Changing a training population requires separate validation; higher coverage alone does
-not establish stronger predictions or better trading. The 70% gate and missing-outcome denominator
-remain unchanged.
+not establish stronger predictions or better trading. Collection does not change the selected
+gate or the missing-outcome denominator.
 
 ### Evidence lanes
 
@@ -213,6 +387,38 @@ for that mint add fee-inclusive paper outcomes at 1, 5, 10, 15, and 20 minutes. 
 the same integer curve quote and configured protocol/network costs as the paper broker. If a
 horizon has no usable future observation within its grace period, it stays **unknown**; it is never
 silently treated as zero or as a loss.
+
+The v1.10.11 activity follow-up adds a separate descriptive breakdown to **new saved decision
+snapshots**: buy share of quote volume, signed net quote flow, trades of at least 0.01 SOL in
+one/five minutes, wallets with at least one such trade, wallets net buying at least 0.01 SOL,
+and positive-amount coverage. These are not added to the learned feature vector, proof
+denominators or Baseline score. Existing feature/schema and policy versions stay unchanged.
+Wallets are identifiers, not verified independent people. Gross wallet turnover can cross the
+older `meaningful_wallet_ratio` cutoff through repeated tiny trades; that existing feature's
+meaning is preserved. The new wallet counts are explicitly different measurements.
+
+Signed flow is `(buy quote - sell quote) / gross quote`, in [-1, 1]. The existing
+`net_quote_flow_ratio` remains an absolute fraction in [0, 1]. New quantitative flow/count
+fields require complete positive amounts in the observed window; wallet counts also require
+complete wallet identities. Empty windows and unsupported quote assets remain unknown.
+Existing freshness, venue, one-second cache, continuity and buffer saturation evidence still
+apply. These fields do not prove five minutes of uninterrupted observation, clean markets,
+good entries or profitable holds. Historical snapshots are not backfilled. See
+[activity evaluation](ACTIVITY_EVALUATION.md) before proposing strategy changes.
+
+The enrollment follow-up, deployed locally on 20 September, also freezes a compact
+`activity-evidence-v1` companion at each new Discovery or Policy parent's original decision.
+It is separate from lesson JSON and training copies. Parent updates, later successful retries
+and decision-history cleanup cannot replace it; deleting its learning parent cascades to the
+companion. Historical parents remain unknown and receive no retrospective backfill. A failed
+optional measurement is explicit, while serious storage failures retain the existing error path.
+These records are research provenance, not new features, manipulation truth labels or proof of
+better buying. [The offline research contract](ACTIVITY_EVALUATION.md#offline-prospective-screen)
+keeps valid failures and missing outcomes in the population and does not grant Champion authority.
+The standalone reader can export a compact period from one read-only snapshot. Persistent identity
+receipts protect earlier opportunities; missing receipts, possible pruning overlap or selection
+truncation prevent a positive screen. Recorded companions and usable inputs are reported separately.
+This research tooling does not run in the trading loop or alter the training window or native proof.
 
 Starting with the `stream-integrity-v6` contract, each eligible lesson also freezes structural
 market evidence available from the same five-minute Solana stream: the share of one-trade
@@ -262,6 +468,14 @@ This lets a repeated pattern of vanishing liquidity favor an earlier review with
 made-up sale price.
 
 ## Training and validation
+
+After a restart, the source continuity safeguard must first establish five uninterrupted minutes
+before new observations can enrol. Each new observation's primary outcome is due five minutes
+after its own enrollment, not five minutes after startup. Retained pending observations can
+progress sooner. One-minute or later-horizon checkpoint updates do not themselves advance the
+primary-outcome retraining counter. New rows, checkpoints, usable primary outcomes and completed
+publications are separate signs of progress; a healthy worker waiting for evidence is not a fit.
+Elapsed time alone guarantees neither a usable quote nor enough qualifying samples.
 
 Training begins after at least 80 usable live discovery outcomes and reruns after ten additional
 outcomes. Eighty samples are only enough to attempt a challenger; they are not proof of an edge.
@@ -313,7 +527,8 @@ conversion is marked non-actionable instead of being credited to a Challenger ve
 A model
 qualifies only when its untouched validation section:
 
-- comes from a recent 1,000-observation window with at least 70% executable five-minute outcomes;
+- comes from a recent 1,000-observation window meeting its recorded coverage requirement
+  (70% by default) for executable five-minute outcomes;
 - beats a training-mean naive forecast on root-mean-square error by at least 2%;
 - improves correlation over the saved baseline score by a margin;
 - has at least a 1% mean outcome in its highest-ranked group; and
@@ -322,7 +537,7 @@ qualifies only when its untouched validation section:
 Ranking is not enough. The `learning-evidence-v2` policy journal independently freezes whether a
 Baseline ENTER was genuinely submittable under cash, exposure, capacity, and conversion gates.
 Only episodes from the exact current risk, configuration, Baseline and feature generation count.
-At least 20 usable policy outcomes, 70% policy-outcome availability, ten familiar cases (within
+At least 20 usable policy outcomes, the recorded policy-outcome coverage (70% by default), ten familiar cases (within
 learned support, whether kept or vetoed) and five proposed vetoes are required. No more than 35%
 of tested vetoes may discard winners, and the
 bounded fee-inclusive uplift must retain a positive conservative lower bound. At least 95% of the
@@ -382,7 +597,7 @@ Both families use the same newest-at-most-1,000 Policy rows and chronological sp
 checkpoint timestamps must precede the held-out boundary. Missing returns cannot train a model,
 but resolved unavailable outcomes stay in the validation denominator. Each horizon needs at
 least 40 usable training rows. The contextual family requires at least 20 usable validation rows,
-70% paired coverage, a conservative advantage of at least one percentage point over both Baseline
+its recorded paired coverage (70% by default), a conservative advantage of at least one percentage point over both Baseline
 and the fixed selector, at least 90% familiar entry contexts, five earlier-review choices and the
 existing 35% harm limit. An identical fixed choice cannot qualify merely by adding complexity.
 
@@ -437,6 +652,8 @@ losses. Once their grace window has resolved, they still count in the availabili
 a survivor-only set of liquid tokens cannot qualify or activate an entry model. A horizon still
 inside its observation window remains pending and is excluded until it actually resolves.
 
+### Retention, training windows and saved evidence
+
 For predictable long-running use on a small home server, pending lessons are always retained and
 the newest 5,000 completed token lessons remain as full point-in-time records. Fitting and timing
 selection use only the newest 1,000 comparable outcomes; entry fitting also exponentially
@@ -445,6 +662,43 @@ ensures new lessons still trigger retraining after the retained window fills. Mo
 their validation metrics remain immutable while retained. Version history is bounded to the
 newest 1,000 challengers; active, suspended, champion, latest-candidate and in-flight tournament
 versions are protected from pruning.
+
+The Entry limit is a **resolved observation window**, not the number of regression examples.
+Usable fee-inclusive outcomes are split chronologically; the newest third (subject to the
+minimum validation count) is held out, and training outcomes that were not known by the
+validation boundary are excluded. A 1,000-observation window can therefore yield far fewer
+training rows. Retaining 5,000 completed observations does not mean every new fit uses all 5,000,
+and a rolling window covers a different time span as traffic changes.
+
+Native independent activation/support and active-health checks have another recency boundary:
+they select from at most 1,000 independent actionable **Policy** opportunities in the matching
+contract, then apply the current composition, receipt and outcome requirements. Independent join
+proof uses at most the latest 60 resolved eligible opportunities and still needs at least 30 usable
+comparisons. These are different populations from Entry's resolved Discovery training window.
+When an upstream Champion vetoes most opportunities, downstream support can grow slowly or shrink
+as older eligible rows leave that Policy population. A falling counter alone does not establish
+lost saved evidence. An isolated review reproduced 30 → 10 → 0 support with increasing newer
+vetoed rows, regardless of those rows' positive or negative outcomes. The current selection rule
+is unchanged; extending it would require a separately defined proof-policy and lifecycle review,
+not retrospective retention of favorable examples. Recovery studies retain their own rules.
+
+Expanded artifact details show only that generation's saved counts, period and cutoff. Entry
+and Manipulation periods describe usable Discovery evidence, not all resolved observations in
+the coverage denominator. Sizing's Policy window includes observations without usable targets;
+those missing targets are separate from chronology exclusions. Contextual Exit inherits its
+shared training-cohort count, while each horizon fits only its available outcomes; historical
+per-horizon fit counts are not recorded. Coach counts refer to historical screening and a
+separate forward study, not a regression split. Unknown formats or absent dates do not borrow
+details from the current collection or another model. Malformed or impossible calendar dates
+remain unavailable rather than being normalized into another date. Checklists explain saved proof and grant
+no promotion or execution permission; Entry's coverage-freshness check appears once per family.
+
+A local retrospective comparison of 1,000/2,000/3,000 windows did not establish a dependable
+benefit from a blanket increase. Larger windows also move the newest-third validation boundary
+further back, which can delay adaptation and prospective validation after a setting change.
+The 1,000 default remains provisional, not a claim of universal optimality. Any future change
+needs independent later evidence and an audit of shared proof selection and reporting bounds;
+simply raising a constant would change more than training history.
 
 Terminal policy and execution evidence is likewise bounded to the newest 5,000 records per lane;
 pending trajectories are never pruned.
@@ -460,7 +714,8 @@ combinations needed to reproduce a lesson. Keeping 5,000 compact JSON lessons is
 SQLite, while limiting the active model window prevents very old regimes from dominating current
 decisions.
 
-Hold timing has a separate gate; it does not inherit the entry model's qualification. For each
+The legacy non-artifact hold-timing fallback has a separate fixed 70% gate; it does not inherit
+the entry model's qualification or the configurable native Exit requirement. For each
 exact risk mode and configuration, at least 60 complete comparable observations are split
 chronologically with the same
 outcome-overlap embargo. The older section selects a review horizon no later than that mode's
@@ -480,10 +735,10 @@ policy proof, while marginal comparisons prefer Linear. Job completion order can
 family. If no champion exists the selected candidate can become the initial saved champion.
 Otherwise both candidate and champion
 are frozen before the next outcomes arrive and are evaluated on those same common-forward cases.
-Promotion requires at least 30 common cases, at least 70% executable coverage, positive
+Promotion requires at least 30 common cases, the battle's frozen coverage requirement (70% by default), positive
 confidence-adjusted improvement and the skill's harm/winner guards. An inconclusive tournament is
 closed after 120 usable common-forward cases, or after 172 resolved cases when executable coverage
-remains below 70%, rather than running forever or learning from a survivor-only subset. Candidate,
+remains below that requirement, rather than running forever or learning from a survivor-only subset. Candidate,
 champion, counters and decisions are stored in SQLite, so restart cannot erase a loss or restart a
 trial selectively. If the promoted champion is already influencing decisions, its exact proved version
 replaces the old one; downstream skills step out and must re-prove beside the new dependency.
@@ -544,7 +799,7 @@ composition-proof window before activation, including for Entry; its immutable r
 does not change. After activation, receipts use its active version and upstream dependencies.
 Missing expected receipts count as unavailable once the required outcomes have resolved; pending
 outcomes do not cause premature suspension. The latest 60 resolved eligible cases must contain at least 30
-usable outcomes, at least 70% coverage,
+usable outcomes, the applicable saved/current coverage requirement (70% by default),
 a positive conservative incremental advantage and the existing harm guard. A saved crown alone
 does not grant influence. The legacy manual Active API keeps its Entry-first contract and rejects
 manual activation while automatic support is enabled, so the two authority policies cannot mix.
@@ -586,7 +841,8 @@ observability may earn its support back through one fixed prospective shadow tri
 the artifact's creation, in the exact current upstream composition and activation epochs. No
 earlier training, battle or active-health result counts. All 60 must resolve or reach their existing
 checkpoint deadlines before a decision; missing receipts and lost rows remain unavailable in the
-denominator. The trial requires at least 30 usable outcomes, 70% coverage, a positive conservative
+denominator. The trial requires at least 30 usable outcomes, its applicable coverage requirement
+(70% by default), a positive conservative
 advantage and the existing harm limit. Entry also retains its current Entry activation gates.
 
 There is one trial per suspension, with no sliding window, early success or retry after failure.
@@ -734,6 +990,32 @@ opinion against a separately frozen five-minute paper outcome including entry/ex
 Unknown evidence citations, extra schema fields, unavailable models, timeouts, and malformed JSON
 are invalid outcomes, never trading instructions.
 
+The local burst follow-up avoids a worker dispatch when every saved assessment for a token is
+still before its outcome horizon. It uses the same observation timestamp as the outcome handler
+and retains a cooperative event-loop yield. Pending tokens keep their retention and priority;
+already-saved outcomes still complete when new AI work is Off or paused. A queued/in-flight
+assessment or incomparable legacy clock conservatively keeps the existing handler. Exact due
+and grace boundaries, executable-route checks, original fees, negative outcomes and database
+failure handling are unchanged. This dispatch optimization does not
+change the statistical learner, Coach qualification or Champion requirements.
+
+The assessment-save follow-up moves blocking persistence to a joined worker. A successful save
+is registered for outcome collection before caller cancellation is allowed to escape. Failed
+saves create no pending outcome; registration remains deduplicated by assessment identity.
+A same-token trade waits for an in-flight save before inspecting pending outcomes, preserving its
+original observation timestamp. Other-token settlement checks return immediately; the serial
+market worker can still wait while handling the token whose save is unfinished. Settings preparation
+waits for both inference and the ensuing save/registration; a timeout fails preparation rather
+than declaring unsaved work ready. Model/configuration provenance, qualification and authority
+stay unchanged. This candidate requires runtime acceptance before a release recommendation.
+
+When registration first makes a token pending, its already queued events receive the same
+critical priority as subsequent arrivals. The current bounded batch rechecks priority before
+selecting more work. This prevents newly critical arrivals from overtaking that token's older
+prefetched or queued ticks. It performs one bounded queue scan per new pending transition,
+not per market event; sequence numbers, season boundaries, persistence-before-processing and
+the rejection of genuinely stale events remain unchanged. No authority is granted before commit.
+
 Guarded is locked to Shadow until that exact model digest and prompt/schema version have at least
 200 measurable outcomes, 20 measurable high-confidence vetoes, 99% valid responses, a positive conservative
 uplift lower bound, and p95 latency at or below 2.5 seconds. If it later qualifies, its only
@@ -756,6 +1038,17 @@ must always be allowed to lose to its simpler reference.
 Learning Overview includes a passive comparison of current Champion support against its reference.
 It uses existing independent Policy episodes and entry-frozen Champion receipts. It never supplies
 an input to training, activation, suspension, Coach admission or the broker.
+
+The local follow-up adds original supported-entry/veto/fallback counts and a separate sample of
+actual entries from at most 30 recent fills. Exact order/decision and parent-buy links, current
+configuration/season/profile and matching Champion receipts govern attribution. Matched full
+closes report proceeds minus entry cost; ambiguous, partial or missing closes remain unresolved.
+A later-attempt origin link does not establish an earlier applied veto. These sampled results
+are neither full account history nor extra Policy proof. See the separate
+[selectivity and fallback study boundaries](SUPPORT_EVALUATION.md); neither study enables buying.
+The completed fixed-window selectivity screen did not satisfy its support or economic
+requirements. Its candidate remains inactive; this result does not change the incumbent,
+coverage policy, training window or any skill's proof requirements.
 
 Entry and Manipulation compare the recorded five-minute Baseline outcome against either that
 outcome or cash preserved by a supported veto. Sizing compares the saved bounded multiplier with
@@ -790,6 +1083,27 @@ There are no new provider requests, inference, database writes, retention rules 
 The report is computed from existing records inside the normal snapshot; it remains bounded for
 long seasons. A full independent two-portfolio experiment is still deferred.
 
+## Fitted coverage explanations (v1.10.11)
+
+New Entry Linear, Entry XGBoost and Manipulation artifacts retain a small numeric breakdown of
+their exact fitted Discovery cohort. The denominator is the existing last 1,000 eligible resolved
+primary-horizon observations, after the existing provenance and Policy-twin exclusions. Usable
+outcomes include zero, losses and rows excluded from training by the chronological embargo.
+The report does not change row eligibility, training/validation separation or the selected gate.
+
+The mutually exclusive counts are usable, quote failures caused by insufficient real reserves,
+quote failures caused by fees exceeding proceeds, other/unspecified quote failures, stale routes
+at expiry, elapsed checkpoint windows and other/unknown missing outcomes. Detailed quote buckets
+require the saved failure receipt; a generic missing reason alone never proves liquidity failure.
+Checkpoint expiry does not prove that collection could have recovered a valid quote.
+
+Counts travel with the artifact's optional numeric metrics, outside model parameters and payload
+hashes. Training freezes only the bounded quote classifications, without bringing bulky route
+receipts back into the fitting copy. The Entry family panels and diagnostic proof events use that
+saved generation; they never substitute current operational coverage or the other family's cohort.
+Old, incomplete, inconsistent or unsupported reports remain unavailable. Old artifacts are not
+rewritten, and Policy proof, Champion authority and performance requirements remain separate.
+
 ## Bankroll growth
 
 The portfolio always distinguishes total cash, cash reserved by pending orders, cash available for
@@ -805,12 +1119,42 @@ all modeled friction, and preserve enough history to learn whether the strategy 
 
 ### Entry validation and authority commit boundaries
 
+The release reliability follow-up, deployed locally on 21 September, prepares Baseline order size,
+evaluation, provenance and entry permission in one joined worker dispatch under the existing market boundary. The same
+checks run in the same order; original feature clocks are not refreshed. Cancellation waits for
+the worker before releasing that boundary, and the original actionable Baseline opportunity is
+still enrolled before Manipulation or other skill influence. Reducing dispatch overhead does not
+change the strategy, support bounds, training inputs, proof requirements or pending-fill checks.
+
+Saved Entry, Manipulation and Sizing evaluation receipts can include version-1 support metadata.
+It explains the existing verdict; it does not change the support bound, prediction, uncertainty
+margin, qualification, training features, selected coverage or Champion permissions. Statistical
+support failures record a count and the first failing feature in model order, its transformed value,
+training mean/scale and signed standardized distance. The existing scale floor and inclusive
+six-standard-deviation bound still apply. Invalid parameters, unavailable verified XGBoost payloads
+and Coach support failures remain separate causes. Older receipts without this metadata are not
+reconstructed. Frozen candidate receipts describe predictions, not an applied veto or actual fill.
+
+Active decision receipts also link to the cached persistent first-Policy identity when known.
+This is a diagnostic annotation, not a new independent sample: later attempts cannot replace that
+opportunity, even across seasons, restarts or parent pruning. Missing cached origins remain unknown
+without a database query; inconsistent/future clocks do not establish an ordering. A linked original
+may no longer be retained. Model replacements do not inherit any new sticky veto or permission.
+
+The saved decision UI separates skill influence, Baseline integrity and paper execution. Unfamiliar
+inputs may leave a proposed veto unapplied while Baseline and the remaining guards still decide.
+That is not evidence of legitimacy, manipulation or a successful fill. Age is computed from the
+original measurement and decision timestamps; cached snapshot freshness can understate that age.
+The snapshot reference clock can itself be market-event time, so this age includes queueing and
+cached-window effects and must not be interpreted as CPU time. No clocks are refreshed or backdated.
+The current freshness limits and shadow-study eligibility remain unchanged.
+
 Native Linear and XGBoost Entry fits record `entry-top-group-v2` in their validation provenance.
 The top third is selected by predictions alone. Scores strictly above the boundary are fully
 included, and the remaining places are shared equally across the tied boundary group. With
 identical forecasts this returns the whole group's mean, not the retrospectively best outcomes.
-No-tie results and the 70% coverage, performance, independent-proof and complexity gates stay
-unchanged. Old artifacts remain readable and can be frozen comparison references, but their
+No-tie results and the applicable coverage, performance, independent-proof and complexity gates
+remain intact. Old artifacts remain readable and can be frozen comparison references, but their
 old qualification cannot restore, recover or newly activate native Entry support.
 
 Champion activation prepares detached authority, atomically commits the affected states, active

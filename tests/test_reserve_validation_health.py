@@ -241,10 +241,10 @@ def test_watchdog_fault_exports_without_learning_counters_and_keeps_proof_priori
             with engine._reserve_validation.batch("watchdog") as batch:
                 batch.rejected("pump_swap", failure())
         assert not engine.learning.collection_diagnostics.events()
-        for i in range(7):
+        for i in range(8):
             engine.diagnostics.event({"kind": "proof", "test_sequence": i})
         engine._record_collection_diagnostics()
-        assert len(engine.diagnostics.events) == 7  # No proof eviction.
+        assert len(engine.diagnostics.events) == 8  # No proof eviction.
         engine.diagnostics.events.clear()
         engine._record_collection_diagnostics()
         assert len(engine.diagnostics.events) == 1

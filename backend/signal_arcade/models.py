@@ -933,6 +933,13 @@ class FillReceipt(BaseModel):
     # Added in v1.10.1. None keeps older immutable receipts readable while making every new fill
     # independently reproducible after bounded raw-market history is pruned.
     reserve_snapshot: ExecutionReserveSnapshot | None = None
+    # Outer optional metadata remains readable by rollback versions (the nested
+    # reserve snapshot rejects extra fields). Validate on audit use, never let a
+    # damaged/unknown optional recipe prevent loading holdings or their ledger.
+    execution_fee_provenance: Annotated[
+        dict[str, Any] | None,
+        BeforeValidator(lambda value: value if isinstance(value, dict) else None),
+    ] = None
     assumptions: list[str] = Field(default_factory=list)
     account_currency: QuoteCurrency = QuoteCurrency.SOL
     account_decimals: int = Field(default=9, ge=0, le=18)

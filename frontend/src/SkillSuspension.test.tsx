@@ -36,6 +36,16 @@ test("restored skills do not keep a suspension warning", () => {
   expect(container).toBeEmptyDOMElement();
 });
 
+test.each([55, 65])("recovery displays its saved %i requirement and a policy closure cannot promise a retry", percent => {
+  const { rerender } = render(<SkillSuspension skill={{ state: "suspended", suspension: { ...suspension, minimum_availability_fraction: percent / 100 } }} paused={false} supportAllowed />);
+  expect(screen.getByText(/One fixed window/)).toHaveTextContent(`${percent}% coverage`);
+  rerender(<SkillSuspension skill={{ state: "suspended", suspension: { ...suspension, minimum_availability_fraction: null } }} paused={false} supportAllowed />);
+  expect(screen.getByText(/One fixed window/)).toHaveTextContent("currently unavailable");
+  rerender(<SkillSuspension skill={{ state: "suspended", suspension: { ...suspension, status: "policy_changed" } }} paused={false} supportAllowed />);
+  expect(screen.getByText(/This trial stays closed/)).toBeInTheDocument();
+  expect(screen.queryByText(/Fresh recovery trial/)).not.toBeInTheDocument();
+});
+
 test.each([undefined, ["advantage", "harm"], ["future_check"]])("failed trial shows saved checks without inventing legacy results: %j", (failed_checks) => {
   render(<SkillSuspension skill={{ state: "suspended", suspension: { ...suspension, status: "failed", observed_count: 60, usable_count: 47, failed_checks } }} paused={false} supportAllowed />);
   expect(screen.getByText(/Recovery trial finished/)).toHaveTextContent("47 usable of 60 resolved");

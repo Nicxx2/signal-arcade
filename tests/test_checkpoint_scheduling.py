@@ -103,17 +103,26 @@ def test_shared_mint_uses_earliest_eligible_clock_without_taking_another_lane_sh
     assert not engine.observations[shared].checkpoints
 
 
-def test_diagnostics_retries_after_lock_deferral_without_false_loss(settings, monkeypatch):
+def _diagnostic_clock(monkeypatch):
+    import signal_arcade.diagnostics as diagnostics
     import signal_arcade.orchestrator as orchestration
 
+    clock = [time.monotonic()]
+    wall_offset = time.time() - clock[0]
+    api = SimpleNamespace(
+        monotonic=lambda: clock[0],
+        time=lambda: clock[0] + wall_offset,
+        process_time=time.process_time,
+    )
+    monkeypatch.setattr(orchestration, "time", api)
+    monkeypatch.setattr(diagnostics, "time", api)
+    return clock
+
+
+def test_diagnostics_retries_after_lock_deferral_without_false_loss(settings, monkeypatch):
     engine = Orchestrator(settings)
     engine.diagnostics.enabled = True
-    clock = [time.monotonic()]
-    monkeypatch.setattr(
-        orchestration,
-        "time",
-        SimpleNamespace(monotonic=lambda: clock[0], process_time=time.process_time),
-    )
+    clock = _diagnostic_clock(monkeypatch)
 
     async def scenario():
         await engine._event_lock.acquire()
@@ -267,16 +276,9 @@ def test_refresh_result_guard_and_durable_diagnostics(settings, monkeypatch, tmp
 
 
 def test_collection_error_is_not_misreported_as_lock_deferral(settings, monkeypatch):
-    import signal_arcade.orchestrator as orchestration
-
     engine = Orchestrator(settings)
     engine.diagnostics.enabled = True
-    clock = [time.monotonic()]
-    monkeypatch.setattr(
-        orchestration,
-        "time",
-        SimpleNamespace(monotonic=lambda: clock[0], process_time=time.process_time),
-    )
+    clock = _diagnostic_clock(monkeypatch)
 
     def fail_collection():
         raise TimeoutError("injected collector failure after acquiring boundary")
@@ -299,16 +301,9 @@ def test_collection_error_is_not_misreported_as_lock_deferral(settings, monkeypa
 
 
 def test_cancelled_diagnostic_collection_cannot_claim_the_market_lock(settings, monkeypatch):
-    import signal_arcade.orchestrator as orchestration
-
     engine = Orchestrator(settings)
     engine.diagnostics.enabled = True
-    clock = [time.monotonic()]
-    monkeypatch.setattr(
-        orchestration,
-        "time",
-        SimpleNamespace(monotonic=lambda: clock[0], process_time=time.process_time),
-    )
+    clock = _diagnostic_clock(monkeypatch)
 
     async def scenario():
         waiting = asyncio.Event()

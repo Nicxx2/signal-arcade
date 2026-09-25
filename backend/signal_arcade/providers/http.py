@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from ..quota import QuotaBroker
+from .telemetry import METHODS, ProviderTelemetry, record
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,8 @@ class HttpProviders:
         # the configured public fallback through the shared logical Solana quota bucket.
         self._solana_unavailable_until = {"primary": 0.0, "fallback": 0.0}
         self._solana_failures = {"primary": 0, "fallback": 0}
+        self.telemetry = ProviderTelemetry("http")
+        self.solana_generation = 0
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(10, connect=5),
             follow_redirects=False,
@@ -74,6 +77,8 @@ class HttpProviders:
     def configure_solana(self, http_url: str, *, fallback_http_url: str | None = None) -> None:
         """Apply an explicit endpoint change without retaining old runtime cooldowns."""
 
+        self.solana_generation += 1
+        self.telemetry = ProviderTelemetry("http")
         self.solana_http = http_url
         self.solana_fallback_http = (
             fallback_http_url if fallback_http_url and fallback_http_url != http_url else None
@@ -93,6 +98,16 @@ class HttpProviders:
     ) -> httpx.Response | None:
         """Send one logical Solana request with bounded, endpoint-local failover."""
 
+        operation = METHODS.get(request_body.get("method", ""), "other")
+        generation, telemetry = self.solana_generation, self.telemetry
+
+        def obsolete(role: str = "unknown") -> bool:
+            if generation == self.solana_generation:
+                return False
+            record(telemetry, "context_changed", role=role, operation=operation)
+            return True
+
+        record(telemetry, "batch", operation=operation)
         endpoints = [("primary", self.solana_http)]
         if self.solana_fallback_http:
             endpoints.append(("fallback", self.solana_fallback_http))
@@ -102,24 +117,81 @@ class HttpProviders:
             for name, endpoint in endpoints
             if now >= self._solana_unavailable_until[name]
         ]
-        if not available or not await self.quota.acquire("solana", critical=critical):
+        if not available:
+            record(telemetry, "cooldown", operation=operation)
+            return None
+        try:
+            admitted = await self.quota.acquire("solana", critical=critical)
+        except asyncio.CancelledError:
+            record(telemetry, "cancelled", role="unknown", operation=operation)
+            raise
+        if obsolete():
+            return None
+        if not admitted:
+            record(telemetry, "quota", operation=operation)
             return None
         for name, endpoint in available:
+            record(telemetry, "attempt", role=name, operation=operation)
             try:
                 response = await self.client.post(endpoint, json=request_body)
+            except asyncio.CancelledError:
+                record(telemetry, "cancelled", role=name, operation=operation)
+                raise
             except httpx.HTTPError:
+                if obsolete(name):
+                    return None
                 self._cool_down_solana_endpoint(name, None)
+                record(
+                    telemetry,
+                    "transport",
+                    role=name,
+                    operation=operation,
+                    retry=max(0.0, self._solana_unavailable_until[name] - time.monotonic()),
+                )
                 continue
-            unavailable = response.status_code in {401, 403, 429} or response.status_code >= 500
+            if obsolete(name):
+                return None
+            # A provider/proxy may reject an otherwise valid bounded account request with
+            # 413. Try the configured alternative once and back off this endpoint; do not
+            # split route pairs, weaken minContextSlot or turn a failed request into a quote.
+            unavailable = (
+                response.status_code in {401, 403, 413, 429} or response.status_code >= 500
+            )
             if unavailable:
                 self._cool_down_solana_endpoint(name, response)
+                record(
+                    telemetry,
+                    "http",
+                    role=name,
+                    operation=operation,
+                    code=response.status_code,
+                    retry=max(0.0, self._solana_unavailable_until[name] - time.monotonic()),
+                )
                 continue
+            if response.status_code >= 300:
+                record(
+                    telemetry,
+                    "http",
+                    role=name,
+                    operation=operation,
+                    code=response.status_code,
+                )
+            malformed = False
             try:
-                rpc_error = response.json().get("error") if response.status_code < 400 else None
+                body = response.json() if response.status_code < 400 else {}
+                malformed = not isinstance(body, dict)
+                rpc_error = body.get("error") if isinstance(body, dict) else None
             except (ValueError, TypeError):
+                malformed = True
                 rpc_error = None
             rpc_code = rpc_error.get("code") if isinstance(rpc_error, dict) else None
-            if rpc_code in {-32603, -32016, -32005}:
+            if malformed:
+                record(telemetry, "malformed", role=name, operation=operation)
+            elif rpc_error is not None:
+                record(telemetry, "rpc", role=name, operation=operation, code=rpc_code)
+            elif response.status_code < 300:
+                record(telemetry, "response", role=name, operation=operation)
+            if type(rpc_code) is int and rpc_code in {-32603, -32016, -32005}:
                 # Internal/provider overload and minimum-context lag can differ by endpoint.
                 # Trying the configured fallback once is useful; invalid caller requests are not.
                 self._cool_down_solana_endpoint(name, None)
@@ -136,7 +208,10 @@ class HttpProviders:
     ) -> None:
         failures = min(8, self._solana_failures[name] + 1)
         self._solana_failures[name] = failures
-        if response is not None and response.status_code == 429:
+        if response is not None and (
+            response.status_code == 429
+            or (response.status_code == 413 and "Retry-After" in response.headers)
+        ):
             delay = _retry_after(response)
         elif response is not None and response.status_code in {401, 403}:
             delay = 300.0

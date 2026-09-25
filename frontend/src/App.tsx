@@ -1,4 +1,10 @@
 import { DiagnosticsHistory } from "./DiagnosticsHistory";
+import LearningFitDetails from "./LearningFitDetails";
+import ActivityEvidence from "./ActivityEvidence";
+import SkillDecisionEvidence from "./SkillDecisionEvidence";
+import { savedEvidenceAge } from "./evidenceTime";
+import { storagePresentation } from "./storagePresentation";
+import { StorageSettingsForm } from "./StorageSettingsForm";
 import {
   Activity,
   AlertTriangle,
@@ -38,6 +44,7 @@ import { contextFor } from "./championArena/model";
 import { HISTORY_WINDOW, mergeHistoryWindow } from "./championArena/history";
 import { copyText } from "./clipboard";
 import EntryProof from "./EntryProof";
+import { LearningCoverageSettings } from "./LearningCoverageSettings";
 import { entryProofSummary } from "./entryProofModel";
 import { challengerOverviewSummary } from "./learningSummary";
 import { latestDecisionsByMint, organizeDecisions } from "./decisionView";
@@ -2087,7 +2094,6 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
   const baselineScorecard = learning.baseline_scorecard;
   const baselinePolicy = baselineScorecard?.policy;
   const commonForwardMinimum = learning.challenger_common_forward_minimum ?? 30;
-  const minimumTournamentAvailability = learning.challenger_minimum_availability ?? 0.70;
   const activeSkillCount = Math.max(learning.active_model ? 1 : 0, Object.keys(learning.active_skill_versions ?? {}).length);
   const baselineState = learning.mode === "active" ? "Core + bounded learner" : "In control";
   const challengerState = learning.mode === "off"
@@ -2203,7 +2209,7 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
       </section>
 
       <section className="stats-grid learning-stats">
-        <Stat label="Tokens remembered" value={compact(learning.observation_count)} hint={`Training window: up to ${compact(learning.model_window_observations)} · Keeps ${compact(learning.retained_observation_limit)} completed + pending`} />
+        <Stat label="Tokens remembered" value={compact(learning.observation_count)} hint={`Entry window: up to ${compact(learning.model_window_observations)} resolved · Keeps ${compact(learning.retained_observation_limit)} completed + pending`} />
         <Stat label="Usable outcomes" value={compact(learning.usable_outcome_count)} hint="Eligible five-minute outcomes after fees" />
         <Stat label="Still unfolding" value={compact(learning.pending_count)} hint="Measured at 1, 5, 10, 15 and 20 minutes" />
         <Stat label="Unknown outcomes" value={compact(learning.unavailable_outcome_count)} hint="Five-minute outcome unavailable; never assumed zero" />
@@ -2224,13 +2230,17 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
               : candidate?.qualified
                 ? "Candidate · qualified"
                 : "Candidate · collecting proof";
+          const minimumTournamentAvailability = skill.tournament.minimum_availability_fraction === undefined
+            ? 0.70 : typeof skill.tournament.minimum_availability_fraction === "number" && Number.isFinite(skill.tournament.minimum_availability_fraction)
+              ? skill.tournament.minimum_availability_fraction : null;
           const tournamentAvailability = typeof skill.tournament.availability_fraction === "number"
             ? skill.tournament.availability_fraction
             : null;
           const supportProof = skill.support_proof?.artifact_version === skill.champion?.version
             ? skill.support_proof : null;
           const battleProgress = skill.testing_version
-            ? skill.common_forward_count >= commonForwardMinimum
+            ? minimumTournamentAvailability === null ? "Battle requirement unavailable"
+              : skill.common_forward_count >= commonForwardMinimum
               && tournamentAvailability !== null
               && tournamentAvailability < minimumTournamentAvailability
               ? `Battle: ${skill.common_forward_count} usable · ${percent(tournamentAvailability)} coverage (needs ${percent(minimumTournamentAvailability)})`
@@ -2257,11 +2267,10 @@ function LearningLabContents({ snapshot, setChampionParticipation, setLearningMo
               <summary>Artifact details</summary>
               <div>
                 {candidate && <span><small>{candidateRole} recipe</small><strong>{modelFamilyLabel(candidate.model_family)} · {candidate.recipe_version ?? "legacy recipe"}</strong></span>}
-                {candidate && <span><small>Evidence split</small><strong>{compact(candidate.training_count)} train · {compact(candidate.validation_count)} validation</strong></span>}
                 {skill.champion && <span><small>Champion recipe</small><strong>{modelFamilyLabel(skill.champion.model_family)} · {skill.champion.recipe_version ?? "legacy recipe"}</strong></span>}
-                {candidate?.training_cutoff_at && <span><small>Frozen cutoff</small><strong>{shortDate(candidate.training_cutoff_at)}</strong></span>}
-                {supportProof && <span className="support-proof-details"><small>Champion support evidence</small><strong>{supportProof.usable_count} usable of {supportProof.observed_count} observed · {percent(minimumTournamentAvailability)} coverage required</strong></span>}
+                {supportProof && <span className="support-proof-details"><small>Champion support evidence</small><strong>{supportProof.usable_count} usable of {supportProof.observed_count} observed · {supportProof.minimum_availability_fraction === null ? "unknown" : percent(supportProof.minimum_availability_fraction ?? 0.70)} coverage required</strong></span>}
               </div>
+              {candidate && <LearningFitDetails artifact={candidate} />}
               {skill.skill === "exit" && <p>{candidate?.recipe_version === "exit-context-v1" || skill.champion?.recipe_version === "exit-context-v1" ? "Contextual timing learns from entry conditions. New positions keep a frozen review choice while permission and health remain valid. " : ""}Exit proof compares fee-inclusive checkpoint values. Actual exits also follow current signals and Baseline safety rules.</p>}
             </details>}
             <ArenaSkillButton skill={skill.skill} />
@@ -2561,6 +2570,8 @@ function AiDecisionLabCard({ snapshot, setAiMode, busy }: {
   </article>;
 }
 
+const RESULT_SORT_LABELS = { profit: "Most profit", loss: "Most loss", recent: "Latest" } as const;
+
 function LeaderboardView({ explain, reportIssue, resolveIssue }: {
   explain: (decision: Decision) => Promise<void>;
   reportIssue: (scope: IssueScope, title: string, cause: unknown) => void;
@@ -2638,6 +2649,11 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
   };
 
   const changingSort = data !== null && data.sort !== sort;
+  const resultOrderStatus = retrying
+    ? data ? `${RESULT_SORT_LABELS[sort]} is taking longer. Retrying… Showing ${RESULT_SORT_LABELS[data.sort]}.` : "Saved results are taking longer. Retrying…"
+    : loading || changingSort
+      ? `Loading ${RESULT_SORT_LABELS[sort]}…${data ? ` Showing ${RESULT_SORT_LABELS[data.sort]}.` : ""}`
+      : `Showing ${RESULT_SORT_LABELS[data?.sort ?? sort]}`;
   const summaryCurrency = data?.summary.quote_currency ?? data?.rows[0]?.quote_currency;
   const summaryDecimals = data?.summary.quote_decimals ?? data?.rows[0]?.quote_decimals;
   const summaryMoneyReady = Boolean(
@@ -2663,8 +2679,9 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
           <button className={view === "seasons" ? "active" : ""} aria-pressed={view === "seasons"} onClick={() => setView("seasons")}>Seasons</button>
         </div>
         {view === "trades" && <div className="leaderboard-sort" aria-label="Sort results">
-          {(["profit", "loss", "recent"] as const).map((value) => <button key={value} className={sort === value ? "active" : ""} aria-pressed={sort === value} onClick={() => { if (value !== sort) { setLoading(true); setSort(value); } }}>{value === "profit" ? "Most profit" : value === "loss" ? "Most loss" : "Latest"}</button>)}
+          {(["profit", "loss", "recent"] as const).map((value) => <button key={value} className={sort === value ? "active" : ""} aria-pressed={sort === value} onClick={() => { if (value !== sort) { setLoading(true); setRetrying(false); setSort(value); } }}>{RESULT_SORT_LABELS[value]}</button>)}
         </div>}
+        {view === "trades" && <p className="results-sort-status" role="status" aria-live="polite" aria-atomic="true">{(loading || changingSort || retrying) && <span className="mini-loader" aria-hidden="true" />}<span>{resultOrderStatus}</span></p>}
       </div>
     </section>
     {view === "seasons" ? <SeasonsView reportIssue={reportIssue} resolveIssue={resolveIssue} /> : <>
@@ -2679,7 +2696,7 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
       ? "Exit evidence and winner reversals will appear after the first closed trade."
       : `${data.summary.audited_exits} of ${data.summary.closed_trades} closed trade${data.summary.closed_trades === 1 ? "" : "s"} ${data.summary.closed_trades === 1 ? "includes" : "include"} saved exit evidence. ${data.summary.winner_reversals ? `${data.summary.winner_reversals} ${data.summary.winner_reversals === 1 ? "trade was" : "trades were"} positive before closing negative.` : "No winner reversals recorded."}`}</span></div></div>}
     {!!data?.summary.invalid_results && <div className="results-audit-warning" role="alert"><AlertTriangle size={15} /><div><strong>Legacy result not counted</strong><span>{data.summary.invalid_results} preserved paper result{data.summary.invalid_results === 1 ? " has" : "s have"} impossible execution timing. It remains visible under Latest for audit and is excluded from scores and learning.</span></div></div>}
-    <div className="leaderboard-table" role="table" aria-busy={loading || changingSort}>
+    <div className="leaderboard-table" role="table" aria-label={data ? `Trades ordered by ${RESULT_SORT_LABELS[data.sort]}` : "Trades"} aria-busy={loading || changingSort}>
       <div className="leaderboard-row leaderboard-head" role="row"><span>Rank</span><span>Token</span><span>Paper P/L</span><span>Fees</span><span>Held</span><span>Outcome</span><span /></div>
       {data?.rows.map((row, index) => {
         const tokenLabel = tokenDisplayLabel(row.symbol, row.mint);
@@ -2696,8 +2713,7 @@ function LeaderboardView({ explain, reportIssue, resolveIssue }: {
       </div>})}
       {data !== null && data.sort === sort && !loading && !data.rows.length && <EmptyState icon={<Trophy size={22} />} title={sort === "recent" ? "No current-season trades yet" : "No closed trades this season yet"} copy={sort === "recent" ? "New paper entries will appear here with simulated fees and saved evidence." : "Choose Latest to review any open positions while completed trades continue accumulating."} />}
       {data !== null && data.sort === sort && !loading && hiddenResultRows > 0 && <div className="leaderboard-list-note">Showing {data.rows.length.toLocaleString()} of {availableRows.toLocaleString()} {sort === "recent" ? "current-season trades, newest first." : `closed trades, ${sort === "profit" ? "highest net results" : "largest net losses"} first.`}</div>}
-      {data === null && <div className="leaderboard-loading"><span className="mini-loader" /> {retrying ? "Saved results are taking longer. Retrying…" : "Loading saved results…"}</div>}
-      {data !== null && (loading || changingSort || retrying) && <div className="leaderboard-refresh-note"><span className="mini-loader" /> {retrying ? "Showing the last saved order while Results retries…" : "Updating result order…"}</div>}
+      {data === null && <div className="leaderboard-loading" aria-hidden="true"><span className="mini-loader" /></div>}
     </div>
     </>}
   </>;
@@ -3198,7 +3214,7 @@ function DecisionEvidence({ decision }: { decision: Decision }) {
     ["Trades in 1 minute", values.trade_count_1m, "number"],
     ["Trades in 5 minutes", values.trade_count_5m, "number"],
     ["Unique wallets (5m)", values.unique_wallets_5m, "number"],
-    ["Buy ratio (5m)", values.buy_ratio_5m, "percent"],
+    ["Buy share of trade count (5m)", values.buy_ratio_5m, "percent"],
     ["Curve progress", values.curve_progress, "percent"],
     ["Momentum (1m)", values.momentum_1m, "signedPercent"],
     ["Wallet volume concentration", values.wallet_volume_hhi, "percent"],
@@ -3211,7 +3227,7 @@ function DecisionEvidence({ decision }: { decision: Decision }) {
     ["One-trade wallets", values.single_trade_wallet_ratio, "percent"],
     ["Wallet round trips", values.round_trip_wallet_ratio, "percent"],
     ["Round-trip volume", values.round_trip_volume_ratio, "percent"],
-    ["Net flow vs gross volume", values.net_quote_flow_ratio, "percent"],
+    ["Absolute net flow vs gross volume", values.net_quote_flow_ratio, "percent"],
     ["Buy/sell alternation", values.side_alternation_ratio, "percent"],
     ["Clustered trade sizes", values.quantized_amount_repeat_ratio, "percent"],
     ["Slot concentration", values.slot_concentration_hhi, "percent"],
@@ -3223,7 +3239,9 @@ function DecisionEvidence({ decision }: { decision: Decision }) {
   return <section className="explain-evidence">
     <div className="explain-score-grid"><ScoreBar label="Opportunity" value={decision.score.opportunity} tone="good" /><ScoreBar label="Danger" value={decision.score.danger} tone="bad" /><ScoreBar label="Execution" value={decision.score.execution} tone="blue" /><ScoreBar label="Evidence confidence" value={decision.score.confidence} tone="purple" /></div>
     <h3>What the engine actually saw</h3>
-    <div className="evidence-grid">{evidence.map(([label, item, format]) => <div key={label}><span>{label}</span><strong>{formatEvidence(item?.value, format)}</strong><small>{item ? `${Math.round(item.quality * 100)}% source quality · ${duration(item.freshness_seconds)} old` : "Not recorded"}</small></div>)}<div><span>Estimated entry impact</span><strong>{estimatedImpact === null ? "Unknown" : percent(estimatedImpact)}</strong><small>Planned paper size ÷ observed reserve depth</small></div></div>
+    <div className="evidence-grid">{evidence.map(([label, item, format]) => <div key={label}><span>{label}</span><strong>{formatEvidence(item?.value, format)}</strong><small>{item ? `${Math.round(item.quality * 100)}% source quality · ${savedEvidenceAge(item.as_of, decision.created_at)}` : "Not recorded"}</small></div>)}<div><span>Estimated entry impact</span><strong>{estimatedImpact === null ? "Unknown" : percent(estimatedImpact)}</strong><small>Planned paper size ÷ observed reserve depth</small></div></div>
+    <ActivityEvidence snapshot={decision.feature_snapshot} decisionAt={decision.created_at} />
+    <SkillDecisionEvidence assessments={decision.challenger_assessments} />
     {sizing && <><h3>Paper sizing receipt</h3><div className="evidence-grid">
       <div><span>Reference size</span><strong>{sizing.base_size_sol.toFixed(4)} SOL</strong><small>The personality's cautious starting point</small></div>
       <div><span>Selected size</span><strong>{sizing.selected_size_sol.toFixed(4)} SOL</strong><small>{sizing.reasons.map(humanize).join(" · ")}</small></div>
@@ -3292,58 +3310,17 @@ function StorageManager({ snapshot, refresh, busy, setBusy, reportIssue, resolve
   resolveIssue: (scope: IssueScope) => void;
 }) {
   const storage = snapshot.storage;
-  const [maxGb, setMaxGb] = useState(() => (storage.max_database_bytes / 1024**3).toFixed(1));
-  const [retention, setRetention] = useState(() => String(storage.raw_trade_retention_hours));
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
   const usedFraction = Math.min(1, storage.live_bytes / Math.max(1, storage.max_database_bytes));
-  const cleanup = storage.maintenance;
-  const oldestTrade = cleanup?.oldest_retained_trade_at
-    ? Date.parse(cleanup.oldest_retained_trade_at) : NaN;
-  const historyAgeHours = Number.isFinite(oldestTrade)
-    ? Math.max(0, (Date.parse(snapshot.server_time) - oldestTrade) / 3_600_000) : null;
-  const historyBehind = historyAgeHours !== null && historyAgeHours > storage.raw_trade_retention_hours + 1;
-  const cleanupCopy = cleanup?.active
-    ? "Background cleanup is working in a small bounded chunk."
-    : cleanup?.deferred_reason
-      ? "Background cleanup is waiting for quieter market traffic."
-      : cleanup?.budget_state === "retained_evidence_above_target"
-        ? "Protected trading and learning records exceed this target and were kept."
-      : cleanup?.last_completed_at
-        ? `Background cleanup ready · last pass ${duration(cleanup.last_duration_seconds)}.`
-        : "Background cleanup is ready and will yield to market traffic.";
-  const save = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const limit = Number(maxGb);
-    const hours = Number(retention);
-    if (!Number.isFinite(limit) || limit < 0.5 || limit > 100 || !Number.isInteger(hours) || hours < 1 || hours > 720) {
-      reportIssue("storage", "Storage settings are invalid", new Error("Use 0.5–100 GB and 1–720 retention hours."));
-      return;
-    }
-    setSaved(false);
-    setSaving(true);
-    setBusy(true);
-    try {
-      await api.updateStorageSettings(limit, hours);
-      resolveIssue("storage");
-      setSaved(true);
-      void refresh();
-    } catch (cause) {
-      reportIssue("storage", "Storage settings were not saved", cause);
-    } finally {
-      setSaving(false);
-      setBusy(false);
-    }
-  };
+  const storageView = storagePresentation(storage, snapshot.server_time);
   return <article className="card settings-card storage-card">
     <SectionHeader title="Storage budget" subtitle="Bound high-volume evidence without deleting trades, P/L, ledger entries, or learned models" />
     <div className="storage-meter"><span style={{ width: `${usedFraction * 100}%` }} /></div>
     <div className="storage-summary"><strong>{formatBytes(storage.live_bytes)} live data</strong><span>{formatBytes(storage.database_bytes)} allocated · {formatBytes(storage.reclaimable_bytes)} reusable</span></div>
-    <p className="storage-maintenance-state"><HardDrive size={13} />{cleanupCopy}</p>
-    {historyBehind && <p className="storage-note">History cleanup is catching up: oldest raw trade is {Math.floor(historyAgeHours ?? 0)} hours old; target {storage.raw_trade_retention_hours} hours. Trading and learning evidence remain protected.</p>}
-    <form className="storage-form" onSubmit={save}><label>Maximum database<input type="number" min="0.5" max="100" step="0.5" value={maxGb} onChange={(event) => { setMaxGb(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>GB</span></label><label>Raw event history<input type="number" min="1" max="720" step="1" value={retention} onChange={(event) => { setRetention(event.target.value); setSaved(false); }} disabled={saving || busy} /><span>hours</span></label><button className={`button${saved ? " saved" : ""}`} type="submit" disabled={saving || busy} aria-live="polite">{saving ? <span className="mini-loader" /> : saved ? <Check size={15} /> : <Save size={15} />}{saving ? "Saving…" : saved ? "Saved" : "Save"}</button></form>
-    {saved && <p className="storage-saved" role="status"><Check size={13} />Policy saved. Cleanup continues safely in the background.</p>}
-    <p className="storage-note"><HardDrive size={14} />SQLite reuses freed pages, so an older file may stay physically large without continuing to grow. Docker text logs are separately rotated and capped at about 30 MB by the included Compose files.</p>
+    <p className="storage-maintenance-state"><HardDrive size={13} />{storageView.status}</p>
+    <p className="storage-note">{storageView.capacityAge} {storageView.historyAge}</p>
+    <p className="storage-note">{storageView.history} Trading and learning evidence remain protected.</p>
+    <StorageSettingsForm policy={storage} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
+    <p className="storage-note"><HardDrive size={14} />This is a cleanup target for live data, not a hard file-size limit. Allocated space, the write-ahead log and protected records can exceed it. SQLite reuses freed pages. Docker text logs are separately rotated and capped at about 30 MB by the included Compose files.</p>
   </article>;
 }
 
@@ -3522,6 +3499,7 @@ function SettingsView({ snapshot, refresh, busy, setBusy, reportIssue, resolveIs
         <div className={`health-summary pipeline-summary ${snapshot.event_pipeline.degraded ? "unhealthy" : "healthy"}`}><span /><div><strong>Market processing {snapshot.event_pipeline.degraded ? snapshot.event_pipeline.degraded_reasons.map(humanize).join(", ") : "current"}</strong><small>{compact(snapshot.event_pipeline.processed)} processed · {compact(snapshot.event_pipeline.ephemeral)} transient · {compact(snapshot.event_pipeline.persisted)} saved · {compact(snapshot.event_pipeline.shed_candidate_events ?? Math.max(0, snapshot.event_pipeline.dropped - (snapshot.event_pipeline.expired_candidate_events ?? 0)))} shed · {compact(snapshot.event_pipeline.expired_candidate_events ?? 0)} expired</small></div></div>
       </article>
       <StorageManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
+      <LearningCoverageSettings policy={snapshot.learning.coverage_policy} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <DiagnosticsHistory />
       <AiModelManager snapshot={snapshot} refresh={refresh} reportIssue={reportIssue} resolveIssue={resolveIssue} />
       <ProviderManager snapshot={snapshot} refresh={refresh} busy={busy} setBusy={setBusy} reportIssue={reportIssue} resolveIssue={resolveIssue} />
@@ -4048,7 +4026,7 @@ function TokenCard({ token }: { token: FeatureSnapshot }) {
       {identityIncomplete && <button className="token-mint-copy" type="button" title={token.mint} aria-label={`Copy ${token.mint} mint address`} onClick={() => void copyMint()}>{copyStatus === "copied" ? <Check size={13} /> : <Copy size={13} />}<span>{copyStatus === "copied" ? "Copied" : copyStatus === "failed" ? "Copy blocked" : "Mint"}</span></button>}
     </div>
     <div className="token-score"><strong>{Math.round(token.data_confidence * 100)}%</strong><span>Market data confidence</span></div>
-    <dl><div><dt>Trades 1m</dt><dd>{String(values.trade_count_1m?.value ?? "—")}</dd></div><div><dt>Buy ratio</dt><dd>{typeof values.buy_ratio_5m?.value === "number" ? percent(values.buy_ratio_5m.value) : "—"}</dd></div><div><dt>Curve</dt><dd>{typeof values.curve_progress?.value === "number" ? percent(values.curve_progress.value) : "—"}</dd></div></dl>
+    <dl><div><dt>Trades 1m</dt><dd>{String(values.trade_count_1m?.value ?? "—")}</dd></div><div><dt>Buy trades (5m)</dt><dd>{typeof values.buy_ratio_5m?.value === "number" ? percent(values.buy_ratio_5m.value) : "—"}</dd></div><div><dt>Curve</dt><dd>{typeof values.curve_progress?.value === "number" ? percent(values.curve_progress.value) : "—"}</dd></div></dl>
     {token.hard_flags.length > 0 && <span className="flag-line">{humanize(token.hard_flags[0]!)}</span>}
   </article>;
 }
@@ -4057,7 +4035,7 @@ function PositionCard({ position, currency, decimals }: { position: Position; cu
   const fraction = position.entry_cost_lamports ? position.unrealized_pnl_lamports / position.entry_cost_lamports : 0;
   const assessment = position.exit_assessment;
   const policy = assessment
-    ? `${humanize(assessment.reason)}${assessment.action === "hold" ? ` · ${Math.round(assessment.support_score * 100)}% support` : ""}`
+    ? `${humanize(assessment.reason)}${assessment.action === "hold" ? ` · ${Math.round(assessment.support_score * 100)}% hold score` : ""}`
     : null;
   const statusCopy = position.market_status === "active"
     ? position.mark_age_seconds !== null ? `marked ${duration(position.mark_age_seconds)} ago` : "verified route"
@@ -4066,7 +4044,7 @@ function PositionCard({ position, currency, decimals }: { position: Position; cu
       : "last known · waiting for a fresh market";
   const valueKind = position.market_status === "active" ? "" : position.market_status === "exit_blocked" ? " indicative" : " last known";
   const tokenLabel = tokenDisplayLabel(position.symbol, position.mint);
-  return <article className={`card position-card ${position.market_status}`}><div className="position-identity"><span className="token-dot" /><strong title={tokenSymbolKnown(position.symbol) ? undefined : position.mint}>{tokenLabel}</strong><small>Opened {ago(position.opened_at)} · {statusCopy}{policy ? ` · ${policy}` : ""}</small><MintActions mint={position.mint} symbol={position.symbol} compact /></div><div className="position-value"><strong>{money(position.last_mark_lamports, currency, decimals)}</strong><span className={fraction >= 0 ? "positive" : "negative"}>{percentSigned(fraction)}{valueKind}</span></div></article>;
+  return <article className={`card position-card ${position.market_status}`}><div className="position-identity"><span className="token-dot" /><strong title={tokenSymbolKnown(position.symbol) ? undefined : position.mint}>{tokenLabel}</strong><small title="Hold score is a policy heuristic, not a probability of profit or an integrity verdict.">Opened {ago(position.opened_at)} · {statusCopy}{policy ? ` · ${policy}` : ""}</small><MintActions mint={position.mint} symbol={position.symbol} compact /></div><div className="position-value"><strong>{money(position.last_mark_lamports, currency, decimals)}</strong><span className={fraction >= 0 ? "positive" : "negative"}>{percentSigned(fraction)}{valueKind}</span></div></article>;
 }
 
 function FillRow({ fill }: { fill: Fill }) {

@@ -51,6 +51,7 @@ from ..strategy import (
     UNCERTAIN_INTEGRITY_SIZE_MULTIPLIER,
     integrity_policy_for_baseline,
 )
+from ..work_timing import timed_work
 from .curve_math import quote_buy, quote_sell
 from .exit_policy import ROUTE_BLOCKERS, assess_exit
 
@@ -289,6 +290,7 @@ class PaperBroker:
         order, _ = self.submit_decision_with_reason(decision, sol_usd_price=sol_usd_price)
         return order
 
+    @timed_work("candidate_permission")
     def entry_blocker(
         self,
         decision: Decision,
@@ -332,6 +334,7 @@ class PaperBroker:
         self.database.save_order(order)
         return order, None
 
+    @timed_work("candidate_reference")
     def planned_order_size_sol(
         self,
         mode: RiskMode,
@@ -372,6 +375,7 @@ class PaperBroker:
         planned_lamports = max(1, min(grown_lamports, exposure_cap_lamports))
         return planned_lamports / LAMPORTS_PER_SOL
 
+    @timed_work("candidate_sizing")
     def plan_entry_size(
         self,
         decision: Decision,
@@ -670,7 +674,9 @@ class PaperBroker:
         reserved_cash = sum(
             self._pending_reservation(order, sol_usd_price) for order in pending_buys
         )
-        if required > max(0, self.cash_lamports - reserved_cash):
+        # The synchronous assessment has performed no cash-changing operation since its
+        # valuation. Submission and fill each start a new assessment with fresh accounting.
+        if required > max(0, portfolio.cash_lamports - reserved_cash):
             return "unreserved_paper_cash_insufficient", None, None
         return None, request, required
 
@@ -814,6 +820,7 @@ class PaperBroker:
             record_equity=record_equity,
         )
 
+    @timed_work("broker_orders")
     def _fill_due_orders(
         self,
         *,
@@ -1164,6 +1171,25 @@ class PaperBroker:
                 real_quote_reserves=state.real_quote_reserves,
                 fee_bps=fee_bps,
             ),
+            execution_fee_provenance={
+                "version": 1,
+                "rounding": (
+                    "components"
+                    if order.side == Side.SELL and state.reserve_fee_components is not None
+                    else "aggregate"
+                ),
+                "fee_components": (
+                    list(state.reserve_fee_components)
+                    if order.side == Side.SELL and state.reserve_fee_components is not None
+                    else None
+                ),
+                "lp_fee_bps": state.reserve_lp_fee_bps if order.side == Side.SELL else 0,
+                "source": (
+                    "observed_event"
+                    if state.reserve_fee_components is not None or state.fee_bps
+                    else "configured_fallback"
+                ),
+            },
             assumptions=[
                 *(
                     [order.failure_reason]
@@ -1445,6 +1471,7 @@ class PaperBroker:
             ),
         )
 
+    @timed_work("broker_mark")
     def _mark_position(
         self,
         state: TokenState,
@@ -1543,6 +1570,7 @@ class PaperBroker:
             return price.as_of
         return state.last_reserve_at or state.last_event_at or fallback
 
+    @timed_work("broker_assess")
     def _schedule_exit_if_needed(
         self,
         state: TokenState,
@@ -1815,6 +1843,7 @@ class PaperBroker:
                 expired.append(order)
         return expired
 
+    @timed_work("broker_snapshot")
     def snapshot(
         self,
         mode: RiskMode | None = None,
@@ -1931,6 +1960,7 @@ class PaperBroker:
             pending_orders=list(self.pending.values()),
         )
 
+    @timed_work("broker_equity")
     def _record_equity(self, now: datetime, *, force: bool = False) -> None:
         if (
             not force

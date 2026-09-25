@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -109,6 +112,61 @@ class TrainingJob:
     runtime_context: tuple[Any, ...]
     frozen_inputs: tuple[bytes, ...] | bytes
     phase_seconds: dict[str, float] = field(default_factory=dict)
+
+
+def release_training_workspace(job: TrainingJob) -> None:
+    """Drop only private ownership on the joined worker, after publication/reporting.
+
+    Published models/artifacts retain their own references. Do not clear or mutate their
+    objects, or clear shared engine containers inherited by the shallow workspace copy.
+    """
+    job.workspace = None
+    job.frozen_inputs = ()
+
+
+@contextmanager
+def observe_training_gc(phases: dict[str, float], *, enabled: bool) -> Iterator[None]:
+    """Bounded major-GC correlation, not a change to collection or scheduling policy.
+
+    GC is process-wide; these spans overlap reconstruction and can run on another thread.
+    The maximum pause's original wall timestamp permits correlation with loop stalls.
+    """
+    if not enabled:
+        yield
+        return
+    started: tuple[float, float] | None = None
+    count = 0
+    elapsed = 0.0
+    maximum = 0.0
+    maximum_at = 0.0
+
+    def observe(phase: str, info: dict[str, int]) -> None:
+        nonlocal started, count, elapsed, maximum, maximum_at
+        if info.get("generation") != 2:
+            return
+        if phase == "start":
+            started = (time.monotonic(), time.time())
+        elif phase == "stop" and started is not None:
+            duration = max(0.0, time.monotonic() - started[0])
+            count += 1
+            elapsed += duration
+            if duration > maximum:
+                maximum, maximum_at = duration, started[1]
+            started = None
+
+    gc.callbacks.append(observe)
+    try:
+        yield
+    finally:
+        # Another observer may have cleared callbacks; never fail a fit for that.
+        with suppress(ValueError):
+            gc.callbacks.remove(observe)
+        phases.update(
+            reconstruct_gc_count=float(count),
+            reconstruct_gc_seconds=elapsed,
+            reconstruct_gc_max_seconds=maximum,
+            reconstruct_gc_max_started_at=maximum_at,
+        )
 
 
 class TrainingReader:

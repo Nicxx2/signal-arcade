@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -11,11 +12,13 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import thread_time
 from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
 from .battle_replay import MAX_REPLAY_BYTES, valid_replay
+from .intelligence.activity_evidence import MAX_ACTIVITY_EVIDENCE_BYTES, Parent, capture_activity
 from .models import (
     AiCriticAssessment,
     ChallengerChampionEvent,
@@ -44,6 +47,7 @@ from .season_strategy import (
     strategy_view,
 )
 from .terminal_evidence import valid_terminal_probe
+from .work_timing import measure_work, measured_context, timed_work
 
 SCHEMA_VERSION = 16
 TERMINAL_POLICY_VERSION = "executable-boundary-v3"
@@ -52,10 +56,37 @@ CHALLENGER_PENDING_SETTING_PREFIX = "challenger_pending_versions_v1:"
 MAX_STATISTICAL_MODEL_ARTIFACT_BYTES = 8 * 1024**2
 RECENT_CHAMPION_EVENTS_IN_MEMORY = 100
 _ReadResult = TypeVar("_ReadResult")
+_PRUNE_AI_ASSESSMENTS = """DELETE FROM ai_critic_assessments WHERE assessment_id IN (
+    SELECT assessment_id FROM ai_critic_assessments
+    WHERE resolved_at IS NOT NULL AND assessment_id NOT IN (
+        SELECT assessment_id FROM ai_critic_assessments WHERE resolved_at IS NOT NULL
+        ORDER BY created_at DESC LIMIT ?
+    ) ORDER BY created_at ASC LIMIT ?
+)"""
+_PRUNE_INCIDENTS = """DELETE FROM operational_incidents WHERE incident_id IN (
+    SELECT incident_id FROM operational_incidents
+    WHERE resolved_at IS NOT NULL ORDER BY last_seen_at DESC LIMIT ? OFFSET ?
+)"""
+
+
+def _cleanup_deadline(duration: float | None, deadline: float | None) -> float | None:
+    """Keep admission/dispatch waits inside the caller's original cleanup budget."""
+    if duration is not None and (not math.isfinite(duration) or duration <= 0):
+        raise ValueError("max duration seconds must be positive and finite")
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("cleanup deadline must be finite")
+    if duration is None:
+        return deadline
+    local = time.monotonic() + duration
+    return local if deadline is None else min(local, deadline)
 
 
 class AdvisoryReadDeferred(Exception):
     """Optional history work yielded; no partial cohort may be used as evidence."""
+
+
+class MaintenanceReadDeferred(Exception):
+    """Maintenance could not obtain a fresh read within its original work budget."""
 
 
 class Database:
@@ -66,6 +97,8 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._reader_lock = threading.RLock()
+        self._activity_counter_lock = threading.Lock()
+        self._activity_counts: dict[str, int] = {}
         self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -74,6 +107,7 @@ class Database:
         self._storage_cache: dict[str, int] | None = None
         self._storage_cache_at = 0.0
         self._storage_revision = 0
+        self._storage_count_cursor = 0
         self._training_publication_active = False
         self._saved_skill_states: dict[tuple[str, str], tuple[str, datetime]] = {}
         self._publication_skill_acks: dict[
@@ -117,6 +151,86 @@ class Database:
                 self._reader_conn.set_progress_handler(None, 0)
             finally:
                 self._reader_lock.release()
+
+    def maintenance_read(  # noqa: UP047
+        self,
+        read: Callable[[], _ReadResult],
+        *,
+        deadline: float,
+        stop_requested: Callable[[], bool] | None = None,
+        timing: dict[str, float] | None = None,
+    ) -> _ReadResult:
+        """Bound reader admission and cooperative SQL; never abandon an executing thread.
+
+        The caller supplies one absolute deadline, including executor/lock waits. Filesystem
+        I/O and OS scheduling are not interruptible deadlines. This wrapper owns only the
+        reader; nested ordinary read methods may reenter it, never another deadline wrapper.
+        """
+        if not math.isfinite(deadline):
+            raise ValueError("maintenance deadline must be finite")
+
+        def stopped() -> bool:
+            return time.monotonic() >= deadline or bool(stop_requested and stop_requested())
+
+        started = time.monotonic()
+        if stopped():
+            if timing is not None:
+                timing["admission_deferred"] = 1.0
+            raise MaintenanceReadDeferred("Maintenance reader yielded")
+        acquired = self._reader_lock.acquire(
+            timeout=min(0.025, max(0.0, deadline - time.monotonic()))
+        )
+        if timing is not None:
+            timing["lock_wait"] = max(0.0, time.monotonic() - started)
+        if not acquired:
+            if timing is not None:
+                timing["lock_deferred"] = 1.0
+            raise MaintenanceReadDeferred("Maintenance reader yielded")
+        busy_timeout: int | None = None
+        phase = "setup"
+        phase_started = time.monotonic()
+        try:
+            if stopped():
+                if timing is not None:
+                    timing["admission_deferred"] = 1.0
+                raise MaintenanceReadDeferred("Maintenance read deadline elapsed")
+            busy_timeout = int(self._reader_conn.execute("PRAGMA busy_timeout").fetchone()[0])
+            self._reader_conn.execute("PRAGMA busy_timeout=0")
+            self._reader_conn.set_progress_handler(stopped, 500)
+            # Setup can consume the remaining admission time. Short statements may never
+            # reach a progress callback, so recheck before granting them any SQL work.
+            if stopped():
+                if timing is not None:
+                    timing["setup_deferred"] = 1.0
+                raise MaintenanceReadDeferred("Maintenance read deadline elapsed during setup")
+            if timing is not None:
+                timing["setup"] = max(0.0, time.monotonic() - phase_started)
+            phase = "query"
+            phase_started = time.monotonic()
+            return read()
+        except sqlite3.OperationalError as exc:
+            code = (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+            if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_INTERRUPT}:
+                if timing is not None:
+                    timing[
+                        "sql_interrupted" if code == sqlite3.SQLITE_INTERRUPT else "sql_busy"
+                    ] = 1.0
+                raise MaintenanceReadDeferred("Maintenance SQL yielded") from exc
+            raise
+        finally:
+            if timing is not None:
+                timing[phase] = max(0.0, time.monotonic() - phase_started)
+            restore_started = time.monotonic()
+            try:
+                try:
+                    self._reader_conn.set_progress_handler(None, 0)
+                finally:
+                    if busy_timeout is not None:
+                        self._reader_conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
+            finally:
+                self._reader_lock.release()
+                if timing is not None:
+                    timing["restore"] = max(0.0, time.monotonic() - restore_started)
 
     def _migrate(self) -> None:
         with self._lock, self._conn:
@@ -750,14 +864,35 @@ class Database:
                 row[0]
                 for row in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                    "('ai_critic_assessments','learning_evidence_episodes','fills',"
-                    "'coach_hypotheses')"
+                    "('ai_critic_assessments','learning_evidence_episodes','learning_observations','fills',"
+                    "'coach_hypotheses','decisions','ledger_entries','operational_incidents')"
                 )
             }
+            # Additive optional metadata: unchanged parent JSON, no backfill. Older readers'
+            # FK-enabled deletes cascade without knowing about these indexed companions.
+            for parent_table, parent_key, companion in (
+                ("learning_observations", "observation_id", "learning_activity_discovery"),
+                ("learning_evidence_episodes", "episode_id", "learning_activity_policy"),
+            ):
+                if parent_table in optional_tables:
+                    self._conn.execute(
+                        f"CREATE TABLE IF NOT EXISTS {companion} ("  # noqa: S608 - fixed names
+                        f"parent_id TEXT PRIMARY KEY REFERENCES {parent_table}({parent_key}) "
+                        "ON DELETE CASCADE, record_json TEXT NOT NULL "
+                        f"CHECK(length(CAST(record_json AS BLOB)) <= {MAX_ACTIVITY_EVIDENCE_BYTES})"
+                        ") WITHOUT ROWID"
+                    )
             if "ai_critic_assessments" in optional_tables:
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ai_assessments_created "
                     "ON ai_critic_assessments(created_at DESC)"
+                )
+            if "operational_incidents" in optional_tables:
+                # Retain the same resolved-only cohort and rowid tie order, without sorting
+                # the whole backlog on every bounded delete. Unresolved incidents stay out.
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_incidents_resolved_seen "
+                    "ON operational_incidents(last_seen_at DESC) WHERE resolved_at IS NOT NULL"
                 )
             if "learning_evidence_episodes" in optional_tables:
                 self._conn.execute(
@@ -767,6 +902,20 @@ class Database:
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_learning_evidence_trajectory "
                     "ON learning_evidence_episodes(lane,trajectory_key)"
+                )
+                # Non-unique: imported histories may share a decision ID. Keep the writer's
+                # trajectory ordering and sort only matching rows for chronological readers.
+                # No authority JSON or schema-version change is needed for this access path.
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_learning_evidence_decision "
+                    "ON learning_evidence_episodes("
+                    "lane,json_extract(record_json,'$.decision_id'),trajectory_key,created_at)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_execution_evidence_entry_fill "
+                    "ON learning_evidence_episodes(json_extract(record_json,'$.entry_fill_id'),"
+                    "json_extract(record_json,'$.decision_id'),trajectory_key,created_at) "
+                    "WHERE lane='execution'"
                 )
             if version < 15:
                 self._conn.execute("""CREATE TABLE IF NOT EXISTS paper_season_strategy (
@@ -792,10 +941,38 @@ class Database:
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_fills_side_mint ON fills(side,mint)"
                 )
+            if "ledger_entries" in optional_tables:
+                # Keep cash reads fresh without revisiting unrelated accounts or wide memos.
+                # Preserve ledger ID order within each account, including integer SUM edges.
+                # This additive access path contains no derived balance or authority state.
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ledger_account_balance "
+                    "ON ledger_entries(account,id,debit_lamports,credit_lamports)"
+                )
             if "coach_hypotheses" in optional_tables:
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coach_work "
                     "ON coach_hypotheses(state,created_at,hypothesis_id)"
+                )
+            # A positive dashboard lane can be sparse in a large PASS/ABSTAIN journal.
+            # Match by action before visiting the large JSON records. Check the current
+            # table, since season rotation leaves old index names on retired tables.
+            decision_indexes = self._conn.execute("PRAGMA index_list(decisions)").fetchall()
+            if "decisions" in optional_tables and not any(
+                row[1].startswith("idx_decisions_action_time_") for row in decision_indexes
+            ):
+                suffix = uuid.uuid4().hex
+                self._conn.execute(
+                    f"CREATE INDEX idx_decisions_action_time_{suffix} "  # noqa: S608
+                    "ON decisions(action,created_at DESC)"
+                )
+            if "decisions" in optional_tables and not any(
+                row[1].startswith("idx_decisions_nonentry_time_") for row in decision_indexes
+            ):
+                suffix = uuid.uuid4().hex
+                self._conn.execute(
+                    f"CREATE INDEX idx_decisions_nonentry_time_{suffix} "  # noqa: S608
+                    "ON decisions(created_at DESC) WHERE action!='enter'"
                 )
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -1027,21 +1204,56 @@ class Database:
         max_rows_per_category: int = 1_000,
         max_duration_seconds: float | None = None,
         stop_requested: Callable[[], bool] | None = None,
+        timing: dict[str, float] | None = None,
+        category_offset: int = 0,
+        deadline: float | None = None,
+        category_rows: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Bound high-volume samples while retaining fills, orders, and entry evidence.
 
         Each maintenance pass removes a bounded number of large raw rows.  This prevents an old,
         multi-gigabyte history from monopolising the shared SQLite connection at startup.
         """
-        if max_rows_per_category < 1:
+        if type(max_rows_per_category) is not int or max_rows_per_category < 1:
             raise ValueError("max rows per category must be positive")
         if max_equity_points < 0:
             raise ValueError("max equity points must be nonnegative")
         if max_duration_seconds is not None and max_duration_seconds <= 0:
             raise ValueError("max duration seconds must be positive")
-        deadline = (
-            time.monotonic() + max_duration_seconds if max_duration_seconds is not None else None
+        if type(category_offset) is not int or category_offset < 0:
+            raise ValueError("category offset must be a nonnegative integer")
+        limits = dict.fromkeys(
+            ("raw_trades", "non_entry_decisions", "equity_points"), max_rows_per_category
         )
+        for category, rows in (category_rows or {}).items():
+            if (
+                category not in limits
+                or type(rows) is not int
+                or not 1 <= rows <= max_rows_per_category
+            ):
+                raise ValueError("category rows must be positive integers within the pass limit")
+            limits[category] = rows
+        started = time.monotonic()
+        started_cpu = thread_time()
+        deadline = _cleanup_deadline(max_duration_seconds, deadline)
+        if timing is not None:
+            timing.clear()
+            timing.update(
+                worker_seconds=0.0,
+                lock_wait_seconds=0.0,
+                query_seconds=0.0,
+                execute_seconds=0.0,
+                execute_cpu_seconds=0.0,
+                transaction_exit_seconds=0.0,
+                committed_rows=0.0,
+                completed_queries=0.0,
+                lock_timeouts=0.0,
+                query_budget_exhausted=0.0,
+                query_busy=0.0,
+                query_budget_seconds=0.0,
+                setup_seconds=0.0,
+                restore_seconds=0.0,
+            )
         queries: list[tuple[str, str, tuple[Any, ...]]] = [
             (
                 "raw_trades",
@@ -1050,7 +1262,7 @@ class Database:
                        WHERE kind=? AND received_at<?
                        ORDER BY received_at ASC LIMIT ?
                    )""",
-                ("trade", raw_trade_before.isoformat(), max_rows_per_category),
+                ("trade", raw_trade_before.isoformat(), limits["raw_trades"]),
             )
         ]
         if non_entry_decision_before is not None:
@@ -1060,9 +1272,9 @@ class Database:
                     """DELETE FROM decisions WHERE decision_id IN (
                            SELECT decision_id FROM decisions
                            WHERE action!='enter' AND created_at<?
-                           ORDER BY created_at ASC LIMIT ?
+                           ORDER BY created_at ASC,rowid DESC LIMIT ?
                        )""",
-                    (non_entry_decision_before.isoformat(), max_rows_per_category),
+                    (non_entry_decision_before.isoformat(), limits["non_entry_decisions"]),
                 )
             )
         queries.append(
@@ -1073,16 +1285,46 @@ class Database:
                            SELECT id FROM equity_points ORDER BY id DESC LIMIT 1 OFFSET ?
                        ) ORDER BY id ASC LIMIT ?
                    )""",
-                (max_equity_points, max_rows_per_category),
+                (max_equity_points, limits["equity_points"]),
             )
         )
         removed = {"raw_trades": 0, "non_entry_decisions": 0, "equity_points": 0}
-        for category, query, parameters in queries:
-            count = self._retention_transaction(query, parameters, deadline, stop_requested)
-            if count is None:
-                removed["work_remaining"] = 1
-                break
-            removed[category] = count
+        # A shared deadline can expire in the first category. Rotate admission across
+        # passes so old decisions/equity still get a turn during a raw-trade backlog.
+        offset = category_offset % len(queries)
+        queries = queries[offset:] + queries[:offset]
+        try:
+            for category, query, parameters in queries:
+                measured = (
+                    "lock_wait_seconds",
+                    "query_seconds",
+                    "execute_seconds",
+                    "execute_cpu_seconds",
+                    "transaction_exit_seconds",
+                    "committed_rows",
+                    "completed_queries",
+                    "lock_timeouts",
+                    "query_budget_exhausted",
+                    "query_busy",
+                    "query_budget_seconds",
+                )
+                before = {name: timing[name] for name in measured} if timing is not None else {}
+                try:
+                    count = self._retention_transaction(
+                        query, parameters, deadline, stop_requested, timing=timing
+                    )
+                finally:
+                    if timing is not None:
+                        for name in measured:
+                            timing[f"{category}_{name}"] = timing[name] - before[name]
+                if count is None:
+                    removed["work_remaining"] = 1
+                    break
+                removed[category] = count
+        finally:
+            if timing is not None:
+                timing["worker_seconds"] = max(0.0, time.monotonic() - started)
+                timing["worker_cpu_seconds"] = max(0.0, thread_time() - started_cpu)
         return removed
 
     def retired_decision_tables(self) -> list[str]:
@@ -1100,12 +1342,19 @@ class Database:
         max_rows: int = 50,
         max_duration_seconds: float = 0.1,
         stop_requested: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> dict[str, int]:
         """Reclaim closed-season decisions in small transactions after the atomic handover."""
         if max_rows < 1 or max_duration_seconds <= 0:
             raise ValueError("cleanup bounds must be positive")
-        deadline = time.monotonic() + max_duration_seconds
-        tables = self.retired_decision_tables()
+        deadline = _cleanup_deadline(max_duration_seconds, deadline)
+        assert deadline is not None
+        try:
+            tables = self.maintenance_read(
+                self.retired_decision_tables, deadline=deadline, stop_requested=stop_requested
+            )
+        except MaintenanceReadDeferred:
+            return {"retired_decisions": 0, "work_remaining": 1}
         removed = 0
         for table in tables:
             count = self._retention_transaction(
@@ -1136,6 +1385,8 @@ class Database:
         parameters: tuple[Any, ...],
         deadline: float | None,
         stop_requested: Callable[[], bool] | None,
+        *,
+        timing: dict[str, float] | None = None,
     ) -> int | None:
         """Commit one small cleanup query, or roll it back before yielding to market work."""
 
@@ -1148,30 +1399,106 @@ class Database:
         if interrupted():
             return None
         timeout = -1.0 if deadline is None else min(0.025, max(0.0, deadline - time.monotonic()))
-        if not self._lock.acquire(timeout=timeout):
+        lock_started = time.monotonic()
+        acquired = self._lock.acquire(timeout=timeout)
+        if timing is not None:
+            timing["lock_wait_seconds"] += max(0.0, time.monotonic() - lock_started)
+        if not acquired:
+            if timing is not None:
+                timing["lock_timeouts"] += 1
             return None
+        busy_timeout: int | None = None
         try:
             if interrupted():
                 return None
+            setup_started = time.monotonic()
             if deadline is not None or stop_requested is not None:
+                # SQLite's busy handler does not run the progress callback. Waiting for
+                # another connection must not hold our writer past the cleanup budget.
+                # Ordinary trading writes retain their original timeout after this pass.
+                busy_timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+                self._conn.execute("PRAGMA busy_timeout=0")
                 self._conn.set_progress_handler(interrupted, 500)
+            if timing is not None:
+                timing["setup_seconds"] = timing.get("setup_seconds", 0.0) + max(
+                    0.0, time.monotonic() - setup_started
+                )
+            # A short statement may finish before its first progress callback. Setup or
+            # descheduling must not grant it permission after the original deadline.
+            if interrupted():
+                return None
+            query_started = time.monotonic()
+            if timing is not None and deadline is not None:
+                timing["query_budget_seconds"] = timing.get("query_budget_seconds", 0.0) + max(
+                    0.0, deadline - query_started
+                )
             try:
-                with self._conn:
-                    count = self._conn.execute(query, parameters).rowcount
+                exit_started: float | None = None
+                try:
+                    with self._conn:
+                        execute_started, execute_cpu = time.monotonic(), thread_time()
+                        try:
+                            count = self._conn.execute(query, parameters).rowcount
+                        finally:
+                            if timing is not None:
+                                timing["execute_seconds"] = timing.get(
+                                    "execute_seconds", 0.0
+                                ) + max(0.0, time.monotonic() - execute_started)
+                                timing["execute_cpu_seconds"] = timing.get(
+                                    "execute_cpu_seconds", 0.0
+                                ) + max(0.0, thread_time() - execute_cpu)
+                            exit_started = time.monotonic()
+                finally:
+                    if timing is not None and exit_started is not None:
+                        # Includes commit OR rollback and descheduling, not isolated fsync.
+                        timing["transaction_exit_seconds"] = timing.get(
+                            "transaction_exit_seconds", 0.0
+                        ) + max(0.0, time.monotonic() - exit_started)
                 if count > 0:
                     # Already own the writer lock. Invalidating after releasing it would let
                     # a busy trader make the supposedly bounded cleanup wait all over again.
                     self._invalidate_storage_cache()
+                if timing is not None:
+                    timing["completed_queries"] += 1
+                    timing["committed_rows"] = timing.get("committed_rows", 0.0) + max(0, count)
                 return max(0, count)
             except sqlite3.OperationalError as exc:
-                if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                code = (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+                if busy_timeout is not None and code in {
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                }:
+                    if timing is not None:
+                        timing["query_busy"] = timing.get("query_busy", 0.0) + 1
+                    return None
+                if code == sqlite3.SQLITE_INTERRUPT:
+                    if (
+                        timing is not None
+                        and deadline is not None
+                        and time.monotonic() >= deadline
+                        and not (stop_requested is not None and stop_requested())
+                    ):
+                        timing["query_budget_exhausted"] += 1
                     return None
                 raise
             finally:
-                # Never let a cleanup deadline interrupt the next trade's transaction.
-                self._conn.set_progress_handler(None, 0)
+                if timing is not None:
+                    timing["query_seconds"] += max(0.0, time.monotonic() - query_started)
         finally:
-            self._lock.release()
+            restore_started = time.monotonic()
+            try:
+                # Never let a cleanup deadline or timeout affect the next trade.
+                self._conn.set_progress_handler(None, 0)
+            finally:
+                try:
+                    if busy_timeout is not None:
+                        self._conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
+                finally:
+                    self._lock.release()
+                    if timing is not None:
+                        timing["restore_seconds"] = timing.get("restore_seconds", 0.0) + max(
+                            0.0, time.monotonic() - restore_started
+                        )
 
     def enforce_storage_budget(
         self,
@@ -1183,6 +1510,8 @@ class Database:
         max_rows_per_chunk: int = 1_000,
         max_duration_seconds: float = 2.0,
         stop_requested: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+        category_offset: int = 0,
     ) -> dict[str, int]:
         """Free reusable SQLite pages before the configured live-data budget is crossed.
 
@@ -1201,10 +1530,33 @@ class Database:
             raise ValueError("max duration seconds must be positive")
         if preserve_recent_events < 0 or preserve_recent_non_entry_decisions < 0:
             raise ValueError("preserved row counts cannot be negative")
+        if type(category_offset) is not int or category_offset < 0:
+            raise ValueError("category offset must be a nonnegative integer")
         target = int(max_database_bytes * 0.90)
         removed_events = 0
         removed_decisions = 0
-        usage = self._page_usage()
+        deadline = _cleanup_deadline(max_duration_seconds, deadline)
+        assert deadline is not None
+        capacity_deferred = False
+
+        def capacity() -> dict[str, int] | None:
+            nonlocal capacity_deferred
+            try:
+                return self.maintenance_read(
+                    self._page_usage, deadline=deadline, stop_requested=stop_requested
+                )
+            except MaintenanceReadDeferred:
+                capacity_deferred = True
+                return None
+
+        usage = capacity()
+        if usage is None:
+            return {
+                "raw_trades": 0,
+                "non_entry_decisions": 0,
+                "work_remaining": 1,
+                "capacity_deferred": 1,
+            }
         if usage["live_bytes"] <= target:
             # This is the normal path. Exact COUNT(*) queries over a multi-million-row event
             # journal are unnecessary when live pages are already inside the budget.
@@ -1218,10 +1570,10 @@ class Database:
         # Keep individual write locks short while allowing one five-minute pass to retire a
         # genuinely busy legacy backlog. New untracked candidate ticks are no longer durable.
         chunk_size = min(max_rows_per_chunk, max_rows_per_pass)
-        deadline = time.monotonic() + max_duration_seconds
         removable_events = True
         removable_decisions = True
         chunks = 0
+        event_turn = category_offset % 2 == 0
 
         while removed_events + removed_decisions < max_rows_per_pass:
             # Upgrade preparation may arrive while a large legacy backlog is being retired.
@@ -1231,10 +1583,16 @@ class Database:
                 break
             if time.monotonic() >= deadline:
                 break
-            if chunks % 5 == 0 and self._page_usage()["live_bytes"] <= target:
-                break
+            if chunks and chunks % 5 == 0:
+                refreshed = capacity()
+                if refreshed is None:
+                    break
+                usage = refreshed
+                if usage["live_bytes"] <= target:
+                    break
             remaining = max_rows_per_pass - removed_events - removed_decisions
-            if removable_events:
+            deleting_events = removable_events and (event_turn or not removable_decisions)
+            if deleting_events:
                 table, timestamp, identifier, predicate, preserved = (
                     "market_events",
                     "received_at",
@@ -1252,8 +1610,9 @@ class Database:
                 )
             else:
                 break
-            # Identifiers are internal constants. Select the retention boundary inside the same
-            # statement as the delete, including deterministic handling of equal timestamps.
+            # Select the exact boundary inside the delete, so concurrent rollover/inserts
+            # cannot leave a stale retained-row watermark. Raw times use a covering index;
+            # only the boundary's timestamp ties need table visits and identifier sorting.
             boundary = (
                 f"AND ({timestamp},{identifier}) < (SELECT {timestamp},{identifier} FROM {table} "  # noqa: S608 - internal identifiers only
                 f"WHERE {predicate} ORDER BY {timestamp} DESC,{identifier} DESC LIMIT 1 OFFSET ?)"
@@ -1269,10 +1628,37 @@ class Database:
                 if preserved
                 else (min(chunk_size, remaining),)
             )
+            if preserved:
+                # Both timestamp access paths cover eligibility without loading wide JSON
+                # rows. Select IDs only for the old chunk and the retained boundary's ties.
+                # All interpolated identifiers/predicates are the fixed choices above.
+                query = f"""DELETE FROM {table} WHERE {identifier} IN (
+                    WITH boundary_time AS MATERIALIZED (
+                        SELECT {timestamp} AS stamp FROM {table} WHERE {predicate}
+                        ORDER BY {timestamp} DESC LIMIT 1 OFFSET ?
+                    ), boundary AS MATERIALIZED (
+                        SELECT {identifier} FROM {table}
+                        WHERE {predicate} AND {timestamp}=(SELECT stamp FROM boundary_time)
+                        ORDER BY {identifier} DESC LIMIT 1 OFFSET (
+                            SELECT ? - COUNT(*) FROM {table}
+                            WHERE {predicate} AND {timestamp}>(SELECT stamp FROM boundary_time)
+                        )
+                    )
+                        SELECT {identifier} FROM {table} WHERE {predicate}
+                        AND {timestamp} <= (SELECT stamp FROM boundary_time)
+                        AND ({timestamp} < (SELECT stamp FROM boundary_time)
+                             OR {identifier} < (SELECT {identifier} FROM boundary))
+                        ORDER BY {timestamp},{identifier} LIMIT ?
+                    )"""  # noqa: S608 -- fixed internal identifiers only
+                # Rows strictly before the retained timestamp need no tie-rank lookup.
+                # The OR short-circuits that second newest-N scan for old chunks. When a
+                # chunk reaches the boundary, use the same exact identifier tie-break as
+                # before, inside this transaction (no cached cursor across writes).
+                parameters = (preserved - 1, preserved - 1, min(chunk_size, remaining))
             removed = self._retention_transaction(query, parameters, deadline, stop_requested)
             if removed is None:
                 break
-            if removable_events:
+            if deleting_events:
                 removed_events += removed
                 if removed < min(chunk_size, remaining):
                     removable_events = False
@@ -1281,26 +1667,35 @@ class Database:
                 if removed < min(chunk_size, remaining):
                     removable_decisions = False
             chunks += 1
+            event_turn = not deleting_events
             # Give waiting event/heartbeat workers a fair chance to take the connection between
             # chunks; RLock acquisition is not guaranteed to be fair across threads.
             time.sleep(0.01)
 
-        usage = self._page_usage()
+        refreshed = capacity()
+        if refreshed is not None:
+            usage = refreshed
         return {
             "raw_trades": removed_events,
             "non_entry_decisions": removed_decisions,
             "live_bytes": usage["live_bytes"],
             "reclaimable_bytes": usage["reclaimable_bytes"],
+            "capacity_deferred": int(capacity_deferred),
             "work_remaining": int(
-                usage["live_bytes"] > target and (removable_events or removable_decisions)
+                capacity_deferred
+                or (usage["live_bytes"] > target and (removable_events or removable_decisions))
             ),
         }
 
     def _page_usage(self) -> dict[str, int]:
         with self._reader_lock:
-            page_size = int(self._reader_conn.execute("PRAGMA page_size").fetchone()[0])
-            page_count = int(self._reader_conn.execute("PRAGMA page_count").fetchone()[0])
-            free_pages = int(self._reader_conn.execute("PRAGMA freelist_count").fetchone()[0])
+            # One read statement keeps these related counters on the same SQLite view and
+            # avoids repeated statement setup on every bounded cleanup/capacity pass.
+            row = self._reader_conn.execute(
+                "SELECT page_size,page_count,freelist_count "
+                "FROM pragma_page_size(),pragma_page_count(),pragma_freelist_count()"
+            ).fetchone()
+            page_size, page_count, free_pages = (int(value) for value in row)
         allocated = page_size * page_count
         reclaimable = page_size * free_pages
         return {
@@ -1365,9 +1760,17 @@ class Database:
                 self._storage_cache_at = now
         return rows
 
-    def bounded_storage_counts(self, *, seconds: float = 0.05) -> dict[str, int]:
+    def bounded_storage_counts(
+        self, *, seconds: float = 0.05, stop_requested: Callable[[], bool] | None = None
+    ) -> dict[str, int]:
         """Refresh what fits in a detached read budget; omitted counters keep their real age."""
         deadline = time.monotonic() + seconds
+
+        def stopped() -> bool:
+            return time.monotonic() >= deadline or bool(stop_requested and stop_requested())
+
+        if stopped():
+            return {}
         connection = sqlite3.connect(
             f"{self.path.absolute().as_uri()}?mode=ro", uri=True, timeout=0.01
         )
@@ -1382,6 +1785,8 @@ class Database:
             "paper_seasons",
             "learning_observations",
             "learning_evidence_episodes",
+            "learning_activity_discovery",
+            "learning_activity_policy",
             "learning_models",
             "challenger_skill_artifacts",
             "statistical_model_artifacts",
@@ -1395,12 +1800,22 @@ class Database:
             "market_events",
         )
         try:
+            connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA cache_size=-1024")
-            connection.set_progress_handler(lambda: time.monotonic() >= deadline, 500)
-            for table in tables:
-                if time.monotonic() >= deadline:
+            connection.set_progress_handler(stopped, 500)
+            offset = self._storage_count_cursor % len(tables)
+            for index in range(len(tables)):
+                if stopped():
                     break
-                counts[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608 - fixed names
+                table_index = (offset + index) % len(tables)
+                table = tables[table_index]
+                # Resume after the last attempted table, including an interrupted one. A
+                # large table must not consume every refresh before small counters get a turn.
+                self._storage_count_cursor = (table_index + 1) % len(tables)
+                # COUNT(*) uses SQLite's single Count opcode: a large B-tree walk need not
+                # call the progress handler. COUNT(1) offers cancellation during the scan.
+                # Publish only complete counts; a timed-out table keeps its previous age.
+                counts[table] = connection.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0]  # noqa: S608 - fixed names
         except sqlite3.OperationalError as exc:
             if getattr(exc, "sqlite_errorcode", None) not in {
                 sqlite3.SQLITE_INTERRUPT,
@@ -1426,7 +1841,7 @@ class Database:
             self._storage_cache = None
 
     def get_setting(self, key: str, default: Any = None) -> Any:
-        with self._reader_lock:
+        with measured_context(self._reader_lock, enter="setting_read_lock"):
             row = self._reader_conn.execute(
                 "SELECT value_json FROM settings WHERE key=?", (key,)
             ).fetchone()
@@ -1805,14 +2220,16 @@ class Database:
     def append_events(self, events: Sequence[MarketEvent]) -> set[str]:
         """Persist a network batch in one transaction and return newly inserted IDs."""
 
+        if len(events) >= 32:
+            return self._append_events_bulk(events)
         inserted: set[str] = set()
-        with self._lock, self._conn:
+        with (
+            measured_context(self._lock, enter="persist_lock"),
+            measured_context(self._conn, exit="persist_transaction"),
+        ):
             for event in events:
-                cursor = self._conn.execute(
-                    """INSERT OR IGNORE INTO market_events(
-                        event_id,source,kind,mint,signature,slot,block_time,received_at,
-                        schema_version,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (
+                with measure_work("persist_serialize"):
+                    values = (
                         event.event_id,
                         event.source,
                         event.kind.value,
@@ -1823,14 +2240,59 @@ class Database:
                         event.received_at.isoformat(),
                         event.schema_version,
                         json.dumps(event.payload, separators=(",", ":")),
-                    ),
-                )
+                    )
+                with measure_work("persist_sql"):
+                    cursor = self._conn.execute(
+                        """INSERT OR IGNORE INTO market_events(
+                            event_id,source,kind,mint,signature,slot,block_time,received_at,
+                            schema_version,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        values,
+                    )
                 if cursor.rowcount == 1:
                     inserted.add(event.event_id)
             if inserted:
-                # Publish cache invalidation before another reader/writer can see the commit.
-                # Releasing and reacquiring here also made market processing wait a second
-                # time behind maintenance even though its durable write had already finished.
+                # Publish cache invalidation before another reader/writer sees the commit.
+                self._invalidate_storage_cache()
+        return inserted
+
+    def _append_events_bulk(self, events: Sequence[MarketEvent]) -> set[str]:
+        """Reduce burst SQL calls without splitting the batch's atomic commit."""
+        inserted: set[str] = set()
+        with (
+            measured_context(self._lock, enter="persist_lock"),
+            measured_context(self._conn, exit="persist_transaction"),
+        ):
+            # 640 parameters stay below SQLite's historical 999 limit. Each statement
+            # is bounded; only the enclosing connection context commits the batch.
+            for offset in range(0, len(events), 64):
+                with measure_work("persist_serialize"):
+                    values = [
+                        (
+                            event.event_id,
+                            event.source,
+                            event.kind.value,
+                            event.mint,
+                            event.signature,
+                            event.slot,
+                            event.block_time.isoformat() if event.block_time else None,
+                            event.received_at.isoformat(),
+                            event.schema_version,
+                            json.dumps(event.payload, separators=(",", ":")),
+                        )
+                        for event in events[offset : offset + 64]
+                    ]
+                with measure_work("persist_sql"):
+                    cursor = self._conn.execute(
+                        "INSERT OR IGNORE INTO market_events("
+                        "event_id,source,kind,mint,signature,slot,block_time,received_at,"
+                        "schema_version,payload_json) VALUES"
+                        + ",".join(["(?,?,?,?,?,?,?,?,?,?)"] * len(values))
+                        + " RETURNING event_id",
+                        tuple(value for row in values for value in row),
+                    )
+                    # Return only inserted identities; result order grants no chronology.
+                    inserted.update(row[0] for row in cursor.fetchall())
+            if inserted:
                 self._invalidate_storage_cache()
         return inserted
 
@@ -1879,25 +2341,27 @@ class Database:
         )
 
     def save_decision(self, decision: Decision) -> None:
-        with self._lock:
+        with measured_context(self._lock, enter="decision_lock"):
             tracked = None
-            with self._conn:
-                inserted = self._conn.execute(
-                    "INSERT OR IGNORE INTO decisions VALUES(?,?,?,?,?)",
-                    (
+            with measured_context(self._conn, exit="decision_commit"):
+                with measure_work("decision_serialize"):
+                    row = (
                         decision.decision_id,
                         decision.mint,
                         decision.action.value,
                         decision.created_at.isoformat(),
                         decision.model_dump_json(),
-                    ),
-                ).rowcount
-                if inserted and decision.season_id:
-                    tracked = self._record_season_strategy_use(
-                        decision.season_id,
-                        decision_participants(decision),
-                        decision.created_at.isoformat(),
                     )
+                with measure_work("decision_sql"):
+                    inserted = self._conn.execute(
+                        "INSERT OR IGNORE INTO decisions VALUES(?,?,?,?,?)", row
+                    ).rowcount
+                    if inserted and decision.season_id:
+                        tracked = self._record_season_strategy_use(
+                            decision.season_id,
+                            decision_participants(decision),
+                            decision.created_at.isoformat(),
+                        )
             # Cache only committed facts; a failed decision write cannot consume a first-use fact.
             if tracked is not None:
                 self._season_strategy_cache = tracked
@@ -1945,13 +2409,20 @@ class Database:
         selected = tuple(dict.fromkeys(actions))
         if not selected or limit < 1:
             return []
-        placeholders = ",".join("?" for _ in selected)
+        # Each indexed lane contributes at most `limit` rows. A plain IN query may
+        # scan the entire time index looking for rare positives, or sort every match.
+        # rowid preserves the existing insertion-order tie break for equal timestamps.
+        lanes = " UNION ALL ".join(
+            "SELECT * FROM (SELECT record_json,created_at,rowid AS row_order "
+            "FROM decisions WHERE action=? ORDER BY created_at DESC,rowid ASC LIMIT ?)"
+            for _ in selected
+        )
+        parameters = tuple(value for action in selected for value in (action, limit))
         with self._reader_lock:
             rows = self._reader_conn.execute(
-                f"""SELECT record_json FROM decisions
-                    WHERE action IN ({placeholders})
-                    ORDER BY created_at DESC LIMIT ?""",  # noqa: S608 - placeholders only
-                (*selected, limit),
+                f"SELECT record_json FROM ({lanes}) "  # noqa: S608 - fixed SQL fragments
+                "ORDER BY created_at DESC,row_order ASC LIMIT ?",
+                (*parameters, limit),
             ).fetchall()
         return [Decision.model_validate_json(row[0]) for row in rows]
 
@@ -1962,20 +2433,114 @@ class Database:
             ).fetchone()
         return None if row is None else Decision.model_validate_json(row[0])
 
-    def save_learning_observation(self, observation: LearningObservation) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                """INSERT INTO learning_observations VALUES(?,?,?,?,?)
-                   ON CONFLICT(observation_id) DO UPDATE SET
-                   status=excluded.status,record_json=excluded.record_json""",
-                (
-                    observation.observation_id,
-                    observation.mint,
-                    observation.created_at.isoformat(),
-                    observation.status.value,
-                    observation.model_dump_json(),
-                ),
+    @timed_work("checkpoint_persist")
+    def save_learning_observation(
+        self,
+        observation: LearningObservation,
+        *,
+        activity_decision: Decision | None = None,
+        activity_quote: str | None = None,
+    ) -> None:
+        activity = self._prepare_activity(observation, activity_decision, activity_quote)
+        result = "invalid_capture"
+        try:
+            with self._lock, self._conn:
+                existing = (
+                    activity_decision is not None
+                    and self._conn.execute(
+                        "SELECT 1 FROM learning_observations WHERE observation_id=?",
+                        (observation.observation_id,),
+                    ).fetchone()
+                    is not None
+                )
+                self._conn.execute(
+                    """INSERT INTO learning_observations VALUES(?,?,?,?,?)
+                       ON CONFLICT(observation_id) DO UPDATE SET
+                       status=excluded.status,record_json=excluded.record_json""",
+                    (
+                        observation.observation_id,
+                        observation.mint,
+                        observation.created_at.isoformat(),
+                        observation.status.value,
+                        observation.model_dump_json(),
+                    ),
+                )
+                if activity_decision is not None:
+                    result = (
+                        "skipped_existing"
+                        if existing
+                        else self._insert_activity(
+                            "learning_activity_discovery", observation.observation_id, activity
+                        )
+                    )
+        except BaseException:
+            if activity_decision is not None:
+                self._count_activity("parent_failed")
+            raise
+        if activity_decision is not None:
+            self._count_activity(result)
+
+    def _count_activity(self, result: str) -> None:
+        with self._activity_counter_lock:
+            self._activity_counts[result] = self._activity_counts.get(result, 0) + 1
+
+    def activity_capture_counts(self) -> dict[str, int]:
+        """Process-local cumulative acknowledgements; never wait for the writer lock."""
+        with self._activity_counter_lock:
+            return dict(self._activity_counts)
+
+    def _prepare_activity(
+        self,
+        parent: Parent,
+        decision: Decision | None,
+        quote: str | None,
+    ) -> tuple[str, str] | None:
+        if decision is None:
+            return None
+        self._count_activity("attempted")
+        try:
+            evidence = capture_activity(parent, decision, quote)
+            payload = evidence.model_dump_json()
+            if len(payload.encode()) > MAX_ACTIVITY_EVIDENCE_BYTES:
+                return None
+            return payload, "persisted_" + evidence.status
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    def _insert_activity(
+        self,
+        table: str,
+        parent_id: str,
+        activity: tuple[str, str] | None,
+    ) -> str:
+        if activity is None:
+            return "invalid_capture"
+        if table not in {"learning_activity_discovery", "learning_activity_policy"}:
+            raise ValueError("unsupported activity table")
+        self._conn.execute("SAVEPOINT activity_capture")
+        try:
+            cursor = self._conn.execute(
+                f"INSERT INTO {table}(parent_id,record_json) VALUES(?,?) "  # noqa: S608 - allowlist
+                "ON CONFLICT(parent_id) DO NOTHING",
+                (parent_id, activity[0]),
             )
+            self._conn.execute("RELEASE activity_capture")
+            return activity[1] if cursor.rowcount else "skipped_existing"
+        except sqlite3.Error as exc:
+            code = (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+            # Only an intact transaction with a recoverable optional statement error may
+            # preserve the core lesson. FULL, CORRUPT, IOERR, INTERRUPT and rollback triggers
+            # propagate through the original failure path, including commit failure.
+            if not self._conn.in_transaction or code not in {
+                sqlite3.SQLITE_CONSTRAINT,
+                sqlite3.SQLITE_ERROR,
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise
+            self._conn.execute("ROLLBACK TO activity_capture")
+            self._conn.execute("RELEASE activity_capture")
+            return "optional_sql_failed"
 
     def list_learning_observations(self) -> list[LearningObservation]:
         with self._reader_lock:
@@ -2009,11 +2574,43 @@ class Database:
             )
         return [str(row[1]) for row in rows]
 
-    def save_learning_evidence_episode(self, episode: LearningEvidenceEpisode) -> None:
+    @timed_work("checkpoint_persist")
+    def save_learning_evidence_episode(
+        self,
+        episode: LearningEvidenceEpisode,
+        *,
+        activity_decision: Decision | None = None,
+        activity_quote: str | None = None,
+    ) -> None:
         """Insert or advance one idempotent, self-contained evidence trajectory."""
 
-        with self._lock, self._conn:
-            self._upsert_learning_evidence_episode(episode)
+        activity = self._prepare_activity(episode, activity_decision, activity_quote)
+        result = "invalid_capture"
+        try:
+            with self._lock, self._conn:
+                existing = (
+                    activity_decision is not None
+                    and self._conn.execute(
+                        "SELECT 1 FROM learning_evidence_episodes WHERE episode_id=?",
+                        (episode.episode_id,),
+                    ).fetchone()
+                    is not None
+                )
+                self._upsert_learning_evidence_episode(episode)
+                if activity_decision is not None:
+                    result = (
+                        "skipped_existing"
+                        if existing
+                        else self._insert_activity(
+                            "learning_activity_policy", episode.episode_id, activity
+                        )
+                    )
+        except BaseException:
+            if activity_decision is not None:
+                self._count_activity("parent_failed")
+            raise
+        if activity_decision is not None:
+            self._count_activity(result)
         self._invalidate_storage_cache()
 
     def _upsert_learning_evidence_episode(self, episode: LearningEvidenceEpisode) -> None:
@@ -2131,8 +2728,9 @@ class Database:
         with self._reader_lock:
             row = self._reader_conn.execute(
                 """SELECT record_json FROM learning_evidence_episodes
+                   INDEXED BY idx_learning_evidence_decision
                    WHERE lane=? AND json_extract(record_json,'$.decision_id')=?
-                   ORDER BY created_at LIMIT 1""",
+                   ORDER BY created_at,rowid LIMIT 1""",
                 (lane, decision_id),
             ).fetchone()
         return None if row is None else LearningEvidenceEpisode.model_validate_json(row[0])
@@ -2141,11 +2739,17 @@ class Database:
         self,
         entry_fill_id: str,
     ) -> LearningEvidenceEpisode | None:
+        # Preserve the preceding build's decision-index traversal for imported duplicate
+        # fill references. Native references are unique. Sort only matching references,
+        # including rowid ties, instead of scanning/parsing every execution episode.
         with self._reader_lock:
             row = self._reader_conn.execute(
                 """SELECT record_json FROM learning_evidence_episodes
+                   INDEXED BY idx_execution_evidence_entry_fill
                    WHERE lane='execution'
-                     AND json_extract(record_json,'$.entry_fill_id')=? LIMIT 1""",
+                     AND json_extract(record_json,'$.entry_fill_id')=?
+                   ORDER BY json_extract(record_json,'$.decision_id'),
+                            trajectory_key,created_at,rowid LIMIT 1""",
                 (entry_fill_id,),
             ).fetchone()
         return None if row is None else LearningEvidenceEpisode.model_validate_json(row[0])
@@ -2538,6 +3142,7 @@ class Database:
         mode: str | None = None,
         grant_consent: bool = False,
         clear_legacy_model: bool = False,
+        coverage_settings: dict[str, Any] | None = None,
     ) -> None:
         """Commit the entire upstream/downstream activation boundary together."""
         with self.training_publication():
@@ -2549,6 +3154,7 @@ class Database:
                     *([("learning_mode", mode)] if mode else []),
                     *([("challenger_consent_granted", True)] if grant_consent else []),
                     *([("active_learning_model", "")] if clear_legacy_model else []),
+                    *list((coverage_settings or {}).items()),
                 ],
                 datetime.now().astimezone().isoformat(),
             )
@@ -2795,19 +3401,61 @@ class Database:
         if max_resolved < 1 or max_rows < 1:
             raise ValueError("AI assessment retention limits must be positive")
         with self._lock, self._conn:
-            removed = self._conn.execute(
-                """DELETE FROM ai_critic_assessments WHERE assessment_id IN (
-                       SELECT assessment_id FROM ai_critic_assessments
-                       WHERE resolved_at IS NOT NULL AND assessment_id NOT IN (
-                           SELECT assessment_id FROM ai_critic_assessments
-                           WHERE resolved_at IS NOT NULL
-                           ORDER BY created_at DESC LIMIT ?
-                       ) ORDER BY created_at ASC LIMIT ?
-                   )""",
-                (max_resolved, max_rows),
-            ).rowcount
+            removed = self._conn.execute(_PRUNE_AI_ASSESSMENTS, (max_resolved, max_rows)).rowcount
         self._invalidate_storage_cache()
         return max(0, removed)
+
+    def prune_optional_history(
+        self,
+        category: str,
+        *,
+        max_rows: int = 50,
+        max_duration_seconds: float = 0.05,
+        deadline: float | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        timing: dict[str, float] | None = None,
+    ) -> dict[str, int]:
+        """One bounded optional transaction; deferral never means the table is empty."""
+        if type(max_rows) is not int or max_rows < 1:
+            raise ValueError("optional history row limit must be a positive integer")
+        if category == "incidents":
+            query, parameters = _PRUNE_INCIDENTS, (max_rows, 2_000)
+        elif category == "ai_assessments":
+            query, parameters = _PRUNE_AI_ASSESSMENTS, (5_000, max_rows)
+        else:
+            raise ValueError("unknown optional history category")
+        deadline = _cleanup_deadline(max_duration_seconds, deadline)
+        details = timing if timing is not None else {}
+        details.update(
+            dict.fromkeys(
+                (
+                    "lock_wait_seconds",
+                    "query_seconds",
+                    "completed_queries",
+                    "lock_timeouts",
+                    "query_budget_exhausted",
+                    "query_busy",
+                    "setup_seconds",
+                    "restore_seconds",
+                    "query_budget_seconds",
+                ),
+                0.0,
+            )
+        )
+        started, cpu_started = time.monotonic(), thread_time()
+        try:
+            removed = self._retention_transaction(
+                query, parameters, deadline, stop_requested, timing=details
+            )
+            return {
+                "removed": removed if removed is not None else 0,
+                "completed": int(removed is not None),
+                "deferred": int(removed is None),
+                "work_remaining": int(removed is None or removed >= max_rows),
+            }
+        finally:
+            details["worker_seconds"] = max(0.0, time.monotonic() - started)
+            details["worker_cpu_seconds"] = max(0.0, thread_time() - cpu_started)
 
     def save_coach_review(self, review: CoachReview) -> None:
         with self._lock, self._conn:
@@ -3446,18 +4094,12 @@ class Database:
         if max_records < 1 or max_rows < 1:
             raise ValueError("incident retention limits must be positive")
         with self._lock, self._conn:
-            removed = self._conn.execute(
-                """DELETE FROM operational_incidents WHERE incident_id IN (
-                       SELECT incident_id FROM operational_incidents
-                       WHERE resolved_at IS NOT NULL ORDER BY last_seen_at DESC
-                       LIMIT ? OFFSET ?
-                   )""",
-                (max_rows, max_records),
-            ).rowcount
+            removed = self._conn.execute(_PRUNE_INCIDENTS, (max_rows, max_records)).rowcount
         return max(0, removed)
 
+    @timed_work("order_save")
     def save_order(self, order: PaperOrder) -> None:
-        with self._lock, self._conn:
+        with measured_context(self._lock, enter="order_lock"), self._conn:
             self._conn.execute(
                 """INSERT INTO paper_orders VALUES(?,?,?,?,?,?)
                    ON CONFLICT(order_id) DO UPDATE SET status=excluded.status,
@@ -3472,12 +4114,14 @@ class Database:
                 ),
             )
             if order.decision_id:
-                row = self._conn.execute(
-                    """SELECT record_json FROM learning_evidence_episodes
-                       WHERE lane='policy'
-                         AND json_extract(record_json,'$.decision_id')=? LIMIT 1""",
-                    (order.decision_id,),
-                ).fetchone()
+                with measure_work("order_lookup"):
+                    row = self._conn.execute(
+                        """SELECT record_json FROM learning_evidence_episodes
+                           WHERE lane='policy'
+                             AND json_extract(record_json,'$.decision_id')=?
+                           ORDER BY trajectory_key LIMIT 1""",
+                        (order.decision_id,),
+                    ).fetchone()
                 if row is not None:
                     episode = LearningEvidenceEpisode.model_validate_json(row[0]).model_copy(
                         update={"order_id": order.order_id}
@@ -3520,6 +4164,61 @@ class Database:
                 "SELECT record_json FROM fills ORDER BY filled_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [FillReceipt.model_validate_json(row[0]) for row in rows]
+
+    def entry_receipt_sample(
+        self, fills: Sequence[FillReceipt]
+    ) -> list[tuple[FillReceipt, FillReceipt | None, Decision | None]]:
+        """Read exact entry provenance for at most 30 displayed fills; never scan decisions.
+
+        A sell may refer to a buy outside the UI window. Resolve that parent by the existing
+        mint/side/time index, and keep an unmatched sell out of realized-pair arithmetic.
+        This is reporting only; existing Policy/Execution records are not rewritten.
+        """
+        if len(fills) > 30:
+            raise ValueError("entry receipt sample is limited to 30 fills")
+        entries: dict[str, tuple[FillReceipt, FillReceipt | None, Decision | None]] = {}
+        seen_fills: set[str] = set()
+        closes: dict[str, set[str]] = {}
+        with self._reader_lock:
+            for fill in fills:
+                if fill.fill_id in seen_fills:
+                    continue
+                seen_fills.add(fill.fill_id)
+                entry = fill
+                close = None
+                if fill.side == Side.SELL:
+                    if fill.position_opened_at is None:
+                        continue
+                    parents = self._reader_conn.execute(
+                        "SELECT record_json FROM fills WHERE mint=? AND side='buy' "
+                        "AND filled_at=? LIMIT 2",
+                        (fill.mint, fill.position_opened_at.isoformat()),
+                    ).fetchall()
+                    if len(parents) != 1:
+                        continue
+                    entry = FillReceipt.model_validate_json(parents[0][0])
+                    close = fill
+                previous = entries.get(entry.fill_id)
+                if close is not None:
+                    closes.setdefault(entry.fill_id, set()).add(close.fill_id)
+                if previous is not None:
+                    # More than one purported full close is ambiguous, never extra profit.
+                    if close is not None:
+                        entries[entry.fill_id] = (
+                            entry,
+                            close if len(closes[entry.fill_id]) == 1 else None,
+                            previous[2],
+                        )
+                    continue
+                row = self._reader_conn.execute(
+                    "SELECT d.record_json FROM paper_orders o JOIN decisions d "
+                    "ON d.decision_id=json_extract(o.record_json,'$.decision_id') "
+                    "WHERE o.order_id=?",
+                    (entry.order_id,),
+                ).fetchone()
+                decision = Decision.model_validate_json(row[0]) if row else None
+                entries[entry.fill_id] = (entry, close, decision)
+        return list(entries.values())
 
     def bought_mints(self) -> set[str]:
         """Exact re-entry guard; a UI history limit must never affect trading authority."""
@@ -3615,6 +4314,7 @@ class Database:
         finally:
             connection.close()
 
+    @timed_work("position_save")
     def save_position(self, position: Position) -> None:
         with self._lock:
             tracked = None
@@ -3658,6 +4358,7 @@ class Database:
         with self._lock, self._conn:
             self._insert_ledger(tx_id, now, rows)
 
+    @timed_work("fill_save")
     def commit_buy_fill(
         self,
         order: PaperOrder,
@@ -3687,6 +4388,7 @@ class Database:
             if evidence_episode is not None:
                 self._upsert_learning_evidence_episode(evidence_episode)
 
+    @timed_work("fill_save")
     def commit_sell_fill(
         self,
         order: PaperOrder,
@@ -3815,7 +4517,10 @@ class Database:
         )
 
     def ledger_balance(self, account: str) -> int:
-        with self._reader_lock:
+        with (
+            measured_context(self._reader_lock, enter="ledger_read_lock"),
+            measure_work("ledger_read_sql"),
+        ):
             row = self._reader_conn.execute(
                 """SELECT COALESCE(SUM(debit_lamports-credit_lamports),0)
                    FROM ledger_entries WHERE account=?""",
@@ -3845,6 +4550,7 @@ class Database:
             ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
+    @timed_work("equity_save")
     def record_equity(
         self,
         equity_lamports: int,
@@ -3855,7 +4561,10 @@ class Database:
         observed_at = recorded_at or datetime.now().astimezone()
         now = observed_at.isoformat()
         bucket = observed_at.replace(minute=0, second=0, microsecond=0).isoformat()
-        with self._lock, self._conn:
+        with (
+            measured_context(self._lock, enter="equity_write_lock"),
+            measured_context(self._conn, exit="equity_commit"),
+        ):
             self._conn.execute(
                 """INSERT INTO equity_points(
                     recorded_at,equity_lamports,cash_lamports) VALUES(?,?,?)""",
@@ -4355,6 +5064,14 @@ class Database:
             )
             self._conn.execute(
                 f"CREATE INDEX idx_decisions_created_{suffix} ON decisions(created_at DESC)"  # noqa: S608
+            )
+            self._conn.execute(
+                f"CREATE INDEX idx_decisions_action_time_{suffix} "  # noqa: S608
+                "ON decisions(action,created_at DESC)"
+            )
+            self._conn.execute(
+                f"CREATE INDEX idx_decisions_nonentry_time_{suffix} "  # noqa: S608
+                "ON decisions(created_at DESC) WHERE action!='enter'"
             )
         for table in (
             "fills",

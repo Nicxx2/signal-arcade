@@ -305,7 +305,7 @@ const snapshot: Snapshot = {
     ai_critic_assessments: 0, coach_reviews: 0, coach_hypotheses: 0,
     operational_incidents: 0,
     database_bytes: 0, live_bytes: 0, reclaimable_bytes: 0, wal_bytes: 0,
-    total_disk_bytes: 0, max_database_bytes: 5 * 1024 ** 3,
+    total_disk_bytes: 0, max_database_bytes: 5 * 1024 ** 3, policy_revision: 0,
     raw_trade_retention_hours: 6, maintenance_interval_seconds: 300, model_storage_included: false,
   },
 };
@@ -952,7 +952,7 @@ test("confirms a storage policy save without waiting for background refresh", as
   let snapshotRequests = 0;
   const fetchMock = vi.fn().mockImplementation(async (input: string) => {
     if (input === "/api/v1/storage-settings") {
-      return { ok: true, json: async () => snapshot.storage };
+      return { ok: true, json: async () => ({ ...snapshot.storage, max_database_bytes: 2.5 * 1024**3, raw_trade_retention_hours: 12, policy_revision: 1 }) };
     }
     snapshotRequests += 1;
     if (snapshotRequests > 1) return new Promise(() => undefined);
@@ -963,17 +963,17 @@ test("confirms a storage policy save without waiting for background refresh", as
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-  fireEvent.change(screen.getByLabelText(/^Maximum database/), { target: { value: "2.5" } });
+  fireEvent.change(screen.getByLabelText(/^Live-data budget/), { target: { value: "2.5" } });
   fireEvent.change(screen.getByLabelText(/^Raw event history/), { target: { value: "12" } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-  expect(await screen.findByRole("button", { name: "Saved" })).toBeEnabled();
+  expect(await screen.findByRole("button", { name: "Saved" })).toBeDisabled();
   expect(screen.getByText("Policy saved. Cleanup continues safely in the background.")).toBeInTheDocument();
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/v1/storage-settings",
     expect.objectContaining({
       method: "PUT",
-      body: JSON.stringify({ max_database_gb: 2.5, raw_trade_retention_hours: 12 }),
+      body: JSON.stringify({ max_database_gb: 2.5, raw_trade_retention_hours: 12, expected_revision: 0 }),
     }),
   );
 });
@@ -1148,10 +1148,13 @@ test("supports keyboard navigation between Learning sub-tabs", async () => {
 
 test("falls back safely when Learning preferences are corrupt or unavailable", async () => {
   window.localStorage.setItem(learningUiKey, "{not-json");
-  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (key: string, value: string) {
+  const originalSetItem = Storage.prototype.setItem;
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key: string, value: string) {
     if (key === learningUiKey) throw new DOMException("Storage unavailable", "SecurityError");
-    window.localStorage.setItem(key, value);
+    originalSetItem.call(this, key, value);
   });
+  window.localStorage.setItem("unrelated-fixture", "kept");
+  expect(window.localStorage.getItem("unrelated-fixture")).toBe("kept");
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot }));
   render(<App />);
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
@@ -1912,7 +1915,7 @@ test("keeps core settings visible while secondary model and provider details sta
   expect(screen.getByText("Data health")).toBeInTheDocument();
   expect(screen.getByText("0 processed · 0 transient · 0 saved · 0 shed · 0 expired")).toBeInTheDocument();
   expect(screen.getByText("Storage budget")).toBeInTheDocument();
-  expect(screen.getByText("Background cleanup is ready and will yield to market traffic.")).toBeInTheDocument();
+  expect(screen.getByText("Waiting for a completed storage check.")).toBeInTheDocument();
   expect(screen.getByText("Selected model")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Show local AI models" })).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByRole("button", { name: "Show data providers" })).toHaveAttribute("aria-expanded", "false");
@@ -1935,16 +1938,16 @@ test.each(["2026-09-01T00:00:00Z", "invalid", undefined])("shows only measured r
       maintenance: { active: false, requested: true, budget_state: "within_budget",
         deferred_reason: null, deferred_since: null, last_started_at: null, last_completed_at: null,
         last_duration_seconds: 0, last_phase_seconds: {}, last_removed: {},
-        oldest_retained_trade_at: oldest } },
+        oldest_retained_trade_at: oldest, history_checked_at: "2026-09-06T00:00:00Z" } },
   };
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => state }));
   render(<App />);
   expect(await screen.findByText("Your strategy, playing forward.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   if (oldest?.startsWith("2026")) {
-    expect(screen.getByText(/oldest raw trade is 120 hours old; target 24 hours/)).toBeInTheDocument();
+    expect(screen.getByText(/oldest raw trade was 120 hours old; target 24 hours/)).toBeInTheDocument();
   } else {
-    expect(screen.queryByText(/History cleanup is catching up:/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Raw history measurement unavailable/)).toBeInTheDocument();
   }
 });
 
@@ -2907,9 +2910,49 @@ test("retains the last good Results table while a new sort retries", async () =>
 
   fireEvent.click(screen.getByRole("button", { name: "Most loss" }));
   await waitFor(() => expect(leaderboardCalls).toBe(2));
-  expect(await screen.findByText("Showing the last saved order while Results retries…")).toBeInTheDocument();
+  expect(await screen.findByText("Most loss is taking longer. Retrying… Showing Most profit.")).toBeInTheDocument();
   expect(screen.getByText("KEPT")).toBeInTheDocument();
   expect(screen.queryByText("No paper results yet")).not.toBeInTheDocument();
+});
+
+test("labels the retained Results order and ignores superseded sort responses", async () => {
+  const result = (sort: "profit" | "loss" | "recent") => ({
+    sort,
+    summary: { closed_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null },
+    rows: [],
+  });
+  const pending: Record<string, (response: unknown) => void> = {};
+  const signals: Record<string, AbortSignal> = {};
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      const sort = new URL(input, "http://localhost").searchParams.get("sort")!;
+      if (sort === "profit") return Promise.resolve({ ok: true, json: async () => result("profit") });
+      signals[sort] = init!.signal as AbortSignal;
+      // Deliberately resolve even after abort: a late response must not replace the new order.
+      return new Promise((resolve) => { pending[sort] = resolve; });
+    }
+    return Promise.resolve({ ok: true, json: async () => snapshot });
+  }));
+  const { container } = render(<App />);
+  await screen.findByText("Your strategy, playing forward.");
+  fireEvent.click(screen.getByRole("button", { name: "Results" }));
+  await screen.findByText("Showing Most profit");
+
+  fireEvent.click(screen.getByRole("button", { name: "Most loss" }));
+  expect(within(container.querySelector(".results-controls") as HTMLElement).getByRole("status"))
+    .toHaveTextContent("Loading Most loss… Showing Most profit.");
+  expect(screen.getByRole("table", { name: "Trades ordered by Most profit" })).toHaveAttribute("aria-busy", "true");
+  expect(screen.queryByText("No closed trades this season yet")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Latest" }));
+  expect(signals.loss!.aborted).toBe(true);
+  expect(screen.getByText("Loading Latest… Showing Most profit.")).toBeInTheDocument();
+  await act(async () => { pending.recent!({ ok: true, json: async () => result("recent") }); });
+  expect(screen.getByRole("table", { name: "Trades ordered by Latest" })).toHaveAttribute("aria-busy", "false");
+  expect(screen.getByText("No current-season trades yet")).toBeInTheDocument();
+  await act(async () => { pending.loss!({ ok: true, json: async () => result("loss") }); });
+  expect(screen.getByText("Showing Latest")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Latest" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.queryByText("Showing Most loss")).not.toBeInTheDocument();
 });
 
 test("makes missing token identity useful without overstating confidence", async () => {
@@ -3791,7 +3834,7 @@ test("shows that stopped positions are preserved and offers resume", async () =>
   expect(screen.getByText("Positions are preserved and still marked from fresh data.")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();
   expect(screen.getByText("AAA")).toBeInTheDocument();
-  expect(screen.getByText(/Adaptive extension · 78% support/)).toBeInTheDocument();
+  expect(screen.getByText(/Adaptive extension · 78% hold score/)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Copy AAA mint address" })).toHaveAttribute("title", "mint-aaa");
   expect(screen.getByRole("link", { name: "Open AAA on GMGN" })).toHaveAttribute("href", "https://gmgn.ai/sol/token/mint-aaa");
   expect(screen.getByRole("link", { name: "Open AAA on GMGN" })).toHaveAttribute("target", "_blank");
@@ -4659,4 +4702,62 @@ test("labels Champion availability separately from the named contender's gates",
   expect(within(card).getByText("Candidate · collecting proof")).toBeInTheDocument();
   expect(within(card).getByText("0 / 1 candidate gates")).toHaveAttribute("title", "newest");
   expect(within(card).getByText("Waiting for evidence")).toBeInTheDocument();
+});
+
+test("describes an unavailable capacity refresh without claiming storage is healthy", async () => {
+  const state: Snapshot = { ...snapshot, storage: { ...snapshot.storage, maintenance: {
+    active: false, requested: true, budget_state: "capacity_unknown", deferred_reason: "storage_reader_busy",
+    deferred_since: null, last_started_at: null, last_completed_at: null,
+    last_duration_seconds: 0.05, last_phase_seconds: {}, last_removed: {}, history_checked_at: null,
+  } } };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => state }));
+  render(<App />);
+  await screen.findByText("Your strategy, playing forward.");
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.getByText("Storage capacity could not be refreshed yet. Showing the last measurement; cleanup will retry.")).toBeInTheDocument();
+  expect(screen.queryByText("Background cleanup is waiting for quieter market traffic.")).not.toBeInTheDocument();
+});
+
+test.each(["retry", "leave"])("handles a stalled Results sort safely on %s", async (scenario) => {
+  const { fetcher, unmount } = recoveringDashboard();
+  let lossCalls = 0;
+  const result = (sort: string) => ({ ok: true, json: async () => ({
+    sort, rows: [], summary: { closed_trades: 0, wins: 0, losses: 0, total_realized_pnl_minor: 0,
+      total_fees_minor: 0, audited_exits: 0, winner_reversals: 0, average_peak_capture_fraction: null },
+  }) });
+  fetcher.mockImplementation((input: string, init?: RequestInit) => {
+    if (input.startsWith("/api/v1/leaderboard")) {
+      const sort = new URL(input, "http://localhost").searchParams.get("sort")!;
+      if (sort === "loss" && ++lossCalls === 1) {
+        return new Promise((_resolve, reject) => {
+          init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      }
+      return Promise.resolve(result(sort));
+    }
+    return Promise.resolve({ ok: true, json: async () => snapshot });
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Results" })); });
+  expect(screen.getByText("Showing Most profit")).toBeInTheDocument();
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Most loss" })); });
+  if (scenario === "leave") {
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Arena" })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(lossCalls).toBe(1);
+    expect(screen.queryByText("Results could not be loaded")).not.toBeInTheDocument();
+  } else {
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(screen.getByText("Most loss is taking longer. Retrying… Showing Most profit.")).toBeInTheDocument();
+    expect(lossCalls).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_999); });
+    expect(lossCalls).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(lossCalls).toBe(2);
+    expect(screen.getByText("Showing Most loss")).toBeInTheDocument();
+  }
+  unmount();
+  const stoppedAt = fetcher.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  expect(fetcher).toHaveBeenCalledTimes(stoppedAt);
 });

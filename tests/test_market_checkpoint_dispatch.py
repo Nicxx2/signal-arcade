@@ -3,6 +3,7 @@
 import asyncio
 import copy
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from signal_arcade.database import Database
@@ -251,7 +252,9 @@ def test_real_event_handler_resumes_each_lane_and_keeps_ai_and_order_updates(set
     monkeypatch.setattr(engine.learning, "observe_market", observe)
     # A pending order, without a position, must also retain the broker update path.
     monkeypatch.setattr(engine.broker, "has_pending_for", lambda mint: mint == state.mint)
-    monkeypatch.setattr(engine.ai_lab, "has_pending_outcome", lambda mint: mint == state.mint)
+    # Keep an actual due clock behind the fake AI observer: pending alone no longer
+    # implies that an outcome handler must run on every trade.
+    engine.ai_lab.pending_outcomes[state.mint] = [SimpleNamespace(outcome_due_at=start)]
     monkeypatch.setattr(
         engine.ai_lab, "observe_market", lambda token, now: ai_calls.append(now) or 0
     )

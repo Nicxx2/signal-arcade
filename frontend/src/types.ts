@@ -49,6 +49,18 @@ export interface FeatureSnapshot {
   hard_flags: string[];
 }
 
+export interface DecisionSkillReceipt {
+  artifact_version: string;
+  skill: string;
+  evaluated_at: string;
+  prediction: number | null;
+  conservative_value: number | null;
+  in_distribution: boolean;
+  proposed_action: string;
+  baseline_actionable: boolean;
+  parameters?: Record<string, number | boolean | string | null>;
+}
+
 export interface Decision {
   decision_id: string;
   mint: string;
@@ -72,6 +84,7 @@ export interface Decision {
   season_profile_fingerprint?: string | null;
   configuration_fingerprint: string | null;
   planned_order_size_sol: number | null;
+  challenger_assessments?: Record<string, DecisionSkillReceipt>;
   integrity_assessment?: {
     policy_version: string;
     state: "clean" | "uncertain" | "suspicious" | "severe";
@@ -175,6 +188,7 @@ export interface Fill {
   latency_ms: number;
   venue: string;
   execution_model_version?: string;
+  execution_fee_provenance?: Record<string, unknown> | null;
   reserve_snapshot?: {
     observed_at: string;
     event_id: string | null;
@@ -366,17 +380,21 @@ export interface ChallengerSkillStatus {
   latest_policy_unchanged?: boolean;
   suspension?: {
     reason: string | null; since: string | null;
-    status: "waiting" | "collecting" | "passed" | "failed" | "context_changed" | "blocked" | "restored";
+    status: "waiting" | "collecting" | "passed" | "failed" | "context_changed" | "policy_changed" | "blocked" | "restored";
     enrolled_count: number; observed_count: number; usable_count: number;
+    minimum_availability_fraction?: number | null;
     availability_fraction: number; window_size: number; restored_at: string | null;
     failed_checks?: string[] | null;
   } | null;
-  support_proof?: { artifact_version: string; ready: boolean; usable_count: number; observed_count: number; availability_fraction: number; uplift_lower_bound: number | null } | null;
+  support_proof?: { minimum_availability_fraction?: number | null; artifact_version: string; ready: boolean; usable_count: number; observed_count: number; availability_fraction: number; uplift_lower_bound: number | null } | null;
   skill: "entry" | "manipulation" | "sizing" | "exit";
   label: string;
   state: "collecting" | "collecting_proof" | "candidate_testing" | "qualified" | "active" | "suspended";
   latest_candidate: {
     version: string;
+    schema_version?: string;
+    evidence_started_at?: string | null;
+    evidence_ended_at?: string | null;
     codename?: string;
     created_at: string;
     model_family?: "linear" | "xgboost" | "deterministic";
@@ -393,7 +411,13 @@ export interface ChallengerSkillStatus {
     validation_count: number;
     embargoed_count: number;
     qualified: boolean;
+    minimum_outcome_coverage?: number | null;
     metrics: Record<string, number | boolean | null>;
+    coverage_breakdown?: {
+      schema: number; resolved: number; usable: number;
+      quote_liquidity: number; quote_fees: number; quote_other: number;
+      stale_route: number; window_elapsed: number; other_missing: number;
+    } | null;
     parameters: Record<string, unknown>;
   } | null;
   testing_version: string | null;
@@ -412,6 +436,7 @@ export interface ChallengerSkillStatus {
     observed_count: number;
     usable_count: number;
     minimum_samples: number;
+    minimum_availability_fraction?: number | null;
     availability_fraction: number;
     estimated_uplift: number | null;
     uplift_upper_bound: number | null;
@@ -515,6 +540,8 @@ export interface EntryProofIdentity {
 }
 
 export interface ChampionImpactComparison {
+  actions?: { supported_entry: number; supported_veto: number; fallback: number; unavailable: number } | null;
+  cash_reference_mean?: number | null;
   subject: ChallengerSkillStatus["skill"] | "team";
   state: "collecting" | "positive" | "negative" | "uncertain";
   observed_count: number;
@@ -533,6 +560,17 @@ export interface ChampionImpactComparison {
 }
 
 export interface ChampionImpactReport {
+  execution_sample?: {
+    state: "available" | "unavailable";
+    sample_limit?: number;
+    unlinked_entries?: number;
+    skills?: Array<{
+      skill: "entry" | "manipulation"; observed_count: number; supported_entry: number;
+      fallback: number; unknown: number; later_fallback: number;
+      outcomes: Array<{ category: string; currency: string; decimals: number; closed_count: number;
+        unresolved_count: number; net_minor: number; winning_count: number }>;
+    }>;
+  };
   schema_version: 1;
   state: "available" | "unavailable";
   as_of: string;
@@ -546,7 +584,17 @@ export interface ChampionImpactReport {
   comparisons: ChampionImpactComparison[];
 }
 
+export interface CoverageSettings {
+  percent: 70 | 65 | 60 | 55;
+  revision: number;
+  effective_at: string | null;
+  options: number[];
+  error: string | null;
+  coach_percent: number;
+}
+
 export interface LearningStatus {
+  coverage_policy?: CoverageSettings;
   mode: LearningMode;
   state: "paused" | "collecting" | "challenger_testing" | "ready" | "active";
   demo_excluded: boolean;
@@ -939,11 +987,12 @@ export interface StorageStatus {
   total_disk_bytes: number;
   max_database_bytes: number;
   raw_trade_retention_hours: number;
+  policy_revision?: number;
   maintenance_interval_seconds: number;
   maintenance?: {
     active: boolean;
     requested: boolean;
-    budget_state: "within_budget" | "cleanup_needed" | "retained_evidence_above_target";
+    budget_state: "within_budget" | "cleanup_needed" | "retained_evidence_above_target" | "capacity_unknown";
     deferred_reason: string | null;
     deferred_since: string | null;
     last_started_at: string | null;
@@ -953,7 +1002,8 @@ export interface StorageStatus {
     last_removed: Record<string, number>;
     removed_since_start?: Record<string, number>;
     oldest_retained_trade_at?: string | null;
-    history_checked_at?: string;
+    history_checked_at?: string | null;
+    capacity_checked_at?: string;
   };
   model_storage_included: false;
 }

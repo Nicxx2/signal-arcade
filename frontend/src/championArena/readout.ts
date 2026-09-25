@@ -32,7 +32,7 @@ export function battleReadout(view: ArenaView, stale: boolean) {
   const contender = view.right?.name ?? "The contender";
   const counts = numeric(view.usable) && numeric(view.observed) && Number.isInteger(view.usable) && Number.isInteger(view.observed) && view.usable > 0 && view.usable <= view.observed;
   const coverage = numeric(view.coverage) && view.coverage >= 0 && view.coverage <= 1;
-  const enough = counts && coverage && view.usable! >= view.minimum && view.minimum > 0 && view.coverage! >= view.minimumCoverage && view.minimumCoverage > 0;
+  const enough = counts && coverage && view.usable! >= view.minimum && view.minimum > 0 && numeric(view.minimumCoverage) && view.coverage! >= view.minimumCoverage && view.minimumCoverage > 0;
   const bounds = numeric(view.mean) && numeric(view.lower) && numeric(view.upper) && view.lower <= view.mean && view.mean <= view.upper;
   // Delayed delivery does not invalidate the last measured comparison. Label its age,
   // while the renderer still pauses exchanges and missing/mismatched proof stays unknown.

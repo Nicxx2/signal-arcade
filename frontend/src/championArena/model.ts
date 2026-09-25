@@ -30,7 +30,7 @@ export interface ArenaView {
   title: string; detail: string; outcome: Outcome | null; event: ChallengerChampionEvent | null;
   usable: number | null; observed: number | null; coverage: number | null;
   mean: number | null; lower: number | null; upper: number | null;
-  minimum: number; minimumCoverage: number; momentum: "left" | "right" | "neutral";
+  minimum: number; minimumCoverage: number | null; momentum: "left" | "right" | "neutral";
   generation: number | null; paused: boolean; gates: ChallengerSkillStatus["gates"];
   replayStep?: number; replayFinal?: boolean; replayAt?: string;
   evidenceAt?: string; superseded?: boolean;
@@ -95,8 +95,8 @@ export function viewForSkill(snapshot: Snapshot, skill: Skill): ArenaView | null
   const upper = matched ? finite(t.uplift_upper_bound) : null;
   const mean = matched ? finite(t.mean_uplift) : null;
   const minimum = count(snapshot.learning.challenger_common_forward_minimum) ?? 30;
-  const minimumCoverage = fraction(snapshot.learning.challenger_minimum_availability) ?? 0.7;
-  const supported = usable !== null && observed !== null && usable <= observed && usable >= minimum && coverage !== null && coverage >= minimumCoverage;
+  const minimumCoverage = t.minimum_availability_fraction === undefined ? 0.7 : fraction(t.minimum_availability_fraction);
+  const supported = usable !== null && observed !== null && usable <= observed && usable >= minimum && coverage !== null && minimumCoverage !== null && coverage >= minimumCoverage;
   // Suspension removes trade influence. A valid shadow pair can still collect proof.
   const paused = snapshot.learning.mode === "off" || !snapshot.learning.collecting_from_current_source;
   return {

@@ -96,7 +96,7 @@ def test_layout_export_waits_behind_proof_and_collection_then_survives_storage(s
             "collection",
         ]
         assert engine.diagnostics.dropped == 0
-        engine.diagnostics.events.clear()
+        engine.diagnostics._take_events(0)
         # Collection cadence must not strand the deferred layout sample for five minutes.
         engine._record_collection_diagnostics()
         assert [e["kind"] for e in engine.diagnostics.events] == ["reserve_layout"]
@@ -134,7 +134,7 @@ def test_four_distinct_layout_samples_fit_event_budget_and_cadence(settings, mon
             with engine._reserve_validation.batch(source) as batch:
                 batch.rejected(venue, error)
         engine._record_reserve_layout_diagnostics()
-        event = engine.diagnostics.events.pop()
+        event = engine.diagnostics._take_events(0)[-1]
         assert len(event["layouts"]) == 4
         assert decode(encode(event, max_payload=MAX_EVENT_PAYLOAD)) == event
         tick[0] += 299.999
@@ -143,7 +143,7 @@ def test_four_distinct_layout_samples_fit_event_budget_and_cadence(settings, mon
         tick[0] += 0.0011
         engine._record_reserve_layout_diagnostics()
         assert len(engine.diagnostics.events) == 1
-        engine.diagnostics.events.clear()
+        engine.diagnostics._take_events(0)
         engine.diagnostics.enabled = False
         tick[0] += 300
         engine._record_reserve_layout_diagnostics()

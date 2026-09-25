@@ -5,7 +5,10 @@ export function SkillSuspension({ skill, paused, supportAllowed }: {
 }) {
   if (skill.state !== "suspended") return null;
   const proof = skill.suspension;
+  const minimum = proof?.minimum_availability_fraction === undefined ? 0.70 : proof.minimum_availability_fraction;
+  const coverage = typeof minimum === "number" && Number.isFinite(minimum) ? `${(minimum * 100).toFixed(0)}% coverage` : "its recorded coverage requirement (currently unavailable)";
   const reason = proof?.reason === "degraded" ? "Recent evidence showed harm."
+    : proof?.reason === "coverage_policy_changed" ? "The coverage requirement changed; this Champion needs new qualifying proof."
     : proof?.reason === "unverifiable" ? "Recent evidence could not verify safe support."
       : "Current activation proof needs a qualified replacement.";
   const since = proof?.since ? new Date(proof.since) : null;
@@ -18,11 +21,12 @@ export function SkillSuspension({ skill, paused, supportAllowed }: {
       ? <p>{!supportAllowed ? "Automatic support is off. " : paused ? "Resume learning to continue checks. " : ""}
         {proof.status === "passed" ? "The recovery trial passed; current activation gates must also pass."
           : `Fresh recovery trial: ${proof.enrolled_count} / ${proof.window_size} enrolled · ${proof.observed_count} resolved · ${proof.usable_count} usable.`}
-        {" "}One fixed window must pass 70% coverage, a safe advantage and harm checks before this Champion can return. Failed windows are not retried.</p>
+        {" "}One fixed window must pass {coverage}, a safe advantage and harm checks before this Champion can return. Failed windows are not retried.</p>
       : <>
         {proof?.status === "failed" && <p>Recovery trial finished: {proof.usable_count} usable of {proof.observed_count} resolved.
           {" "}{failed.length ? `Checks not met: ${failed.join(", ")}.` : "Not all safety checks passed; individual results were not recorded."}
           {" "}This fixed trial will not restart.</p>}
+        {proof?.status === "policy_changed" && <p>The requirement was raised during recovery. This trial stays closed; changing it back does not restart the trial.</p>}
         {proof?.status === "context_changed" && <p>The skill combination changed during recovery. This trial cannot establish support for the new combination.</p>}
         <p>A newly proved replacement can still qualify through the normal battle process.</p>
       </>}

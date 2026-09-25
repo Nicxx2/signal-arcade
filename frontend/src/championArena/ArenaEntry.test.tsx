@@ -1,9 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, beforeAll, expect, test } from "vitest";
 import { ArenaProvider, ArenaRecapButton, ArenaSkillButton } from "./ArenaEntry";
 import { GRAPHICS_KEY } from "./model";
 import { eventFixture, snapshotFixture, skillFixture } from "./fixtures";
 
+// Focus behavior must not depend on the test runner's cold lazy-module compilation time.
+beforeAll(async () => { await import("./ArenaDialog"); });
 afterEach(() => { cleanup(); localStorage.clear(); });
 test("switching skills preserves the original trigger for focus restoration", async () => {
   localStorage.setItem(GRAPHICS_KEY, "off");
@@ -11,7 +13,7 @@ test("switching skills preserves the original trigger for focus restoration", as
   render(<ArenaProvider snapshot={snapshot}><ArenaSkillButton skill="entry" /></ArenaProvider>);
   const trigger = screen.getByRole("button", { name: "Entry: Watch battle in Champion Arena" });
   trigger.focus(); fireEvent.click(trigger);
-  const exit = await screen.findByRole("button", { name: "Exit" });
+  const exit = await screen.findByRole("button", { name: "Exit" }, { timeout: 3000 });
   exit.focus(); fireEvent.click(exit);
   await waitFor(() => expect(screen.getByRole("button", { name: "Exit" })).toHaveAttribute("aria-pressed", "true"));
   fireEvent.keyDown(window, { key: "Escape" });

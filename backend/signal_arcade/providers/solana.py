@@ -4,22 +4,25 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import struct
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 
 from ..models import EventKind, MarketEvent
 from .anchor import AnchorEventDecoder, b58encode
+from .telemetry import ProviderTelemetry, SubscriptionError, failure, record
 
 logger = logging.getLogger(__name__)
+STABLE_STREAM_SECONDS = 60.0
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -87,6 +90,10 @@ class SolanaLogProvider:
         self.reconnects = 0
         self.last_error: str | None = None
         self.next_retry_at: datetime | None = None
+        self.telemetry = ProviderTelemetry("ws")
+        self._generation = 0
+        self._configuration_changed = asyncio.Event()
+        self._attempt_stable = False
         self.max_pool_mappings = max_pool_mappings
         self.pool_mints: OrderedDict[str, str] = OrderedDict()
         self.pool_quotes: OrderedDict[str, str] = OrderedDict()
@@ -125,33 +132,70 @@ class SolanaLogProvider:
         backoff = 1.0
         try:
             while not stop.is_set():
+                generation, telemetry = self._generation, self.telemetry
+                self._configuration_changed.clear()
+                self._attempt_stable = False
                 try:
                     self.next_retry_at = None
+                    role = "fallback" if self.using_fallback else "primary"
+                    record(telemetry, "attempt", role=role, operation="stream")
                     await self._run_once(handler, stop)
                     backoff = 1.0
                 except asyncio.CancelledError:
+                    record(telemetry, "cancelled", role=role, operation="stream")
                     raise
                 except Exception as exc:  # provider boundary must not stop the app
+                    if generation != self._generation:
+                        record(telemetry, "context_changed", role=role, operation="stream")
+                        backoff = 1.0
+                        continue
                     self.connected = False
                     self.last_error = self._safe_error(exc)
                     self.reconnects += 1
+                    if self._attempt_stable and not self._is_rate_limited(exc):
+                        backoff = 1.0
                     if self._activate_fallback(exc):
                         delay, backoff = 1.0, 1.0
                     else:
                         delay, backoff = self._retry_backoff(exc, backoff)
+                    category, code = failure(exc)
+                    record(
+                        telemetry,
+                        category,
+                        role=role,
+                        operation="stream",
+                        code=code,
+                        retry=delay,
+                    )
                     self.next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
                     logger.warning("Solana stream disconnected: %s", self.last_error)
-                    with suppress(TimeoutError):
-                        await asyncio.wait_for(stop.wait(), timeout=delay)
+                    await self._wait_retry(stop, delay)
+                    if generation != self._generation:
+                        backoff = 1.0
         finally:
             self.connected = False
             self.next_retry_at = None
+
+    async def _wait_retry(self, stop: asyncio.Event, delay: float) -> None:
+        """Both shutdown and explicit settings changes interrupt retry waiting."""
+        waiters = [
+            asyncio.create_task(event.wait()) for event in (stop, self._configuration_changed)
+        ]
+        try:
+            await asyncio.wait(waiters, timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waiters:
+                task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     async def _run_once(
         self,
         handler: Callable[[MarketEvent], Awaitable[None]],
         stop: asyncio.Event,
     ) -> None:
+        generation, telemetry = self._generation, self.telemetry
+        self._attempt_stable = False
+        acknowledged_at: float | None = None
         async with websockets.connect(
             self.active_ws_url,
             open_timeout=15,
@@ -161,9 +205,13 @@ class SolanaLogProvider:
             max_queue=1_024,
             close_timeout=5,
         ) as socket:
+            if generation != self._generation:
+                return
             self.connected = False
             self.last_error = None
             for request_id, program in enumerate((PUMP_PROGRAM, PUMP_AMM_PROGRAM), start=1):
+                if generation != self._generation:
+                    return
                 await socket.send(
                     json.dumps(
                         {
@@ -177,8 +225,8 @@ class SolanaLogProvider:
                         }
                     )
                 )
-            acknowledged: set[int] = set()
-            while not stop.is_set():
+            acknowledged: dict[int, int] = {}
+            while not stop.is_set() and generation == self._generation:
                 try:
                     raw = await asyncio.wait_for(socket.recv(), timeout=30)
                 except TimeoutError:
@@ -188,28 +236,75 @@ class SolanaLogProvider:
                 # WebSocket ``recv`` calls then complete without suspending, so explicitly give
                 # HTTP, health and market-worker tasks a scheduling turn between messages.
                 await asyncio.sleep(0)
+                if generation != self._generation:
+                    return
                 self.last_message_at = datetime.now(UTC)
                 message = json.loads(raw)
+                if not isinstance(message, dict):
+                    raise ValueError("Malformed stream envelope")
                 if message.get("error") is not None:
                     error = message.get("error") or {}
                     code = error.get("code", "unknown") if isinstance(error, dict) else "unknown"
-                    raise RuntimeError(f"Solana subscription rejected with code {code}")
+                    raise SubscriptionError(code)
                 params = message.get("params")
                 if not params:
                     response_id = message.get("id")
-                    if response_id in {1, 2} and message.get("result") is not None:
-                        acknowledged.add(int(response_id))
-                        self.connected = acknowledged == {1, 2}
+                    subscription = message.get("result")
+                    if (
+                        type(response_id) is int
+                        and response_id in {1, 2}
+                        and type(subscription) is int
+                        and subscription >= 0
+                    ):
+                        acknowledged.setdefault(response_id, subscription)
+                        self.connected = (
+                            set(acknowledged) == {1, 2} and len(set(acknowledged.values())) == 2
+                        )
+                        if self.connected and acknowledged_at is None:
+                            acknowledged_at = time.monotonic()
+                            record(
+                                telemetry,
+                                "response",
+                                operation="stream",
+                                role="fallback" if self.using_fallback else "primary",
+                            )
                     continue
+                if not isinstance(params, dict):
+                    raise ValueError("Malformed stream params")
                 result = params.get("result", {})
+                if not isinstance(result, dict):
+                    raise ValueError("Malformed stream result")
                 context = result.get("context", {})
                 value = result.get("value", {})
+                if not isinstance(context, dict) or not isinstance(value, dict):
+                    raise ValueError("Malformed stream notification")
+                if (
+                    not self._attempt_stable
+                    and acknowledged_at is not None
+                    and time.monotonic() - acknowledged_at >= STABLE_STREAM_SECONDS
+                    and message.get("method") == "logsNotification"
+                    and type(params.get("subscription")) is int
+                    and params["subscription"] in acknowledged.values()
+                    and type(context.get("slot")) is int
+                    and context["slot"] > 0
+                    and isinstance(value.get("signature"), str)
+                    and bool(value["signature"])
+                    and isinstance(value.get("logs"), list)
+                    and "err" in value
+                    and (value["err"] is None or isinstance(value["err"], dict))
+                    and all(isinstance(line, str) for line in value["logs"])
+                ):
+                    self._attempt_stable = True
                 if value.get("err") is not None:
                     continue
                 signature = str(value.get("signature") or "")
                 slot = int(context.get("slot") or 0)
                 logs = value.get("logs") or []
                 for event in self.events_from_logs(signature, slot, logs):
+                    # A handler can yield under queue backpressure. Recheck before
+                    # handing off another decoded event from the same notification.
+                    if stop.is_set() or generation != self._generation:
+                        return
                     await handler(event)
 
     def events_from_logs(
@@ -313,18 +408,9 @@ class SolanaLogProvider:
         }
 
     def _safe_error(self, exc: Exception) -> str:
-        try:
-            parsed = urlsplit(self.ws_url)
-            host = parsed.hostname or "configured-rpc"
-            if parsed.port:
-                host = f"{host}:{parsed.port}"
-            redacted_url = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
-        except ValueError:
-            redacted_url = "<configured-rpc>"
-        detail = str(exc).replace(self.ws_url, redacted_url)
-        if self.fallback_ws_url:
-            detail = detail.replace(self.fallback_ws_url, "<fallback-rpc>")
-        return f"{type(exc).__name__}: {detail}"[:300]
+        category, code = failure(exc)
+        role = "fallback" if self.using_fallback else "primary"
+        return f"{role} stream: {category}" + (f" ({code})" if code is not None else "")
 
     @staticmethod
     def _is_rate_limited(exc: Exception) -> bool:
@@ -333,15 +419,24 @@ class SolanaLogProvider:
         return bool(status == 429 or re.search(r"\bHTTP\s+429\b", str(exc), re.IGNORECASE))
 
     def _activate_fallback(self, exc: Exception) -> bool:
-        if self.using_fallback or self.fallback_ws_url is None or not self._is_rate_limited(exc):
+        rate_limited = self._is_rate_limited(exc)
+        rejected = getattr(getattr(exc, "response", None), "status_code", None) == 413
+        if self.using_fallback or self.fallback_ws_url is None or not (rate_limited or rejected):
             return False
         self.active_ws_url = self.fallback_ws_url
         self.using_fallback = True
-        self.fallback_reason = "primary_rate_limited"
+        self.fallback_reason = "primary_rate_limited" if rate_limited else "primary_http_413"
         return True
 
     def configure(self, ws_url: str, *, fallback_ws_url: str | None = None) -> None:
         """Apply an explicit provider change and reset any previous runtime fallback."""
+        self._generation += 1
+        self._configuration_changed.set()
+        self._attempt_stable = False
+        self.telemetry = ProviderTelemetry("ws")
+        self.connected = False
+        self.last_error = None
+        self.last_message_at = None
         self.ws_url = ws_url
         self.fallback_ws_url = fallback_ws_url if fallback_ws_url != ws_url else None
         self.active_ws_url = ws_url
@@ -353,7 +448,9 @@ class SolanaLogProvider:
     def _retry_backoff(exc: Exception, current: float) -> tuple[float, float]:
         """Honor provider rate limits without turning restarts into a reconnect storm."""
         response = getattr(exc, "response", None)
-        if not SolanaLogProvider._is_rate_limited(exc):
+        rate_limited = SolanaLogProvider._is_rate_limited(exc)
+        rejected = getattr(response, "status_code", None) == 413
+        if not rate_limited and not rejected:
             return current, min(30.0, current * 2)
 
         retry_after = 0.0
@@ -362,6 +459,13 @@ class SolanaLogProvider:
             raw_retry_after = headers.get("Retry-After")
             with suppress(TypeError, ValueError):
                 retry_after = float(raw_retry_after)
+        if not math.isfinite(retry_after):
+            retry_after = 0.0
+        if not rate_limited:
+            if retry_after <= 0:
+                return current, min(30.0, current * 2)
+            delay = min(300.0, max(current, retry_after))
+            return delay, min(300.0, delay * 2)
         delay = min(300.0, max(60.0, current, retry_after))
         return delay, min(300.0, max(60.0, delay * 2))
 

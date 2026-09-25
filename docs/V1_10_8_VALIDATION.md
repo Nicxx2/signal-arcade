@@ -365,7 +365,7 @@ validation records before deployment; schema 16 and installed dependencies remai
 The final local image (`sha256:c37b6dffa191f86ec4104cadf18e3fb6cd0800e5e4bc7c189531ebf771d745fd`)
 was deployed at **2026-09-08 16:03:35 UTC**, after a verified 10,961,874-byte diagnostics backup;
 the earlier verified full data backup and prior compatible images remain available. Season,
-settings, support/Coach permissions and Sizing/Exit versions were preserved. The father's remote
+settings, support/Coach permissions and Sizing/Exit versions were preserved. The separate remote
 instance was not changed.
 
 Four serial observations through 16:06:00 UTC showed all seven workers running. Startup queue

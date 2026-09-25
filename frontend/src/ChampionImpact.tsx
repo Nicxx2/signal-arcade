@@ -47,6 +47,14 @@ export function ChampionImpact({ learning, seasonId, profile, serverTime }: Prop
     && Number.isFinite(age) && age >= -5000 && age <= 120000;
   const candidate = current ? report.comparisons.find(item => item.subject === subject) : undefined;
   const comparison = !paused && enabled && candidate && validComparison(candidate) ? candidate : undefined;
+  const counts = comparison?.actions;
+  const actions = counts && Object.values(counts).every(x => Number.isInteger(x) && x >= 0)
+    && Object.values(counts).reduce((a, b) => a + b, 0) === comparison.observed_count ? counts : undefined;
+  const sample = comparison && report?.execution_sample?.state === "available" ? report.execution_sample : undefined;
+  const entrySample = sample?.skills?.find(item => item.skill === subject);
+  const entries = entrySample && [entrySample.observed_count, entrySample.supported_entry, entrySample.fallback, entrySample.unknown, entrySample.later_fallback].every(x => Number.isInteger(x) && x >= 0 && x <= 30)
+    && entrySample.supported_entry + entrySample.fallback + entrySample.unknown === entrySample.observed_count
+    && entrySample.later_fallback <= entrySample.fallback ? entrySample : undefined;
   const state = comparison?.state ?? "collecting";
   const participants = subject === "team" ? active : [subject];
   const message = paused ? "Comparison paused" : suspended ? "Support suspended" : !enabled ? "Waiting for active support" : "Waiting for current comparisons";
@@ -81,6 +89,20 @@ export function ChampionImpact({ learning, seasonId, profile, serverTime }: Prop
         <div className="impact-scale-labels"><span>Lower outcome</span><span>Equal</span><span>Higher outcome</span></div>
       </div>}
       <p className="impact-sample">{comparison.usable_count} usable / {comparison.observed_count} resolved · {(comparison.coverage * 100).toFixed(1)}% coverage{comparison.pending_count > 0 ? ` · ${comparison.pending_count} pending` : ""}</p>
+      {actions && <p className="impact-sample">Original opportunities: {actions.supported_entry} supported entries · {actions.supported_veto} supported vetoes · {actions.fallback} Baseline fallbacks · {actions.unavailable} unknown receipts.</p>}
+      {actions && actions.supported_veto > 0 && actions.supported_entry === 0 && <p>No supported entries in this window. Avoiding trades can preserve cash; this alone does not demonstrate selective entry.</p>}
+      {actions && comparison.cash_reference_mean === 0 && <p>Keeping cash on the same quoted opportunities returns 0%. This reference does not simulate a portfolio or qualify a skill.</p>}
+      {entries && <details className="impact-entries"><summary>Recent actual entries · bounded fill sample</summary>
+        <p>{entries.supported_entry} supported · {entries.fallback} Baseline fallbacks · {entries.unknown} unknown receipts. {entries.later_fallback} fallbacks linked to a later attempt.</p>
+        {entries.outcomes.filter(item => ["fallback", "supported_entry"].includes(item.category) && ["SOL", "USDC"].includes(item.currency)
+          && Number.isInteger(item.decimals) && item.decimals >= 0 && item.decimals <= 9
+          && [item.closed_count, item.unresolved_count, item.winning_count].every(x => Number.isInteger(x) && x >= 0 && x <= 30)
+          && item.winning_count <= item.closed_count && Number.isSafeInteger(item.net_minor)).map(item => <p key={`${item.category}-${item.currency}`}>
+          {item.category === "fallback" ? "Fallback" : "Supported"}: {item.closed_count} matched closed trades · {item.winning_count} positive · {item.closed_count ? `${(item.net_minor / 10 ** item.decimals).toFixed(4)} ${item.currency} after costs` : "Result pending"} · {item.unresolved_count} open or unmatched.
+        </p>)}
+        <p>At most 30 recent fills and their exact entry records. Older or missing records limit this sample; {sample?.unlinked_entries ?? 0} entries could not be linked. A later-attempt link does not prove an earlier veto. These actual results are separate from Policy proof and do not establish legitimacy or future profit.</p>
+      </details>}
+      {comparison && report?.execution_sample?.state === "unavailable" && <p>Actual-entry reporting is unavailable; no empty or healthy sample is inferred.</p>}
     </> : <div className="impact-empty"><strong>{message}</strong><p>{detail}</p></div>}
     <footer><span>Checkpoint comparison, not portfolio profit.</span><details className="impact-help"><summary aria-label="How Champion impact is measured"><CircleHelp size={18} /><span>How this works</span></summary>
       <div>

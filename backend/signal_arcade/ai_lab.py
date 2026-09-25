@@ -7,8 +7,10 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from statistics import fmean
+from threading import RLock
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -29,6 +31,7 @@ from .models import (
 from .paper.curve_math import quote_buy, quote_sell
 from .providers.http import HttpProviders, ProviderError
 from .redaction import redact_secrets
+from .workers import await_worker, joined_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,7 @@ class AiDecisionLab:
         select_model: Callable[[str], None],
         configuration_fingerprint: Callable[[], str],
         shadow_can_run: Callable[[], bool] | None = None,
+        pending_registered: Callable[[str], None] | None = None,
     ) -> None:
         self.database = database
         self.http = http
@@ -125,6 +129,7 @@ class AiDecisionLab:
         self.select_model = select_model
         self.configuration_fingerprint = configuration_fingerprint
         self.shadow_can_run = shadow_can_run or (lambda: True)
+        self.pending_registered = pending_registered
         self.shadow_deferred = False
         try:
             self.mode = AiDecisionMode(
@@ -157,6 +162,9 @@ class AiDecisionLab:
         self.shadow_queue_drops = 0
         self.queued_mints: set[str] = set()
         self.pending_outcomes: dict[str, list[AiCriticAssessment]] = {}
+        self._pending_lock = RLock()
+        self._assessment_saves: dict[str, set[asyncio.Task[None]]] = {}
+        self._shadow_assessing = False
         for assessment in database.unresolved_ai_assessments(5_000):
             self.pending_outcomes.setdefault(assessment.mint, []).append(assessment)
 
@@ -176,7 +184,7 @@ class AiDecisionLab:
             self.runtime_status["reachable"] = False
             self.runtime_status["compute"] = "unavailable"
         if self.mode == AiDecisionMode.GUARDED:
-            qualification = await asyncio.to_thread(self.qualification)
+            qualification = await joined_to_thread(self.qualification)
             if not qualification["qualified"]:
                 self.mode = AiDecisionMode.SHADOW
                 self.database.set_setting("ai_decision_mode", self.mode.value)
@@ -207,7 +215,7 @@ class AiDecisionLab:
                 # qualification() is cache-fast when nothing changed, but also notices a new risk,
                 # fee, model, season, or prompt fingerprint. Keep scans off the market worker and
                 # off interactive dashboard requests.
-                await asyncio.to_thread(self.qualification)
+                await joined_to_thread(self.qualification)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -230,13 +238,75 @@ class AiDecisionLab:
     def has_pending_outcome(self, mint: str) -> bool:
         """Return whether a saved Shadow assessment still needs this mint's market data."""
 
-        return bool(self.pending_outcomes.get(mint))
+        with self._pending_lock:
+            return bool(self.pending_outcomes.get(mint))
+
+    def has_due_outcome(self, mint: str, now: datetime) -> bool:
+        """Skip only provable no-op dispatches; pending/priority semantics stay separate."""
+        with self._pending_lock:
+            assessments = tuple(self.pending_outcomes.get(mint, []))
+        if not assessments:
+            return False
+        # An in-flight Shadow result may register another assessment at the dispatch
+        # await. Preserve that existing scheduling boundary instead of assuming its clock.
+        if mint in self.queued_mints:
+            return True
+        try:
+            return any(
+                item.outcome_due_at is not None and now >= item.outcome_due_at
+                for item in assessments
+            )
+        except (TypeError, ValueError, OverflowError):
+            # Legacy/incomparable clocks retain the original handler and error behaviour.
+            return True
 
     @property
     def tracked_mints(self) -> set[str]:
         """Mints whose queued or saved AI work must survive candidate pruning."""
 
-        return set(self.queued_mints) | set(self.pending_outcomes)
+        with self._pending_lock:
+            return set(self.queued_mints) | set(self.pending_outcomes)
+
+    @property
+    def assessment_busy(self) -> bool:
+        """Inference and the following durable-to-memory handoff must both settle."""
+        return self._shadow_assessing or bool(self._assessment_saves)
+
+    async def _save_assessment(self, assessment: AiCriticAssessment) -> None:
+        """Own the complete save/registration across cancellation, not just the SQL worker."""
+
+        async def publish() -> None:
+            await joined_to_thread(self.database.save_ai_assessment, assessment)
+            # No await after commit until pending tracking is visible. Qualification/display
+            # updates cannot leave a durable assessment without its outcome registration.
+            was_pending = self.has_pending_outcome(assessment.mint)
+            self._track_pending(assessment)
+            if (
+                not was_pending
+                and self.has_pending_outcome(assessment.mint)
+                and self.pending_registered is not None
+            ):
+                self.pending_registered(assessment.mint)
+            self.qualification_cache = None
+            self._remember_current_assessment(assessment)
+
+        task = asyncio.create_task(publish(), name="ai-assessment-save")
+        pending = self._assessment_saves.setdefault(assessment.mint, set())
+        pending.add(task)
+        try:
+            await await_worker(task)
+        finally:
+            pending.discard(task)
+            if not pending:
+                self._assessment_saves.pop(assessment.mint, None)
+
+    async def settle_assessment_for_mint(self, mint: str) -> None:
+        """A tick may not overtake a same-mint save and lose its original outcome time."""
+        for task in tuple(self._assessment_saves.get(mint, ())):
+            # The owning critic reports a failed optional save. It must not fail an
+            # unrelated market transaction or manufacture an outcome for unsaved data.
+            with suppress(Exception):
+                await await_worker(task)
 
     def selected_model_provenance(self) -> tuple[str, str]:
         """Return the exact optional model identity used by durable advisory artifacts."""
@@ -291,10 +361,7 @@ class AiDecisionLab:
         )
         if assessment is None:
             return decision
-        self.database.save_ai_assessment(assessment)
-        self._remember_current_assessment(assessment)
-        self.qualification_cache = None
-        self._track_pending(assessment)
+        await self._save_assessment(assessment)
         if (
             assessment.valid
             and assessment.verdict == AiCriticVerdict.VETO
@@ -324,6 +391,7 @@ class AiDecisionLab:
                     self.shadow_queue_drops += 1
                     continue
                 try:
+                    self._shadow_assessing = True
                     assessment = await self._assess(
                         decision,
                         outcome,
@@ -331,18 +399,15 @@ class AiDecisionLab:
                         timeout_seconds=28,
                     )
                     if assessment is not None:
-                        self.database.save_ai_assessment(assessment)
-                        self._remember_current_assessment(assessment)
-                        self.qualification_cache = None
-                        self._track_pending(assessment)
-                        await asyncio.to_thread(
+                        await self._save_assessment(assessment)
+                        await joined_to_thread(
                             self.database.resolve_incidents,
                             "ai_shadow_worker",
                         )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    await asyncio.to_thread(
+                    await joined_to_thread(
                         self.database.record_incident,
                         scope="ai_shadow_worker",
                         severity="warning",
@@ -351,6 +416,7 @@ class AiDecisionLab:
                         metadata={"decision_id": decision.decision_id},
                     )
             finally:
+                self._shadow_assessing = False
                 self.shadow_deferred = False
                 self.queued_mints.discard(decision.mint)
                 self.queue.task_done()
@@ -459,7 +525,8 @@ class AiDecisionLab:
         )
 
     def observe_market(self, state: TokenState, now: datetime) -> int:
-        assessments = list(self.pending_outcomes.get(state.mint, []))
+        with self._pending_lock:
+            assessments = list(self.pending_outcomes.get(state.mint, []))
         changed = 0
         for assessment in assessments:
             if assessment.outcome_due_at is None or now < assessment.outcome_due_at:
@@ -544,8 +611,10 @@ class AiDecisionLab:
 
     def expire_outcomes(self, now: datetime) -> int:
         changed = 0
-        for assessments in list(self.pending_outcomes.values()):
-            for assessment in list(assessments):
+        with self._pending_lock:
+            pending = [list(items) for items in self.pending_outcomes.values()]
+        for assessments in pending:
+            for assessment in assessments:
                 if (
                     assessment.outcome_due_at is None
                     or now <= assessment.outcome_due_at + timedelta(seconds=90)
@@ -599,17 +668,19 @@ class AiDecisionLab:
 
     def _track_pending(self, assessment: AiCriticAssessment) -> None:
         if assessment.resolved_at is None and assessment.outcome_due_at is not None:
-            items = self.pending_outcomes.setdefault(assessment.mint, [])
-            if all(item.assessment_id != assessment.assessment_id for item in items):
-                items.append(assessment)
+            with self._pending_lock:
+                items = self.pending_outcomes.setdefault(assessment.mint, [])
+                if all(item.assessment_id != assessment.assessment_id for item in items):
+                    items.append(assessment)
 
     def _untrack_pending(self, assessment: AiCriticAssessment) -> None:
-        items = self.pending_outcomes.get(assessment.mint, [])
-        remaining = [item for item in items if item.assessment_id != assessment.assessment_id]
-        if remaining:
-            self.pending_outcomes[assessment.mint] = remaining
-        else:
-            self.pending_outcomes.pop(assessment.mint, None)
+        with self._pending_lock:
+            items = self.pending_outcomes.get(assessment.mint, [])
+            remaining = [item for item in items if item.assessment_id != assessment.assessment_id]
+            if remaining:
+                self.pending_outcomes[assessment.mint] = remaining
+            else:
+                self.pending_outcomes.pop(assessment.mint, None)
 
     def qualification(self) -> dict[str, Any]:
         curated_model = self.http.ollama_model in {str(item["name"]) for item in MODEL_CATALOG}
@@ -882,7 +953,7 @@ class AiDecisionLab:
                     await asyncio.sleep(delay_seconds)
             await self.refresh_models()
             self.select_installed_model(model)
-            await asyncio.to_thread(
+            await joined_to_thread(
                 self.database.resolve_incidents,
                 "ollama_model_download",
             )
@@ -899,7 +970,7 @@ class AiDecisionLab:
         except Exception as exc:
             error = redact_secrets(exc)
             job.update({"status": "error", "error": error, "message": "Download failed"})
-            await asyncio.to_thread(
+            await joined_to_thread(
                 self.database.record_incident,
                 scope="ollama_model_download",
                 severity="warning",

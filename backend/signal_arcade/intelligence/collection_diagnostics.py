@@ -46,6 +46,7 @@ class CollectionTargets(dict[str, list[tuple[str, int]]]):
 
 
 MAX_TRACKED_CHECKPOINTS = 20_000
+SELECTION_REASONS = ("eligible", "fresh_cache", "excluded_identity", "missing_state", "expired")
 EXPIRY_RPC_STAGES = (
     "unknown",
     "no_rpc_selection",
@@ -91,6 +92,82 @@ class CollectionDiagnostics:
         self._counts: dict[str, dict[str, int]] = {}
         self._pending: OrderedDict[tuple[str, int, str], list[str]] = OrderedDict()
         self._expiry: dict[str, dict[str, int]] = {}
+        self._selection_passes = 0
+        self._selection_latest: dict[str, Any] | None = None
+        self._selection_next_monotonic = 0.0
+
+    def selection_sample_due(self) -> bool:
+        """Sample at most once a minute; blocked/cached passes consume no slot."""
+        return self._selection_latest is None or time.monotonic() >= self._selection_next_monotonic
+
+    def selection_sample(
+        self,
+        now: datetime,
+        counts: dict[str, list[list[int]]],
+        routes: dict[str, list[int]],
+        budget: list[int],
+        *,
+        clock_unclassified: dict[str, int] | None = None,
+        selected_bands: dict[str, list[int]] | None = None,
+        guards_passed: bool = False,
+    ) -> None:
+        """One admitted RPC pass, not unique losses or a history-wide population."""
+        self._selection_passes = min(2**53 - 1, self._selection_passes + 1)
+        self._selection_latest = {
+            "sampled_at": now.timestamp(),
+            "pass": self._selection_passes,
+            "counts": counts,
+            "routes": routes,
+            "budget": budget,
+            "clock_unclassified": clock_unclassified or {"discovery": 0, "policy": 0},
+            "selected_bands": selected_bands,
+            "guard_context": "preselection_passed" if guards_passed else "not_reported",
+        }
+        self._selection_next_monotonic = time.monotonic() + 60
+
+    def selection_events(self) -> list[dict[str, Any]]:
+        sample = self._selection_latest
+        if sample is None:
+            return []
+        # Separate small lane events preserve the existing compressed event cap.
+        return [
+            {
+                "kind": "collection_selection",
+                "version": 1,
+                "at": time.time(),
+                "scope": self.scope,
+                "lane": lane,
+                "sampled_at": sample["sampled_at"],
+                "pass": sample["pass"],
+                "horizons": [60, 300, 600, 900, 1200],
+                "reasons": list(SELECTION_REASONS),
+                "counts": sample["counts"][lane],
+                # Excluded trajectories with unresolved work but an incomparable
+                # clock. Their due/expired status is unknown, not a healthy zero.
+                "clock_unclassified": sample["clock_unclassified"][lane],
+                # Eligible unique mints with <=5s, (5,15]s and >15s remaining;
+                # selected unique mints in this lane (shared mints count in both).
+                "routes": sample["routes"][lane],
+                # Configured cap, eligible deduplicated mints, scheduler selections.
+                # Actual request rejection/address/account results are separate.
+                "budget": sample["budget"],
+                # Same pass and original lane clocks, before shared-mint deduplication.
+                # Unselected work is a sampled opportunity, never a unique lost outcome.
+                "selected_bands": (
+                    sample["selected_bands"][lane] if sample.get("selected_bands") else None
+                ),
+                "unselected_bands": (
+                    [
+                        sample["routes"][lane][i] - sample["selected_bands"][lane][i]
+                        for i in range(3)
+                    ]
+                    if sample.get("selected_bands")
+                    else None
+                ),
+                "guard_context": sample.get("guard_context", "not_reported"),
+            }
+            for lane in ("discovery", "policy")
+        ]
 
     def track(self, lane: str, horizon: int, trajectory_id: str, *, enrolled: bool = False) -> None:
         if (
