@@ -15,12 +15,12 @@ from test_publication_pressure import queued_job
 
 
 @pytest.fixture
-def clock(engine, monkeypatch):  # noqa: F811
+def clock(engine, monkeypatch, request):  # noqa: F811
     import signal_arcade.diagnostics as diagnostics
     import signal_arcade.intelligence.learning as learning
     import signal_arcade.orchestrator as orchestration
 
-    origin = time.monotonic()
+    origin = getattr(request, "param", time.monotonic())
     now = [origin]
     clock_api = SimpleNamespace(
         monotonic=lambda: now[0],
@@ -221,6 +221,12 @@ def test_reporting_failure_cannot_fail_publication_or_spin(engine, clock, monkey
     assert not engine._event_lock.locked()
 
 
+@pytest.mark.parametrize(
+    "clock",
+    [0.0, 300.298341847, 86_400.123456789, 31_536_000.12345679],
+    indirect=True,
+    ids=["zero", "ci-fractional-origin", "one-day-uptime", "one-year-uptime"],
+)
 def test_early_collection_cannot_accelerate_long_run_cadence(engine, clock, monkeypatch):  # noqa: F811
     origin = clock[0]
     for index in range(120):
@@ -228,10 +234,16 @@ def test_early_collection_cannot_accelerate_long_run_cadence(engine, clock, monk
         engine.diagnostics.publications.clear()
         engine.diagnostics.queue.clear()  # Healthy isolated writer drains each interval.
         publication(engine, clock, monkeypatch)
-        clock[0] = origin + (index + 1) * 60 - 5
+        # Drive the exact early boundary of the recorded slot. Independently
+        # recomputing it can land just below the boundary through float rounding.
+        clock[0] = engine.diagnostics.next_collection_monotonic - 5
         publication(engine, clock, monkeypatch)
         assert engine.diagnostics.sequence == index + 1
-        assert engine.diagnostics.next_collection_monotonic == origin + (index + 2) * 60
+        # Repeated addition and the closed form can differ by a few float ULPs.
+        # Keep a fixed 10ns tolerance, never one that grows with host uptime.
+        assert engine.diagnostics.next_collection_monotonic == pytest.approx(
+            origin + (index + 2) * 60, rel=0, abs=1e-8
+        )
     assert engine.diagnostics.total_dropped == 0
 
 
