@@ -748,7 +748,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.10.10
+    image: nicxx2/signal-arcade:1.10.11
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
