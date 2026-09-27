@@ -1,4 +1,5 @@
-FROM node:24-alpine AS web
+# Build browser assets natively once; only static output crosses into each target runtime.
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web
 WORKDIR /build
 RUN corepack enable
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
@@ -8,7 +9,7 @@ COPY frontend frontend
 RUN pnpm --filter signal-arcade-web build
 
 FROM python:3.12-slim AS runtime
-ARG SIGNAL_ARCADE_VERSION=1.10.11
+ARG SIGNAL_ARCADE_VERSION=1.10.12
 LABEL org.opencontainers.image.title="Signal Arcade" \
       org.opencontainers.image.description="A local-first Solana paper-trading and learning lab" \
       org.opencontainers.image.version="${SIGNAL_ARCADE_VERSION}" \

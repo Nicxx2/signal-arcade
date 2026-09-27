@@ -1,4 +1,4 @@
-# 🧠 Signal Arcade v1.10.11
+# 🧠 Signal Arcade v1.10.12
 
 **A local-first Solana paper-trading lab where every decision leaves evidence.**
 
@@ -7,7 +7,7 @@ deterministic engine, simulates fee-aware paper fills, and learns from what happ
 An optional local AI coach observes the same saved outcomes outside the trading decision path.
 No wallet keys, live orders, paid provider or cloud AI are required.
 
-[![Version](https://img.shields.io/badge/version-v1.10.11-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
+[![Version](https://img.shields.io/badge/version-v1.10.12-7568ff)](https://github.com/Nicxx2/signal-arcade/releases)
 [![Paper only](https://img.shields.io/badge/mode-paper%20only-20c997)](https://github.com/Nicxx2/signal-arcade)
 [![Docker image](https://img.shields.io/badge/docker-nicxx2%2Fsignal--arcade-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/nicxx2/signal-arcade)
 [![License](https://img.shields.io/badge/license-MIT-a78bfa)](https://github.com/Nicxx2/signal-arcade/blob/main/LICENSE)
@@ -18,7 +18,76 @@ No wallet keys, live orders, paid provider or cloud AI are required.
 
 ---
 
-## What changed in v1.10.11
+## What's new in v1.10.12
+
+This release improves checkpoint processing, stream recovery and dashboard reconnection,
+and makes gaps in diagnostic history easier to identify.
+
+- **Less repeated learning work:** reuse Policy population selection during a checkpoint pass,
+  while checking proof and Champion health immediately after every outcome.
+- **Stronger stream recovery:** reconnect when subscription setup stalls or the subscribed
+  stream stops delivering valid notifications, using the existing retry backoff.
+- **More resilient live updates:** recover missed browser disconnect callbacks and support
+  authenticated notification connections in browsers that omit WebSocket login headers.
+- **Clearer diagnostic evidence:** give training/proof reports priority in the bounded handoff
+  queue, report losses and uncertain writes explicitly, and separate worker time from waiting.
+
+Trading rules, model recipes, proof gates, coverage settings and provider budgets are unchanged.
+The update keeps schema 16 and existing learning, positions, seasons and Champion history.
+
+**Runtime limits remain:** sustained bursts can still cause candidate expiry and diagnostic gaps,
+and retention can fall behind. Use monitoring during extended operation; weeks or months of
+unattended reliability and improved trading returns have not been established.
+
+<details>
+<summary><strong>v1.10.12 technical details and validation</strong></summary>
+
+The checkpoint optimization reuses Policy population selection within one synchronous cached
+checkpoint pass. Every outcome still receives its immediate proof and Champion health checks;
+enrollment, replacement and pruning invalidate selection, and nothing is reused across passes.
+Heartbeat diagnostics now separate worker execution from dispatch/resumption, and training reports
+attribute publication retries to their initial admission blocker. No trading rule, proof gate,
+provider budget, database schema or learning generation changes.
+
+The recovery follow-up protects training/proof diagnostic reports throughout the bounded
+interval queue, retains pending reports when interval encoding fails, and distinguishes
+unsaved reports from writes that committed before a later reporting error. Diagnostics remain
+best effort: an empty publication backlog is not proof that every report reached disk.
+Solana subscriptions now have a 30-second setup deadline and recover after three minutes
+without a valid notification across either subscribed program, using the existing retry
+backoff. This is stream recovery, not a no-trades timer or extra RPC polling. Local handler
+work does not consume either receive-progress allowance. Dashboard polling also repairs a
+missed WebSocket close callback without requiring a page reload.
+
+The dashboard also supports browsers that omit Basic authentication on the live
+notification connection. Authenticated page/snapshot reads issue a five-minute, origin-bound,
+HttpOnly notification cookie; API requests still require the admin login. Existing refresh and
+retry intervals are unchanged. The guarded local deployment and live notification/reconnect
+checks passed on 27 September; longer runtime acceptance remains open.
+
+The bounded historical-fixture comparison reduced median protected waiting from 1.88 to 0.91
+seconds with identical checkpoint and per-outcome governance results. This is mechanism evidence,
+not a live throughput or unattended-reliability guarantee. See the
+[v1.10.12 validation record](docs/V1_10_12_VALIDATION.md) for status and limitations.
+
+Validation includes **3,540 backend cases**, strict typing and lint/format checks. The previously
+passed **577 frontend cases** were reused after verifying unchanged frontend inputs and assets;
+new Chromium and Firefox integration checks covered notification authentication and reconnects.
+Disposable Settings upgrade/cancel/restart checks and the guarded reference deployment passed.
+Two further performance experiments failed their acceptance gates and were excluded from the
+release. Passing local checks does not establish sustained live performance.
+
+</details>
+
+## Earlier releases
+
+The v1.10.11 improvements to processing, storage reporting, learning evidence and recovery remain
+included. Expand the history below or read the [full changelog](CHANGELOG.md).
+
+<a id="what-changed-in-v11011"></a>
+
+<details>
+<summary><strong>v1.10.11 — performance, learning evidence and reliability</strong></summary>
 
 **Release status (25 September):** local regression and upgrade checks passed. The completed
 six-hour live review preserved all 119 observed training/proof publication groups and reduced
@@ -56,7 +125,7 @@ weeks or months of unattended reliability have **not** been established. See the
   transaction exit, so slow fixed commit overhead alone does not shrink its chunks toward one
   row; growth still requires a fast complete transaction. Bounded timings distinguish worker
   execution from event-loop resumption. These preserve existing evidence and authority rules;
-  this candidate was **deployed locally through Settings preparation on 24 September**.
+  this change was **deployed locally through Settings preparation on 24 September**.
   Sustained runtime acceptance remains pending; see the
   [rollout checks](docs/V1_10_11_VALIDATION.md#assessment-handoff-live-rollout--24-september-2026).
 - **Bounded optional housekeeping:** resolved incident and AI-audit cleanup now uses small,
@@ -159,8 +228,8 @@ weeks or months of unattended reliability have **not** been established. See the
   The Entry window remains at most 1,000 eligible resolved observations, not 1,000 fitted rows;
   see [training-window and saved-evidence details](docs/LEARNING.md#retention-training-windows-and-saved-evidence).
   Optional diagnostic losses now identify a fixed set of event types within the existing
-  limits. Deployed locally through Settings preparation on 19 September; community publication
-  remains pending. See [validation and rollout limits](docs/V1_10_11_VALIDATION.md#community-presentation-and-diagnostic-polish--19-september-2026).
+  limits. Deployed locally through Settings preparation on 19 September and included in v1.10.11.
+  See [validation and rollout limits](docs/V1_10_11_VALIDATION.md#community-presentation-and-diagnostic-polish--19-september-2026).
 - **Optional learning coverage requirement:** Settings → Learning requirements offers **70%
   (default), 65%, 60% or 55%** for native Entry (Linear/XGBoost), Manipulation, Sizing and Exit.
   Lower values accept less complete evidence; they do not improve measured coverage, accuracy or
@@ -247,7 +316,7 @@ The preceding saved-evidence presentation and diagnostic-loss polish provides th
 See its [build and rollout checks](docs/V1_10_11_VALIDATION.md#learning-presentationdiagnostic-polish-live-rollout--19-september-2026)
 and the [17:58 BST follow-up](docs/V1_10_11_VALIDATION.md#post-rollout-read-only-edge-review--19-september-2026).
 The short sample does not establish sustained burst performance; earlier candidate losses and
-limited host disk space remain open concerns. Community publication remains pending.
+limited host disk space were concerns at that checkpoint. See the dated review for its limits.
 
 The earlier idle-recovery, slow-work evidence and receipt-audit additions were **deployed locally
 through Settings preparation on 19 September**. See [their rollout and limits](docs/V1_10_11_VALIDATION.md#idle-recovery-and-audit-live-rollout--19-september-2026).
@@ -266,12 +335,14 @@ publication-boundary collection, worker-detail timing, order-lookup and fitted-c
 upgraded through Settings preparation on
 18 September 2026. See the
 [v1.10.11 validation record](docs/V1_10_11_VALIDATION.md#coverage-and-order-lookup-live-rollout--18-september-2026)
-for the exact deployed build, checks and remaining limits. Community publication remains on
-hold for longer natural-traffic validation; the public v1.10.11 image has not been published.
+for the exact deployed build, checks and remaining limits. That review preceded community
+publication of v1.10.11 and is retained as historical evidence.
 New fitted-cohort reports appear with natural refits; existing artifacts retain their original
 metrics and show an unavailable breakdown. Longer natural-traffic validation remains necessary.
 The [post-burst candidate checks](docs/V1_10_11_VALIDATION.md#post-burst-local-candidate--18-september-2026)
 remain separate from live observations; passing tests does not establish sustained burst capacity.
+
+</details>
 
 <details>
 <summary><strong>Earlier v1.10.10 improvements retained</strong></summary>
@@ -354,7 +425,7 @@ remain in place. Collection deadlines, scheduler priorities and live batch setti
 event losses do not mean zero lag, and a recovered queue does not restore lost evidence or prove
 sustained peak-load capacity. Check retained critical-lag peaks, recent losses and worker health
 in Settings diagnostics, and monitor host disk space during extended operation. See the
-[v1.10.11 validation results and remaining limits](docs/V1_10_11_VALIDATION.md).
+[v1.10.12 validation results and remaining limits](docs/V1_10_12_VALIDATION.md).
 
 <details>
 <summary><strong>Release details and verification</strong></summary>
@@ -404,11 +475,12 @@ read contention and report specific failures; check for an `export_complete` tra
 a download as complete history. See
 [diagnostics history and its limits](docs/DIAGNOSTICS_HISTORY.md).
 
-The [v1.10.11 release notes](CHANGELOG.md#11011---2026-09-18) describe the latest fixes. Entry still
+The [v1.10.12 release notes](CHANGELOG.md#11012---2026-09-27) describe the latest fixes. Entry still
 needs its applicable coverage requirement (70% by default) and independent performance proof.
 
-**Upgrade:** v1.10.11 retains database schema 16. Saved Exit plans, Policy identities and fill
-indexes remain in place. Native Entry artifacts with the old ranking-validation contract remain
+**Upgrade:** v1.10.12 retains database schema 16 and introduces no new evidence migration or
+learner-generation reset. Saved Exit plans, Policy identities and fill indexes remain in place.
+When upgrading from older releases, native Entry artifacts with the old ranking-validation contract remain
 historical records but need a fresh, corrected fit before supporting trades. Unfinished legacy
 Coach studies close once as inconclusive with their evidence preserved; new proposals collect
 fresh Policy evidence after selection. Research and support permissions are preserved.
@@ -503,9 +575,10 @@ short evidence-driven exchanges and Champion ceremonies.** Open Learning → Cha
   Chest marks identify family (Linear bars, XGBoost branches, deterministic shield outline);
   XGBoost also has branched antennae. Decorative armor and handheld shields can appear in any family.
 
-The [v1.10.11 verification record](docs/V1_10_11_VALIDATION.md) summarizes regression checks,
-the isolated deadline/batch checks and remaining live-validation limits. Earlier implementation
-records remain available for [v1.10.10](docs/V1_10_10_VALIDATION.md), [v1.10.9](docs/V1_10_9_VALIDATION.md),
+The [v1.10.12 verification record](docs/V1_10_12_VALIDATION.md) summarizes regression checks,
+the isolated checkpoint comparison, connection recovery and remaining runtime limits. Earlier
+records remain available for [v1.10.11](docs/V1_10_11_VALIDATION.md),
+[v1.10.10](docs/V1_10_10_VALIDATION.md), [v1.10.9](docs/V1_10_9_VALIDATION.md),
 [v1.10.8](docs/V1_10_8_VALIDATION.md), [v1.10.7](docs/V1_10_7_VALIDATION.md),
 [v1.10.6](docs/V1_10_6_VALIDATION.md), [v1.10.5](docs/V1_10_5_VALIDATION.md),
 [quote recovery](docs/V1_10_5_QUOTE_RECOVERY.md),
@@ -526,10 +599,10 @@ Additional views: [Reigning Champions](docs/screenshots/v1.10.7-live-2026-09-07/
 [recorded battle](docs/screenshots/v1.10.7-live-2026-09-07/13-recorded-battle.png)
 and [Entry model profile](docs/screenshots/v1.10.7-live-2026-09-07/16-entry-profile.png).
 
-## Reliability improvements inherited from v1.10.4
+<a id="reliability-improvements-inherited-from-v1104"></a>
 
 <details>
-<summary><strong>Season continuity, evidence refresh and preserved safety gates</strong></summary>
+<summary><strong>v1.10.4 — season continuity, evidence refresh and preserved safety gates</strong></summary>
 
 - Auto new season finishes through a finite event boundary, even while new market events arrive.
   After the configured verified grace period, unresolved dormant inventory gets one persisted
@@ -665,7 +738,7 @@ before supporting Baseline.
 
 ## ⚡ At a glance
 
-| Player | What it does | Influence in v1.10.11 |
+| Player | What it does | Influence in v1.10.12 |
 |---|---|---|
 | **Fast Baseline** | Scores fresh evidence, distinguishes economically meaningful flow from synthetic-looking activity, and sizes inside hard limits | Runs the paper portfolio |
 | **Statistical Challenger** | Learns Entry, Manipulation, Sizing and Exit skills chronologically from fee-inclusive forward outcomes | Optional automatic support lets each qualified skill join after its own Baseline/composition proof; influence remains monitored and reversible |
@@ -732,10 +805,7 @@ before supporting Baseline.
 Only Docker with Compose support and one admin password are required. Provider keys and local AI
 models are optional and can be configured later from the web UI.
 
-The example below pins the published v1.10.10 image. This checkout contains v1.10.11;
-its public Docker Hub/GitHub release has not been published as part of this local update.
-The target public tag is `nicxx2/signal-arcade:1.10.11`; it is not available from this local build.
-Use a local source build for these changes until the versioned public image is available.
+The example below pins the v1.10.12 release image for reproducible installation.
 
 ### 1. Create `.env`
 
@@ -748,7 +818,7 @@ SIGNAL_ARCADE_ADMIN_PASSWORD=replace-this-with-a-long-unique-password
 ```yaml
 services:
   signal-arcade:
-    image: nicxx2/signal-arcade:1.10.11
+    image: nicxx2/signal-arcade:1.10.12
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 45s
@@ -859,14 +929,14 @@ counter; retained pending evidence may progress sooner. A running trainer can th
 correctly waiting for evidence. Check outcome progress and diagnostic timestamps rather than
 expecting a new model immediately. See [learning continuity](docs/LEARNING.md#training-and-validation).
 
-Upgrading an existing v1.9.2 or v1.10.x installation to v1.10.11 preserves the bankroll, open
+Upgrading an existing v1.9.2 or earlier v1.10.x installation to v1.10.12 preserves the bankroll, open
 positions, pending-order accounting, seasons, settings, learning evidence and Champion history in
 the same data volume. For an upgrade from v1.10.6 or v1.10.7, Baseline stays on v1.5, existing learning
 records remain available and no new paper season is required. Evidence selection enforces the
 current contract and durable identity rules. Restarts revalidate current activation receipts;
 older artifacts remain available for audit but cannot gain authority under a different feature schema.
 
-**v1.10.11 retains schema 16.** Upgrading from published v1.10.7 through v1.10.10 adds no
+**v1.10.12 retains schema 16.** Upgrading from published v1.10.7 through v1.10.11 adds no
 evidence migration or reset. Contextual Exit timing introduced in v1.10.9 uses optional
 position/order JSON, not a new table.
 Existing positions use Baseline timing when a contextual Champion has no original saved plan.
@@ -899,7 +969,7 @@ image together. Published v1.10.4/v1.10.5 images use schema 14 and cannot open s
 A v1.10.3 image also cannot open schema 14. Never copy only a running SQLite database file while
 leaving its WAL behind.
 
-v1.10.11 and published v1.10.7 through v1.10.10 use schema 16, but matching the database schema is
+v1.10.12 and published v1.10.7 through v1.10.11 use schema 16, but matching the database schema is
 not sufficient for rollback. Once a changed Learning requirement has created versioned policy
 records, use only a build that understands their saved proof and authority contracts. Returning
 the setting to 70% does not remove that history. A compatible coverage-policy-aware build can
@@ -1179,15 +1249,17 @@ Technical documentation:
 - [Decision model](https://github.com/Nicxx2/signal-arcade/blob/main/docs/DECISION_MODEL.md)
 - [Learning](https://github.com/Nicxx2/signal-arcade/blob/main/docs/LEARNING.md)
 - [Paper execution](https://github.com/Nicxx2/signal-arcade/blob/main/docs/PAPER_EXECUTION.md)
+- [v1.10.12 validation and runtime limits](docs/V1_10_12_VALIDATION.md)
+- [Diagnostics history](docs/DIAGNOSTICS_HISTORY.md)
 - [Changelog](https://github.com/Nicxx2/signal-arcade/blob/main/CHANGELOG.md)
 
 ---
 
 ## ⚠️ Important limitations
 
-- v1.10.11 still needs monitoring under sustained market pressure. Candidate events can expire,
-  diagnostic intervals can be delayed, and retention can temporarily fall behind; see the
-  [runtime review](docs/V1_10_11_VALIDATION.md#six-hour-runtime-and-source-publication-review--25-september-2026).
+- v1.10.12 still needs monitoring under sustained market pressure. Candidate events can expire,
+  diagnostic intervals can be delayed, and retention can fall behind; see the
+  [validation record and runtime limits](docs/V1_10_12_VALIDATION.md).
 - Paper results are not evidence that a strategy will be profitable live.
 - Latency, MEV, failed transactions, RPC gaps and adversarial tokens can be worse than any paper
   model.

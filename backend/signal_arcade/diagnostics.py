@@ -17,6 +17,7 @@ from time import thread_time
 from typing import Any
 
 from . import __version__
+from .diagnostics_handoff import CATEGORIES, add_counts, event_counts, protected
 from .diagnostics_optional import CUMULATIVE_REPORTS, optional_key
 from .diagnostics_schema import PROOF_METRICS
 from .diagnostics_store import BUDGET, COUNTERS, LAG_BOUNDS, MAX_INPUT, MAXIMA
@@ -224,12 +225,15 @@ class DiagnosticsRecorder:
                 "event_capacity",
                 "interval_input",
                 "interval_queue",
+                "interval_shutdown",
+                "event_shutdown",
                 "collector_error",
                 "reporting_error",
             ),
             0,
         )
         self.lost_event_categories = dict.fromkeys(("training", "proof", "storage", "other"), 0)
+        self.lost_handoff_events = dict.fromkeys(CATEGORIES, 0)
         # A fixed breakdown of "other", not extra losses or arbitrary event identifiers.
         self.lost_other_event_kinds = dict.fromkeys(OTHER_EVENT_KINDS, 0)
         self.collection_deferred = 0
@@ -238,6 +242,7 @@ class DiagnosticsRecorder:
         self.next_collection_monotonic = self.previous_monotonic + 60
         self.previous_context: dict[str, Any] | None = None
         self.previous_dropped = 0
+        self.previous_uncertain = 0
         self.fingerprint: str | None = None
         self._status: dict[str, Any] = {"state": "starting" if enabled else "disabled"}
 
@@ -588,25 +593,27 @@ class DiagnosticsRecorder:
             if detached is not None:
                 self.events.append(detached)
 
-    def _take_events(self, at: float) -> list[dict[str, Any]]:
+    def _take_events(self, at: float, *, commit: bool = True) -> list[dict[str, Any]]:
         selected: list[dict[str, Any]] = []
+        publications = self.publications if commit else self.publications.copy()
+        events = self.events if commit else self.events.copy()
         # Whole groups keep a publication together. Leave at least one slot for
         # ordinary diagnostics; sustained overload still has finite retention.
-        while self.publications and len(selected) + len(self.publications[0][1]) <= 7:
-            _, group = self.publications.popleft()
+        while publications and len(selected) + len(publications[0][1]) <= 7:
+            _, group = publications.popleft()
             selected.extend({**event, "collected_at": at} for event in group)
-        while self.events and len(selected) < 8:
+        while events and len(selected) < 8:
             # Training errors retain priority over optional detail, even if a group
             # used seven slots. Unselected events remain bounded for the next pass.
             index = next(
-                (i for i, event in enumerate(self.events) if event.get("kind") in PROTECTED_EVENTS),
+                (i for i, event in enumerate(events) if event.get("kind") in PROTECTED_EVENTS),
                 0,
             )
-            event = self.events[index]
+            event = events[index]
             selected.append(event)
-            del self.events[index]
+            del events[index]
             key = optional_key(event)
-            if key is not None:
+            if key is not None and commit:
                 self._optional_collected[key] = (event["scope"], time.monotonic())
                 self.runtime_evidence.collected(event)
         return selected
@@ -640,10 +647,19 @@ class DiagnosticsRecorder:
         return {
             **self.loss_reasons,
             "event_categories": dict(self.lost_event_categories),
+            # Events inside lost intervals are a breakdown of interval loss, never
+            # added to the mixed-unit legacy dropped total or input-event categories.
+            "handoff_event_categories": dict(self.lost_handoff_events),
+            "writer_event_categories": (
+                self.writer.loss_events()
+                if self.writer and hasattr(self.writer, "loss_events")
+                else dict.fromkeys(CATEGORIES, 0)
+            ),
             "other_event_kinds": {
                 kind: count for kind, count in self.lost_other_event_kinds.items() if count
             },
             "writer_intervals": self.writer.rejected if self.writer else 0,
+            "writer_uncertain_intervals": getattr(self.writer, "uncertain", 0),
         }
 
     def collect(
@@ -663,10 +679,17 @@ class DiagnosticsRecorder:
         # watermark for flags, the saved gauge and the next comparison; otherwise
         # a rejection between reads can advance the watermark without recording a gap.
         dropped = self.total_dropped
+        uncertain = getattr(self.writer, "uncertain", 0)
         flags = []
         if self.sequence == 0 or elapsed < 55:
             flags.append("partial_interval")
-        if gap or elapsed > 90 or self._loss_since_collection or dropped > self.previous_dropped:
+        if (
+            gap
+            or elapsed > 90
+            or self._loss_since_collection
+            or dropped > self.previous_dropped
+            or uncertain > self.previous_uncertain
+        ):
             flags.append("recording_gap")
         if abs(at - self.previous_at - elapsed) > 5:
             flags.append("clock_jump")
@@ -690,20 +713,31 @@ class DiagnosticsRecorder:
                 "diagnostics_deferred": self.collection_deferred,
             },
             "skills": skills,
-            "events": self._take_events(at),
+            "events": self._take_events(at, commit=False),
         }
         self.sequence += 1
         self.previous_at, self.previous_monotonic = at, mono
         self.previous_context = context
         self.previous_dropped = dropped
+        self.previous_uncertain = uncertain
         self._loss_since_collection = False
         self.phases = {}
         try:
             raw = json.dumps(record, separators=(",", ":"), allow_nan=False).encode() + b"\n"
             if len(raw) > MAX_INPUT:
                 raise ValueError("record_too_large")
+            # No await separates preview, serialization and consumption. A failed
+            # interval leaves reports pending with their original identity and age.
+            self._take_events(at)
             if len(self.queue) == self.queue.maxlen:
+                victim = next((i for i, item in enumerate(self.queue) if not protected(item)), None)
                 self._record_loss("interval_queue")
+                if victim is None and not protected(raw):
+                    add_counts(self.lost_handoff_events, event_counts(raw))
+                    return
+                victim = 0 if victim is None else victim
+                add_counts(self.lost_handoff_events, event_counts(self.queue[victim]))
+                del self.queue[victim]
             self.queue.append(raw)
         except (ValueError, TypeError, RecursionError):
             self._record_loss("interval_input")
@@ -742,6 +776,7 @@ class DiagnosticsRecorder:
 
     def status(self) -> dict[str, Any]:
         ack = self.writer.last_ack_monotonic if self.writer else None
+        saved = getattr(self.writer, "last_saved_monotonic", None)
         return {
             **self._status,
             **(self.writer.status if self.writer else {}),
@@ -751,6 +786,7 @@ class DiagnosticsRecorder:
             "build": self.fingerprint,
             "version": __version__,
             "ack_age_seconds": max(0, time.monotonic() - ack) if ack is not None else None,
+            "saved_age_seconds": max(0, time.monotonic() - saved) if saved is not None else None,
             "queued": len(self.queue)
             + (self.writer.messages.qsize() + int(self.writer.busy) if self.writer else 0),
             "dropped": self.total_dropped,
@@ -778,6 +814,15 @@ class DiagnosticsRecorder:
         }
 
     async def stop(self) -> None:
+        while self.queue:
+            self._record_loss("interval_shutdown")
+            add_counts(self.lost_handoff_events, event_counts(self.queue.popleft()))
+        while self.publications:
+            _, events = self.publications.popleft()
+            for event in events:
+                self._record_loss("event_shutdown", event)
+        while self.events:
+            self._record_loss("event_shutdown", self.events.popleft())
         if self.writer is not None:
             self.writer.request_stop()
             if self.writer.thread.is_alive():

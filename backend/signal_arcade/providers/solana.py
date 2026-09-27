@@ -23,6 +23,17 @@ from .telemetry import ProviderTelemetry, SubscriptionError, failure, record
 
 logger = logging.getLogger(__name__)
 STABLE_STREAM_SECONDS = 60.0
+# These bound application readiness, independently of transport ping/pong. The
+# idle limit covers BOTH broad program feeds, never individual tokens or trades.
+SUBSCRIPTION_SETUP_SECONDS = 30.0
+NOTIFICATION_IDLE_SECONDS = 180.0
+
+
+class StreamTimeout(TimeoutError):
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__("Stream progress timeout")
+
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -87,6 +98,7 @@ class SolanaLogProvider:
         self.decoder = AnchorEventDecoder([idl_dir / "pump.json", idl_dir / "pump_amm.json"])
         self.connected = False
         self.last_message_at: datetime | None = None
+        self.last_notification_at: datetime | None = None
         self.reconnects = 0
         self.last_error: str | None = None
         self.next_retry_at: datetime | None = None
@@ -209,28 +221,45 @@ class SolanaLogProvider:
                 return
             self.connected = False
             self.last_error = None
+            self.last_notification_at = None
+            setup_deadline = time.monotonic() + SUBSCRIPTION_SETUP_SECONDS
             for request_id, program in enumerate((PUMP_PROGRAM, PUMP_AMM_PROGRAM), start=1):
                 if generation != self._generation:
                     return
-                await socket.send(
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "method": "logsSubscribe",
-                            "params": [
-                                {"mentions": [program]},
-                                {"commitment": "confirmed"},
-                            ],
-                        }
-                    )
+                await asyncio.wait_for(
+                    socket.send(
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "method": "logsSubscribe",
+                                "params": [
+                                    {"mentions": [program]},
+                                    {"commitment": "confirmed"},
+                                ],
+                            }
+                        )
+                    ),
+                    timeout=max(0.001, setup_deadline - time.monotonic()),
                 )
             acknowledged: dict[int, int] = {}
+            idle_deadline: float | None = None
             while not stop.is_set() and generation == self._generation:
+                deadline = setup_deadline if idle_deadline is None else idle_deadline
+                phase = "subscription_setup" if idle_deadline is None else "notification_idle"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StreamTimeout(phase)
                 try:
-                    raw = await asyncio.wait_for(socket.recv(), timeout=30)
+                    raw = await asyncio.wait_for(socket.recv(), timeout=min(30, remaining))
                 except TimeoutError:
-                    await socket.ping()
+                    if stop.is_set() or generation != self._generation:
+                        return
+                    if time.monotonic() >= deadline:
+                        raise StreamTimeout(phase) from None
+                    await asyncio.wait_for(
+                        socket.ping(), timeout=max(0.001, deadline - time.monotonic())
+                    )
                     continue
                 # A busy provider can keep thousands of already-buffered messages ready. Some
                 # WebSocket ``recv`` calls then complete without suspending, so explicitly give
@@ -262,6 +291,7 @@ class SolanaLogProvider:
                         )
                         if self.connected and acknowledged_at is None:
                             acknowledged_at = time.monotonic()
+                            idle_deadline = acknowledged_at + NOTIFICATION_IDLE_SECONDS
                             record(
                                 telemetry,
                                 "response",
@@ -278,11 +308,8 @@ class SolanaLogProvider:
                 value = result.get("value", {})
                 if not isinstance(context, dict) or not isinstance(value, dict):
                     raise ValueError("Malformed stream notification")
-                if (
-                    not self._attempt_stable
-                    and acknowledged_at is not None
-                    and time.monotonic() - acknowledged_at >= STABLE_STREAM_SECONDS
-                    and message.get("method") == "logsNotification"
+                known_notification = (
+                    message.get("method") == "logsNotification"
                     and type(params.get("subscription")) is int
                     and params["subscription"] in acknowledged.values()
                     and type(context.get("slot")) is int
@@ -291,10 +318,15 @@ class SolanaLogProvider:
                     and bool(value["signature"])
                     and isinstance(value.get("logs"), list)
                     and "err" in value
-                    and (value["err"] is None or isinstance(value["err"], dict))
+                    and (value["err"] is None or isinstance(value["err"], (dict, str)))
                     and all(isinstance(line, str) for line in value["logs"])
-                ):
-                    self._attempt_stable = True
+                )
+                received = time.monotonic()
+                if known_notification and acknowledged_at is not None:
+                    self.last_notification_at = datetime.now(UTC)
+                    idle_deadline = received + NOTIFICATION_IDLE_SECONDS
+                    if received - acknowledged_at >= STABLE_STREAM_SECONDS:
+                        self._attempt_stable = True
                 if value.get("err") is not None:
                     continue
                 signature = str(value.get("signature") or "")
@@ -306,6 +338,14 @@ class SolanaLogProvider:
                     if stop.is_set() or generation != self._generation:
                         return
                     await handler(event)
+                if known_notification:
+                    # Backpressure/decoding belongs to the local consumer. Do not
+                    # mistake that time for a silent provider or discard its buffer.
+                    processing = max(0.0, time.monotonic() - received)
+                    if idle_deadline is None:
+                        setup_deadline += processing
+                    else:
+                        idle_deadline += processing
 
     def events_from_logs(
         self,
@@ -410,7 +450,13 @@ class SolanaLogProvider:
     def _safe_error(self, exc: Exception) -> str:
         category, code = failure(exc)
         role = "fallback" if self.using_fallback else "primary"
-        return f"{role} stream: {category}" + (f" ({code})" if code is not None else "")
+        detail = (
+            f" ({exc.phase})"
+            if isinstance(exc, StreamTimeout)
+            and exc.phase in {"subscription_setup", "notification_idle"}
+            else (f" ({code})" if code is not None else "")
+        )
+        return f"{role} stream: {category}" + detail
 
     @staticmethod
     def _is_rate_limited(exc: Exception) -> bool:
@@ -437,6 +483,7 @@ class SolanaLogProvider:
         self.connected = False
         self.last_error = None
         self.last_message_at = None
+        self.last_notification_at = None
         self.ws_url = ws_url
         self.fallback_ws_url = fallback_ws_url if fallback_ws_url != ws_url else None
         self.active_ws_url = ws_url
@@ -477,6 +524,9 @@ class SolanaLogProvider:
             "connected": self.connected,
             "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
             "message_age_seconds": age,
+            "last_notification_at": (
+                self.last_notification_at.isoformat() if self.last_notification_at else None
+            ),
             "reconnects": self.reconnects,
             "last_error": self.last_error,
             "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,

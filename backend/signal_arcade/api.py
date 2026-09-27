@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import secrets
 import sqlite3
 import time
@@ -25,6 +26,7 @@ from starlette.types import Receive, Scope, Send
 
 from . import __version__
 from .config import Settings, load_settings
+from .dashboard_auth import SESSION_SECONDS, DashboardSessions
 from .database import AdvisoryReadDeferred
 from .diagnostics_store import LAG_BOUNDS, DiagnosticsReadError, read_events, read_page
 from .models import (
@@ -54,9 +56,10 @@ else:
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: Any, password: str | None) -> None:
+    def __init__(self, app: Any, password: str | None, sessions: DashboardSessions) -> None:
         super().__init__(app)
         self.password = password
+        self.sessions = sessions
 
     async def dispatch(self, request: RequestType, call_next: RequestResponseEndpoint) -> Response:
         if not self.password or request.url.path == "/api/v1/health":
@@ -66,7 +69,29 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
                 headers={"WWW-Authenticate": 'Basic realm="Signal Arcade", charset="UTF-8"'},
             )
-        return await call_next(request)
+        response = await call_next(request)
+        if (
+            request.method == "GET"
+            and request.url.path in {"/", "/api/v1/snapshot"}
+            and response.status_code == 200
+        ):
+            # Existing authenticated reads renew the browser handshake credential.
+            # No extra polling, password exposure to JS, or API cookie authority.
+            target = str(request.url)
+            name = self.sessions.cookie_name(target)
+            token = self.sessions.issue(target)
+            if name is not None and token is not None:
+                response.set_cookie(
+                    name,
+                    token,
+                    max_age=SESSION_SECONDS,
+                    path="/ws",
+                    secure=request.url.scheme == "https",
+                    httponly=True,
+                    samesite="strict",
+                )
+                response.headers["Cache-Control"] = "private, no-store"
+        return response
 
 
 class SameOriginMiddleware(BaseHTTPMiddleware):
@@ -303,6 +328,8 @@ def _validated_provider_changes(body: ProviderSecretChanges) -> dict[str, str | 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     orchestrator = Orchestrator(settings)
+    dashboard_sessions = DashboardSessions()
+    notification_rejections: set[str] = set()
 
     async def normal_operation() -> AsyncIterator[None]:
         """Serialize mutations with the upgrade boundary and reject them once it is crossed."""
@@ -334,7 +361,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.orchestrator = orchestrator
     app.add_middleware(GZipMiddleware, minimum_size=1_024, compresslevel=4)
     app.add_middleware(SameOriginMiddleware)
-    app.add_middleware(BasicAuthMiddleware, password=settings.admin_password)
+    app.add_middleware(
+        BasicAuthMiddleware, password=settings.admin_password, sessions=dashboard_sessions
+    )
 
     diagnostic_exports = asyncio.Semaphore(2)
 
@@ -883,15 +912,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/ws")
     async def websocket(websocket: WebSocketType) -> None:
+        async def reject(reason: str, code: int) -> None:
+            # At most four fixed categories per application lifetime. Never log
+            # credentials, cookie values, URLs or arbitrary request headers.
+            if reason not in notification_rejections:
+                notification_rejections.add(reason)
+                logging.getLogger(__name__).info("Dashboard notification rejected: %s", reason)
+            await websocket.close(code=code)
+
         origin = websocket.headers.get("origin")
         if origin and not _same_origin(origin, str(websocket.url)):
-            await websocket.close(code=4403)
+            await reject("origin", 4403)
             return
-        if settings.admin_password and not _valid_basic_auth(
-            websocket.headers.get("authorization"), settings.admin_password
-        ):
-            await websocket.close(code=4401)
-            return
+        if settings.admin_password:
+            authorization = websocket.headers.get("authorization")
+            target = str(websocket.url)
+            cookie_name = dashboard_sessions.cookie_name(target)
+            # An explicitly supplied bad credential still fails closed. Cookie
+            # fallback is only for browsers which omit Basic auth on the upgrade.
+            authenticated = (
+                _valid_basic_auth(authorization, settings.admin_password)
+                if authorization is not None
+                else bool(
+                    origin
+                    and cookie_name
+                    and dashboard_sessions.valid(websocket.cookies.get(cookie_name), target)
+                )
+            )
+            if not authenticated:
+                reason = (
+                    "credentials"
+                    if authorization is not None
+                    else "session_origin"
+                    if not origin
+                    else "session"
+                )
+                await reject(reason, 4401)
+                return
         await websocket.accept()
         try:
             async for message in orchestrator.bus.subscribe():

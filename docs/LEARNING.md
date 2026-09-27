@@ -11,6 +11,21 @@ Compact dashboard projection retains rolling-feature calculations and their cach
 only omits construction of values the dashboard would discard. These are processing optimizations,
 not a change to training populations, trading rules or evidence required for promotion.
 
+## Checkpoint processing in v1.10.12
+
+A synchronous cached-checkpoint pass may reuse its selected Policy population across mints.
+It reads current checkpoint objects and recalculates governance after each update. The selection
+does not depend on outcome values; missing and negative outcomes remain in the same population.
+Enrollment, committed evidence replacement and pruning clear it, including failed pruning.
+The cache ends with the call and never crosses an await or market-lock release. Nested independent
+scopes invalidate their parent's selection before restoring it. Reuse requires the explicit
+checkpoint-pass owner; an enclosing dashboard or other selection scope cannot supply its rows.
+
+The 20-mint budget still counts mints, not individual checkpoints or episodes. This optimization
+reduces repeated work; it does not impose a hard time bound, delay Champion health checks, alter
+the original checkpoint grace windows or extend the 120-second training-publication validity
+fence. Rules, model recipes, coverage settings, evidence identities and provider demand are unchanged.
+
 ## Configurable skill coverage (v1.10.11)
 
 Settings → **Learning requirements** offers **70% (default), 65%, 60% and 55%**. The choice measures

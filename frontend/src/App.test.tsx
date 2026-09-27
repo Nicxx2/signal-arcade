@@ -486,6 +486,36 @@ test("recovers a stalled handshake without reloading the page", async () => {
   expect(screen.getByText("Live updates")).toBeInTheDocument();
 });
 
+test.each([DashboardSocket.CLOSED, DashboardSocket.CLOSING])("repairs a missed close during ordinary polling (%s)", async (state) => {
+  const { fetcher } = recoveringDashboard();
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = DashboardSocket.OPEN; first.onopen?.(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  first.readyState = state; // No callback, visibility change or online event.
+  await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+  expect(screen.getByText("Auto refresh")).toBeInTheDocument();
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  expect(DashboardSocket.instances).toHaveLength(2);
+  const next = DashboardSocket.instances[1]!;
+  act(() => { next.readyState = DashboardSocket.OPEN; next.onopen?.(); });
+  expect(screen.getByText("Live updates")).toBeInTheDocument();
+  expect(fetcher.mock.calls.length).toBeGreaterThan(1);
+});
+
+test("quiet open sockets keep fallback polling without needless reconnections", async () => {
+  const { fetcher, unmount } = recoveringDashboard();
+  const first = DashboardSocket.instances[0]!;
+  act(() => { first.readyState = DashboardSocket.OPEN; first.onopen?.(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+  expect(DashboardSocket.instances).toHaveLength(1);
+  expect(fetcher.mock.calls.length).toBeGreaterThan(5);
+  expect(fetcher.mock.calls.length).toBeLessThan(12);
+  unmount();
+  const count = fetcher.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+  expect(fetcher.mock.calls.length).toBe(count);
+});
+
 test("repairs a missed close when returning to the tab", async () => {
   const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
   recoveringDashboard();

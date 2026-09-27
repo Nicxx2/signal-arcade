@@ -192,7 +192,9 @@ def test_secondary_outcome_advances_governance_without_requesting_a_fit() -> Non
         request_retraining=lambda **kw: calls.append("fit"),
         _govern_skill_ensemble=lambda: calls.append("ensemble"),
     )
-    engine._policy_selection_scope = lambda: LearningEngine._policy_selection_scope(engine)
+    engine._policy_selection_scope = lambda **kwargs: LearningEngine._policy_selection_scope(
+        engine, **kwargs
+    )
     LearningEngine._advance_primary_outcomes(engine, set(), outcomes_changed=True)
     assert calls == ["health", "tournaments", "ensemble"]
     assert engine._status_policy_cache.rows is None

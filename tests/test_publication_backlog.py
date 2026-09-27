@@ -125,7 +125,7 @@ def test_interval_encoding_failure_is_not_reported_as_saved(tmp_path):
     recorder.collect(pipeline={}, context={"bad": float("nan")}, gauges={}, skills=[])
     assert not recorder.queue
     assert recorder.loss_counts()["interval_input"] == 1
-    assert recorder.pending_publication_events == 0
+    assert recorder.pending_publication_events == 6
     assert "recording_gap" in collect(recorder)["flags"]
 
 

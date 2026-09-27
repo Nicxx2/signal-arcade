@@ -821,6 +821,7 @@ class LearningEngine:
             existing.lane != episode.lane or existing.mint != episode.mint
         ):
             raise ValueError("committed evidence identity changed")
+        self._invalidate_policy_selection()
         self.evidence_episodes[episode.episode_id] = episode.model_copy(deep=True)
         mint_ids = self._evidence_episode_ids_by_mint.setdefault(episode.mint, [])
         if episode.episode_id not in mint_ids:
@@ -1673,6 +1674,7 @@ class LearningEngine:
                 entry_reserve_observed_at=state.last_reserve_at or state.last_event_at,
             )
             identity_key = _policy_identity_key(episode)
+            self._invalidate_policy_selection()
             if identity_key not in self._policy_identities:
                 self._policy_identities.update(self.database.policy_identities({identity_key}))
             reserved = self._policy_identities.get(identity_key)
@@ -1697,6 +1699,7 @@ class LearningEngine:
             self.collection_diagnostics.enrolled("policy", episode.episode_id)
             created = True
         if not discovery_exists:
+            self._invalidate_policy_selection()
             key = _policy_identity_key(observation)
             if key not in self._policy_identities:
                 self._policy_identities.update(self.database.policy_identities({key}))
@@ -1770,6 +1773,7 @@ class LearningEngine:
             raise ValueError("original checkpoint fee context unavailable")
         return self.settings.network_fee_lamports + self.settings.priority_fee_lamports
 
+    @timed_work("checkpoint_observe")
     def observe_market(
         self,
         state: TokenState,
@@ -2027,7 +2031,7 @@ class LearningEngine:
             return
         # Forward health and suspension are inexpensive safety controls and remain on the
         # outcome boundary. Only coefficient fitting/publishing moves off the event path.
-        with self._policy_selection_scope():
+        with self._policy_selection_scope(reuse=True):
             self._govern_active_model()
             self._advance_entry_tournaments()
             for target_mode, target_configuration in sorted(
@@ -2121,6 +2125,7 @@ class LearningEngine:
                     missing_reason=reason,
                 )
 
+    @timed_work("checkpoint_select")
     def due_checkpoint_mints(
         self,
         states: dict[str, TokenState],
@@ -2310,17 +2315,22 @@ class LearningEngine:
     ) -> int:
         if not live:
             return 0
-        return sum(
-            self.observe_market(states[mint], now, live=True, cached=True)
-            for mint in self.due_checkpoint_mints(
-                states,
-                now,
-                limit=max_observations,
-                fresh=True,
-                diagnostics=self.collection_diagnostics,
+        # A single synchronous pass owns the same market boundary and timestamp. Only
+        # population selection is reusable: checkpoint objects stay live, and every
+        # outcome still triggers immediate governance. Pruning/enrollment clears reuse.
+        with self._policy_selection_scope(checkpoint_pass=True):
+            return sum(
+                self.observe_market(states[mint], now, live=True, cached=True)
+                for mint in self.due_checkpoint_mints(
+                    states,
+                    now,
+                    limit=max_observations,
+                    fresh=True,
+                    diagnostics=self.collection_diagnostics,
+                )
             )
-        )
 
+    @timed_work("checkpoint_expire")
     def expire_checkpoints(
         self,
         now: datetime,
@@ -2865,15 +2875,33 @@ class LearningEngine:
         return checks[key]
 
     @contextmanager
-    def _policy_selection_scope(self) -> Iterator[None]:
-        # Rows and identities stay fixed during one synchronous market-boundary pass.
-        # Reuse only population selection, never authority, receipts or health conclusions.
+    def _policy_selection_scope(
+        self, *, reuse: bool = False, checkpoint_pass: bool = False
+    ) -> Iterator[None]:
+        # Selection ignores checkpoint values, which may advance during a synchronous
+        # cached-checkpoint pass. Every proof/health calculation reads those current
+        # objects again. No selection survives this call, a yield, or membership change.
         previous = getattr(self._status_policy_cache, "rows", None)
-        self._status_policy_cache.rows = {}
+        previous_owner = getattr(self._status_policy_cache, "checkpoint_rows", None)
+        rows = previous if reuse and previous is not None and previous is previous_owner else {}
+        self._status_policy_cache.rows = rows
+        # A dashboard/other nested scope must never become an outcome cache owner.
+        self._status_policy_cache.checkpoint_rows = (
+            rows if checkpoint_pass else previous_owner if rows is previous else None
+        )
         try:
             yield
         finally:
+            if previous is not None and rows is not previous:
+                # A separately scoped nested operation may have changed membership.
+                previous.clear()
             self._status_policy_cache.rows = previous
+            self._status_policy_cache.checkpoint_rows = previous_owner
+
+    def _invalidate_policy_selection(self) -> None:
+        rows = getattr(self._status_policy_cache, "rows", None)
+        if rows is not None:
+            rows.clear()
 
     def _status(
         self, *, demo_mode: bool, impact_context: tuple[str | None, str | None, int] | None = None
@@ -7967,6 +7995,8 @@ class LearningEngine:
 
     @timed_work("checkpoint_prune")
     def _prune_complete_history(self) -> None:
+        # Clear before any write, including failures part-way through maintenance.
+        self._invalidate_policy_selection()
         removed = False
         for mint in self.database.prune_learning_observations(MAX_COMPLETED_OBSERVATIONS):
             self.observations.pop(mint, None)

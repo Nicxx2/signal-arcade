@@ -689,6 +689,12 @@ export default function App() {
       pollDue = due;
       pollTimer = window.setTimeout(() => {
         pollTimer = null;
+        // A suspended/mobile browser can miss a close callback even while the
+        // page is visible. Repair known terminal state at the existing cadence;
+        // silence on an OPEN socket is not evidence that notifications failed.
+        if (socket && typeof socket.readyState === "number" && (
+          socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING
+        )) disconnected(socket);
         void refresh().finally(schedulePoll);
       }, delay);
     };
@@ -1059,7 +1065,7 @@ export default function App() {
               <AlertTriangle size={14} /> Risk paused
             </span>
           )}
-          <span className={`connection ${connected ? "online" : "fallback"}`} title={connected ? "Live notifications with automatic refresh fallback." : expectedRestart ? "Waiting for the app to finish updating." : "Refreshing periodically; the live connection will retry automatically."}>
+          <span className={`connection ${connected ? "online" : "fallback"}`} title={connected ? "Live notifications with automatic refresh fallback. Check status for data freshness." : expectedRestart ? "Waiting for the app to finish updating." : "Periodic refresh is enabled while live notifications reconnect. Check status for refresh failures or stale data."}>
             {connected ? <Wifi size={15} /> : <RotateCcw size={15} />}
             {connected ? "Live updates" : expectedRestart ? "Updating" : "Auto refresh"}
           </span>

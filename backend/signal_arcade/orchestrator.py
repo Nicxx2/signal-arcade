@@ -84,6 +84,7 @@ from .risk_profiles import (
     build_season_profile,
     season_profile_catalog,
 )
+from .runtime_evidence import SLOW_FIELDS
 from .strategy import (
     LEGACY_BASELINE_VERSION,
     LEGACY_INTEGRITY_POLICY_VERSION,
@@ -254,6 +255,22 @@ async def _timed_to_thread(  # noqa: UP047
                     recorder.observe_duration(phase + "_worker", max(0.0, finished - started))
                 if phase == "event_learning":
                     recorder.observe_learning_waits(dispatch_wait, resume_wait)
+                if phase == "heartbeat" and (heartbeat_work := _HEARTBEAT_WORK.get()) is not None:
+                    # Joined worker detail belongs to this one coherent lock hold. Nested
+                    # elapsed phases overlap; only worker_cpu is CPU time. Never sum them.
+                    heartbeat_work.update(
+                        dispatch=dispatch_wait,
+                        worker=max(0.0, finished - started),
+                        worker_cpu=max(0.0, cpu_seconds),
+                        resume=resume_wait,
+                    )
+                    heartbeat_work.update(
+                        {
+                            name: values[1]
+                            for name, values in (detail or {}).items()
+                            if name in SLOW_FIELDS["heartbeat"]
+                        }
+                    )
                 if detail is not None:
                     assert detail_lane is not None
                     record_work(detail, detail_lane + "_dispatch", dispatch_wait)
@@ -1689,16 +1706,27 @@ class Orchestrator:
         # Admit only between finite event batches with no queued urgent work. Unlike
         # preparing a fit, a completed job may publish with a small candidate backlog;
         # requiring an entirely empty stream here can repeatedly waste valid fits.
-        return bool(
-            not self._maintenance_requested
-            and not self._storage_maintenance_active
-            and not self.event_queue.boundary_active
-            and not self.event_queue.has_dequeued_work
-            and self._event_batches_in_flight == 0
-            and self.event_queue.qsize() / max(1, self.settings.event_queue_max) < 0.05
-            and not self.event_queue.has_ready_before(1)
-            and self._learning_lag_allows_idle_work()
-        )
+        return self._learning_publication_blocked_reason() is None
+
+    def _learning_publication_blocked_reason(self) -> str | None:
+        """First failing guard, in admission order; no new permission or queue mutation."""
+        if self._maintenance_requested:
+            return "maintenance"
+        if self._storage_maintenance_active:
+            return "storage"
+        if self.event_queue.boundary_active:
+            return "boundary"
+        if self.event_queue.has_dequeued_work:
+            return "dequeued"
+        if self._event_batches_in_flight != 0:
+            return "batch"
+        if self.event_queue.qsize() / max(1, self.settings.event_queue_max) >= 0.05:
+            return "queue"
+        if self.event_queue.has_ready_before(1):
+            return "priority"
+        if not self._learning_lag_allows_idle_work():
+            return "lag"
+        return None
 
     def _training_runtime_context(self) -> tuple[Any, ...]:
         return (id(self.learning), self.demo_mode, self.broker.season_id, self.stop_event.is_set())
@@ -1717,11 +1745,19 @@ class Orchestrator:
                 or time.monotonic() - job.started_monotonic > 120
             )
             if terminal or self._learning_publication_can_run():
+                lock_started = time.monotonic()
                 async with self._event_lock:
+                    job.phase_seconds["publication_lock_seconds"] = job.phase_seconds.get(
+                        "publication_lock_seconds", 0.0
+                    ) + max(0.0, time.monotonic() - lock_started)
                     context = self._training_runtime_context()
                     terminal = error is not None or learner.training_job_stale(job, context)
                     if not terminal and self._learning_publication_can_run():
+                        collection_started = time.monotonic()
                         self._collect_before_publication(job)
+                        job.phase_seconds["publication_collect_seconds"] = job.phase_seconds.get(
+                            "publication_collect_seconds", 0.0
+                        ) + max(0.0, time.monotonic() - collection_started)
                         # Even in-memory reporting consumes time. It must not extend a
                         # job's validity or authorize publication over new market work.
                         context = self._training_runtime_context()
@@ -1735,7 +1771,17 @@ class Orchestrator:
                         self.diagnostics.observe_phase("training_publish", started)
                         self._record_training_diagnostics(job, ran, started)
                         return ran
-            await self._wait_for_stop(0.25)
+            # Attribute this retry interval to the first guard at its start, not to a
+            # fabricated continuous cause. It includes sleep and event-loop resume delay.
+            reason = self._learning_publication_blocked_reason() or "recheck"
+            blocked_started = time.monotonic()
+            try:
+                await self._wait_for_stop(0.25)
+            finally:
+                key = f"publication_blocked_{reason}_seconds"
+                job.phase_seconds[key] = job.phase_seconds.get(key, 0.0) + max(
+                    0.0, time.monotonic() - blocked_started
+                )
 
     def _exit_timing_arguments(self, mint: str | None = None) -> dict[str, Any]:
         position = self.broker.positions.get(mint or "")

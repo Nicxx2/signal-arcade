@@ -13,6 +13,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any
 
+from .diagnostics_handoff import CATEGORIES, add_counts, event_counts
 from .diagnostics_store import MAX_INPUT, DiagnosticsStore
 
 WRITER_WAIT_REASONS = ("admission", "market_yield", "storage", "maintenance", "training", "guard")
@@ -54,11 +55,16 @@ class DiagnosticsWriter:
         self._wait_counts = dict.fromkeys(WRITER_WAIT_REASONS, 0)
         self._wait_seconds = dict.fromkeys(WRITER_WAIT_REASONS, 0.0)
         self.messages: Queue[bytes | None] = Queue(maxsize=1)
+        self._message_lock = threading.Lock()
         self.stopping = threading.Event()
         self.allowed = threading.Event()
         self.rejected = 0
+        self.uncertain = 0
+        self._loss_lock = threading.Lock()
+        self._lost_events = dict.fromkeys(CATEGORIES, 0)
         self.busy = False
         self.last_ack_monotonic: float | None = None
+        self.last_saved_monotonic: float | None = None
         self.status: dict[str, Any] = {"state": "starting"}
         self.thread = threading.Thread(target=self._run, name="diagnostics-io", daemon=True)
 
@@ -103,16 +109,27 @@ class DiagnosticsWriter:
             self._observe_wait(reason)
 
     def offer(self, raw: bytes) -> bool:
-        if len(raw) > MAX_INPUT or not self.thread.is_alive():
-            return False
-        try:
-            self.messages.put_nowait(raw)
-            return True
-        except Full:
-            return False
+        with self._message_lock:
+            if len(raw) > MAX_INPUT or not self.thread.is_alive() or self.stopping.is_set():
+                return False
+            try:
+                self.messages.put_nowait(raw)
+                return True
+            except Full:
+                return False
+
+    def _reject(self, raw: bytes) -> None:
+        with self._loss_lock:
+            self.rejected = min(2**53 - 1, self.rejected + 1)
+            add_counts(self._lost_events, event_counts(raw))
+
+    def loss_events(self) -> dict[str, int]:
+        with self._loss_lock:
+            return dict(self._lost_events)
 
     def _run(self) -> None:
         started_cpu = time.thread_time()
+        raw: bytes | None = None
         try:
             if self.directory.is_symlink():
                 raise ValueError("unexpected_diagnostic_files")
@@ -154,6 +171,8 @@ class DiagnosticsWriter:
                             self.stopping.wait(0.1)
                         if self.stopping.is_set():
                             break
+                        accepted: bool | None = None
+                        record = None
                         try:
                             record = json.loads(raw)
                             rss = None
@@ -163,14 +182,28 @@ class DiagnosticsWriter:
                                     rss = pages * os.sysconf("SC_PAGE_SIZE")
                             record["gauges"]["app_rss_bytes"] = rss
                             accepted = store.append(record)
-                            self.rejected += int(not accepted)
+                            if accepted:
+                                self.last_saved_monotonic = time.monotonic()
+                            else:
+                                self._reject(raw)
                             self.status = {
                                 **store.status(),
                                 "last_ack_at": time.time(),
                                 "writer_cpu_seconds": time.thread_time() - started_cpu,
                             }
                         except Exception as error:
-                            self.rejected += 1
+                            # append may have committed before checkpointing failed. A
+                            # failed status refresh also cannot undo a successful append.
+                            if accepted is None:
+                                try:
+                                    accepted = bool(record and store.contains_interval(record))
+                                except Exception:
+                                    self.uncertain = min(2**53 - 1, self.uncertain + 1)
+                                else:
+                                    if accepted:
+                                        self.last_saved_monotonic = time.monotonic()
+                                    else:
+                                        self._reject(raw)
                             self.status = {
                                 **self.status,
                                 "state": "paused_error",
@@ -178,6 +211,7 @@ class DiagnosticsWriter:
                                 "last_ack_at": time.time(),
                             }
                         finally:
+                            raw = None
                             self.last_ack_monotonic = time.monotonic()
                             self.busy = False
                 finally:
@@ -185,13 +219,26 @@ class DiagnosticsWriter:
         except Exception as error:
             self.status = {**self.status, "state": "unavailable", "error": error_code(error)}
         finally:
+            if raw is not None:
+                self._reject(raw)
+            self.busy = False
+            with self._message_lock:
+                self.stopping.set()
+                with suppress(Empty):
+                    queued = self.messages.get_nowait()
+                    if queued is not None:
+                        self._reject(queued)
             with suppress(Exception):
                 self._observe_wait(None)
 
     def request_stop(self) -> None:
-        self.stopping.set()
-        # A sentinel wakes an idle writer. A queued record is expendable diagnostic detail.
-        with suppress(Empty):
-            self.messages.get_nowait()
-        with suppress(Full):
-            self.messages.put_nowait(None)
+        with self._message_lock:
+            self.stopping.set()
+            # A sentinel wakes an idle writer. A busy writer accounts for its own
+            # record; serialization of offer/stop prevents post-stop acceptance.
+            with suppress(Empty):
+                raw = self.messages.get_nowait()
+                if raw is not None:
+                    self._reject(raw)
+            with suppress(Full):
+                self.messages.put_nowait(None)

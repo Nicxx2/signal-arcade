@@ -403,6 +403,20 @@ class DiagnosticsStore:
         self.last_write_seconds = time.monotonic() - started
         return True
 
+    def contains_interval(self, record: dict[str, Any]) -> bool:
+        """Resolve a write exception by exact identity, never the sequence watermark."""
+        if self.connection.in_transaction:
+            # This connection can see its own uncommitted insert after a failed
+            # rollback. Visibility in that state is not proof of a durable write.
+            raise RuntimeError("diagnostic_commit_unresolved")
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM intervals WHERE tier=0 AND boot=? AND seq=?",
+                (record.get("boot"), record.get("seq")),
+            ).fetchone()
+            is not None
+        )
+
     def status(self) -> dict[str, Any]:
         ranges = {}
         for tier, label in ((0, "minute"), (1, "hour")):

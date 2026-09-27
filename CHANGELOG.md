@@ -4,6 +4,41 @@ Signal Arcade uses semantic versions. Within the paper-trading generation, featu
 `1.x.0` and compatible fixes or fine tuning use `1.x.x`. Live execution is outside V1's scope and
 would require a deliberate V2 release.
 
+## 1.10.12 - 2026-09-27
+
+- Build static frontend assets on the builder's native platform and share them across
+  AMD64/ARM64 images. Avoid a redundant emulated dependency install and UI build while
+  retaining the frozen lockfile and each target's native Python runtime dependencies.
+- Support dashboard notification connections when a browser omits Basic authentication on
+  the WebSocket handshake. Existing authenticated reads renew a short-lived, origin-bound
+  HttpOnly cookie accepted only by the notification route. Preserve API authentication,
+  origin rejection, explicit invalid-credential rejection and existing refresh/retry pacing.
+- Preserve training/proof diagnostic reports preferentially through the bounded interval
+  handoff without reordering writes. Keep reports pending after interval encoding failure;
+  separately account for events in lost intervals and writer/shutdown losses. Distinguish
+  committed writes from subsequent status/checkpoint failures and unresolved write outcomes.
+- Bound Solana subscription setup and recover a ping-responsive but silent subscribed stream
+  through the existing retry path. Count valid notifications, including failed transactions,
+  independently of executable trades; retain rate-limit handling and clean-stream safeguards.
+- Repair missed dashboard WebSocket close callbacks during existing fallback polling,
+  preserving authentication, retry limits, quiet open connections and hidden-tab pacing.
+- Reuse Policy population selection within a single synchronous cached-checkpoint pass,
+  while recalculating proof and Champion health immediately after every outcome. Clear
+  selection on enrollment, committed evidence replacement and pruning, including failure;
+  never retain it across passes or yields. Preserve ordering, missing/negative outcomes,
+  training/proof separation, permissions and all qualification rules.
+- Add bounded coherent heartbeat selection/governance and worker dispatch/resume detail.
+  Attribute training-publication retries to their first admission blocker, with separate
+  lock acquisition and diagnostic-collection spans. Preserve admission guards, the original
+  job deadline, diagnostic byte limits, cancellation ownership and provider demand.
+- Add differential checkpoint/governance, timestamp-tie, restart, invalidation and diagnostic
+  payload tests. The isolated historical-fixture comparison passed its predeclared gates;
+  live runtime acceptance remains separate. See `docs/V1_10_12_VALIDATION.md`.
+- Keep trading/learning semantics, model recipes, qualification gates, provider budgets and
+  schema 16 unchanged. Additional scheduling and training-copy experiments failed their
+  performance gates and are excluded. Burst expiry, diagnostic gaps and retention backlog
+  remain operational limits; this release does not certify long-term unattended reliability.
+
 ## 1.10.11 - 2026-09-25
 
 - Complete the six-hour runtime review and document remaining limits: 119 complete saved
@@ -190,16 +225,15 @@ would require a deliberate V2 release.
   counts, chronology exclusions and recorded periods, without reconstructing historical cohorts.
   Missing or malformed dates, including impossible calendar dates, remain unavailable.
   Keep the 1,000-observation window, fit recipes, proof and permissions unchanged. Add a fixed
-  optional-event-type loss breakdown within the existing diagnostic event budget. This latest
-  polish was deployed locally through Settings preparation on 19 September; community publication
-  remains pending.
+  optional-event-type loss breakdown within the existing diagnostic event budget. This polish
+  was deployed locally through Settings preparation on 19 September and included in v1.10.11.
 - Add a collapsed Learning requirements section in Settings with 70% (default), 65% and 60%
   native skill coverage choices. Persist a versioned requirement independently of market/cohort
   identity; freeze it in new fitted, battle, activation and recovery proof. Require prospective
   validation after a change, fence in-flight fitting across changes, and atomically revoke
   authority that cannot meet a raised requirement. Keep failed trials closed, all other proof
   gates and fixed battle budgets intact, and Coach-derived support at 70%. Deployed locally
-  through Settings preparation on 19 September; community publication remains pending.
+  through Settings preparation on 19 September and included in v1.10.11.
   A lower requirement accepts less complete evidence, not better performance.
 - Recover diagnostic collection after historical lag when admitted market work has drained.
   Admit local learning work after five quiet seconds following a successful batch, preserving

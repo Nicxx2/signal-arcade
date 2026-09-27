@@ -1,6 +1,42 @@
 # Local diagnostics history
 
-The latest local v1.10.11 candidate adds a bounded optional `slow_work` sample with lane
+The v1.10.12 recovery follow-up preserves protected report intervals preferentially while
+keeping surviving interval sequence order. Optional intervals cannot displace an all-protected
+queue. If all bounded slots contain protected reports, a newer protected interval still evicts
+the oldest one explicitly; no finite best-effort queue guarantees lossless overload retention.
+Failed interval encoding leaves selected reports pending, with original identities and times.
+
+New `handoff_event_categories` and `writer_event_categories` count training/proof/storage/other
+events inside discarded intervals. They are breakdowns of interval losses, not additions to
+the mixed-unit `dropped` total or the original input `event_categories`. `interval_shutdown`
+and `event_shutdown` account for unsent work on a controlled stop. A hard crash can prevent
+these volatile counters from being saved. `writer_uncertain_intervals` denotes write failures
+whose durable outcome could not be checked; unknown is neither saved nor confirmed lost.
+The writer checks the exact interval identity after an append exception, and does not count
+a committed write as rejected solely because a later status/checkpoint operation failed.
+
+Status `saved_age_seconds` measures the last confirmed interval write this boot; null means
+none has yet been confirmed. `ack_age_seconds` remains the age of the writer's last completed
+attempt/initialization, including rejections. Neither clock alone proves complete publication
+groups. Inspect original publication indices, expected counts, all loss stages, omission flags
+and persisted reports. Older builds without the added counters leave those losses unmeasured.
+
+v1.10.12 extends the existing bounded `slow_work` heartbeat sample
+with `dispatch`, `worker`, `worker_cpu`, `resume`, checkpoint selection/observation/expiry,
+persistence/pruning and governance detail. These belong to the same joined heartbeat operation.
+Checkpoint and governance spans overlap their parent phases; do not add them as CPU time.
+Only `worker_cpu` measures that worker's CPU. Counts and durations in optional work detail
+describe function calls, not unique lessons or lost outcomes.
+
+Training phase reports add `publication_lock_seconds`, `publication_collect_seconds` and
+`publication_blocked_<reason>_seconds` for maintenance, storage, boundary, dequeued work, batch,
+queue, priority, lag or recheck. A retry interval is attributed to its first blocking guard at
+the interval's start; the value includes deliberate waiting and delayed task resumption, and
+does not prove that guard remained the cause throughout. These fields are nested within total
+publication waiting. Admission rules and the original age/context fences are unchanged.
+The same byte limits, optional sampling and honest diagnostic-loss counters apply.
+
+v1.10.11 adds a bounded optional `slow_work` sample with lane
 `capacity`. Its phases include `lock_wait`, `setup`, `query`, `restore`, `dispatch`,
 `worker`, `cpu`, `read` and `resume`. `stage` is 0 for the initial admission read and 1 for
 the final read; an early deferral never reaches the latter. `admission_deferred`,
@@ -141,7 +177,7 @@ These CPU fields measure the owning thread, not total CPU across any native libr
 The existing byte limits, proof priority, optional cadence and truthful loss accounting remain.
 These measurements do not change model inputs, evidence eligibility or promotion requirements.
 
-The 21 September community-polish candidate adds optional category detail to the existing
+The v1.10.11 community-polish changes add optional category detail to the existing
 `storage` event's `history_work` object. `at`, `chunk_rows` and `category_offset` identify the
 history pass that supplied the timings, before any later adaptive chunk adjustment. Offsets
 0/1/2 start with raw trades/non-entry decisions/equity in the normal three-category controller.
@@ -445,8 +481,9 @@ Recorder status includes `publication_backlog` with pending groups/events, capac
 oldest age and `pending_collection`/`empty`. An empty backlog can mean reports were handed to the
 bounded interval queue, not saved. Check writer state, queue/loss counters and persisted records;
 acknowledgement time alone is insufficient because a rejected write is also acknowledged.
-Interval encoding failures, writer rejection and compression omissions retain their separate
-existing accounting. A process crash or shutdown may lose unsent reports; this buffer adds no
+Interval encoding failures, writer rejection and compression omissions have separate
+accounting; v1.10.12 adds the downstream event breakdown described above. A crash may lose
+unsent reports and volatile counters; this buffer adds no
 crash-durability guarantee and never reconstructs missing intervals as healthy observations.
 
 ### Admitted RPC selection samples
@@ -531,10 +568,10 @@ already-tight interval payload. Its counters are `event_input` (encoding/size re
 `event_capacity` (input-event eviction/rejection), `interval_input` (whole-interval encoding/size
 rejection), `interval_queue`
 (whole-interval eviction), and `writer_intervals` (whole intervals rejected by the writer).
-The post-burst candidate adds `collector_error` and `reporting_error` for failed collection or
+v1.10.11 adds `collector_error` and `reporting_error` for failed collection or
 reporting attempts. These exception counts are not exact missing-event counts: one interrupted
 reporting attempt can omit several records. They use the same saturation and recording-gap rules.
-`event_categories` breaks down only the two input-event counters into training, proof, storage
+`event_categories` breaks down input-event rejection/eviction and controlled-stop loss into training, proof, storage
 and other; do not add it to the reason totals. Counts are cumulative boot samples, not sums
 across intervals. A loss during collection is reported in a subsequent successfully captured
 sample. The recorder uses one captured writer-loss count for its gap flag, saved gauge and
@@ -573,7 +610,7 @@ before writing. It receives only allowlisted diagnostic facts. Queues, message
 sizes, proof slots, events and filesystem usage are bounded. Recorder failure cannot stop a core
 worker. Unsent data, including the final partial interval at shutdown/crash, can be lost.
 
-The post-burst candidate also permits a compact collection immediately before an admitted valid
+v1.10.11 also permits a compact collection immediately before an admitted valid
 publication if its upcoming reports would displace protected events. It must be within five
 seconds of the shared monotonic deadline or overdue, at least 55 and no more than 90 seconds
 after the previous collection, with handoff space and a running writer in the recording state.
@@ -641,7 +678,7 @@ The ordinary in-memory event buffer retains eight compact events; the separate p
 backlog retains up to four bounded groups. Sustained pressure can still exceed those allowances:
 older diagnostic detail is counted as dropped and the interval is marked, while the saved
 learning artifacts remain in the main database. This is distinct
-from losing market events or model publications. In the local community-polish candidate,
+from losing market events or model publications. Since v1.10.11,
 `snapshot_age` measures from the on-demand UI snapshot's capture time, including assembly,
 matching the UI's age semantics. Earlier builds measured from cache completion, excluding assembly.
 Invalidation does not rewrite the capture time; absent snapshots remain unavailable. The age can

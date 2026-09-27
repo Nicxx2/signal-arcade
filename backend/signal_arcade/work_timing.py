@@ -67,6 +67,9 @@ WORK_FIELDS = {
             "checkpoint_persist",
             "checkpoint_govern",
             "checkpoint_prune",
+            "checkpoint_select",
+            "checkpoint_expire",
+            "checkpoint_observe",
             "rpc_dispatch",
             "rpc_resume",
         }
